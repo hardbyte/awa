@@ -486,106 +486,18 @@ async fn holds_advisory_lock(pool: &PgPool, pid: i32) -> Result<bool, sqlx::Erro
     .await
 }
 
-/// A pooled connection keeps a session lock it leaks, so a raise of the floor
-/// that is cancelled must leave the floor's lock free. The gate releases the
-/// lock and cancels the waiting raiser in one statement, so the raiser is
-/// granted the lock before it handles the cancel: the error is raised with the
-/// lock held, inside the locked block. A cancel while still waiting is covered
-/// by the statement timeout round.
-#[sqlx::test(migrations = false)]
-async fn cancelled_floor_raise_leaves_no_session_lock(pool: PgPool) -> TestResult {
-    migrations::run(&pool).await?;
-    let lock_key: i64 = sqlx::query_scalar(
-        "SELECT hashtextextended('awa.queue_storage.ring_generation_floor:awa', 0)",
-    )
-    .fetch_one(&pool)
-    .await?;
-    let mut gate = pool.acquire().await?;
-    let mut raiser = pool.acquire().await?;
-    let raiser_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *raiser)
-        .await?;
-
-    for (round, timeout) in [(1_i64, None), (2, None), (3, Some("200ms"))] {
-        rotate_to(&pool, "awa", round, 16).await?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *gate)
-            .await?;
-        if let Some(timeout) = timeout {
-            sqlx::query(audited_sql(format!("SET statement_timeout = '{timeout}'")))
-                .execute(&mut *raiser)
-                .await?;
-        }
-        let raise = async {
-            sqlx::query("SELECT FROM awa.enqueue_ring_cursor()")
-                .execute(&mut *raiser)
-                .await
-        };
-        let cancel = async {
-            for _ in 0..500 {
-                let waiting: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-                     WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')",
-                )
-                .bind(raiser_pid)
-                .fetch_one(&pool)
-                .await?;
-                if waiting {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            if timeout.is_some() {
-                // Let the statement timeout fire while the raiser waits.
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                sqlx::query("SELECT pg_advisory_unlock($1)")
-                    .bind(lock_key)
-                    .execute(&mut *gate)
-                    .await?;
-            } else {
-                sqlx::query("SELECT pg_advisory_unlock($1), pg_cancel_backend($2)")
-                    .bind(lock_key)
-                    .bind(raiser_pid)
-                    .execute(&mut *gate)
-                    .await?;
-            }
-            Ok::<(), sqlx::Error>(())
-        };
-        let (raised, cancelled) = tokio::join!(raise, cancel);
-        cancelled?;
-        let err = raised.expect_err("the raise is cancelled");
-        assert_eq!(
-            err.as_database_error().and_then(|db| db.code()).as_deref(),
-            Some("57014"),
-            "round {round}: {err}"
-        );
-        sqlx::query("SET statement_timeout = 0")
-            .execute(&mut *raiser)
-            .await?;
-        assert!(
-            !holds_advisory_lock(&pool, raiser_pid).await?,
-            "round {round}: the raiser's session kept the floor lock"
-        );
-    }
-
-    let cursor: (i32, i64) =
-        sqlx::query_as("SELECT slot, generation FROM awa.enqueue_ring_cursor()")
-            .fetch_one(&mut *gate)
-            .await?;
-    assert_eq!(cursor, (3, 3), "a later raise still succeeds");
-    Ok(())
-}
-
-/// Runs `statement` on `victim` while `gate` holds the session advisory lock
-/// `lock_key`, then releases the lock and cancels `victim` in one statement,
-/// so the victim is granted the lock before it handles the cancel. Returns
-/// whether the victim's session still holds an advisory lock afterwards.
+/// Runs `statement` on a fresh connection while another holds the session
+/// advisory lock `lock_key`, then releases the lock and cancels the waiting
+/// statement in one statement, so it is granted the lock before it handles the
+/// cancel: the error is raised with the lock held. Returns whether the
+/// statement's session still holds an advisory lock afterwards, or `None` when
+/// the cancel arrived only after the statement had finished, which proves
+/// nothing and is worth another try.
 async fn cancel_as_granted(
     pool: &PgPool,
     lock_key: i64,
     statement: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
     let mut gate = pool.acquire().await?;
     let mut victim = pool.acquire().await?;
     let victim_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -623,13 +535,117 @@ async fn cancel_as_granted(
     };
     let (ran, cancelled) = tokio::join!(run, cancel);
     cancelled?;
-    let err = ran.expect_err("the statement is cancelled");
+    match ran {
+        Ok(_) => Ok(None),
+        Err(err) => {
+            assert_eq!(
+                err.as_database_error().and_then(|db| db.code()).as_deref(),
+                Some("57014"),
+                "{statement}: {err}"
+            );
+            Ok(Some(holds_advisory_lock(pool, victim_pid).await?))
+        }
+    }
+}
+
+/// Runs [`cancel_as_granted`] until the cancel lands while the statement runs,
+/// calling `before` ahead of each try, and returns whether the lock was left
+/// held.
+async fn cancel_as_granted_until_cancelled<F, Fut>(
+    pool: &PgPool,
+    lock_key: i64,
+    statement: &str,
+    mut before: F,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = TestResult>,
+{
+    for _ in 0..10 {
+        before().await?;
+        if let Some(held) = cancel_as_granted(pool, lock_key, statement).await? {
+            return Ok(held);
+        }
+    }
+    Err(format!("{statement}: no cancel landed while it ran in 10 tries").into())
+}
+
+/// A pooled connection keeps a session lock it leaks, so a raise of the floor
+/// that is cancelled must leave the floor's lock free, whether the cancel lands
+/// as the lock is granted or a statement timeout fires while it waits.
+#[sqlx::test(migrations = false)]
+async fn cancelled_floor_raise_leaves_no_session_lock(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    let lock_key: i64 = sqlx::query_scalar(
+        "SELECT hashtextextended('awa.queue_storage.ring_generation_floor:awa', 0)",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    // Each try needs a raise, so the ring moves one generation first.
+    let generation = std::sync::atomic::AtomicI64::new(0);
+    let held = cancel_as_granted_until_cancelled(
+        &pool,
+        lock_key,
+        "SELECT FROM awa.enqueue_ring_cursor()",
+        || {
+            let next = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let pool = pool.clone();
+            async move { rotate_to(&pool, "awa", next, 16).await }
+        },
+    )
+    .await?;
+    assert!(
+        !held,
+        "a cancel as the lock was granted kept the floor lock"
+    );
+
+    // A statement timeout that fires while the raise waits for the lock.
+    let next = generation.load(std::sync::atomic::Ordering::Relaxed) + 1;
+    rotate_to(&pool, "awa", next, 16).await?;
+    let mut gate = pool.acquire().await?;
+    let mut raiser = pool.acquire().await?;
+    let raiser_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *raiser)
+        .await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *gate)
+        .await?;
+    sqlx::query("SET statement_timeout = '200ms'")
+        .execute(&mut *raiser)
+        .await?;
+    let err = sqlx::query("SELECT FROM awa.enqueue_ring_cursor()")
+        .execute(&mut *raiser)
+        .await
+        .expect_err("the statement timeout cancels the waiting raise");
     assert_eq!(
         err.as_database_error().and_then(|db| db.code()).as_deref(),
         Some("57014"),
-        "{statement}: {err}"
+        "{err}"
     );
-    Ok(holds_advisory_lock(pool, victim_pid).await?)
+    sqlx::query("SET statement_timeout = 0")
+        .execute(&mut *raiser)
+        .await?;
+    assert!(
+        !holds_advisory_lock(&pool, raiser_pid).await?,
+        "a timeout while waiting left a lock held"
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(lock_key)
+        .execute(&mut *gate)
+        .await?;
+
+    let cursor: (i32, i64) =
+        sqlx::query_as("SELECT slot, generation FROM awa.enqueue_ring_cursor()")
+            .fetch_one(&mut *gate)
+            .await?;
+    assert_eq!(
+        cursor,
+        ((next % 16) as i32, next),
+        "a later raise still succeeds"
+    );
+    Ok(())
 }
 
 /// The lane-sequence helpers take a session lock on the lane's sequence. A
@@ -654,22 +670,31 @@ async fn cancelled_lane_sequence_moves_leave_no_session_lock(pool: PgPool) -> Te
     };
 
     let (claim_seq, claim_key) = lane_key("queue_claim_heads").await?;
-    assert!(
-        !cancel_as_granted(
-            &pool,
-            claim_key,
-            &format!("SELECT awa.set_sequence_next('{claim_seq}', 5)"),
-        )
-        .await?,
-        "set_sequence_next kept the lane sequence lock"
+    // Each try moves the cursor further, so a try that completes still
+    // leaves the next one something to do.
+    let target = std::sync::atomic::AtomicI64::new(5);
+    let claim_sql = |next: i64| format!("SELECT awa.set_sequence_next('{claim_seq}', {next})");
+    let mut held = None;
+    for _ in 0..10 {
+        let next = target.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        if let Some(result) = cancel_as_granted(&pool, claim_key, &claim_sql(next)).await? {
+            held = Some(result);
+            break;
+        }
+    }
+    assert_eq!(
+        held,
+        Some(false),
+        "set_sequence_next kept the lane sequence lock, or no cancel landed in 10 tries"
     );
 
     let (_, enqueue_key) = lane_key("queue_enqueue_heads").await?;
     assert!(
-        !cancel_as_granted(
+        !cancel_as_granted_until_cancelled(
             &pool,
             enqueue_key,
             "UPDATE awa.queue_enqueue_heads SET next_seq = next_seq + 3 WHERE queue = 'lock_q'",
+            || async { Ok(()) },
         )
         .await?,
         "the enqueue-head trigger kept the lane sequence lock"
@@ -678,4 +703,122 @@ async fn cancelled_lane_sequence_moves_leave_no_session_lock(pool: PgPool) -> Te
     // The lane still takes work.
     store.enqueue_batch(&pool, "lock_q", 2, 1).await?;
     Ok(())
+}
+
+/// The lane functions `awa.refresh_lane_sequence_helpers` replaces.
+const LANE_FUNCTIONS: &str = "'ensure_lane_sequences', 'queue_enqueue_head_sequence_sync', \
+     'queue_claim_head_sequence_sync', 'provision_lane_sequences', 'provision_lane', \
+     'set_sequence_next'";
+
+/// v062 refreshes the lane helpers through
+/// `awa.refresh_lane_sequence_helpers_as_migrator`. A migration role that may
+/// only SET ROLE to the owner of the schema and its lane functions refreshes
+/// them as that owner, lending it EXECUTE on the refresh helper for the call,
+/// and gets its own role back inside the same transaction.
+#[sqlx::test(migrations = false)]
+async fn lane_refresh_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) -> TestResult {
+    let server_version: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&pool)
+            .await?;
+    if server_version < 160000 {
+        return Ok(());
+    }
+    migrations::run(&pool).await?;
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("lane_owner_{suffix}");
+    let migrator = format!("lane_migrator_{suffix}");
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await?;
+    sqlx::raw_sql(audited_sql(format!(
+        "CREATE ROLE {owner} NOLOGIN NOSUPERUSER;
+         CREATE ROLE {migrator} LOGIN NOSUPERUSER PASSWORD 'floor_test';
+         GRANT {owner} TO {migrator} WITH INHERIT FALSE, SET TRUE;
+         GRANT CONNECT ON DATABASE \"{database}\" TO {migrator};
+         GRANT USAGE ON SCHEMA awa TO {migrator};
+         GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers_as_migrator(text) TO {migrator};
+         GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) TO {migrator} WITH GRANT OPTION;
+         ALTER SCHEMA awa OWNER TO {owner};
+         DO $$
+         DECLARE f regprocedure;
+         BEGIN
+             FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
+                      WHERE p.pronamespace = 'awa'::regnamespace
+                        AND p.proname IN ({LANE_FUNCTIONS})
+             LOOP
+                 EXECUTE format('ALTER FUNCTION %s OWNER TO {owner}', f);
+             END LOOP;
+         END $$;"
+    )))
+    .execute(&pool)
+    .await?;
+    // The released set_sequence_next, whose unlock handler misses a cancel.
+    let current: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('awa.set_sequence_next(text,bigint)'::regprocedure)",
+    )
+    .fetch_one(&pool)
+    .await?;
+    sqlx::raw_sql(audited_sql(
+        current.replace("WHEN OTHERS OR query_canceled THEN", "WHEN OTHERS THEN"),
+    ))
+    .execute(&pool)
+    .await?;
+
+    let result = async {
+        let migrator_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                pool.connect_options()
+                    .as_ref()
+                    .clone()
+                    .username(&migrator)
+                    .password("floor_test"),
+            )
+            .await?;
+        let mut tx = migrator_pool.begin().await?;
+        let refreshed: bool =
+            sqlx::query_scalar("SELECT awa.refresh_lane_sequence_helpers_as_migrator('awa')")
+                .fetch_one(&mut *tx)
+                .await?;
+        let role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        migrator_pool.close().await;
+        ensure!(refreshed, "the refresh reported success");
+        ensure_eq!(role, migrator, "the caller's role is restored");
+
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_functiondef('awa.set_sequence_next(text,bigint)'::regprocedure)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        ensure!(
+            definition.contains("OR query_canceled"),
+            "set_sequence_next was refreshed"
+        );
+        let (owners, lent): (Vec<String>, bool) = sqlx::query_as(audited_sql(format!(
+            "SELECT array_agg(DISTINCT pg_get_userbyid(p.proowner)::text),
+                    has_function_privilege('{owner}', 'awa.refresh_lane_sequence_helpers(text)', 'EXECUTE')
+             FROM pg_proc p
+             WHERE p.pronamespace = 'awa'::regnamespace AND p.proname IN ({LANE_FUNCTIONS})"
+        )))
+        .fetch_one(&pool)
+        .await?;
+        ensure_eq!(owners, vec![owner.clone()], "the lane functions keep their owner");
+        ensure!(!lent, "EXECUTE lent to the owner was taken back");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    sqlx::raw_sql(audited_sql(format!(
+        "ALTER SCHEMA awa OWNER TO CURRENT_USER;
+         REASSIGN OWNED BY {owner} TO CURRENT_USER;
+         DROP OWNED BY {owner}; DROP OWNED BY {migrator};
+         DROP ROLE {migrator}; DROP ROLE {owner};"
+    )))
+    .execute(&pool)
+    .await?;
+    result
 }

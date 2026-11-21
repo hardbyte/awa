@@ -490,6 +490,77 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
+-- Refreshes p_schema's lane helpers from a migration. They are replaced in
+-- place, which needs their owner's privileges: a migration role that may
+-- only SET ROLE to the schema's owner (PostgreSQL 16+ INHERIT FALSE) retries
+-- as that owner, lending it EXECUTE on awa.refresh_lane_sequence_helpers and
+-- USAGE on awa for the call when it lacks them and taking them back after. A
+-- role that can do neither keeps the old helpers, with a warning, and the
+-- function returns false rather than failing the migration.
+CREATE OR REPLACE FUNCTION awa.refresh_lane_sequence_helpers_as_migrator(p_schema TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $refresh$
+DECLARE
+    v_owner OID;
+    v_owner_name TEXT;
+    v_previous_role TEXT;
+    v_lent_execute BOOLEAN := false;
+    v_lent_usage BOOLEAN := false;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    BEGIN
+        PERFORM awa.refresh_lane_sequence_helpers(p_schema);
+        RETURN true;
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+
+    SELECT namespace.nspowner INTO v_owner
+    FROM pg_namespace AS namespace
+    WHERE namespace.nspname = p_schema;
+    v_owner_name := pg_get_userbyid(v_owner);
+    -- Everything here runs in one subtransaction, so a failure also undoes
+    -- the lent privileges and the role switch.
+    BEGIN
+        IF v_owner IS NULL OR NOT pg_has_role(current_user, v_owner, v_set_mode) THEN
+            RAISE insufficient_privilege;
+        END IF;
+        IF NOT has_function_privilege(v_owner, 'awa.refresh_lane_sequence_helpers(text)', 'EXECUTE') THEN
+            EXECUTE format('GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) TO %I', v_owner_name);
+            v_lent_execute := true;
+        END IF;
+        IF NOT has_schema_privilege(v_owner, 'awa', 'USAGE') THEN
+            EXECUTE format('GRANT USAGE ON SCHEMA awa TO %I', v_owner_name);
+            v_lent_usage := true;
+        END IF;
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', v_owner_name, true);
+        PERFORM awa.refresh_lane_sequence_helpers(p_schema);
+        PERFORM set_config('role', v_previous_role, true);
+        IF v_lent_execute THEN
+            EXECUTE format('REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) FROM %I', v_owner_name);
+        END IF;
+        IF v_lent_usage THEN
+            EXECUTE format('REVOKE USAGE ON SCHEMA awa FROM %I', v_owner_name);
+        END IF;
+        RETURN true;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE WARNING 'could not refresh the lane-sequence helpers of schema %: %', p_schema, SQLERRM
+            USING HINT = format(
+                'Run SELECT awa.refresh_lane_sequence_helpers(%L) as the owner of its lane functions.',
+                p_schema
+            );
+        RETURN false;
+    END;
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers_as_migrator(TEXT) FROM PUBLIC;
+
 -- Lane sequences in p_schema (or the one named p_sequence) that are not owned
 -- by the schema owner or lack a runtime grant. A lane sequence carries a head
 -- table's cursor, so whoever may write that head table (INSERT or UPDATE) gets
