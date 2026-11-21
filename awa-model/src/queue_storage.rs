@@ -3714,6 +3714,54 @@ impl DoneJobRow {
     }
 }
 
+/// One pass of DLQ retention for [`QueueStorage::delete_expired_dlq_rows`].
+#[derive(Debug, Clone, Copy)]
+pub struct DlqExpiry<'a> {
+    /// Rows older than this are deleted.
+    pub retention: std::time::Duration,
+    /// At most this many rows are deleted.
+    pub limit: i64,
+    /// With a queue, the pass covers that queue; without one, every queue
+    /// except `overridden_queues`.
+    pub queue: Option<&'a str>,
+    /// Queues with a retention of their own. A pass without a queue leaves
+    /// them alone; a pass for a queue leaves its stripes that are listed here
+    /// alone.
+    pub overridden_queues: &'a [&'a str],
+    /// Treat a queue's stripes `q#N` as part of `q`, by the rule the store
+    /// routes with, while the store stripes its queues.
+    pub stripe_families: bool,
+    /// Delete in `(dlq_at, job_id)` order.
+    pub oldest_first: bool,
+}
+
+/// SQL that is true when `queue` is a stripe name of `logical`, by the rule
+/// `QueueStorage` routes with: `logical`, the stripe delimiter `#`, then a
+/// suffix that parses as `usize` (ASCII digits, an optional leading `+`, a
+/// value no greater than `usize_max`). The stripe count does not bound the
+/// suffix, so stripes left over from a larger former stripe count stay
+/// stripes, and a suffix too large for `usize` names an independent queue.
+fn stripe_of_sql(queue: &str, logical: &str, usize_max: &str) -> String {
+    let suffix = format!("substr({queue}, char_length({logical}) + 2)");
+    format!(
+        "(left({queue}, char_length({logical}) + 1) = {logical} || '#' \
+         AND CASE WHEN {suffix} ~ '^\\+?[0-9]+$' \
+                  THEN ltrim({suffix}, '+')::numeric <= {usize_max}::numeric \
+                  ELSE false END)"
+    )
+}
+
+/// The unique-claim fields of a deleted DLQ row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DeletedDlqRow {
+    job_id: i64,
+    state: JobState,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+}
+
+const DELETED_DLQ_COLUMNS: &str = "job_id, state, unique_key, unique_states";
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DlqJobRow {
     job_id: i64,
@@ -19273,6 +19321,155 @@ impl QueueStorage {
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rows.len() as u64)
+    }
+
+    /// Release the unique claims of the DLQ rows `deleted` removed. A DLQ
+    /// row is a failed job, and a unique key whose states include `failed`
+    /// stays claimed while the row exists; deleting the row without this
+    /// leaves a claim that refuses the key to new jobs. The claims are
+    /// locked in key order, the order every other claim change takes.
+    async fn release_deleted_dlq_claims_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: &[DeletedDlqRow],
+    ) -> Result<(), AwaError> {
+        let mut released: Vec<(&[u8], i64)> = deleted
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
+            .filter_map(|row| Some((row.unique_key.as_deref()?, row.job_id)))
+            .collect();
+        if released.is_empty() {
+            return Ok(());
+        }
+        released.sort_unstable();
+        let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = released.into_iter().unzip();
+        // The locking clause applies after ORDER BY, so the CTE locks the
+        // claims in key order; the DELETE only reaches rows it has locked.
+        sqlx::query(
+            r#"
+            WITH released AS MATERIALIZED (
+                SELECT claims.unique_key
+                FROM unnest($1::bytea[], $2::bigint[]) AS input(unique_key, job_id)
+                JOIN awa.job_unique_claims AS claims
+                  ON claims.unique_key = input.unique_key
+                 AND claims.job_id = input.job_id
+                ORDER BY claims.unique_key
+                FOR UPDATE OF claims
+            )
+            DELETE FROM awa.job_unique_claims AS claims
+            USING released
+            WHERE claims.unique_key = released.unique_key
+            "#,
+        )
+        .bind(&keys)
+        .bind(&job_ids)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Delete the DLQ rows `predicate` selects in one transaction, releasing
+    /// their unique claims, and return how many were deleted.
+    pub(crate) async fn purge_dlq_where(
+        &self,
+        pool: &PgPool,
+        predicate: &crate::job_query::Predicate,
+    ) -> Result<u64, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let sql = format!(
+            "DELETE FROM {}.dlq_entries {} RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema(),
+            predicate.where_clause()
+        );
+        let deleted: Vec<DeletedDlqRow> = predicate
+            .bind_query_as(sqlx::query_as(audited_sql(sql)))
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
+    }
+
+    /// Delete one DLQ row, releasing its unique claim.
+    pub async fn purge_dlq_job(&self, pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            "DELETE FROM {}.dlq_entries WHERE job_id = $1 RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema()
+        )))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(!deleted.is_empty())
+    }
+
+    /// Delete up to `expiry.limit` DLQ rows older than `expiry.retention`,
+    /// releasing their unique claims, and return how many were deleted. See
+    /// [`DlqExpiry`] for which rows a pass covers.
+    pub async fn delete_expired_dlq_rows(
+        &self,
+        pool: &PgPool,
+        expiry: &DlqExpiry<'_>,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let retention_secs = i64::try_from(expiry.retention.as_secs()).unwrap_or(i64::MAX);
+        let order = if expiry.oldest_first {
+            "ORDER BY dlq_at ASC, job_id ASC"
+        } else {
+            ""
+        };
+        // A stripe `q#N` belongs to `q`'s family only while this store
+        // stripes its queues; otherwise `q#N` is a queue of its own.
+        let stripes = expiry.stripe_families && self.queue_stripe_count() > 1;
+        let stripe_of_queue = stripe_of_sql("queue", "$3", "$6");
+        let stripe_of_overridden = stripe_of_sql("dlq_entries.queue", "overridden.queue", "$6");
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE job_id IN (
+                SELECT job_id FROM {schema}.dlq_entries
+                WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+                  AND (
+                      $3::text IS NULL
+                      OR queue = $3
+                      -- A stripe with an override of its own keeps it.
+                      OR ($5::boolean AND {stripe_of_queue} AND queue <> ALL($4::text[]))
+                  )
+                  AND (
+                      $3::text IS NOT NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM unnest($4::text[]) AS overridden(queue)
+                          WHERE dlq_entries.queue = overridden.queue
+                             OR ($5::boolean AND {stripe_of_overridden})
+                      )
+                  )
+                {order}
+                LIMIT $2
+            )
+            RETURNING {DELETED_DLQ_COLUMNS}
+            "#
+        )))
+        .bind(retention_secs)
+        .bind(expiry.limit)
+        .bind(expiry.queue)
+        .bind(expiry.overridden_queues)
+        .bind(stripes)
+        .bind(usize::MAX.to_string())
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
     }
 
     pub async fn retry_from_dlq(

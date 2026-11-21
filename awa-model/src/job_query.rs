@@ -122,23 +122,6 @@ impl Predicate {
         }
         query
     }
-
-    pub(crate) fn bind_query<'q>(
-        &self,
-        mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-        for bind in self.binds.iter().cloned() {
-            query = match bind {
-                Bind::Text(v) => query.bind(v),
-                Bind::Int(v) => query.bind(v),
-                Bind::Ints(v) => query.bind(v),
-                Bind::Time(v) => query.bind(v),
-                Bind::States(v) => query.bind(v),
-                Bind::Json(v) => query.bind(v),
-            };
-        }
-        query
-    }
 }
 
 /// The DLQ rows `filter` selects, or `None` when it can select none: every

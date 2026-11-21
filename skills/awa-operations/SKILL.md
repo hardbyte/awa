@@ -241,6 +241,11 @@ awa dlq purge --kind SendEmail           # destructive; --all required if unfilt
 - `retry-bulk`, `purge`, and `move` require `--all` when no filter is given —
   the guard against reviving or wiping the whole DLQ. Purge is unrecoverable;
   prefer `retry-bulk` if you might want the data back.
+- A DLQ row whose unique key's states include `failed` holds that key, so a new
+  job with the same key is refused as a duplicate while the row exists. Purging
+  the row, by `purge`, by ID or through DLQ retention, releases the key in the
+  same transaction. 0.6 before 0.6.19 and 0.7 up to 0.7.0-alpha.2 left the key
+  claimed after a purge.
 - Enabling `dlq_enabled` does not retroactively move existing `failed` rows.
   Move them explicitly with `awa dlq move --reason ... [--all]`.
 

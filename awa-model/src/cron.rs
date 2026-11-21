@@ -92,20 +92,40 @@ impl PeriodicJob {
     /// Returns `None` if no fire time exists in the range (after, now].
     /// This handles both "first registration" (after=None → find latest past fire)
     /// and "regular evaluation" (after=Some(last_enqueued_at)).
+    ///
+    /// Also returns `None`, with a warning, when the schedule's cron
+    /// expression or timezone does not parse, as for a `PeriodicJob` built
+    /// or deserialized without the builder's validation.
     pub fn latest_fire_time(
         &self,
         now: DateTime<Utc>,
         after: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
-        let cron = Cron::new(&self.cron_expr)
-            .with_seconds_optional()
-            .parse()
-            .expect("cron_expr was validated at build time");
+        let cron = match Cron::new(&self.cron_expr).with_seconds_optional().parse() {
+            Ok(cron) => cron,
+            Err(err) => {
+                tracing::warn!(
+                    name = %self.name,
+                    cron_expr = %self.cron_expr,
+                    error = %err,
+                    "Skipping periodic job with an invalid cron expression"
+                );
+                return None;
+            }
+        };
 
-        let tz: chrono_tz::Tz = self
-            .timezone
-            .parse()
-            .expect("timezone was validated at build time");
+        let tz: chrono_tz::Tz = match self.timezone.parse() {
+            Ok(tz) => tz,
+            Err(err) => {
+                tracing::warn!(
+                    name = %self.name,
+                    timezone = %self.timezone,
+                    error = %err,
+                    "Skipping periodic job with an invalid timezone"
+                );
+                return None;
+            }
+        };
 
         let now_tz = now.with_timezone(&tz);
 
@@ -580,6 +600,25 @@ mod tests {
             metadata: serde_json::json!({}),
             missed_fire_policy: CronMissedFirePolicy::Coalesce,
         }
+    }
+
+    #[test]
+    fn latest_fire_time_skips_an_unvalidated_cron_expression() {
+        let mut pj = make_periodic("0 9 * * *", "UTC");
+        pj.cron_expr = "not a cron".to_string();
+        let now = Utc::now();
+        assert_eq!(pj.latest_fire_time(now, None), None);
+        assert_eq!(
+            pj.latest_fire_time(now, Some(now - chrono::Duration::hours(1))),
+            None
+        );
+    }
+
+    #[test]
+    fn latest_fire_time_skips_an_unvalidated_timezone() {
+        let mut pj = make_periodic("* * * * *", "UTC");
+        pj.timezone = "Not/AZone".to_string();
+        assert_eq!(pj.latest_fire_time(Utc::now(), None), None);
     }
 
     #[test]

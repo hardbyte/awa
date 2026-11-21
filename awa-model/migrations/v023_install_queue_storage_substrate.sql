@@ -4763,20 +4763,46 @@ BEGIN
             spent_prefix AS (
                 SELECT
                     selected_with_spent.lane_seq,
-                    selected_with_spent.lane_seq
-                        - row_number() OVER (ORDER BY selected_with_spent.lane_seq)::bigint AS prefix_group
+                    count(*) FILTER (WHERE NOT selected_with_spent.attempt_spent)
+                        OVER (ORDER BY selected_with_spent.lane_seq) AS unspent_through
                 FROM selected_with_spent
-                WHERE attempt_spent
             )
-            SELECT max(spent_prefix.lane_seq) + 1
+            SELECT LEAST(
+                max(spent_prefix.lane_seq) + 1,
+                (
+                    SELECT min(other.first_lane_seq)
+                    FROM %1$I.ready_segments AS other
+                    WHERE other.queue = p_queue
+                      AND other.priority = v_lane_priority
+                      AND other.enqueue_shard = v_lane_shard
+                      AND other.next_lane_seq > v_lane_claim_seq
+                      AND other.next_lane_seq <= max(spent_prefix.lane_seq)
+                      AND (other.ready_slot, other.ready_generation)
+                          IS DISTINCT FROM (v_target_slot, v_target_generation)
+                )
+            )
             INTO v_spent_next_seq
             FROM spent_prefix
-            WHERE prefix_group = v_lane_claim_seq - 1;
+            WHERE unspent_through = 0;
 
                 IF v_spent_next_seq IS NOT NULL THEN
-                    -- Safe in-transaction sequence movement: only skip a
-                    -- contiguous prefix of attempts with already-committed
-                    -- evidence. Later spent/tombstoned lanes cannot move the
+                    -- Safe in-transaction sequence movement: only skip the
+                    -- leading run of committed rows with already-committed
+                    -- spent evidence, and the rolled-back reservations before
+                    -- and between them. Every enqueue reserves its lane_seq
+                    -- through reserve_enqueue_seq, which holds the lane's
+                    -- reservation lock until the enqueue ends, so a committed
+                    -- row follows only ended reservations. A path that
+                    -- writes ready rows from any other allocation (such as
+                    -- the enqueue-head trigger) would break this. A position
+                    -- outside this generation's window can still hold a
+                    -- committed row of another generation (a producer whose
+                    -- snapshot predates a ring rotation), so the prefix stops
+                    -- at the first segment of another generation that ends
+                    -- inside it; segments are contiguous per enqueue and
+                    -- never span a position of this generation. The next
+                    -- claim targets that segment. Later
+                    -- spent/tombstoned lanes cannot move the
                     -- cursor past an earlier live row, because the surrounding
                     -- claim transaction could still abort.
                     PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_spent_next_seq);

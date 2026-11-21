@@ -21004,6 +21004,121 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dlq_deletes_release_unique_claims() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_dlq_delete_claims";
+    let schema = "awa_qs_dlq_delete_claims";
+    let store = create_store(&pool, schema).await;
+    // The default unique states plus `failed`, so a dead-lettered job keeps
+    // its key against new jobs.
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts {
+            states: UniqueOpts::default().states | 1 << JobState::Failed.bit_position(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut job_ids = Vec::new();
+    for id in 0..5 {
+        job_ids.push(enqueue_job(&pool, &store, &DlqJob { id }, opts.clone()).await);
+    }
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(TerminalFailureWorker)
+        .dlq_enabled_by_default(true)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("Failed to build dlq delete client");
+    client
+        .start()
+        .await
+        .expect("Failed to start dlq delete client");
+    wait_for_dlq_count(&pool, &store, queue, 5, Duration::from_secs(10)).await;
+    client.shutdown(Duration::from_secs(5)).await;
+
+    // While its row is in the DLQ, each failed job holds its key.
+    let claims_held = |pool: sqlx::PgPool, job_ids: Vec<i64>| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM awa.job_unique_claims WHERE job_id = ANY($1)",
+        )
+        .bind(&job_ids)
+        .fetch_one(&pool)
+        .await
+        .expect("count claims")
+    };
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 5);
+    let err = insert::insert_with(&pool, &DlqJob { id: 0 }, opts.clone())
+        .await
+        .expect_err("a dead-lettered job keeps its key");
+    assert!(matches!(err, AwaError::UniqueConflict { .. }), "{err:?}");
+
+    assert!(awa::model::dlq::purge_dlq_job(&pool, job_ids[0])
+        .await
+        .expect("purge_dlq_job"));
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 4);
+
+    let cleaned = awa::model::dlq::cleanup_dlq(&pool, Duration::ZERO, 1, Some(queue))
+        .await
+        .expect("cleanup_dlq");
+    assert_eq!(cleaned, 1);
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 3);
+
+    // The maintenance leader's retention pass.
+    let expired = store
+        .delete_expired_dlq_rows(
+            &pool,
+            &awa::model::queue_storage::DlqExpiry {
+                retention: Duration::ZERO,
+                limit: 1,
+                queue: None,
+                overridden_queues: &[],
+                stripe_families: true,
+                oldest_first: false,
+            },
+        )
+        .await
+        .expect("delete_expired_dlq_rows");
+    assert_eq!(expired, 1);
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 2);
+
+    let purged =
+        awa::model::dlq::purge_dlq_matching(&pool, &awa::JobFilter::new().queue(queue), false)
+            .await
+            .expect("purge_dlq_matching");
+    assert_eq!(purged, 2);
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 0);
+
+    for id in 0..5 {
+        let reinserted = insert::insert_with(&pool, &DlqJob { id }, opts.clone())
+            .await
+            .expect("a purged DLQ row no longer holds its key");
+        assert_eq!(reinserted.state, JobState::Available);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_jobs_view_compat";
