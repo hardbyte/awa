@@ -1897,6 +1897,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v061-claims-cross-rolled-back-reservations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v061: claims cross rolled-back reservations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#tag-indexes-adr-049" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2965,6 +2976,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v061-claims-cross-rolled-back-reservations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v061: claims cross rolled-back reservations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#tag-indexes-adr-049" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3461,6 +3483,10 @@ workers report not ready until the migration runs, as for any version bump.</p>
 <p>A claim checks each candidate row against <code>ready_tombstones</code>, which records rows that were cancelled, retried or moved before they were claimed. For a small batch PostgreSQL could plan that <code>EXISTS</code> check as a hashed subplan that reads the slot's whole tombstone partition on every claim, although the lookup index exists, so the cost of each claim grew with churn in the slot. The check now carries <code>OFFSET 0</code>, which keeps it correlated: one index probe per candidate row.</p>
 <p>v060 rewrites <code>&lt;schema&gt;.claim_ready_runtime</code> and each <code>&lt;schema&gt;.claim_ready_slot_&lt;n&gt;</code> in the default and every discovered custom queue-storage schema from their own definitions, so signatures, owners, privileges and settings are unchanged. A function that already carries the check is left alone, so a replay, a fresh install and a database coming from 0.6.17 (whose <code>correlated_claim_tombstones</code> schema patch made the same change) are no-ops. It reinstalls no table or trigger and takes no lock on any <code>awa</code> or queue-storage table; a claim in flight finishes on the old body.</p>
 <p>Binaries before v060 call the same functions with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete <code>awa migrate --sql --from 59 --to 60</code> bundle as the owner of the claim functions, or as a role that can <code>SET ROLE</code> to it.</p>
+<h2 id="v061-claims-cross-rolled-back-reservations">v061: claims cross rolled-back reservations<a class="headerlink" href="#v061-claims-cross-rolled-back-reservations" title="Permanent link">&para;</a></h2>
+<p>When the first ready row at or after a lane's claim cursor is spent (cancelled, deleted, moved, reprioritised or already claimed), the claim moves the cursor over the spent rows and returns no jobs. It stopped at the first lane position left by an enqueue that rolled back, so a lane whose head held spent rows separated by such gaps cost one empty claim per gap, and while the lane had the oldest head every claim on the queue picked it. The claim now crosses the rolled-back positions between the leading spent rows. Every enqueue reserves its positions through <code>reserve_enqueue_seq</code>, which holds the lane's reservation lock until the enqueue ends, so a committed row follows only ended reservations. A position between those spent rows can still hold a committed row of another ring generation, written by a producer in a <code>REPEATABLE READ</code> or <code>SERIALIZABLE</code> transaction whose snapshot predates a ring rotation, so the claim stops at the first segment of another generation inside the run and the next claim takes that segment.</p>
+<p>v061 rewrites <code>&lt;schema&gt;.claim_ready_runtime</code> in the default and every discovered custom queue-storage schema from its own definition, so its signature, owner, privileges and settings are unchanged; the per-slot claim functions carry no spent prefix and are not touched. A function that already carries the change is left alone, so a replay and a fresh install are no-ops. On a database coming from 0.6.19, whose <code>claim_spent_prefix_gaps</code> schema patch crosses the gaps without the generation bound, v061 adds the bound. It reinstalls no table or trigger and takes no lock on any <code>awa</code> or queue-storage table; a claim in flight finishes on the old body.</p>
+<p>v061 changes only the function's body: its name, arguments and results are unchanged, so binaries before v061 call it the same way before and after the migration. No rehearsal runs them against the migrated schema; <code>claim_spent_prefix_gaps_test</code> checks that the rewrite keeps the function in place and matches the installer. External migration runners apply the complete <code>awa migrate --sql --from 60 --to 61</code> bundle as the owner of the claim functions, or as a role that can <code>SET ROLE</code> to it.</p>
 <h2 id="tag-indexes-adr-049">Tag indexes (ADR-049)<a class="headerlink" href="#tag-indexes-adr-049" title="Permanent link">&para;</a></h2>
 <p>Tags become the indexed way to find jobs on queue storage. There is no
 migration: new schemas, and the empty partitions of existing ones, get their
