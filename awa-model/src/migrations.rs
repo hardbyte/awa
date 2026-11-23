@@ -541,6 +541,62 @@ macro_rules! sequence_lock_cancel_release_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `ring_generation_floor` patch: the floor
+/// helper, the installer that should call it, the compat producers that should
+/// read the ring through `enqueue_ring_cursor()` (a missing producer counts, so
+/// the patch runs after `insert_jobs_compat_batch` creates it), and each
+/// installed queue-storage substrate (found as for
+/// `sequence_lock_cancel_release`, by its queue ring) without the floor or
+/// without a cancel-safe `enqueue_ring_cursor()`.
+macro_rules! ring_generation_floor_pending_sql {
+    () => {
+        "SELECT 'awa.refresh_ring_generation_floor_helper'::text AS target \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'refresh_ring_generation_floor_helper') \
+         UNION ALL \
+         SELECT 'awa.install_queue_storage_substrate' \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc NOT LIKE '%refresh_ring_generation_floor_helper%') \
+         UNION ALL \
+         SELECT 'awa.' || compat.proname \
+         FROM (VALUES ('insert_job_compat'), ('insert_jobs_compat_batch')) AS compat(proname) \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = compat.proname \
+               AND p.prosrc LIKE '%enqueue_ring_cursor()%') \
+         UNION ALL \
+         SELECT format('generation floor in schema %s', n.nspname) \
+         FROM pg_namespace AS n \
+         WHERE n.nspname ~ '^[a-z_][a-z0-9_]*$' \
+           AND EXISTS ( \
+                 SELECT 1 FROM pg_proc AS p \
+                 WHERE p.pronamespace = n.oid \
+                   AND p.proname = 'claim_ready_runtime' \
+                   AND oidvectortypes(p.proargtypes) \
+                       = 'text, bigint, double precision, double precision') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'queue_ring_state' \
+                         AND c.relkind IN ('r', 'p')) \
+           AND (NOT EXISTS (SELECT 1 FROM pg_class AS c \
+                            WHERE c.relnamespace = n.oid \
+                              AND c.relname = 'queue_ring_generation_floor' \
+                              AND c.relkind = 'S') \
+                OR NOT EXISTS (SELECT 1 FROM pg_proc AS p \
+                               WHERE p.pronamespace = n.oid \
+                                 AND p.proname = 'enqueue_ring_cursor' \
+                                 AND p.pronargs = 0 \
+                                 AND p.prosecdef \
+                                 AND p.prosrc LIKE '%query_canceled%'))"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
@@ -569,6 +625,9 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
             " ORDER BY 1"
         )),
         "replica_identity" => Some(concat!(replica_identity_pending_sql!(), " ORDER BY 1")),
+        "ring_generation_floor" => {
+            Some(concat!(ring_generation_floor_pending_sql!(), " ORDER BY 1"))
+        }
         _ => None,
     }
 }
@@ -697,14 +756,33 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         description: "Replica identity for every awa table (awa 0.7 migration v047)",
         // The v023 definitions first, so the installer sets the identity in
         // schemas prepared later; the patch then sets it on existing tables.
-        // Keep last but for `spent_claim_prefix_gaps`: it holds table locks
-        // until its transaction commits.
+        // Keep last but for the patches that rewrite the installer, which
+        // replace functions only: it holds table locks until its transaction
+        // commits.
         sql: concat!(
             include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
             "\n",
             include_str!("../migrations/patches/replica_identity.sql"),
         ),
         applied_probe: concat!("SELECT NOT EXISTS (", replica_identity_pending_sql!(), ")"),
+    },
+    SchemaPatch {
+        name: "ring_generation_floor",
+        description:
+            "Keep a lane's ring generations in order under REPEATABLE READ producers (awa 0.7 migration v062)",
+        // Adds the floor helper and rewrites the installed installer and
+        // compat producers in place; the versioned v023 file stays as
+        // released. Keep after every patch that embeds the v023 installer,
+        // which would restore the released installer, and after
+        // `insert_jobs_compat_batch`, which would restore the released batch
+        // producer. Its probe reports a missing batch producer, so it is
+        // pending whenever that patch is.
+        sql: include_str!("../migrations/patches/ring_generation_floor.sql"),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            ring_generation_floor_pending_sql!(),
+            ")"
+        ),
     },
     SchemaPatch {
         name: "sequence_lock_cancel_release",
@@ -757,13 +835,11 @@ async fn pending_schema_patches_conn(
     conn: &mut PgConnection,
 ) -> Result<Vec<SchemaPatch>, AwaError> {
     let mut pending = Vec::new();
-    let mut installer_restored = false;
     for patch in SCHEMA_PATCHES {
         let applied: bool = sqlx::query_scalar(patch.applied_probe)
             .fetch_one(&mut *conn)
             .await?;
-        if !applied || (installer_restored && rewrites_installer(patch)) {
-            installer_restored |= embeds_installer(patch);
+        if !applied || pending.iter().any(|earlier| reruns_after(patch, earlier)) {
             pending.push(*patch);
         }
     }
@@ -772,19 +848,19 @@ async fn pending_schema_patches_conn(
 
 /// The patches `awa migrate` applies, in order, to a schema at
 /// [`CURRENT_VERSION`] that lacks exactly the patches named in `missing`:
-/// those, and every patch that rewrites the installer once a patch applied
-/// before it has put the released installer back. Tests use it to state which
-/// patches their setup removes rather than the full list `awa migrate` runs.
+/// those, and every patch that rewrites a definition in place once a patch
+/// applied before it has put the released definition back (see
+/// [`reruns_after`]). Tests use it to state which patches their setup removes
+/// rather than the full list `awa migrate` runs.
 pub fn patches_to_apply(missing: &[&str]) -> Vec<&'static str> {
-    let mut apply = Vec::new();
-    let mut installer_restored = false;
+    let mut apply: Vec<&SchemaPatch> = Vec::new();
     for patch in SCHEMA_PATCHES {
-        if missing.contains(&patch.name) || (installer_restored && rewrites_installer(patch)) {
-            installer_restored |= embeds_installer(patch);
-            apply.push(patch.name);
+        if missing.contains(&patch.name) || apply.iter().any(|earlier| reruns_after(patch, earlier))
+        {
+            apply.push(patch);
         }
     }
-    apply
+    apply.into_iter().map(|patch| patch.name).collect()
 }
 
 /// Whether applying `patch` puts the released v023 installer back.
@@ -799,8 +875,16 @@ fn embeds_installer(patch: &SchemaPatch) -> bool {
 fn rewrites_installer(patch: &SchemaPatch) -> bool {
     matches!(
         patch.name,
-        "sequence_lock_cancel_release" | "spent_claim_prefix_gaps"
+        "sequence_lock_cancel_release" | "spent_claim_prefix_gaps" | "ring_generation_floor"
     )
+}
+
+/// Whether `patch` must run again once `earlier` has been applied, because
+/// `earlier` puts back a released definition that `patch` rewrites in place:
+/// the installer, or, for `ring_generation_floor`, the batch producer.
+fn reruns_after(patch: &SchemaPatch, earlier: &SchemaPatch) -> bool {
+    (rewrites_installer(patch) && embeds_installer(earlier))
+        || (patch.name == "ring_generation_floor" && earlier.name == "insert_jobs_compat_batch")
 }
 
 /// Whether one schema patch is present, and if not, where it is missing.
@@ -1050,12 +1134,16 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
     if current <= CURRENT_VERSION {
         let before = schema_patch_status_conn(conn).await?;
         let mut applied_this_run = Vec::new();
-        let mut installer_restored = false;
+        let mut applied_patches: Vec<&SchemaPatch> = Vec::new();
         for (status, patch) in before.iter().zip(SCHEMA_PATCHES) {
-            if status.applied && !(installer_restored && rewrites_installer(patch)) {
+            if status.applied
+                && !applied_patches
+                    .iter()
+                    .any(|earlier| reruns_after(patch, earlier))
+            {
                 continue;
             }
-            installer_restored |= embeds_installer(patch);
+            applied_patches.push(patch);
             info!(
                 patch = patch.name,
                 description = patch.description,
@@ -1682,7 +1770,11 @@ mod tests {
                 .position(|patch| patch.name == name)
                 .expect("registered patch")
         };
-        for fix_name in ["sequence_lock_cancel_release", "spent_claim_prefix_gaps"] {
+        for fix_name in [
+            "sequence_lock_cancel_release",
+            "spent_claim_prefix_gaps",
+            "ring_generation_floor",
+        ] {
             let fix = position(fix_name);
             assert!(rewrites_installer(&SCHEMA_PATCHES[fix]));
             // External runners apply the exported R__ scripts in name order.
@@ -1727,6 +1819,25 @@ mod tests {
             .find(|patch| !embeds_installer(patch) && !rewrites_installer(patch))
             .expect("a patch that leaves the installer alone");
         assert_eq!(patches_to_apply(&[standalone.name]), [standalone.name]);
+    }
+
+    #[test]
+    fn ring_generation_floor_reruns_after_the_batch_producer_patch() {
+        // insert_jobs_compat_batch puts back the released batch producer,
+        // which ring_generation_floor rewrites in place.
+        assert_eq!(
+            patches_to_apply(&["insert_jobs_compat_batch"]),
+            ["insert_jobs_compat_batch", "ring_generation_floor"]
+        );
+        let position = |name: &str| {
+            SCHEMA_PATCHES
+                .iter()
+                .position(|patch| patch.name == name)
+                .expect("registered patch")
+        };
+        // External runners apply the exported R__ scripts in name order.
+        assert!(position("insert_jobs_compat_batch") < position("ring_generation_floor"));
+        assert!("insert_jobs_compat_batch" < "ring_generation_floor");
     }
 
     #[test]
