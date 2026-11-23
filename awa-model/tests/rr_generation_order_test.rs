@@ -892,3 +892,75 @@ async fn a_floor_restored_ahead_of_the_ring_is_lowered(pool: PgPool) -> TestResu
     );
     Ok(())
 }
+
+/// A READ COMMITTED cursor call whose ring row is updated while it reads
+/// returns the latest committed ring, and must raise the floor to it: a later
+/// REPEATABLE READ producer in the lane that falls back to the floor would
+/// otherwise write into an older generation than this call returned.
+///
+/// ```text
+/// floor at 1, ring at 0           -- as a restore can leave it
+/// R (RC):  UPDATE ring to 2       -- uncommitted
+/// P (RC):  enqueue_ring_cursor()  -- sees 0 < floor, waits on FOR SHARE
+/// R:       COMMIT
+/// P:       returns generation 2, and the floor is 2
+/// ```
+#[sqlx::test(migrations = false)]
+async fn the_latest_ring_a_cursor_returns_raises_the_floor(pool: PgPool) -> TestResult {
+    setup(&pool).await?;
+    sqlx::query(&format!(
+        "SELECT setval('{SCHEMA}.queue_ring_generation_floor', 1, true)"
+    ))
+    .execute(&pool)
+    .await?;
+    let mut rotation = pool.begin().await?;
+    sqlx::query(&format!(
+        "UPDATE {SCHEMA}.queue_ring_state
+         SET generation = generation + 2, current_slot = (current_slot + 2) % slot_count
+         WHERE singleton"
+    ))
+    .execute(&mut *rotation)
+    .await?;
+
+    let cursor_pool = pool.clone();
+    let cursor = tokio::spawn(async move {
+        sqlx::query_as::<_, (i32, i64)>(&format!(
+            "SELECT slot, generation FROM {SCHEMA}.enqueue_ring_cursor()"
+        ))
+        .fetch_one(&cursor_pool)
+        .await
+    });
+    let mut waiting = false;
+    for _ in 0..500 {
+        waiting = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock' AND wait_event = 'transactionid')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if waiting {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(waiting, "the cursor waits on the uncommitted ring update");
+    rotation.commit().await?;
+
+    let (_, generation) = cursor.await??;
+    assert_eq!(
+        generation, 2,
+        "the cursor returns the latest committed ring"
+    );
+    let floor: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT pg_sequence_last_value('{SCHEMA}.queue_ring_generation_floor'::regclass)"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        floor,
+        Some(2),
+        "the floor is raised to what the cursor returned"
+    );
+    Ok(())
+}

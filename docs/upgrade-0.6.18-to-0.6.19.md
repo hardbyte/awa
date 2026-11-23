@@ -19,7 +19,7 @@ Otherwise, binaries and the migration can roll in either order.
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
    ```
 
-   On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. They replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema. None of them blocks queue traffic: the only table lock among them is `ring_generation_floor`'s `ACCESS SHARE` read of each schema's `queue_ring_state`, to seed the floor.
+   On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. They replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema. None of them blocks queue traffic: the only table lock among them is `ring_generation_floor`'s `ACCESS SHARE` read of each schema's `queue_ring_state`, to seed the floor. The exception is a run on a database restored from a logical dump (below) whose floor is ahead of the ring: there it locks the ring row `FOR SHARE` to repair the floor, and rotation in that schema waits until the run commits.
 
    Don't prepare a new queue-storage schema while this runs: no `prepare_schema()` and no first start of a runtime on a new custom schema. The patches find schemas in the catalogs, so they cannot see one whose installer has not committed yet, and an installer that started before the patch installs that schema without the floor. When the roll is done, check that nothing is left:
 
@@ -73,6 +73,12 @@ This is one transaction that takes the same advisory lock as `awa migrate`. Keep
 On queue storage, a job enqueued inside a `REPEATABLE READ` or `SERIALIZABLE` transaction could be written into an older ring generation than a job already committed ahead of it in the same lane (#847). Claims then moved the lane past it, so it was never run, and queue prune later deleted it. This affected every producer path: `awa.insert_job_compat`, `awa.insert_jobs_compat_batch` and the Rust and Python batch enqueues. Producers on `READ COMMITTED`, PostgreSQL's default, were not affected.
 
 0.6.19 keeps a generation floor in each queue-storage schema, a sequence that snapshots don't hide. Every producer raises it while it holds its lane lock, and the maintenance leader raises it after each rotation. Producers write into the newer of the floor and the generation they can see. Prune also counts unclaimed jobs, leases and open claims of any generation in a slot, so a job written into an older generation holds its slot until it is claimed. The `ring_generation_floor` patch adds the sequence and the function `enqueue_ring_cursor()` to each queue-storage schema; the function runs as the owner of the queue ring and any role may execute it, so runtime roles need no new grant.
+
+After a logical restore (`pg_dump` and `pg_restore`), the floor can come back ahead of the ring, because `pg_dump` reads sequences outside its snapshot. The first READ COMMITTED enqueue and the maintenance leader's next rotation each lower it to the ring. Until then, a REPEATABLE READ or SERIALIZABLE enqueue that races a rotation can write into a generation the ring has not reached, so on a restored database repair the floor before starting producers, by running this at READ COMMITTED (psql's default) for each queue-storage schema:
+
+```sql
+SELECT * FROM <schema>.enqueue_ring_cursor();
+```
 
 The floor protects a lane only once every process that enqueues into it, and the maintenance leader, run 0.6.19: a 0.6.18 producer or leader does not raise it. Until then, a `REPEATABLE READ` or `SERIALIZABLE` producer can still land behind a 0.6.18 producer's job in an older generation. So:
 

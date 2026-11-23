@@ -597,9 +597,14 @@ async fn cancel_as_granted(
 ) -> Result<Option<bool>, Box<dyn std::error::Error>> {
     let mut gate = pool.acquire().await?;
     let mut victim = pool.acquire().await?;
-    let victim_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *victim)
-        .await?;
+    // Should the observer below fail before it opens the gate, the victim
+    // still ends, and so does the test.
+    victim.close_on_drop();
+    let victim_pid: i32 = sqlx::query_scalar(
+        "SELECT pg_backend_pid() FROM set_config('statement_timeout', '30s', false)",
+    )
+    .fetch_one(&mut *victim)
+    .await?;
     // advisory-lock: test gate on a connection it releases below.
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(lock_key)

@@ -49,8 +49,11 @@
 -- Live load: one sequence and one function per schema, and three function
 -- replacements. Its only table lock is ACCESS SHARE on each schema's
 -- queue_ring_state, read to seed the floor, which blocks no claim, enqueue or
--- rotation. Its work scales with the number of schemas, not with job count. An enqueue in
--- flight finishes on the old body; the next call uses the new one. It does not
+-- rotation. The exception is a floor ahead of the ring, as a logical restore
+-- can leave it: seeding then locks the ring row FOR SHARE to repair it, and a
+-- rotation in that schema waits until the migration commits. Its work scales
+-- with the number of schemas, not with job count. An enqueue in flight
+-- finishes on the old body; the next call uses the new one. It does not
 -- wait for a schema's install lock, which prepare_schema() holds while it runs
 -- the installer: when the lock is taken the patch fails with 55P03, changes
 -- nothing, and can be run again.
@@ -193,41 +196,6 @@ BEGIN
 
             -- NULL until the first raise after creation or a reset.
             v_floor := pg_sequence_last_value(%2$L::regclass);
-            IF v_floor IS NULL OR v_floor < v_generation THEN
-                -- setval is not a compare-and-set, so raise under a short
-                -- session lock, released before returning rather than at the
-                -- end of the caller's transaction. Only the first producer to
-                -- see each rotation gets here. A pooled connection would keep a
-                -- leaked session lock, so every way out releases it, including
-                -- a cancel or statement timeout, which OTHERS does not catch;
-                -- the handler checks pg_locks because the error may have come
-                -- before the lock was granted.
-                BEGIN
-                    PERFORM pg_advisory_lock(v_lock_key);
-                    v_floor := pg_sequence_last_value(%2$L::regclass);
-                    IF v_floor IS NULL OR v_floor < v_generation THEN
-                        PERFORM setval(%2$L::regclass, v_generation, true);
-                        v_floor := v_generation;
-                    END IF;
-                    PERFORM pg_advisory_unlock(v_lock_key);
-                EXCEPTION WHEN OTHERS OR query_canceled THEN
-                    IF EXISTS (
-                        SELECT 1
-                        FROM pg_catalog.pg_locks AS held
-                        WHERE held.locktype = 'advisory'
-                          AND held.pid = pg_backend_pid()
-                          AND held.granted
-                          AND held.objsubid = 1
-                          -- pg_locks shows a bigint key's high half in
-                          -- classid and its low half in objid.
-                          AND ((held.classid::int8 << 32) | held.objid::int8) = v_lock_key
-                    ) THEN
-                        PERFORM pg_advisory_unlock(v_lock_key);
-                    END IF;
-                    RAISE;
-                END;
-            END IF;
-
             IF v_floor > v_generation THEN
                 -- The floor is ahead of the ring this snapshot sees. Usually
                 -- the snapshot predates the latest rotation (REPEATABLE READ or
@@ -308,6 +276,42 @@ BEGIN
                 END IF;
             END IF;
 
+            IF v_floor IS NULL OR v_floor < v_generation THEN
+                -- Every generation returned is at or below the floor, so a
+                -- later producer in the lane never writes into an older one.
+                -- setval is not a compare-and-set, so raise under a short
+                -- session lock, released before returning rather than at the
+                -- end of the caller's transaction. Usually only the first
+                -- producer to see each rotation gets here. A pooled connection would keep a
+                -- leaked session lock, so every way out releases it, including
+                -- a cancel or statement timeout, which OTHERS does not catch;
+                -- the handler checks pg_locks because the error may have come
+                -- before the lock was granted.
+                BEGIN
+                    PERFORM pg_advisory_lock(v_lock_key);
+                    v_floor := pg_sequence_last_value(%2$L::regclass);
+                    IF v_floor IS NULL OR v_floor < v_generation THEN
+                        PERFORM setval(%2$L::regclass, v_generation, true);
+                    END IF;
+                    PERFORM pg_advisory_unlock(v_lock_key);
+                EXCEPTION WHEN OTHERS OR query_canceled THEN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_locks AS held
+                        WHERE held.locktype = 'advisory'
+                          AND held.pid = pg_backend_pid()
+                          AND held.granted
+                          AND held.objsubid = 1
+                          -- pg_locks shows a bigint key's high half in
+                          -- classid and its low half in objid.
+                          AND ((held.classid::int8 << 32) | held.objid::int8) = v_lock_key
+                    ) THEN
+                        PERFORM pg_advisory_unlock(v_lock_key);
+                    END IF;
+                    RAISE;
+                END;
+            END IF;
+
             slot := v_slot;
             generation := v_generation;
             RETURN NEXT;
@@ -363,12 +367,15 @@ BEGIN
         END IF;
     END IF;
 
-    -- The function runs as its owner, so its owner must be able to read the
-    -- ring and the floor. If it cannot (the transfer above was not possible),
-    -- the function is dropped: producers then read the ring as they did
+    -- The function runs as its owner, so its owner must be able to read and
+    -- lock the ring and read and set the floor. If it cannot (the transfer
+    -- above was not possible), the function is dropped: producers then read the ring as they did
     -- before the floor existed, instead of failing.
     IF has_schema_privilege(v_object_owner, v_namespace, 'USAGE')
        AND has_table_privilege(v_object_owner, v_state, 'SELECT')
+       -- FOR SHARE, which a floor ahead of the snapshot reads the ring with,
+       -- also needs UPDATE on some column.
+       AND has_any_column_privilege(v_object_owner, v_state, 'UPDATE')
        AND has_sequence_privilege(v_object_owner, v_sequence, 'SELECT')
        AND has_sequence_privilege(v_object_owner, v_sequence, 'UPDATE') THEN
         -- New functions are executable by PUBLIC already; this restores it
