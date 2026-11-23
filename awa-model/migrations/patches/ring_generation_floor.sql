@@ -291,6 +291,11 @@ BEGIN
         EXECUTE format('SELECT FROM %I.enqueue_ring_cursor()', p_schema);
     ELSE
         EXECUTE format('DROP FUNCTION %I.enqueue_ring_cursor()', p_schema);
+        -- Drop the floor with it when this role owns it, so the ring's owner
+        -- can install both later instead of meeting a sequence it cannot use.
+        IF pg_has_role((SELECT relowner FROM pg_class WHERE oid = v_sequence), 'USAGE') THEN
+            EXECUTE format('DROP SEQUENCE %I.queue_ring_generation_floor', p_schema);
+        END IF;
         RAISE WARNING '% cannot read the queue ring of schema %, so enqueues there keep writing without the generation floor (#847)',
             pg_get_userbyid(v_object_owner), p_schema
             USING HINT = format(
@@ -311,6 +316,7 @@ REVOKE EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(TEXT) FROM P
 DO $$
 DECLARE
     v_schema TEXT;
+    v_grantee OID;
     v_function REGPROCEDURE;
     v_definition TEXT;
     v_updated TEXT;
@@ -329,7 +335,14 @@ BEGIN
                 '
 
     -- #847: the queue-ring generation floor (schema patch ring_generation_floor).
-    PERFORM awa.refresh_ring_generation_floor_helper(p_schema);
+    -- A role that may run the installer but not the floor helper still
+    -- installs the schema; enqueues there read the ring as before.
+    IF has_function_privilege(''awa.refresh_ring_generation_floor_helper(text)'', ''EXECUTE'') THEN
+        PERFORM awa.refresh_ring_generation_floor_helper(p_schema);
+    ELSE
+        RAISE WARNING ''schema % was installed without the queue-ring generation floor: % may not execute awa.refresh_ring_generation_floor_helper(text)'', p_schema, current_user
+            USING HINT = ''Grant EXECUTE on that function to the roles that run awa.install_queue_storage_substrate, then run awa migrate.'';
+    END IF;
 END;\1$function$'
             );
             IF v_updated = v_definition THEN
@@ -338,6 +351,21 @@ END;\1$function$'
             END IF;
             EXECUTE v_updated;
         END IF;
+        -- Every role that may run the installer may run the floor helper it
+        -- now calls.
+        FOR v_grantee IN
+            SELECT DISTINCT acl.grantee
+            FROM pg_proc AS p
+            CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
+            WHERE p.oid = v_function
+              AND acl.privilege_type = 'EXECUTE'
+              AND acl.grantee <> 0
+        LOOP
+            EXECUTE format(
+                'GRANT EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(text) TO %I',
+                pg_get_userbyid(v_grantee)
+            );
+        END LOOP;
     END IF;
 
     -- The compat producers read the ring through enqueue_ring_cursor() when

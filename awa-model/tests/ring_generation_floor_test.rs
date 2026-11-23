@@ -418,6 +418,15 @@ async fn floor_helper_leaves_out_a_function_its_owner_could_not_run(pool: PgPool
                 .fetch_one(&pool)
                 .await?;
         ensure!(!present, "the function is left out");
+        let floor_left: bool = sqlx::query_scalar(
+            "SELECT to_regclass('awa.queue_ring_generation_floor') IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await?;
+        ensure!(
+            !floor_left,
+            "the floor the migrator created is dropped with the function, so the owner can install both"
+        );
         ensure_eq!(
             pending_targets(&pool).await?,
             vec!["generation floor in schema awa".to_string()],
@@ -799,11 +808,18 @@ async fn the_probe_names_what_lacks_the_patch(pool: PgPool) -> TestResult {
     .execute(&pool)
     .await?;
     let (_, installer) = awa_function(&pool, "install_queue_storage_substrate").await?;
-    let without_floor = installer.replace(
-        "\n\n    -- #847: the queue-ring generation floor (schema patch ring_generation_floor).\n    \
-         PERFORM awa.refresh_ring_generation_floor_helper(p_schema);",
-        "",
-    );
+    // Cut the patch's floor block, from its marker to the installer's END.
+    let without_floor = {
+        let marker = "\n\n    -- #847: the queue-ring generation floor";
+        let start = installer
+            .find(marker)
+            .ok_or("the installer calls the floor helper")?;
+        let end = start
+            + installer[start..]
+                .find("\nEND;")
+                .ok_or("the installer ends")?;
+        format!("{}{}", &installer[..start], &installer[end..])
+    };
     assert_ne!(without_floor, installer);
     sqlx::raw_sql(&without_floor).execute(&pool).await?;
     assert_eq!(
@@ -850,11 +866,21 @@ async fn the_patch_does_not_wait_for_an_install_lock(pool: PgPool) -> TestResult
     )
     .execute(&mut *installer)
     .await?;
+    // A patch that waited for the lock would otherwise hang here, since the
+    // holder releases it only after this returns.
+    let mut patcher = pool.acquire().await?;
+    sqlx::query("SET statement_timeout = '10s'")
+        .execute(&mut *patcher)
+        .await?;
     let started = std::time::Instant::now();
     let error = sqlx::raw_sql(patch_sql())
-        .execute(&pool)
+        .execute(&mut *patcher)
         .await
         .expect_err("the install lock is held");
+    sqlx::query("RESET statement_timeout")
+        .execute(&mut *patcher)
+        .await?;
+    drop(patcher);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert_eq!(
         error
@@ -874,4 +900,39 @@ async fn the_patch_does_not_wait_for_an_install_lock(pool: PgPool) -> TestResult
     sqlx::raw_sql(patch_sql()).execute(&pool).await?;
     assert!(pending_targets(&pool).await?.is_empty());
     Ok(())
+}
+
+/// A role granted the installer may also run the floor helper the installer
+/// now calls, so it can still prepare a schema after the patch.
+#[sqlx::test(migrations = false)]
+async fn installer_grantees_may_run_the_floor_helper(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    let operator = format!("floor_operator_{}", uuid::Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {operator} NOLOGIN;
+         GRANT EXECUTE ON FUNCTION awa.install_queue_storage_substrate(text, integer, integer, integer, boolean) TO {operator};"
+    ))
+    .execute(&pool)
+    .await?;
+    let result = async {
+        let before: bool = sqlx::query_scalar(&format!(
+            "SELECT has_function_privilege('{operator}', 'awa.refresh_ring_generation_floor_helper(text)', 'EXECUTE')"
+        ))
+        .fetch_one(&pool)
+        .await?;
+        ensure!(!before, "the helper is not executable by default");
+        sqlx::raw_sql(patch_sql()).execute(&pool).await?;
+        let after: bool = sqlx::query_scalar(&format!(
+            "SELECT has_function_privilege('{operator}', 'awa.refresh_ring_generation_floor_helper(text)', 'EXECUTE')"
+        ))
+        .fetch_one(&pool)
+        .await?;
+        ensure!(after, "the patch grants the helper to the installer's grantees");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    sqlx::raw_sql(&format!("DROP OWNED BY {operator}; DROP ROLE {operator};"))
+        .execute(&pool)
+        .await?;
+    result
 }
