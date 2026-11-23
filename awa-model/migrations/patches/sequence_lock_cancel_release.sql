@@ -200,8 +200,10 @@ BEGIN
                       AND held.pid = pg_backend_pid()
                       AND held.granted
                       AND held.objsubid = 1
-                      AND held.classid = ((hashtextextended(v_lock_key, 0) >> 32) & 4294967295)::oid
-                      AND held.objid = (hashtextextended(v_lock_key, 0) & 4294967295)::oid
+                      -- pg_locks shows a bigint key's high half in classid
+                      -- and its low half in objid.
+                      AND ((held.classid::int8 << 32) | held.objid::int8)
+                          = hashtextextended(v_lock_key, 0)
                 ) THEN
                     PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
                 END IF;
@@ -286,8 +288,10 @@ BEGIN
                           AND held.pid = pg_backend_pid()
                           AND held.granted
                           AND held.objsubid = 1
-                          AND held.classid = ((hashtextextended(v_qualified_seq, 0) >> 32) & 4294967295)::oid
-                          AND held.objid = (hashtextextended(v_qualified_seq, 0) & 4294967295)::oid
+                          -- pg_locks shows a bigint key's high half in
+                          -- classid and its low half in objid.
+                          AND ((held.classid::int8 << 32) | held.objid::int8)
+                              = hashtextextended(v_qualified_seq, 0)
                     ) THEN
                         PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
                     END IF;

@@ -1,5 +1,7 @@
 pub mod adapter;
 pub mod admin;
+// Internal to awa's crates; not part of the 0.6 public API.
+#[doc(hidden)]
 pub mod advisory;
 pub mod batch_operations;
 pub mod bridge;
