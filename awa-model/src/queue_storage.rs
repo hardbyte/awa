@@ -4595,6 +4595,14 @@ impl QueueStorage {
         self.activate_backend(pool).await
     }
 
+    /// Empties the queue-storage schema: deletes every job, lease and DLQ
+    /// entry, and restarts the ring, the generation floor and the job id
+    /// sequence. A test fixture, not a recovery or maintenance operation.
+    ///
+    /// Stop every producer, worker and the maintenance leader using the
+    /// schema, and let their transactions finish, before calling it: an
+    /// enqueue or rotation that commits while it runs can leave a job in a
+    /// ring generation the reset ring has not reached.
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;

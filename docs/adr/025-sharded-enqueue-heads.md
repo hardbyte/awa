@@ -49,7 +49,7 @@ Add an `enqueue_shard SMALLINT` column to every table in the active plane:
 
 Sharding is a per-queue tunable on `awa.queue_meta.enqueue_shards` (`SMALLINT NOT NULL DEFAULT 1 CHECK (BETWEEN 1 AND 64)`). With the default value of 1, only shard 0 exists and every code path reduces to the pre-shard behaviour observationally — single FIFO per lane, one head row per `(queue, priority)`, terminal keys colliding only on `job_id` (which is globally unique). Raising the value spreads producer writes across the configured shard count.
 
-The producer-side helper `shard_for_enqueue` reads the per-queue shard count once (cached in-process, invalidated on `reset()`) and selects a shard for each no-key `(queue, priority)` sub-batch by advancing a per-store `AtomicU16` counter modulo the shard count. Rows with an `ordering_key` bypass the rotor and route by the deterministic key hash.
+The producer-side helper `shard_for_enqueue` reads the per-queue shard count once (cached in-process until the process restarts) and selects a shard for each no-key `(queue, priority)` sub-batch by advancing a per-store `AtomicU16` counter modulo the shard count. Rows with an `ordering_key` bypass the rotor and route by the deterministic key hash.
 
 The claim-side function `claim_ready_runtime` walks every shard row for a `(queue, priority)` via a `lane_candidates` CTE, picks one candidate (ordered by effective priority, `run_at`, and priority), locks that shard's `queue_claim_heads` row with `FOR UPDATE OF claims SKIP LOCKED`, and drains rows from that shard's `ready_entries` slice. Gap recovery is per-shard.
 
@@ -131,7 +131,7 @@ Lowering is safe in the steady state because every claim, rescue, and admin path
 - The promotion path (`deferred_jobs` → `ready_entries`) calls `shard_for_enqueue` with the _current_ shard count, so promoted rows land on `[0, newS)`. They cannot leak onto out-of-range shards.
 - DLQ is unsharded; its PK is `job_id`.
 
-The in-process `enqueue_shards_cache` on `QueueStorage` is the only caveat: a running runtime that cached the old shard count keeps producing to shards `>= newS` until the cache is invalidated by `reset()` or process restart. That is operator-intent-stale but correctness-safe — the rows still claim, run, and finalise through the same code paths. Operators rolling out a `S` reduction restart runtimes (or trigger `reset()`) so producers immediately observe the new value.
+The in-process `enqueue_shards_cache` on `QueueStorage` is the only caveat: a running runtime that cached the old shard count keeps producing to shards `>= newS` until the process restarts. That is operator-intent-stale but correctness-safe — the rows still claim, run, and finalise through the same code paths. Operators rolling out a `S` reduction restart runtimes so producers immediately observe the new value. `reset()` also clears the cache, but it deletes every job in the schema and is only for tests.
 
 Operational procedure:
 

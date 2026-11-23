@@ -936,3 +936,83 @@ async fn installer_grantees_may_run_the_floor_helper(pool: PgPool) -> TestResult
         .await?;
     result
 }
+
+/// A role granted the installer and its 0.6.18 helpers gets the floor helper
+/// from the patch and prepares schemas with the floor; once the helper is
+/// revoked it still prepares them, without the floor and with a warning.
+#[sqlx::test(migrations = false)]
+async fn an_installer_grantee_prepares_a_schema_with_or_without_the_helper(
+    pool: PgPool,
+) -> TestResult {
+    migrations::run(&pool).await?;
+    let operator = format!("floor_installer_{}", uuid::Uuid::new_v4().simple());
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await?;
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {operator} LOGIN NOSUPERUSER PASSWORD 'floor_test';
+         GRANT CONNECT, CREATE ON DATABASE \"{database}\" TO {operator};
+         GRANT USAGE ON SCHEMA awa TO {operator};
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA awa TO {operator};
+         GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {operator};
+         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {operator};"
+    ))
+    .execute(&pool)
+    .await?;
+    let result = async {
+        let operator_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                pool.connect_options()
+                    .as_ref()
+                    .clone()
+                    .username(&operator)
+                    .password("floor_test"),
+            )
+            .await?;
+        let has_floor = |schema: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(&format!(
+                    "SELECT to_regprocedure('{schema}.enqueue_ring_cursor()') IS NOT NULL"
+                ))
+                .fetch_one(&pool)
+                .await
+            }
+        };
+
+        // The patch grants the helper to the installer's grantees.
+        sqlx::raw_sql(patch_sql()).execute(&pool).await?;
+        sqlx::query("SELECT awa.install_queue_storage_substrate('floor_with')")
+            .execute(&operator_pool)
+            .await?;
+        ensure!(
+            has_floor("floor_with").await?,
+            "a granted caller installs the floor"
+        );
+
+        // Without the helper the schema is still prepared, without the floor.
+        sqlx::raw_sql(&format!(
+            "REVOKE EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(text) FROM {operator}"
+        ))
+        .execute(&pool)
+        .await?;
+        sqlx::query("SELECT awa.install_queue_storage_substrate('floor_without')")
+            .execute(&operator_pool)
+            .await?;
+        ensure!(
+            !has_floor("floor_without").await?,
+            "a caller that may not run the helper installs without the floor"
+        );
+        operator_pool.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    sqlx::raw_sql(&format!(
+        "DROP SCHEMA IF EXISTS floor_without CASCADE; DROP SCHEMA IF EXISTS floor_with CASCADE;
+         DROP OWNED BY {operator}; DROP ROLE {operator};"
+    ))
+    .execute(&pool)
+    .await?;
+    result
+}
