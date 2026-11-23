@@ -12,6 +12,7 @@ cel = ["awa-model/cel"]
 anyhow = ["awa-worker/anyhow"]
 http-worker = ["awa-worker/http-worker"]
 tokio-postgres = ["awa-model/tokio-postgres"]
+sqlx09 = ["awa-model/sqlx09"]
 __python-bridge = ["awa-worker/__python-bridge"]
 
 [dependencies]

@@ -251,7 +251,7 @@ impl PreparedJobInsert {
 /// there, before any lane. It works with and without the
 /// `insert_jobs_compat_batch` schema patch, including when one process writes
 /// to databases that differ in whether they have it.
-const INSERT_MANY_ROW_FUNCTION_SQL: &str = r#"
+pub(crate) const INSERT_MANY_ROW_FUNCTION_SQL: &str = r#"
     WITH claim_keys AS (
         SELECT DISTINCT claim.unique_key
         FROM unnest($4::text[], $10::bytea[], $11::text[]) AS claim(state, unique_key, unique_states)
@@ -471,7 +471,7 @@ where
 }
 
 /// Pre-compute all row values including unique keys from InsertParams.
-fn precompute_rows(jobs: &[InsertParams]) -> Result<Vec<PreparedRow>, AwaError> {
+pub(crate) fn precompute_rows(jobs: &[InsertParams]) -> Result<Vec<PreparedRow>, AwaError> {
     jobs.iter()
         .map(|job| prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone()))
         .collect()
@@ -479,7 +479,7 @@ fn precompute_rows(jobs: &[InsertParams]) -> Result<Vec<PreparedRow>, AwaError> 
 
 /// [`ordering_key_hash64`] of a row's ordering key as decimal text, the form
 /// the batch statements cast to `numeric` to derive the row's shard.
-fn ordering_hash_text(row: &PreparedRow) -> Option<String> {
+pub(crate) fn ordering_hash_text(row: &PreparedRow) -> Option<String> {
     row.ordering_key
         .as_deref()
         .map(|key| ordering_key_hash64(key).to_string())
