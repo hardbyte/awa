@@ -188,7 +188,7 @@ awa 0.6 is built on sqlx 0.8, and its API takes sqlx 0.8 types such as `PgPool`.
 ```toml
 [dependencies]
 awa = "0.6"
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring", "postgres"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json", "chrono"] }
 sqlx08 = { package = "sqlx", version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 ```
 
@@ -202,25 +202,36 @@ let client = awa::Client::builder(awa_pool.clone())
     .build()?;
 ```
 
-awa's Rust insert functions take a sqlx 0.8 executor, so they cannot join a sqlx 0.9 transaction. To enqueue in the same transaction as your own writes, call awa's SQL producer, `awa.insert_job_compat`, on that transaction:
+awa's Rust insert functions take a sqlx 0.8 executor, so they cannot join a sqlx 0.9 transaction. To enqueue in the same transaction as your own writes, prepare the job with `awa::adapter::postgres` and run its insert statement on that transaction. The preparation is the one `awa::insert_with` uses, so unique keys, the scheduled state for a future `run_at`, and ordering keys come out the same; see [bridge adapters](bridge-adapters.md#rust-external-adapter-api).
 
 ```rust
+use awa::adapter::postgres::{prepare_job_insert, INSERT_JOB_SQL};
+
 let mut tx = app_pool.begin().await?;
 sqlx::query("INSERT INTO signups (email) VALUES ($1)")
-    .bind(email)
+    .bind(&email)
     .execute(&mut *tx)
     .await?;
-sqlx::query(
-    "SELECT awa.insert_job_compat(p_kind => 'send_welcome_email', p_queue => 'welcome', \
-                                  p_args => jsonb_build_object('email', $1::text))",
-)
-.bind(email)
-.execute(&mut *tx)
-.await?;
+let job = prepare_job_insert(&SendWelcomeEmail { email }, InsertOpts::default())?;
+sqlx::query(INSERT_JOB_SQL)
+    .bind(job.kind())
+    .bind(job.queue())
+    .bind(job.args())
+    .bind(job.state_db_str())
+    .bind(job.priority())
+    .bind(job.max_attempts())
+    .bind(job.run_at())
+    .bind(job.metadata())
+    .bind(job.tags())
+    .bind(job.unique_key())
+    .bind(job.unique_states_bit_string())
+    .bind(job.ordering_key())
+    .execute(&mut *tx)
+    .await?;
 tx.commit().await?;
 ```
 
-`insert_job_compat` takes the kind, queue, args, priority, maximum attempts, run time, metadata, tags and `p_ordering_key` (the same bytes as `InsertOpts::ordering_key`). A unique job needs awa's own insert API on awa's pool, outside your transaction, because awa derives its unique key. [`examples/sqlx-0-9-app`](../examples/sqlx-0-9-app/src/main.rs) is a complete application that CI builds against sqlx 0.9.1 and runs. awa moves to sqlx 0.9 in 0.7.
+The application's sqlx 0.9 needs its `json` and `chrono` features for these binds. A duplicate unique job fails the insert with SQLSTATE `23505` (`awa::adapter::postgres::UNIQUE_VIOLATION_SQLSTATE`), which aborts the transaction. [`examples/sqlx-0-9-app`](../examples/sqlx-0-9-app/src/main.rs) is a complete application, which CI builds against the newest sqlx 0.9 release and runs. awa moves to sqlx 0.9 in 0.7.
 
 ## Routing related jobs to the same shard
 

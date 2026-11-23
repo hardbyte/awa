@@ -1,0 +1,3 @@
+# Resolved fresh on each build, so CI follows new sqlx 0.9 releases and the
+# workspace version without a lockfile to keep in step.
+Cargo.lock

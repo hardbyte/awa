@@ -11,9 +11,11 @@ description = "An application on sqlx 0.9 that runs awa 0.6, which is built on s
 [dependencies]
 awa = { path = "../../awa" }
 async-trait = "0.1"
+chrono = "0.4"
 serde_json = "1"
-# The application's own sqlx.
-sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls-ring", "postgres"] }
+# The application's own sqlx. With no lockfile, CI builds against the newest
+# sqlx 0.9 release from 0.9.1 on.
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json", "chrono"] }
 # The sqlx awa 0.6 is built on, under another name, for awa's pool.
 sqlx08 = { package = "sqlx", version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 tokio = { version = "1", features = ["full"] }
