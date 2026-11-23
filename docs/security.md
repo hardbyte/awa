@@ -250,6 +250,10 @@ FROM awa.lane_sequence_problems('awa') \gexec
 
 The `claim_batch_job_index` schema patch adds `ensure_claim_batch_job_index(slot)` to each queue-storage schema. Claim prune calls it right after truncating a claim slot to give that `lease_claim_batches` partition its GIN index on `job_ids`. It is `SECURITY DEFINER`, owned by the owner of `lease_claim_batches` (creating an index needs table ownership), with a pinned `search_path`. It only creates that one index, and only on a partition that is empty and unlocked. `PUBLIC` cannot execute it: Each time the patch or installer runs, `EXECUTE` is reset to exactly the roles that then hold `TRUNCATE` on `lease_claim_batches`: a runtime role given `TRUNCATE` later gets it on the next run (or from the step 4 `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA` until then), and a role that has lost `TRUNCATE` loses it. A runtime that cannot execute it skips the step and claims keep working.
 
+### Queue-ring generation floor
+
+The `ring_generation_floor` schema patch adds `enqueue_ring_cursor()` and the sequence `queue_ring_generation_floor` to each queue-storage schema (#847). Enqueues call the function to choose the queue-ring generation they write into; it raises the floor to the generation its caller can see and returns the newer of the two. It is `SECURITY DEFINER`, owned by the owner of `queue_ring_state`, with a pinned `search_path`, and `PUBLIC` may execute it, so a runtime role needs no grant on the function or the sequence. It returns only the ring cursor and cannot move the floor past a generation its caller can see. If the migration role can neither give the function to that owner nor read the ring itself, the patch warns and leaves the function out, and enqueues there read the cursor directly, as before the patch.
+
 ### 5. Configure your processes
 
 | Process | Role | Connection string |
