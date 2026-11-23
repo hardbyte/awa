@@ -53,6 +53,19 @@ def strip_sql_comment(line: str) -> str:
     return line.split("--", 1)[0]
 
 
+# A string literal or quoted identifier that opens and closes on the line, with
+# doubled quotes inside it.
+QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
+def case_delta(line: str) -> tuple[int, int]:
+    """CASEs a line opens and closes, not counting quoted text such as
+    RAISE NOTICE 'CASE'."""
+    code = QUOTED.sub("''", line)
+    end_case = len(END_CASE.findall(code))
+    return len(CASE.findall(code)) - end_case, end_case + len(BARE_END.findall(code))
+
+
 def marked(lines: list[str], index: int, lookback: int) -> bool:
     return any(MARKER in lines[i] for i in range(max(0, index - lookback), index + 1))
 
@@ -87,9 +100,7 @@ def handler_branches(handler_lines: list[str]) -> list[tuple[str, str]]:
             branches.append([line, ""])
         elif branches:
             branches[-1][1] += " " + line
-        end_case = len(END_CASE.findall(line))
-        opened = len(CASE.findall(line)) - end_case
-        closed = end_case + len(BARE_END.findall(line))
+        opened, closed = case_delta(line)
         case_depth = max(0, case_depth + opened - closed)
     result = []
     for head, body in branches:
@@ -171,9 +182,7 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
             continue
         if stack:
             block = stack[-1]
-            end_case = len(END_CASE.findall(line))
-            opened = len(CASE.findall(line)) - end_case
-            closed = end_case + len(BARE_END.findall(line))
+            opened, closed = case_delta(line)
             closes_case = block.case_depth > 0 and closed > 0
             block.case_depth = max(0, block.case_depth + opened - closed)
             if BLOCK_END.match(line) and not closes_case:
