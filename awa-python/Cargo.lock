@@ -117,6 +117,7 @@ dependencies = [
  "croner",
  "hex",
  "opentelemetry",
+ "pg-session-lock",
  "semver",
  "serde",
  "serde_json",
@@ -165,6 +166,7 @@ dependencies = [
  "chrono-tz",
  "croner",
  "opentelemetry",
+ "pg-session-lock",
  "serde",
  "serde_json",
  "sqlx",
@@ -1268,6 +1270,13 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pg-session-lock"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+]
 
 [[package]]
 name = "phf"

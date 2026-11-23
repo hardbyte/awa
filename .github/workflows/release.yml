@@ -89,6 +89,21 @@ jobs:
           sys.exit(fail)
           PY
 
+      # pg-session-lock is released on its own (pg-session-lock-release.yml).
+      # The awa crates that depend on it can only publish once the version in
+      # this commit is on crates.io.
+      - name: pg-session-lock version is on crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pg-session-lock/Cargo.toml", "rb"))["package"]["version"])')
+          if ! curl -sSf -A "awa-release-check" -o /dev/null \
+              "https://crates.io/api/v1/crates/pg-session-lock/${version}"; then
+            echo "::error file=pg-session-lock/Cargo.toml::pg-session-lock ${version} is not on crates.io; release it first by pushing the tag pg-session-lock-v${version}"
+            exit 1
+          fi
+          echo "ok: pg-session-lock ${version} is on crates.io"
+
   # ─── Exact-candidate gate ────────────────────────────────────────
   # Require the complete CI workflow triggered by the merge push to have
   # passed on this exact commit before the release rehearsal or publication.

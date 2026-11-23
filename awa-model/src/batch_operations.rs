@@ -1,10 +1,10 @@
-use crate::advisory::SessionAdvisoryLock;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::filter::JobFilter;
 use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
+use pg_session_lock::SessionAdvisoryLock;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::types::Json;

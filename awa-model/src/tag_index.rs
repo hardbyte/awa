@@ -232,8 +232,8 @@ async fn build_if_empty(
 fn is_retryable(err: &AwaError) -> bool {
     match err {
         AwaError::UniqueConflict { .. } => true,
-        AwaError::Database(sqlx::Error::Database(db)) => {
-            matches!(db.code().as_deref(), Some("55P03" | "40P01"))
+        AwaError::Database(err) => {
+            pg_session_lock::is_lock_not_available(err) || pg_session_lock::is_deadlock(err)
         }
         _ => false,
     }

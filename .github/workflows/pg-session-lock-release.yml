@@ -1,0 +1,78 @@
+name: pg-session-lock release
+
+# pg-session-lock is versioned on its own. Tag `pg-session-lock-vX.Y.Z` on a
+# commit whose pg-session-lock/Cargo.toml says X.Y.Z; awa's own release
+# (`v*` tags, release.yml) does not publish it.
+on:
+  push:
+    tags:
+      - "pg-session-lock-v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (pg${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        postgres: ["17", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pg_session_lock_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches pg-session-lock/Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${GITHUB_REF_NAME#pg-session-lock-v}"
+          actual=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "pg-session-lock"))')
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error file=pg-session-lock/Cargo.toml::version ${actual} does not match tag ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+      - name: Test
+        run: cargo test -p pg-session-lock
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pg_session_lock_test
+      - name: Package (builds the crate outside the workspace)
+        run: cargo package -p pg-session-lock
+
+  # crates.io Trusted Publishing via GitHub OIDC, as in release.yml. The crate
+  # needs a (Pending) Trusted Publisher entry on crates.io for this repository
+  # and this workflow file before its first publish.
+  publish:
+    name: Publish to crates.io
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate to crates.io (OIDC)
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish pg-session-lock
+        run: cargo publish --package pg-session-lock
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}

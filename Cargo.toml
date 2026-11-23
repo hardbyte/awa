@@ -10,6 +10,7 @@ members = [
     "awa-cli",
     "awa-seaorm",
     "awa-ui",
+    "pg-session-lock",
 ]
 exclude = ["awa-python", "spike"]
 
@@ -24,6 +25,8 @@ keywords = ["postgres", "job-queue", "background-jobs", "async"]
 categories = ["database", "asynchronous", "web-programming"]
 
 [workspace.dependencies]
+# Versioned on its own; see pg-session-lock/Cargo.toml.
+pg-session-lock = { path = "pg-session-lock", version = "0.1.0" }
 # Internal crates
 awa-model = { path = "awa-model", version = "0.7.0-alpha.2" }
 awa-macros = { path = "awa-macros", version = "0.7.0-alpha.2" }
