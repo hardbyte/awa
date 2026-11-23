@@ -90,19 +90,28 @@ jobs:
           PY
 
       # pg-session-lock is released on its own (pg-session-lock-release.yml).
-      # The awa crates that depend on it can only publish once the version in
-      # this commit is on crates.io.
-      - name: pg-session-lock version is on crates.io
+      # The awa crates published from this commit depend on the crates.io
+      # release with this commit's version, so that release must exist and
+      # ship the same code that CI tested here as a path dependency.
+      - name: pg-session-lock in this commit is the one on crates.io
         shell: bash
         run: |
           set -euo pipefail
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("pg-session-lock/Cargo.toml", "rb"))["package"]["version"])')
-          if ! curl -sSf -A "awa-release-check" -o /dev/null \
-              "https://crates.io/api/v1/crates/pg-session-lock/${version}"; then
+          published="$(mktemp -d)"
+          if ! curl -sSfL -A "awa-release-check" -o "${published}/crate.tar.gz" \
+              "https://static.crates.io/crates/pg-session-lock/pg-session-lock-${version}.crate"; then
             echo "::error file=pg-session-lock/Cargo.toml::pg-session-lock ${version} is not on crates.io; release it first by pushing the tag pg-session-lock-v${version}"
             exit 1
           fi
-          echo "ok: pg-session-lock ${version} is on crates.io"
+          tar -xzf "${published}/crate.tar.gz" -C "${published}"
+          crate="${published}/pg-session-lock-${version}"
+          if ! diff -r "${crate}/src" pg-session-lock/src \
+              || ! diff "${crate}/Cargo.toml.orig" pg-session-lock/Cargo.toml; then
+            echo "::error file=pg-session-lock/Cargo.toml::pg-session-lock/ differs from the published ${version}; bump its version and release it (tag pg-session-lock-v<new version>) before releasing awa"
+            exit 1
+          fi
+          echo "ok: pg-session-lock ${version} on crates.io matches this commit"
 
   # ─── Exact-candidate gate ────────────────────────────────────────
   # Require the complete CI workflow triggered by the merge push to have
