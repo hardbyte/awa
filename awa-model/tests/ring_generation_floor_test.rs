@@ -598,7 +598,9 @@ async fn cancel_as_granted(
     let mut gate = pool.acquire().await?;
     let mut victim = pool.acquire().await?;
     // Should the observer below fail before it opens the gate, the victim
-    // still ends, and so does the test.
+    // still ends, and so does the test, and neither connection goes back to
+    // the pool holding a lock.
+    gate.close_on_drop();
     victim.close_on_drop();
     let victim_pid: i32 = sqlx::query_scalar(
         "SELECT pg_backend_pid() FROM set_config('statement_timeout', '30s', false)",
