@@ -2,6 +2,7 @@
 //! floor, which keeps a lane's ring generations in order under REPEATABLE READ
 //! and SERIALIZABLE producers.
 
+use awa_model::advisory::PG_LOCKS_KEY;
 use awa_model::{migrations, QueueStorage, QueueStorageConfig};
 use sqlx::PgPool;
 
@@ -644,14 +645,12 @@ async fn cancel_as_granted(
 /// Ends the sessions in this database holding the advisory lock `key`, so a
 /// lock a cancelled try leaked does not stall the next one.
 async fn end_lock_holders(pool: &PgPool, key: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         "SELECT pg_terminate_backend(pid) FROM pg_locks
          WHERE locktype = 'advisory' AND granted AND pid <> pg_backend_pid()
            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-           AND objsubid = 1
-           AND classid = (($1 >> 32) & 4294967295)::oid
-           AND objid = ($1 & 4294967295)::oid",
-    )
+           AND objsubid = 1 AND {PG_LOCKS_KEY} = $1"
+    ))
     .bind(key)
     .execute(pool)
     .await?;
