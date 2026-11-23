@@ -806,7 +806,7 @@ async fn set_only_schema_owner_membership_repairs_legacy_lanes_and_restores_role
     let pending = migrations::pending_schema_patches(&cluster.owner).await?;
     assert_eq!(
         pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-        ["definer_lane_provisioning", "spent_claim_prefix_gaps"]
+        migrations::patches_to_apply(&["definer_lane_provisioning"])
     );
     let report = migrations::run_with_report(&cluster.owner).await?;
     assert!(report.complete(), "{:?}", report.patches);
@@ -1034,7 +1034,7 @@ async fn set_only_schema_owner_membership_resets_claim_batch_job_index_execute()
             .iter()
             .map(|patch| patch.name)
             .collect::<Vec<_>>(),
-        ["claim_batch_job_index", "spent_claim_prefix_gaps"]
+        migrations::patches_to_apply(&["claim_batch_job_index"])
     );
     let report = migrations::run_with_report(&migrate_pool).await?;
     let role_after: (String, String) = sqlx::query_as(role_query).fetch_one(&migrate_pool).await?;

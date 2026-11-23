@@ -361,15 +361,12 @@ async fn exercise_stale_custom_schema(options: PgConnectOptions, migrator: &str)
     )
     .await?;
     // The old helper also predates lane provisioning, so both patches that
-    // refresh the helpers name the schema.
+    // refresh the helpers name the schema, and the installer rewrites re-run
+    // after them.
     let pending = migrations::pending_schema_patches(&pool).await?;
     assert_eq!(
         pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-        vec![
-            "prepared_lane_sequences",
-            "definer_lane_provisioning",
-            "spent_claim_prefix_gaps"
-        ]
+        migrations::patches_to_apply(&["prepared_lane_sequences", "definer_lane_provisioning"])
     );
     let status = lane_patch_status(&pool).await?;
     assert!(!status.applied);

@@ -25523,7 +25523,7 @@ async fn test_claim_batch_job_index_patch_leaves_indexing_to_claim_prune() {
             .iter()
             .map(|patch| patch.name)
             .collect::<Vec<_>>(),
-        vec!["claim_batch_job_index", "spent_claim_prefix_gaps"]
+        migrations::patches_to_apply(&["claim_batch_job_index"])
     );
 
     let schema_versions = || async {
