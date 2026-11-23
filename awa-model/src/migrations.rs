@@ -983,43 +983,69 @@ pub async fn run_with_report(pool: &PgPool) -> Result<MigrationReport, AwaError>
     // closed socket; elsewhere the setting is refused and the run goes ahead
     // without it.
     let mut lock = SessionAdvisoryLock::acquire(pool, MIGRATION_LOCK_KEY).await?;
-    let checks_client = lock
+    let checks_client = if lock
         .connection()
         .server_version_num()
         .is_some_and(|version| version >= 140_000)
-        && sqlx::query("SET client_connection_check_interval = '1s'")
-            .execute(lock.connection())
-            .await
-            .is_ok();
+    {
+        set_session_setting(lock.connection(), "client_connection_check_interval", "1s").await
+    } else {
+        None
+    };
 
     // Migration steps and schema patches open their transactions with a plain
     // `BEGIN`, or run as one implicit transaction, and the versioned files
     // cannot change. Run them at READ COMMITTED whatever the role or database
     // default_transaction_isolation, as awa's other transactions do (#847).
-    let read_committed = sqlx::query("SET default_transaction_isolation = 'read committed'")
-        .execute(lock.connection())
-        .await
-        .is_ok();
+    let isolation = set_session_setting(
+        lock.connection(),
+        "default_transaction_isolation",
+        "read committed",
+    )
+    .await;
 
     let result = run_inner(lock.connection()).await;
 
-    // The connection returns to the pool only with its settings restored;
-    // otherwise dropping the guard closes it.
-    let restored = (!checks_client
-        || sqlx::query("RESET client_connection_check_interval")
-            .execute(lock.connection())
-            .await
-            .is_ok())
-        && (!read_committed
-            || sqlx::query("RESET default_transaction_isolation")
+    // The connection returns to the pool only with the values it had before,
+    // which a pool's after_connect may have set, rather than the role or
+    // database defaults RESET would give; otherwise dropping the guard closes
+    // it.
+    let mut restored = true;
+    for (name, previous) in [
+        ("client_connection_check_interval", checks_client),
+        ("default_transaction_isolation", isolation),
+    ] {
+        if let Some(previous) = previous {
+            restored &= sqlx::query("SELECT set_config($1, $2, false)")
+                .bind(name)
+                .bind(previous)
                 .execute(lock.connection())
                 .await
-                .is_ok());
+                .is_ok();
+        }
+    }
     if restored {
         let _ = lock.release().await;
     }
 
     result
+}
+
+/// Sets a session setting and returns the value it had, or `None` when the
+/// server refused it (an unknown setting, a server too old for it).
+async fn set_session_setting(conn: &mut PgConnection, name: &str, value: &str) -> Option<String> {
+    let previous: String = sqlx::query_scalar("SELECT current_setting($1)")
+        .bind(name)
+        .fetch_one(&mut *conn)
+        .await
+        .ok()?;
+    sqlx::query("SELECT set_config($1, $2, false)")
+        .bind(name)
+        .bind(value)
+        .execute(&mut *conn)
+        .await
+        .ok()?;
+    Some(previous)
 }
 
 async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError> {

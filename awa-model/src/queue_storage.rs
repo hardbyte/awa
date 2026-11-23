@@ -16980,6 +16980,7 @@ impl QueueStorage {
         };
 
         {
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
                 .insert_deferred_rows_tx(&mut savepoint, vec![deferred.clone()], None)
@@ -17025,6 +17026,7 @@ impl QueueStorage {
         };
 
         let claimed = {
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
                 .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), None)
@@ -18776,6 +18778,7 @@ impl QueueStorage {
                 .as_ref()
                 .map(|pairs| pairs.iter().copied().unzip())
                 .unwrap_or_default();
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                 r#"
@@ -18970,6 +18973,7 @@ impl QueueStorage {
                 .as_ref()
                 .map(|pairs| pairs.iter().copied().unzip())
                 .unwrap_or_default();
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                 r#"
@@ -19163,6 +19167,7 @@ impl QueueStorage {
                 .as_ref()
                 .map(|pairs| pairs.iter().copied().unzip())
                 .unwrap_or_default();
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                 r#"

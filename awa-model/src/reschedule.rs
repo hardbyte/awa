@@ -302,6 +302,7 @@ async fn reschedule_canonical(
             .map(|outcome| (outcome, None));
     }
     {
+        // isolation: a savepoint, at the enclosing transaction's level
         let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
         match move_canonical(
             savepoint.as_mut(),

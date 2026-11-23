@@ -18,12 +18,18 @@ class TransactionIsolationTests(unittest.TestCase):
     def test_pool_begin(self):
         self.assertEqual(lines("fn f() {\n    let tx = pool.begin().await?;\n}"), [2])
         self.assertEqual(lines("let tx = self.pool.try_begin().await?;"), [1])
-        self.assertEqual(lines("let tx = self\n    .pool\n    .begin()\n    .await?;"), [2])
+        self.assertEqual(lines("let tx = self\n    .pool\n    .begin()\n    .await?;"), [3])
 
-    def test_read_committed_and_other_receivers(self):
+    def test_any_receiver_needs_read_committed_or_a_marker(self):
         self.assertEqual(lines("let tx = pool.begin_read_committed().await?;"), [])
-        self.assertEqual(lines("let savepoint = tx.begin().await?;"), [])
-        self.assertEqual(lines("let tx = conn.begin().await?;"), [])
+        # Names don't say whether a receiver is a pool, a connection or a
+        # transaction, so every begin() is checked.
+        self.assertEqual(lines("let tx = db_pool.begin().await?;"), [1])
+        self.assertEqual(lines("let tx = maintenance.begin().await?;"), [1])
+        self.assertEqual(lines("let tx = conn.begin().await?;"), [1])
+        self.assertEqual(
+            lines("// isolation: a savepoint\nlet savepoint = tx.begin().await?;"), []
+        )
 
     def test_application_owned_transaction_is_marked(self):
         text = "// isolation: the application owns this transaction\nlet tx = pool.begin().await?;"

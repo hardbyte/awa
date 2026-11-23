@@ -1847,6 +1847,7 @@ pub async fn cancel_tx(
     conn: &mut sqlx::PgConnection,
     job_id: i64,
 ) -> Result<Option<JobRow>, AwaError> {
+    // isolation: the caller's connection; the transaction keeps the caller's level
     let mut tx = conn.begin().await?;
     match cancel_in_tx(&mut tx, job_id).await {
         Ok(row) => {
@@ -2312,6 +2313,7 @@ pub async fn cancel_by_unique_key_tx(
     args: Option<&serde_json::Value>,
     period_bucket: Option<i64>,
 ) -> Result<Option<JobRow>, AwaError> {
+    // isolation: the caller's connection; the transaction keeps the caller's level
     let mut tx = conn.begin().await?;
     match cancel_by_unique_key_in_tx(&mut tx, kind, queue, args, period_bucket).await {
         Ok(row) => {

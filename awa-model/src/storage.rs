@@ -522,6 +522,7 @@ async fn repair_lane_sequence_as_login_role(
     schema: &str,
     sequence_name: &str,
 ) -> Result<Option<Option<LaneSequenceRepair>>, AwaError> {
+    // isolation: the caller's connection; the transaction keeps the caller's level
     let mut transaction = conn.begin().await?;
     sqlx::query("SET LOCAL ROLE NONE")
         .execute(&mut *transaction)

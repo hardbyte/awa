@@ -39,6 +39,7 @@ pub async fn begin_read_committed_on(
     conn: &mut PgConnection,
 ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
     if conn.is_in_transaction() {
+        // isolation: a savepoint, at the enclosing transaction's level
         conn.begin().await
     } else {
         Connection::begin_with(conn, BEGIN_READ_COMMITTED).await

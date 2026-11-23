@@ -5,9 +5,9 @@ Queue storage takes a lock and then reads what earlier holders committed. A
 role or database default_transaction_isolation above READ COMMITTED keeps the
 transaction's first snapshot and hides those rows (#847), so library code opens
 its own transactions with awa_model::isolation::BeginReadCommitted rather than
-PgPool::begin. A transaction handed to the application, which keeps the
-session's level, is marked with an `isolation:` comment on the line or in the
-three lines above. Test modules (`#[cfg(test)] mod ...`) are not checked.
+begin(). Any begin() is flagged, whatever its receiver is named; a savepoint, or
+a transaction on a connection the caller owns, which keeps the caller's level,
+is marked with an `isolation:` comment on the line or in the three lines above. Test modules (`#[cfg(test)] mod ...`) are not checked.
 
 Usage: check-transaction-isolation.py [repository root]
 """
@@ -18,7 +18,10 @@ import re
 import sys
 from pathlib import Path
 
-POOL_BEGIN = re.compile(r"\bpool(?:\(\))?\s*\.\s*(?:try_)?begin\(\)")
+# Any `.begin()`, whatever its receiver is called: a pool, a connection (which
+# begins at the session's default) or a transaction (a savepoint, at the outer
+# transaction's level). Names don't tell them apart, so each needs a marker.
+POOL_BEGIN = re.compile(r"\.\s*(?:try_)?begin\(\)")
 # A BEGIN statement in a string literal that does not name its isolation level.
 BARE_BEGIN = re.compile(r'"BEGIN\b(?![^"]*ISOLATION LEVEL)[^"]*"', re.IGNORECASE)
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s")
@@ -106,9 +109,9 @@ def findings(path: str, text: str) -> list[tuple[str, int, str]]:
             (
                 path,
                 line,
-                "pool.begin() inherits the session's default isolation; use "
-                "BeginReadCommitted::begin_read_committed, or mark a transaction "
-                f"the application owns with `// {MARKER} <why>`",
+                "begin() takes the session's default isolation; use "
+                "BeginReadCommitted::begin_read_committed or begin_read_committed_on, "
+                f"or mark a savepoint or a transaction the caller owns with `// {MARKER} <why>`",
             )
         )
     return found

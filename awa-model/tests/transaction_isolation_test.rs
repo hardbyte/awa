@@ -225,3 +225,41 @@ async fn prune_on_a_read_committed_pool_keeps_a_job_committed_during_its_lock_wa
     assert_kept_pending_job(outcome, survived);
     Ok(())
 }
+
+/// `migrations::run` runs at READ COMMITTED on its own connection, then gives
+/// that connection back with the settings it had: a pool's `after_connect`
+/// value, not the role or database default `RESET` would restore.
+#[sqlx::test(migrations = false)]
+async fn migrations_give_the_connection_back_with_its_own_settings(pool: PgPool) -> TestResult {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query(
+                    "SELECT set_config('default_transaction_isolation', 'repeatable read', false), \
+                            set_config('client_connection_check_interval', '7s', false)",
+                )
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&pool)
+        .await?;
+
+    migrations::run(&pool).await?;
+
+    let (same, isolation, check): (i32, String, String) = sqlx::query_as(
+        "SELECT pg_backend_pid(), current_setting('default_transaction_isolation'), \
+                current_setting('client_connection_check_interval')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(same, pid, "the migration connection went back to the pool");
+    assert_eq!(isolation, "repeatable read");
+    assert_eq!(check, "7s");
+    Ok(())
+}
