@@ -14,6 +14,30 @@
 //! Prefer a transaction-scoped lock (`pg_advisory_xact_lock`) where the work
 //! fits in one transaction: it ends with the transaction and needs no guard.
 //!
+//! Closing is asynchronous: sqlx closes a dropped connection in a background
+//! task, so another session can take the key only once the server has seen
+//! the connection end. A waiting [`SessionAdvisoryLock::acquire`] holds one
+//! of the pool's connections for as long as it waits.
+//!
+//! # Leaders
+//!
+//! A leader that keeps its lock for as long as its connection lives
+//! ([`SessionAdvisoryLock::into_connection_closed_on_drop`]) must notice when
+//! it has lost it. If the network drops the connection, the server releases
+//! the lock only once it detects the dead connection, which with default TCP
+//! keepalive settings can take hours; meanwhile the old leader may still
+//! believe it leads, and once the server notices, another session can lead
+//! too. So:
+//!
+//! - Check [`session_holds`] on the leader's connection periodically, and
+//!   step down when it returns `false` or an error.
+//! - Set TCP keepalives on the server or the connection (for example
+//!   `tcp_keepalives_idle`, `tcp_keepalives_interval` and
+//!   `tcp_keepalives_count`) so a dead connection is detected in seconds.
+//! - Session locks need a real session: they do not work through a
+//!   transaction-mode connection pooler such as PgBouncer in `transaction`
+//!   mode, which hands each transaction to any server connection.
+//!
 //! ```no_run
 //! # async fn run(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
 //! use pg_session_lock::SessionAdvisoryLock;
@@ -39,9 +63,14 @@ use sqlx::{PgConnection, PgPool, Postgres};
 /// taken. The columns are unqualified, so don't join `pg_locks` to a relation
 /// that also has them.
 ///
+/// Advisory keys are per database, but `pg_locks` lists the whole cluster's
+/// locks, so filter by database too, unless you filter by `pid`:
+///
 /// ```
 /// let sql: &'static str = concat!(
-///     "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 AND ",
+///     "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+///        AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+///        AND ",
 ///     pg_session_lock::pg_locks_key!(),
 ///     " = $1"
 /// );
@@ -96,10 +125,14 @@ impl SessionAdvisoryLock {
             conn: Some(pool.acquire().await?),
             key,
         };
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        let locked: bool = match sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(key)
             .fetch_one(lock.connection())
-            .await?;
+            .await
+        {
+            Ok(locked) => locked,
+            Err(err) => return Err(lock.refused(err)),
+        };
         if locked {
             Ok(Some(lock))
         } else {
@@ -110,18 +143,35 @@ impl SessionAdvisoryLock {
     }
 
     /// Takes `pg_advisory_lock(key)` on a connection from `pool`, waiting until
-    /// the lock is free. Bound the wait with `lock_timeout` or a timeout on the
-    /// future; dropping it closes the connection.
+    /// the lock is free. Bound the wait with the session's `lock_timeout`, which
+    /// fails with SQLSTATE `55P03` and returns the connection to the pool, or
+    /// with a timeout on the future, which closes the connection because the
+    /// lock may have been granted as the future was dropped. The wait holds one
+    /// of the pool's connections.
     pub async fn acquire(pool: &PgPool, key: i64) -> Result<Self, sqlx::Error> {
         let mut lock = Self {
             conn: Some(pool.acquire().await?),
             key,
         };
-        sqlx::query("SELECT pg_advisory_lock($1)")
+        if let Err(err) = sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(key)
             .execute(lock.connection())
-            .await?;
+            .await
+        {
+            return Err(lock.refused(err));
+        }
         Ok(lock)
+    }
+
+    /// The lock request failed with `err`. An error the server returned (a
+    /// lock or statement timeout, a cancel) means the lock was not granted,
+    /// so the connection goes back to the pool; any other error leaves that
+    /// unknown, and dropping the guard closes the connection.
+    fn refused(mut self, err: sqlx::Error) -> sqlx::Error {
+        if matches!(err, sqlx::Error::Database(_)) {
+            drop(self.conn.take());
+        }
+        err
     }
 
     /// Hands over the connection holding the lock, marked to close rather than
@@ -206,8 +256,9 @@ pub fn is_deadlock(err: &sqlx::Error) -> bool {
     has_sqlstate(err, "40P01")
 }
 
-/// A lock was not available: `lock_timeout` expired, or `NOWAIT` or
-/// `SKIP LOCKED`-style probing found it taken (SQLSTATE `55P03`).
+/// A lock was not available: `lock_timeout` expired, or a `NOWAIT` lock found
+/// it taken (SQLSTATE `55P03`). `SKIP LOCKED` skips such rows without an
+/// error.
 pub fn is_lock_not_available(err: &sqlx::Error) -> bool {
     has_sqlstate(err, "55P03")
 }

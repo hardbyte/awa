@@ -286,3 +286,44 @@ async fn timeouts_are_recognised(pool: PgPool) -> TestResult {
     assert!(is_lock_not_available(&err), "{err}");
     Ok(())
 }
+
+/// A lock request the server refuses (here `lock_timeout`) was not granted, so
+/// the connection goes back to the pool rather than being closed.
+#[sqlx::test(migrations = false)]
+async fn a_refused_acquire_returns_the_connection(pool: PgPool) -> TestResult {
+    let key = 7_109;
+    let holder = SessionAdvisoryLock::try_acquire(&pool, key)
+        .await?
+        .expect("the lock is free");
+    let waiters = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '50ms'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&waiters)
+        .await?;
+
+    let err = SessionAdvisoryLock::acquire(&waiters, key)
+        .await
+        .expect_err("the lock wait times out");
+    assert!(is_lock_not_available(&err), "{err}");
+    let same: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&waiters)
+        .await?;
+    assert_eq!(
+        same, pid,
+        "the connection went back to the pool, not closed"
+    );
+
+    holder.release().await?;
+    waiters.close().await;
+    Ok(())
+}

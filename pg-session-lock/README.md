@@ -22,9 +22,19 @@ For a leader that holds its lock for as long as its connection lives, `into_conn
 
 Where the work fits in one transaction, prefer `pg_advisory_xact_lock`: it ends with the transaction and needs no guard.
 
+## Leaders
+
+A leader that holds its lock for as long as its connection lives must notice when it loses it. If the network drops the connection, the server releases the lock only when it detects the dead connection, which with default TCP keepalive settings can take hours. The old leader may still believe it leads, and once the server notices, another session can lead too.
+
+- Check `session_holds` on the leader's connection periodically, and step down on `false` or an error.
+- Set TCP keepalives on the server or connection (`tcp_keepalives_idle`, `tcp_keepalives_interval`, `tcp_keepalives_count`) so a dead connection is found in seconds.
+- Session locks need a real session: they don't work through a transaction-mode pooler such as PgBouncer in `transaction` mode.
+
+A dropped guard's lock is released once sqlx has closed its connection, which it does in a background task. A waiting `acquire` holds one of the pool's connections; bound the wait with `lock_timeout`, which returns the connection to the pool.
+
 ## Also included
 
-- `PG_LOCKS_KEY`: the SQL expression that rebuilds a bigint advisory key from `pg_locks.classid` and `objid`, and `session_holds`, which uses it.
+- `pg_locks_key!()` / `PG_LOCKS_KEY`: the SQL expression that rebuilds a bigint advisory key from `pg_locks.classid` and `objid`, and `session_holds`, which uses it. `pg_locks` lists every database's locks, so filter by database too when you don't filter by `pid`.
 - `is_serialization_failure` (`40001`), `is_deadlock` (`40P01`), `is_lock_not_available` (`55P03`) and `is_query_canceled` (`57014`) for `sqlx::Error`.
 
 ## sqlx versions
