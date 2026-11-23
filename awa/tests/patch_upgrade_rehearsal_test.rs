@@ -89,17 +89,57 @@ fn env_path(var: &str) -> PathBuf {
 /// A released version the rehearsal runs against.
 struct Released {
     version: &'static str,
-    /// The schema patches the candidate's `awa migrate` applies to a database
-    /// this version installed, in `migrations::SCHEMA_PATCHES` order.
-    pending_patches: &'static [&'static str],
+    /// The schema patches this version shipped. A database it installed has
+    /// these and lacks every later one.
+    shipped_patches: &'static [&'static str],
     /// Whether its runtimes report runtime-control observations.
     observes_runtime_controls: bool,
+}
+
+impl Released {
+    /// The schema patches the candidate's `awa migrate` applies to a database
+    /// this version installed, in `migrations::SCHEMA_PATCHES` order.
+    fn pending_patches(&self) -> Vec<&'static str> {
+        let missing: Vec<&str> = migrations::SCHEMA_PATCHES
+            .iter()
+            .map(|patch| patch.name)
+            .filter(|name| !self.shipped_patches.contains(name))
+            .collect();
+        migrations::patches_to_apply(&missing)
+    }
 }
 
 const RELEASED: &[Released] = &[
     Released {
         version: "0.6.9",
-        pending_patches: &[
+        shipped_patches: &["wait_free_dirty_marks"],
+        observes_runtime_controls: false,
+    },
+    Released {
+        version: "0.6.15",
+        shipped_patches: &[
+            "wait_free_dirty_marks",
+            "prepared_lane_sequences",
+            "definer_lane_provisioning",
+        ],
+        observes_runtime_controls: false,
+    },
+    Released {
+        version: "0.6.16",
+        shipped_patches: &[
+            "wait_free_dirty_marks",
+            "prepared_lane_sequences",
+            "definer_lane_provisioning",
+            "claim_batch_job_index",
+            "insert_jobs_compat_batch",
+            "prune_controls",
+        ],
+        observes_runtime_controls: true,
+    },
+    Released {
+        version: "0.6.17",
+        shipped_patches: &[
+            "wait_free_dirty_marks",
             "prepared_lane_sequences",
             "definer_lane_provisioning",
             "claim_batch_job_index",
@@ -107,37 +147,7 @@ const RELEASED: &[Released] = &[
             "prune_controls",
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
-            "replica_identity",
-            "spent_claim_prefix_gaps",
         ],
-        observes_runtime_controls: false,
-    },
-    Released {
-        version: "0.6.15",
-        pending_patches: &[
-            "claim_batch_job_index",
-            "insert_jobs_compat_batch",
-            "prune_controls",
-            "runtime_maintenance_eligibility",
-            "correlated_claim_tombstones",
-            "replica_identity",
-            "spent_claim_prefix_gaps",
-        ],
-        observes_runtime_controls: false,
-    },
-    Released {
-        version: "0.6.16",
-        pending_patches: &[
-            "runtime_maintenance_eligibility",
-            "correlated_claim_tombstones",
-            "replica_identity",
-            "spent_claim_prefix_gaps",
-        ],
-        observes_runtime_controls: true,
-    },
-    Released {
-        version: "0.6.17",
-        pending_patches: &["replica_identity", "spent_claim_prefix_gaps"],
         observes_runtime_controls: true,
     },
 ];
@@ -923,7 +933,7 @@ async fn released_patch_upgrade_and_rollback() {
         cli_ok(&released_cli, &fixture.owner_url, args).await;
     }
     grant_released_runtime(&fixture).await;
-    let expected_pending = released().pending_patches;
+    let expected_pending = released().pending_patches();
     let lane_patch_pending = expected_pending.contains(&"prepared_lane_sequences");
     let before = lane_patch_applied(&fixture.admin).await;
     assert_eq!(
@@ -1188,11 +1198,12 @@ async fn released_patch_upgrade_and_rollback() {
     );
     let unexpected_lock_count = unexpected_locks.len();
     let mut expected_lines = vec!["Schema: v40 (unchanged)".to_string()];
+    // A retry after a replica_identity timeout re-applies that patch and the
+    // installer rewrites that follow it; everything else is already present.
+    let applied_on_retry = migrations::patches_to_apply(&["replica_identity"]);
     for patch in migrations::SCHEMA_PATCHES {
         let outcome = if expected_pending.contains(&patch.name)
-            && (migrate_attempts == 1
-                || patch.name == "replica_identity"
-                || patch.name == "spent_claim_prefix_gaps")
+            && (migrate_attempts == 1 || applied_on_retry.contains(&patch.name))
         {
             "applied"
         } else {

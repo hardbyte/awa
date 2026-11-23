@@ -48,6 +48,11 @@ AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldReEnqueueUniqueDeadlock.
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg ;; NoDeadlock is violated ;; old row-order claim pass against a fresh unique enqueue witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderCompletionFollowUpDeadlock.cfg ;; NoDeadlock is violated ;; completion follow-up claiming a key across two passes (known gap)
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg ;; NoDeadlock is violated ;; old claim-prune slot-row order against rescue witness
+AwaSessionAdvisoryLock.tla     ;; -                                       ;; pass ;; session locks released on cancel, error, drop and failed unlock
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockOthersOnly.cfg    ;; NoPooledLock is violated ;; WHEN OTHERS handler misses a cancel after the grant
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockLockBeforeBlock.cfg ;; NoPooledLock is violated ;; lock taken before the block whose handler unlocks
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockCancelOnly.cfg    ;; NoPooledLock is violated ;; handler without OTHERS misses an ordinary error
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockUnguardedPool.cfg ;; NoPooledLock is violated ;; dropped Rust holder pools its locked connection
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + #456 reschedule drain
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence

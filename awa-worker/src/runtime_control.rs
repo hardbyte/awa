@@ -735,6 +735,7 @@ mod tests {
             .fetch_one(&mut *conn)
             .await
             .unwrap();
+        // advisory-lock: test fixture; LeaderObserver closes this connection on drop.
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(42)")
             .fetch_one(&mut *conn)
             .await
