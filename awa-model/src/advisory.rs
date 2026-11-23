@@ -15,6 +15,13 @@
 use sqlx::pool::PoolConnection;
 use sqlx::{PgConnection, PgPool, Postgres};
 
+/// The bigint advisory key of a `pg_locks` row. PostgreSQL shows a bigint key
+/// split in two, its high 32 bits in `classid` and its low 32 bits in `objid`,
+/// with `objsubid = 1`; this puts the halves back together for comparison with
+/// the key. `int8 << 32` does not check for overflow, so a key with its sign
+/// bit set comes back negative, as it was taken.
+pub const PG_LOCKS_KEY: &str = "((classid::int8 << 32) | objid::int8)";
+
 /// A session advisory lock held on a connection checked out of a pool.
 ///
 /// The connection goes back to the pool only through [`release`] after the
@@ -108,13 +115,11 @@ impl SessionAdvisoryLock {
         }
         // Session advisory locks stack: one unlock releases one hold. The
         // connection is pooled only once this session holds the key no more.
-        let still_held: bool = sqlx::query_scalar(
+        let still_held: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks \
              WHERE locktype = 'advisory' AND pid = pg_backend_pid() \
-               AND objsubid = 1 \
-               AND classid = (($1 >> 32) & 4294967295)::oid \
-               AND objid = ($1 & 4294967295)::oid)",
-        )
+               AND objsubid = 1 AND {PG_LOCKS_KEY} = $1)"
+        ))
         .bind(key)
         .fetch_one(self.connection())
         .await?;
