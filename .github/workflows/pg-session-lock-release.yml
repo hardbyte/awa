@@ -64,9 +64,10 @@ jobs:
       - name: Package (builds the crate outside the workspace)
         run: cargo package -p pg-session-lock
 
-  # crates.io Trusted Publishing via GitHub OIDC, as in release.yml. The crate
-  # needs a (Pending) Trusted Publisher entry on crates.io for this repository
-  # and this workflow file before its first publish.
+  # crates.io Trusted Publishing via GitHub OIDC, as in release.yml. A trusted
+  # publisher can only be added to a crate that exists, so 0.1.0 was published
+  # by hand; later versions publish here once the crate's settings on
+  # crates.io name this repository and this workflow file.
   publish:
     name: Publish to crates.io
     needs: [test]
