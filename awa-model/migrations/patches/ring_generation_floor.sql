@@ -47,8 +47,9 @@
 -- insert_jobs_compat_batch, which puts the released batch producer back.
 --
 -- Live load: one sequence and one function per schema, and three function
--- replacements. It takes no lock on any awa or queue-storage table and its
--- work scales with the number of schemas, not with job count. An enqueue in
+-- replacements. Its only table lock is ACCESS SHARE on each schema's
+-- queue_ring_state, read to seed the floor, which blocks no claim, enqueue or
+-- rotation. Its work scales with the number of schemas, not with job count. An enqueue in
 -- flight finishes on the old body; the next call uses the new one. It does not
 -- wait for a schema's install lock, which prepare_schema() holds while it runs
 -- the installer: when the lock is taken the patch fails with 55P03, changes
@@ -66,8 +67,8 @@
 -- that can SET ROLE to it.
 
 -- Installs or refreshes the generation floor of p_schema: the sequence, and
--- enqueue_ring_cursor(), which it seeds the floor through. Replacing the
--- function takes no table locks. The installer calls this too, once this
+-- enqueue_ring_cursor(), which it seeds the floor through. Seeding reads
+-- queue_ring_state (ACCESS SHARE). The installer calls this too, once this
 -- patch has rewritten it.
 CREATE OR REPLACE FUNCTION awa.refresh_ring_generation_floor_helper(p_schema TEXT)
 RETURNS VOID

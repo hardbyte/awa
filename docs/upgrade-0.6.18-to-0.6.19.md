@@ -19,7 +19,7 @@ Otherwise, binaries and the migration can roll in either order.
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
    ```
 
-   On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. None of them takes a table lock; they replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema.
+   On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. They replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema. None of them blocks queue traffic: the only table lock among them is `ring_generation_floor`'s `ACCESS SHARE` read of each schema's `queue_ring_state`, to seed the floor.
 
 3. Roll workers, producers and admin processes to 0.6.19, in any order, subject to the two cautions above.
 
