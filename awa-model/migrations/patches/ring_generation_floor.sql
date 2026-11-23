@@ -102,7 +102,18 @@ BEGIN
       ON state.relnamespace = namespace.oid
      AND state.relname = 'queue_ring_state'
      AND state.relkind IN ('r', 'p')
-    WHERE namespace.nspname = p_schema;
+    WHERE namespace.nspname = p_schema
+      -- The ring awa installs, not another table of the same name.
+      AND (SELECT count(*)
+           FROM pg_attribute AS col
+           WHERE col.attrelid = state.oid
+             AND col.attnum > 0
+             AND NOT col.attisdropped
+             AND (col.attname::text, col.atttypid) IN (
+                     ('singleton', 'boolean'::regtype::oid),
+                     ('current_slot', 'integer'::regtype::oid),
+                     ('generation', 'bigint'::regtype::oid),
+                     ('slot_count', 'integer'::regtype::oid))) = 4;
     IF v_owner IS NULL THEN
         RAISE EXCEPTION 'refresh_ring_generation_floor_helper: schema % has no queue ring',
             p_schema
@@ -170,6 +181,9 @@ BEGIN
             v_generation BIGINT;
             v_slot_count INT;
             v_floor BIGINT;
+            v_latest_slot INT;
+            v_latest_generation BIGINT;
+            v_lowered BOOLEAN := FALSE;
             v_lock_key BIGINT := hashtextextended(%3$L, 0);
         BEGIN
             SELECT state.current_slot, state.generation, state.slot_count
@@ -215,11 +229,83 @@ BEGIN
             END IF;
 
             IF v_floor > v_generation THEN
-                -- Rotation advances slot and generation together from (0, 0)
-                -- and slot_count changes only when reset restarts the ring,
-                -- so the floor's slot is its generation modulo slot_count.
-                v_slot := (v_floor %% v_slot_count)::int;
-                v_generation := v_floor;
+                -- The floor is ahead of the ring this snapshot sees. Usually
+                -- the snapshot predates the latest rotation (REPEATABLE READ or
+                -- SERIALIZABLE). But a logical restore can bring back a floor
+                -- ahead of the ring, because pg_dump reads sequences outside
+                -- its snapshot, and a floor nothing can reach would wedge the
+                -- ring: enqueues would fill a slot rotation has not reached.
+                -- Locking the ring row tells the two apart. FOR SHARE conflicts
+                -- with a rotation's update (FOR KEY SHARE would not), so at
+                -- REPEATABLE READ or SERIALIZABLE it fails with 40001 when a
+                -- rotation committed after the snapshot, and at READ COMMITTED
+                -- it reads the latest committed ring, waiting only for a
+                -- rotation that is committing. Only an enqueue that sees the
+                -- floor ahead of its snapshot gets here. The floor is read
+                -- first, so a floor still ahead of the latest ring cannot have
+                -- come from a producer or rotation.
+                BEGIN
+                    SELECT state.current_slot, state.generation
+                    INTO v_latest_slot, v_latest_generation
+                    FROM %1$I.queue_ring_state AS state
+                    WHERE state.singleton
+                    FOR SHARE;
+                EXCEPTION WHEN serialization_failure THEN
+                    v_latest_generation := NULL;
+                END;
+
+                IF v_latest_generation IS NOT NULL AND v_floor > v_latest_generation THEN
+                    -- Lower it under the raise's lock, checking the ring
+                    -- again, so a rotation and its raise cannot slip in
+                    -- between. Every way out releases the lock, as above.
+                    BEGIN
+                        PERFORM pg_advisory_lock(v_lock_key);
+                        BEGIN
+                            SELECT state.current_slot, state.generation
+                            INTO v_latest_slot, v_latest_generation
+                            FROM %1$I.queue_ring_state AS state
+                            WHERE state.singleton
+                            FOR SHARE;
+                            IF pg_sequence_last_value(%2$L::regclass) > v_latest_generation THEN
+                                PERFORM setval(%2$L::regclass, v_latest_generation, true);
+                            END IF;
+                            v_lowered := TRUE;
+                        EXCEPTION WHEN serialization_failure THEN
+                            -- A rotation committed meanwhile; the floor is
+                            -- not ahead of the ring any more.
+                            NULL;
+                        END;
+                        PERFORM pg_advisory_unlock(v_lock_key);
+                    EXCEPTION WHEN OTHERS OR query_canceled THEN
+                        IF EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_locks AS held
+                            WHERE held.locktype = 'advisory'
+                              AND held.pid = pg_backend_pid()
+                              AND held.granted
+                              AND held.objsubid = 1
+                              AND ((held.classid::int8 << 32) | held.objid::int8) = v_lock_key
+                        ) THEN
+                            PERFORM pg_advisory_unlock(v_lock_key);
+                        END IF;
+                        RAISE;
+                    END;
+                END IF;
+
+                IF v_lowered OR (v_latest_generation IS NOT NULL AND v_latest_generation >= v_floor) THEN
+                    -- The latest committed ring: after lowering a restored
+                    -- floor, or at READ COMMITTED once a rotation committed
+                    -- after this statement began.
+                    v_slot := v_latest_slot;
+                    v_generation := v_latest_generation;
+                ELSE
+                    -- A snapshot older than the latest rotation. Rotation
+                    -- advances slot and generation together from (0, 0) and
+                    -- slot_count changes only when reset restarts the ring,
+                    -- so the floor's slot is its generation modulo slot_count.
+                    v_slot := (v_floor %% v_slot_count)::int;
+                    v_generation := v_floor;
+                END IF;
             END IF;
 
             slot := v_slot;
@@ -411,10 +497,22 @@ END;\1$function$'
                     AND p.proname = 'claim_ready_runtime'
                     AND oidvectortypes(p.proargtypes)
                         = 'text, bigint, double precision, double precision')
+          -- A ring with awa's columns: another schema with a table of the
+          -- same name would otherwise fail the seeding below.
           AND EXISTS (SELECT 1 FROM pg_class AS c
                       WHERE c.relnamespace = n.oid
                         AND c.relname = 'queue_ring_state'
-                        AND c.relkind IN ('r', 'p'))
+                        AND c.relkind IN ('r', 'p')
+                        AND (SELECT count(*)
+                             FROM pg_attribute AS col
+                             WHERE col.attrelid = c.oid
+                               AND col.attnum > 0
+                               AND NOT col.attisdropped
+                               AND (col.attname::text, col.atttypid) IN (
+                                       ('singleton', 'boolean'::regtype::oid),
+                                       ('current_slot', 'integer'::regtype::oid),
+                                       ('generation', 'bigint'::regtype::oid),
+                                       ('slot_count', 'integer'::regtype::oid))) = 4)
         ORDER BY n.nspname
     LOOP
         -- Serialize with a concurrent prepare_schema() of the same schema. This

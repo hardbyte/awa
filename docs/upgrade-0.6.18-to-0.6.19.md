@@ -21,6 +21,14 @@ Otherwise, binaries and the migration can roll in either order.
 
    On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. They replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema. None of them blocks queue traffic: the only table lock among them is `ring_generation_floor`'s `ACCESS SHARE` read of each schema's `queue_ring_state`, to seed the floor.
 
+   Don't prepare a new queue-storage schema while this runs: no `prepare_schema()` and no first start of a runtime on a new custom schema. The patches find schemas in the catalogs, so they cannot see one whose installer has not committed yet, and an installer that started before the patch installs that schema without the floor. When the roll is done, check that nothing is left:
+
+   ```bash
+   awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --sql --pending
+   ```
+
+   It prints `Schema is up to date (version 40).` when every schema has every patch. Otherwise it prints the patches still needed; run `awa migrate` again. A 0.6.19 process that enqueues into a schema without the floor after the patch also logs a warning naming the schema.
+
 3. Roll workers, producers and admin processes to 0.6.19, in any order, subject to the two cautions above.
 
 0.6.18 binaries run unchanged against the patched schema.
@@ -49,7 +57,16 @@ Extract the full set with:
 awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --extract-to ./sql/awa --from 40
 ```
 
-Replace all `R__` files together with that set and keep previously applied `V` files unchanged. `awa migrate --sql` runs the pending patches in one transaction that takes the same advisory lock as `awa migrate`; pipe it to `psql -v ON_ERROR_STOP=1`.
+Replace all `R__` files together with that set and keep previously applied `V` files unchanged.
+
+To apply the patches with `psql` instead, print what the target database lacks:
+
+```bash
+awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --sql --pending \
+  | psql -v ON_ERROR_STOP=1 "$AWA_MIGRATOR_DATABASE_URL"
+```
+
+This is one transaction that takes the same advisory lock as `awa migrate`. Keep `--pending` and the target URL: without them `--sql` prints every migration from V1, for a new database, not an upgrade.
 
 ## Producers above `READ COMMITTED`
 
@@ -60,7 +77,7 @@ On queue storage, a job enqueued inside a `REPEATABLE READ` or `SERIALIZABLE` tr
 The floor protects a lane only once every process that enqueues into it, and the maintenance leader, run 0.6.19: a 0.6.18 producer or leader does not raise it. Until then, a `REPEATABLE READ` or `SERIALIZABLE` producer can still land behind a 0.6.18 producer's job in an older generation. So:
 
 1. Keep producers that enqueue on queue storage on `READ COMMITTED` until both `awa migrate` has applied `ring_generation_floor` and the binary roll is complete; binaries can roll first, so either can finish last. A producer that sets `default_transaction_isolation` on its role or database, or opens its transactions at a higher level, should enqueue in a `READ COMMITTED` transaction for now.
-2. Once both are done, higher isolation levels are safe: `awa migrate` reports `ring_generation_floor` as applied with no schema still missing it, and every producer, worker and the maintenance leader run 0.6.19. 0.6.19 binaries on a schema without the patch read the ring as 0.6.18 did, so the binary roll alone does not protect them. A `SERIALIZABLE` producer can still see serialization failures (SQLSTATE `40001`) from its own transaction; retry them as usual.
+2. Once both are done, higher isolation levels are safe: `awa migrate --sql --pending` prints `Schema is up to date (version 40).`, so no schema is still missing the floor, and every producer, worker and the maintenance leader run 0.6.19. 0.6.19 binaries on a schema without the patch read the ring as 0.6.18 did, so the binary roll alone does not protect them. A `SERIALIZABLE` producer can still see serialization failures (SQLSTATE `40001`) from its own transaction; retry them as usual.
 
 A job that a stale snapshot already placed behind its lane's claim cursor before the upgrade is not recovered: claims have moved past it, and prune can still delete it. If you ran such producers on 0.6.18 or earlier and suspect lost jobs, compare your own enqueue records with awa's.
 

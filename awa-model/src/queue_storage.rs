@@ -3636,6 +3636,8 @@ pub struct QueueStorage {
     /// the function appears, each enqueue checks again, so producers start
     /// using the floor with the first enqueue after the patch commits.
     enqueue_ring_cursor_present: AtomicBool,
+    /// Set once a schema left without the floor after the patch was logged.
+    enqueue_ring_cursor_warned: AtomicBool,
     prune_lock_timeout: Duration,
 }
 
@@ -3684,6 +3686,7 @@ impl QueueStorage {
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
             enqueue_ring_cursor_present: AtomicBool::new(false),
+            enqueue_ring_cursor_warned: AtomicBool::new(false),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
     }
@@ -5198,8 +5201,9 @@ impl QueueStorage {
         if self.enqueue_ring_cursor_present.load(Ordering::Relaxed) {
             return Ok(true);
         }
-        let callable: bool = sqlx::query_scalar(
-            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), false)",
+        let (callable, patched): (bool, bool) = sqlx::query_as(
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), false), \
+                    to_regprocedure('awa.refresh_ring_generation_floor_helper(text)') IS NOT NULL",
         )
         .bind(format!("{}.enqueue_ring_cursor()", self.schema()))
         .fetch_one(executor)
@@ -5208,6 +5212,21 @@ impl QueueStorage {
         if callable {
             self.enqueue_ring_cursor_present
                 .store(true, Ordering::Relaxed);
+        } else if patched
+            && !self
+                .enqueue_ring_cursor_warned
+                .swap(true, Ordering::Relaxed)
+        {
+            // The patch is applied but this schema has no floor: it was
+            // prepared by an installer that started before the patch, or the
+            // patch could not install the floor here.
+            tracing::warn!(
+                schema = %self.schema(),
+                "queue-storage schema has no generation floor although schema patch \
+                 ring_generation_floor is applied; enqueues read the ring directly, which a \
+                 REPEATABLE READ or SERIALIZABLE producer must not rely on. Run `awa migrate` \
+                 again to install it."
+            );
         }
         Ok(callable)
     }

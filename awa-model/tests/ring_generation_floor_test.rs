@@ -779,11 +779,36 @@ async fn the_probe_names_what_lacks_the_patch(pool: PgPool) -> TestResult {
         r#"CREATE SCHEMA "Lookalike";
            CREATE TABLE "Lookalike".queue_ring_state ();
            CREATE FUNCTION "Lookalike".claim_ready_runtime(text, bigint, double precision, double precision)
+               RETURNS void LANGUAGE sql AS '';
+           CREATE SCHEMA lookalike;
+           CREATE TABLE lookalike.queue_ring_state (description text);
+           CREATE FUNCTION lookalike.claim_ready_runtime(text, bigint, double precision, double precision)
                RETURNS void LANGUAGE sql AS '';"#,
     )
     .execute(&pool)
     .await?;
     assert!(pending_targets(&pool).await?.is_empty());
+    // A lowercase schema with awa's claim function and a ring table of the
+    // same name but not awa's columns is not a substrate: the patch replays
+    // over it and leaves it alone.
+    sqlx::raw_sql(patch_sql()).execute(&pool).await?;
+    let floor_added: bool = sqlx::query_scalar(
+        "SELECT to_regclass('lookalike.queue_ring_generation_floor') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(!floor_added, "the lookalike schema gets no floor");
+    let refused = sqlx::query("SELECT awa.refresh_ring_generation_floor_helper('lookalike')")
+        .execute(&pool)
+        .await
+        .expect_err("the helper refuses a table that is not awa's ring");
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|e| e.code())
+            .as_deref(),
+        Some("22023")
+    );
 
     drop_floor(&pool, "awa").await?;
     assert_eq!(

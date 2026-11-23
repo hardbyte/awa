@@ -829,3 +829,66 @@ async fn terminal_rollup_folds_every_generation_in_the_slot(pool: PgPool) -> Tes
     );
     Ok(())
 }
+
+/// A logical restore can bring back a floor ahead of the ring: pg_dump reads
+/// sequences outside its snapshot, so a rotation between the snapshot and the
+/// sequence read leaves the floor one generation ahead. Enqueues must not
+/// follow it into a slot the ring has not reached, which would leave that
+/// slot busy so rotation and prune could never move past it. The first
+/// enqueue lowers the floor to the ring, and the ring keeps turning.
+#[sqlx::test(migrations = false)]
+async fn a_floor_restored_ahead_of_the_ring_is_lowered(pool: PgPool) -> TestResult {
+    let store = setup(&pool).await?;
+    // The state a restore leaves: ring at generation 0, floor at 1.
+    sqlx::query(&format!(
+        "SELECT setval('{SCHEMA}.queue_ring_generation_floor', 1, true)"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let mut conn = pool.acquire().await?;
+    produce(&mut conn, Producer::InsertJobCompat, "a").await?;
+    drop(conn);
+    // A REPEATABLE READ producer with a current snapshot is put right too.
+    sqlx::query(&format!(
+        "SELECT setval('{SCHEMA}.queue_ring_generation_floor', 1, true)"
+    ))
+    .execute(&pool)
+    .await?;
+    let mut tx = begin_with(&pool, Isolation::RepeatableRead).await?;
+    produce(&mut tx, Producer::InsertJobsCompatBatch, "b").await?;
+    tx.commit().await?;
+
+    let placed = placement(&pool).await?;
+    assert_eq!(placed["a"].1, 0, "a goes in the ring's slot: {placed:?}");
+    assert_eq!(
+        placed["a"].2, 0,
+        "a goes in the ring's generation: {placed:?}"
+    );
+    assert_eq!(
+        placed["b"].2, 0,
+        "b goes in the ring's generation: {placed:?}"
+    );
+    let floor: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT pg_sequence_last_value('{SCHEMA}.queue_ring_generation_floor'::regclass)"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(floor, Some(0), "the floor is lowered to the ring");
+
+    assert_eq!(claim_and_complete_all(&pool, &store).await?, vec!["a", "b"]);
+    let rotated = store.rotate(&pool).await?;
+    assert!(
+        matches!(
+            rotated,
+            awa_model::RotateOutcome::Rotated { generation: 1, .. }
+        ),
+        "the ring rotates: {rotated:?}"
+    );
+    let pruned = store.prune_oldest(&pool, Duration::ZERO).await?;
+    assert!(
+        matches!(pruned, awa_model::PruneOutcome::Pruned { .. }),
+        "the sealed slot is pruned: {pruned:?}"
+    );
+    Ok(())
+}

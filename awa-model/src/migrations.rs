@@ -583,7 +583,17 @@ macro_rules! ring_generation_floor_pending_sql {
            AND EXISTS (SELECT 1 FROM pg_class AS c \
                        WHERE c.relnamespace = n.oid \
                          AND c.relname = 'queue_ring_state' \
-                         AND c.relkind IN ('r', 'p')) \
+                         AND c.relkind IN ('r', 'p') \
+                         AND (SELECT count(*) \
+                              FROM pg_attribute AS col \
+                              WHERE col.attrelid = c.oid \
+                                AND col.attnum > 0 \
+                                AND NOT col.attisdropped \
+                                AND (col.attname::text, col.atttypid) IN ( \
+                                        ('singleton', 'boolean'::regtype::oid), \
+                                        ('current_slot', 'integer'::regtype::oid), \
+                                        ('generation', 'bigint'::regtype::oid), \
+                                        ('slot_count', 'integer'::regtype::oid))) = 4) \
            AND (NOT EXISTS (SELECT 1 FROM pg_class AS c \
                             WHERE c.relnamespace = n.oid \
                               AND c.relname = 'queue_ring_generation_floor' \
