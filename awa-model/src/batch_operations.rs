@@ -1,5 +1,6 @@
 use crate::advisory::SessionAdvisoryLock;
 use crate::error::{map_sqlx_error, AwaError};
+use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
@@ -638,7 +639,7 @@ async fn scan_operation(
         };
         after_job_id = last_job_id;
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         insert_operation_items(&mut tx, operation_id, &ids).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
 
@@ -811,14 +812,14 @@ async fn apply_item(
     spec: &BatchOperationSpec,
     job_id: i64,
 ) -> Result<ItemOutcome, AwaError> {
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     let outcome = match apply_to_job_tx(&mut tx, spec, job_id).await {
         Ok(true) => ItemOutcome::Processed,
         Ok(false) => ItemOutcome::Skipped,
         Err(err) => {
             tx.rollback().await.map_err(map_sqlx_error)?;
             let outcome = ItemOutcome::Errored(format!("job_id={job_id}: {err}"));
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
             record_item_outcome_tx(&mut tx, operation_id, job_id, &outcome).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(outcome);

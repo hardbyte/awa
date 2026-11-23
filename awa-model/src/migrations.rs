@@ -992,16 +992,30 @@ pub async fn run_with_report(pool: &PgPool) -> Result<MigrationReport, AwaError>
             .await
             .is_ok();
 
+    // Migration steps and schema patches open their transactions with a plain
+    // `BEGIN`, or run as one implicit transaction, and the versioned files
+    // cannot change. Run them at READ COMMITTED whatever the role or database
+    // default_transaction_isolation, as awa's other transactions do (#847).
+    let read_committed = sqlx::query("SET default_transaction_isolation = 'read committed'")
+        .execute(lock.connection())
+        .await
+        .is_ok();
+
     let result = run_inner(lock.connection()).await;
 
-    // The connection returns to the pool only with the setting restored;
+    // The connection returns to the pool only with its settings restored;
     // otherwise dropping the guard closes it.
-    if !checks_client
+    let restored = (!checks_client
         || sqlx::query("RESET client_connection_check_interval")
             .execute(lock.connection())
             .await
-            .is_ok()
-    {
+            .is_ok())
+        && (!read_committed
+            || sqlx::query("RESET default_transaction_isolation")
+                .execute(lock.connection())
+                .await
+                .is_ok());
+    if restored {
         let _ = lock.release().await;
     }
 
@@ -1160,7 +1174,7 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
         // Wrapped in an explicit transaction because SET LOCAL is only
         // effective inside a transaction block (not in autocommit mode).
         let _ = sqlx::raw_sql(
-            "BEGIN; SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata(); COMMIT;",
+            "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata(); COMMIT;",
         )
         .execute(&mut *conn)
         .await;
