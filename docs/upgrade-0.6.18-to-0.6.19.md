@@ -5,7 +5,7 @@
 Two things need care during the roll:
 
 - **Retrying jobs cancelled as duplicates.** Retry them only from 0.6.19 processes until no 0.6.18 process that retries jobs is left. See [duplicate retries during the roll](#duplicate-retries-during-the-roll).
-- **Producers that enqueue inside `REPEATABLE READ` or `SERIALIZABLE` transactions on queue storage.** Keep them on `READ COMMITTED` until every producer and the maintenance leader run 0.6.19. See [producers above `READ COMMITTED`](#producers-above-read-committed).
+- **Producers that enqueue inside `REPEATABLE READ` or `SERIALIZABLE` transactions on queue storage.** Keep them on `READ COMMITTED` until `awa migrate` has applied `ring_generation_floor` to every queue-storage schema and every producer and the maintenance leader run 0.6.19. See [producers above `READ COMMITTED`](#producers-above-read-committed).
 
 Otherwise, binaries and the migration can roll in either order.
 
@@ -59,7 +59,7 @@ On queue storage, a job enqueued inside a `REPEATABLE READ` or `SERIALIZABLE` tr
 
 The floor protects a lane only once every process that enqueues into it, and the maintenance leader, run 0.6.19: a 0.6.18 producer or leader does not raise it. Until then, a `REPEATABLE READ` or `SERIALIZABLE` producer can still land behind a 0.6.18 producer's job in an older generation. So:
 
-1. Keep producers that enqueue on queue storage on `READ COMMITTED` until the roll is complete. A producer that sets `default_transaction_isolation` on its role or database, or opens its transactions at a higher level, should enqueue in a `READ COMMITTED` transaction for now.
+1. Keep producers that enqueue on queue storage on `READ COMMITTED` until both `awa migrate` has applied `ring_generation_floor` and the binary roll is complete; binaries can roll first, so either can finish last. A producer that sets `default_transaction_isolation` on its role or database, or opens its transactions at a higher level, should enqueue in a `READ COMMITTED` transaction for now.
 2. Once both are done, higher isolation levels are safe: `awa migrate` reports `ring_generation_floor` as applied with no schema still missing it, and every producer, worker and the maintenance leader run 0.6.19. 0.6.19 binaries on a schema without the patch read the ring as 0.6.18 did, so the binary roll alone does not protect them. A `SERIALIZABLE` producer can still see serialization failures (SQLSTATE `40001`) from its own transaction; retry them as usual.
 
 A job that a stale snapshot already placed behind its lane's claim cursor before the upgrade is not recovered: claims have moved past it, and prune can still delete it. If you ran such producers on 0.6.18 or earlier and suspect lost jobs, compare your own enqueue records with awa's.
