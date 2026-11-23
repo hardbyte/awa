@@ -16,12 +16,15 @@ permissions:
 
 jobs:
   test:
-    name: Test (pg${{ matrix.postgres }})
+    name: Test (pg${{ matrix.postgres }}, sqlx ${{ matrix.sqlx }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       matrix:
         postgres: ["17", "18"]
+        # `locked` is the workspace's Cargo.lock, the oldest sqlx 0.9 release
+        # awa builds with; `newest` is the latest 0.9.x on crates.io.
+        sqlx: [locked, newest]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine
@@ -49,8 +52,13 @@ jobs:
             echo "::error file=pg-session-lock/Cargo.toml::version ${actual} does not match tag ${GITHUB_REF_NAME}"
             exit 1
           fi
+      - name: Use the newest sqlx 0.9.x
+        if: matrix.sqlx == 'newest'
+        run: cargo update -p sqlx
       - name: Test
-        run: cargo test -p pg-session-lock
+        run: |
+          cargo tree -p pg-session-lock -i sqlx --depth 0
+          cargo test -p pg-session-lock
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/pg_session_lock_test
       - name: Package (builds the crate outside the workspace)

@@ -31,7 +31,9 @@ Where the work fits in one transaction, prefer `pg_advisory_xact_lock`: it ends 
 
 | pg-session-lock | sqlx |
 |---|---|
-| 0.1 | 0.9 |
+| 0.1 | 0.9.0 and later 0.9.x |
+
+Each release is tested against sqlx 0.9.0 and the newest 0.9.x.
 
 It enables only sqlx's `postgres` feature. The runtime and TLS features come from your own sqlx dependency.
 
