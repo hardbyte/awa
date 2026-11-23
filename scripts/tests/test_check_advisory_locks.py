@@ -77,6 +77,16 @@ class SqlTests(unittest.TestCase):
             "        WHEN OTHERS THEN\n            PERFORM pg_advisory_unlock(42);\n            RAISE;\n",
         )
         self.assertEqual(sql(split), [])
+        # Quoted text is not SQL: a 'CASE' or "END" inside it opens or closes
+        # nothing.
+        for quoted in ("RAISE NOTICE 'CASE';", "RAISE NOTICE 'it''s a CASE';", 'PERFORM "case";'):
+            noted = split.replace(
+                "            PERFORM pg_advisory_unlock(42);\n            RAISE;\n        WHEN OTHERS",
+                f"            PERFORM pg_advisory_unlock(42);\n            {quoted}\n            RAISE;\n"
+                "        WHEN OTHERS",
+            )
+            self.assertNotEqual(noted, split)
+            self.assertEqual(sql(noted), [], quoted)
 
     def test_a_specific_branch_before_others_must_unlock(self):
         # Postgres runs only the first matching branch, so the later cleanup
