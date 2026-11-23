@@ -12,6 +12,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
+- **Applications on sqlx 0.9 can run awa 0.6** with a sqlx 0.8 pool of their own for awa, enqueueing in their own sqlx 0.9 transactions through `awa.insert_job_compat`. [Getting started](docs/getting-started-rust.md#applications-on-sqlx-09) shows how, and CI builds and runs [`examples/sqlx-0-9-app`](examples/sqlx-0-9-app/src/main.rs) against sqlx 0.9.1. awa itself stays on sqlx 0.8 in 0.6; it moves to sqlx 0.9 in 0.7.
+
 - **`awa::flush_wakeups(&pool, timeout)`** sends a pool's pending wake-ups without waiting for the 50 ms window and waits until they have been sent, for at most `timeout`. A Rust producer that enqueues or retries and then exits or closes its pool calls it first; it returns `false` if the timeout ran out, leaving the jobs to polling. `Client::shutdown` (after the drain, for at most one more second), the Python client's `close()` and the CLI call it. Closing a pool fails any wake-up still waiting to be sent, so before this a Python script that enqueued and then called `close()` never woke its claimers.
 
 ### Changed

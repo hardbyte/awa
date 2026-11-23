@@ -1,0 +1,19 @@
+[package]
+name = "awa-sqlx-0-9-app"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "An application on sqlx 0.9 that runs awa 0.6, which is built on sqlx 0.8"
+
+# Built on its own, not as part of the awa workspace.
+[workspace]
+
+[dependencies]
+awa = { path = "../../awa" }
+async-trait = "0.1"
+serde_json = "1"
+# The application's own sqlx.
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls-ring", "postgres"] }
+# The sqlx awa 0.6 is built on, under another name, for awa's pool.
+sqlx08 = { package = "sqlx", version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+tokio = { version = "1", features = ["full"] }
