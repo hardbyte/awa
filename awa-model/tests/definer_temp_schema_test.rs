@@ -34,9 +34,11 @@ async fn install_custom(pool: &PgPool) -> TestResult {
     Ok(())
 }
 
-/// A login role with only `USAGE` on each schema: what any runtime role has.
-/// `EXECUTE` on the definer functions comes from `PUBLIC`, and `TEMP` on the
-/// database from `PUBLIC` by default.
+/// A login role with what any runtime role has: `USAGE` on each schema, and
+/// `EXECUTE` on `ensure_claim_batch_job_index`, which the installer grants to
+/// every role holding `TRUNCATE` on `lease_claim_batches`. `EXECUTE` on the
+/// other definer functions comes from `PUBLIC`, and `TEMP` on the database
+/// from `PUBLIC` by default.
 async fn create_caller(pool: &PgPool, schemas: &[&str]) -> Result<String, sqlx::Error> {
     let role = format!("definer_shadow_caller_{}", uuid::Uuid::new_v4().simple());
     let database: String = sqlx::query_scalar("SELECT current_database()")
@@ -47,7 +49,10 @@ async fn create_caller(pool: &PgPool, schemas: &[&str]) -> Result<String, sqlx::
          GRANT CONNECT, TEMP ON DATABASE \"{database}\" TO {role};"
     );
     for schema in schemas {
-        sql.push_str(&format!("GRANT USAGE ON SCHEMA {schema} TO {role};"));
+        sql.push_str(&format!(
+            "GRANT USAGE ON SCHEMA {schema} TO {role};
+             GRANT EXECUTE ON FUNCTION {schema}.ensure_claim_batch_job_index(integer) TO {role};"
+        ));
     }
     sqlx::raw_sql(&sql).execute(pool).await?;
     Ok(role)
@@ -71,6 +76,14 @@ async fn connect_as(pool: &PgPool, role: &str) -> Result<PgConnection, sqlx::Err
     )
     .await
 }
+
+/// The `SECURITY DEFINER` functions a runtime role may execute in each schema.
+const RUNTIME_DEFINERS: &[&str] = &[
+    "enqueue_ring_cursor",
+    "ensure_claim_batch_job_index",
+    "provision_lane",
+    "provision_lane_sequences",
+];
 
 /// The call that exercises each `SECURITY DEFINER` function a runtime role may
 /// execute, in `schema`. A new definer function must be added here.
@@ -145,10 +158,14 @@ async fn definer_functions_never_read_a_callers_temporary_relation(pool: PgPool)
         .bind(&caller)
         .fetch_all(&pool)
         .await?;
-        ensure!(
-            definers.iter().any(|(_, name)| name == "enqueue_ring_cursor"),
-            "found the definer functions: {definers:?}"
-        );
+        for schema in ["awa", CUSTOM] {
+            for name in RUNTIME_DEFINERS {
+                ensure!(
+                    definers.iter().any(|(s, n)| s == schema && n == name),
+                    "{schema}.{name} is missing from the definer functions the caller may execute: {definers:?}"
+                );
+            }
+        }
 
         let mut session = connect_as(&pool, &caller).await?;
         sqlx::raw_sql(
