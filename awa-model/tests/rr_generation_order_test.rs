@@ -460,24 +460,26 @@ async fn wait_for_advisory_waiter(pool: &PgPool) -> Result<(), Box<dyn std::erro
     Err("no producer blocked on the lane lock".into())
 }
 
-/// The same layout with no early statement: the stale producer's snapshot is
-/// taken by the enqueue statement itself, before it waits for the lane lock.
-/// The producer is the Rust `QueueStorage::enqueue_params_batch`, on a pool
-/// whose sessions default to REPEATABLE READ
-/// (`default_transaction_isolation`), so `pool.begin()` inside the store is
-/// REPEATABLE READ.
+/// The same layout with no early statement, through the Rust
+/// `QueueStorage::enqueue_params_batch` on a pool whose sessions default to
+/// REPEATABLE READ (`default_transaction_isolation`). The store opens its own
+/// transaction at READ COMMITTED whatever that default, so its cursor read
+/// sees the rotation committed during the lock wait: this is the control
+/// that a session default no longer reaches awa's own enqueues. Enqueues in
+/// a caller's REPEATABLE READ transaction go through the compat producers,
+/// which the tests above cover.
 ///
 /// ```text
 /// z (RC):  enqueue, claim, complete       -- lane 1, generation 0
 /// H (RC):  BEGIN; reserve_enqueue_seq     -- holds the lane lock (lane 2)
-/// P (RR):  enqueue_params_batch(b)        -- snapshot at generation 0, waits
+/// P:       enqueue_params_batch(b)        -- READ COMMITTED, waits
 ///          rotate                         -- ring at generation 1
 /// H:       enqueue a; COMMIT              -- lane 3, generation 1
-/// P:       (lock granted)                 -- lane 4, generation 0 (stale)
+/// P:       (lock granted)                 -- lane 4, generation 1
 /// c (RC):  enqueue                        -- lane 5, generation 1
 /// ```
 #[sqlx::test(migrations = false)]
-async fn repeatable_read_rust_enqueue_after_lock_wait_keeps_every_job(pool: PgPool) -> TestResult {
+async fn rust_enqueue_on_a_repeatable_read_pool_keeps_every_job(pool: PgPool) -> TestResult {
     let store = setup(&pool).await?;
     let rr_options: PgConnectOptions = pool
         .connect_options()
@@ -648,7 +650,15 @@ async fn repeatable_read_snapshot_older_than_the_ring_keeps_the_job(pool: PgPool
 async fn enqueue_after_reset_writes_generation_zero(pool: PgPool) -> TestResult {
     let store = setup(&pool).await?;
     assert_eq!(advance_ring(&pool, &store, 3).await?, 3);
+    let floor_sql =
+        format!("SELECT pg_sequence_last_value('{SCHEMA}.queue_ring_generation_floor'::regclass)");
+    let floor: Option<i64> = sqlx::query_scalar(&floor_sql).fetch_one(&pool).await?;
+    assert_eq!(floor, Some(3), "the rotations raised the floor");
     store.reset(&pool).await?;
+    // Checked before any enqueue, which would lower a floor left ahead of
+    // the reset ring and hide a missing restart.
+    let floor: Option<i64> = sqlx::query_scalar(&floor_sql).fetch_one(&pool).await?;
+    assert_eq!(floor, None, "reset restarts the floor");
     let mut conn = pool.acquire().await?;
     produce(&mut conn, Producer::InsertJobCompat, "after_reset").await?;
     drop(conn);
@@ -962,5 +972,30 @@ async fn the_latest_ring_a_cursor_returns_raises_the_floor(pool: PgPool) -> Test
         Some(2),
         "the floor is raised to what the cursor returned"
     );
+    Ok(())
+}
+
+/// An attempt passed to `complete_runtime_batch` twice is closed once: queue
+/// prune proves a slot's claims closed by counting closures, so a second
+/// closure for one claim could hide another claim in the slot still open.
+#[sqlx::test(migrations = false)]
+async fn an_attempt_completed_twice_in_one_batch_is_closed_once(pool: PgPool) -> TestResult {
+    let store = setup(&pool).await?;
+    let mut conn = pool.acquire().await?;
+    produce(&mut conn, Producer::InsertJobCompat, "once").await?;
+    drop(conn);
+    let batch = store
+        .claim_runtime_batch(&pool, QUEUE, 10, Duration::ZERO)
+        .await?;
+    assert_eq!(batch.len(), 1);
+    let twice = vec![batch[0].clone(), batch[0].clone()];
+    store.complete_runtime_batch(&pool, &twice).await?;
+    let closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT (SELECT count(*) FROM {SCHEMA}.lease_claim_closures)
+              + (SELECT COALESCE(sum(closed_count), 0) FROM {SCHEMA}.lease_claim_closure_batches)"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(closures, 1, "one closure for the one claim");
     Ok(())
 }

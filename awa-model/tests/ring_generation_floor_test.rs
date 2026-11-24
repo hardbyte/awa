@@ -214,9 +214,7 @@ async fn the_patch_upgrades_a_released_schema(pool: PgPool) -> TestResult {
     // This release's enqueue path on a schema without the floor reads the
     // ring as before.
     rotate_to(&pool, CUSTOM, 6).await?;
-    custom_store(CUSTOM)?
-        .enqueue_batch(&pool, "fallback", 2, 1)
-        .await?;
+    store.enqueue_batch(&pool, "fallback", 2, 1).await?;
     assert_eq!(written(&pool, CUSTOM, "fallback").await?, (2, 6));
 
     sqlx::raw_sql(patch_sql()).execute(&pool).await?;
@@ -304,10 +302,19 @@ async fn the_patch_upgrades_a_released_schema(pool: PgPool) -> TestResult {
     assert_eq!(stale_cursor, (1, 9));
     assert_eq!(floor(&pool, CUSTOM).await?, Some(9));
 
-    // A store that read the ring directly before the patch uses the floor
-    // with its next enqueue.
+    // The store that read the ring directly before the patch uses the floor
+    // with its next enqueue: the ring moves to 10 without raising the floor,
+    // and only an enqueue through the cursor raises it to 10. A direct read
+    // would write the same place and leave the floor at 9.
+    rotate_to(&pool, CUSTOM, 10).await?;
+    assert_eq!(floor(&pool, CUSTOM).await?, Some(9));
     store.enqueue_batch(&pool, "after_patch", 2, 1).await?;
-    assert_eq!(written(&pool, CUSTOM, "after_patch").await?, (1, 9));
+    assert_eq!(written(&pool, CUSTOM, "after_patch").await?, (2, 10));
+    assert_eq!(
+        floor(&pool, CUSTOM).await?,
+        Some(10),
+        "the enqueue used the cursor"
+    );
     Ok(())
 }
 

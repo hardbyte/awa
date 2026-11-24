@@ -19,7 +19,7 @@ Otherwise, binaries and the migration can roll in either order.
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
    ```
 
-   On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. They replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema. None of them blocks queue traffic: the only table lock among them is `ring_generation_floor`'s `ACCESS SHARE` read of each schema's `queue_ring_state`, to seed the floor. The exception is a run on a database restored from a logical dump (below) whose floor is ahead of the ring: there it locks the ring row `FOR SHARE` to repair the floor, and rotation in that schema waits until the run commits.
+   On a 0.6.18 database the output reports three schema patches applied: `ring_generation_floor`, `sequence_lock_cancel_release` and `spent_claim_prefix_gaps`. They replace functions, and `ring_generation_floor` also adds one sequence and one function to each queue-storage schema. None of them blocks queue traffic: the only table lock among them is `ring_generation_floor`'s `ACCESS SHARE` read of each schema's `queue_ring_state`, to seed the floor. The exception is a run that finds the floor ahead of the ring it first reads, as on a database restored from a logical dump (below), or on a live, already patched schema when a rotation and an enqueue commit between its two reads: it then locks the ring row `FOR SHARE`, and rotation in that schema waits until the run commits.
 
    Don't prepare a new queue-storage schema while this runs: no `prepare_schema()` and no first start of a runtime on a new custom schema. The patches find schemas in the catalogs, so they cannot see one whose installer has not committed yet, and an installer that started before the patch installs that schema without the floor. When the roll is done, check that nothing is left:
 
@@ -62,9 +62,12 @@ Replace all `R__` files together with that set and keep previously applied `V` f
 To apply the patches with `psql` instead, print what the target database lacks:
 
 ```bash
+set -o pipefail
 awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --sql --pending \
   | psql -v ON_ERROR_STOP=1 "$AWA_MIGRATOR_DATABASE_URL"
 ```
+
+`pipefail` makes the pipeline fail when `awa` does: otherwise `psql` reads empty input and exits 0.
 
 This is one transaction that takes the same advisory lock as `awa migrate`. Keep `--pending` and the target URL: without them `--sql` prints every migration from V1, for a new database, not an upgrade.
 

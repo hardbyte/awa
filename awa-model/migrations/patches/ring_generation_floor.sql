@@ -532,7 +532,7 @@ END;\1$function$'
         ) THEN
             RAISE EXCEPTION 'ring_generation_floor: schema % is being prepared', v_schema
                 USING ERRCODE = 'lock_not_available',
-                      HINT = 'A prepare_schema() of that schema holds its install lock. This patch changed nothing and is safe to run again.';
+                      HINT = 'A prepare_schema() of that schema holds its install lock. The patch rolled back; a floor it lowered in a schema before this one stays lowered, which is the repair an enqueue makes anyway. It is safe to run again.';
         END IF;
         -- A role that can neither create in the schema nor SET ROLE to its
         -- owner leaves that schema without the floor; the patch probe names
@@ -542,7 +542,7 @@ END;\1$function$'
         EXCEPTION WHEN insufficient_privilege THEN
             RAISE WARNING 'could not install the queue-ring generation floor in schema %: %', v_schema, SQLERRM
                 USING HINT = format(
-                    'Run SELECT awa.refresh_ring_generation_floor_helper(%L) as the owner of %I.queue_ring_state.',
+                    'Run awa migrate as a role that can SET ROLE to the owner of %2$I.queue_ring_state, or grant that owner USAGE on schema awa and EXECUTE on awa.refresh_ring_generation_floor_helper(text) and run SELECT awa.refresh_ring_generation_floor_helper(%1$L) as it.',
                     v_schema, v_schema
                 );
         END;
