@@ -255,9 +255,7 @@ async fn insert(pool: &PgPool, mode: &str, opts: InsertOpts) -> i64 {
 }
 
 /// Wait until every job has reached its expected state, and return the row
-/// each was first seen in. All jobs are polled together, and a state once seen
-/// is kept: with the test's short retention and fast rotation, queue prune can
-/// remove a terminal row soon after it is written.
+/// each was first seen in.
 async fn wait_for_states(
     logs: &CapturedLogs,
     store: &QueueStorage,
@@ -431,6 +429,16 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
 
     let store = QueueStorage::new(QueueStorageConfig::default()).unwrap();
     let pool = &runtime_pool;
+    // Queue prune truncates a sealed slot as soon as its claims close, so a
+    // terminal row can be gone before any poll reads it. Holding a shared lock
+    // on the terminal partitions makes prune report the slot blocked until
+    // every job's state has been seen; the maintenance wait below checks that
+    // prune catches up once it is released.
+    let mut prune_hold = superuser.begin().await.unwrap();
+    sqlx::query("LOCK TABLE awa.done_entries IN ACCESS SHARE MODE")
+        .execute(&mut *prune_hold)
+        .await
+        .unwrap();
     let completed = insert(pool, "complete", InsertOpts::default()).await;
     let progress = insert(pool, "progress", InsertOpts::default()).await;
     let retried = insert(pool, "retry_once", InsertOpts::default()).await;
@@ -485,6 +493,7 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
         ],
     )
     .await;
+    prune_hold.rollback().await.unwrap();
     let rescued_attempt = reached[&rescued].attempt;
     assert!(
         rescued_attempt >= 2,
