@@ -228,12 +228,18 @@ impl Budget {
             .map(|(_, count)| count)
             .sum();
         let available = self.usable.saturating_sub(used);
-        assert!(
-            available >= min,
-            "connection budget exhausted: {label} needs at least {min}, {available} of {} left; \
-             raise max_connections or lower AWA_SOAK_SCALE / persona count. Allocations: {allocations:?}",
-            self.usable
-        );
+        if available < min {
+            let held = format!("{allocations:?}");
+            // Release the lock before failing, so one persona's shortfall doesn't
+            // poison the budget for every persona that reserves after it.
+            drop(allocations);
+            panic!(
+                "connection budget exhausted: {label} needs at least {min}, {available} of {} left; \
+                 raise max_connections (SOAK_MAX_CONNECTIONS) or lower AWA_SOAK_SCALE / persona count. \
+                 Allocations: {held}",
+                self.usable
+            );
+        }
         let granted = want.min(available).max(min);
         allocations.insert(label.to_string(), granted);
         granted

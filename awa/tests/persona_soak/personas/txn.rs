@@ -357,7 +357,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         "txn",
         persona,
         2,
-        10,
+        6,
         2,
         queues
             .iter()
