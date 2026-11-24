@@ -3,6 +3,7 @@ use crate::bulk::{self, BulkBatch, BulkCursor, BulkError, BulkIds};
 use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
+use crate::isolation::BeginReadCommitted;
 use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
@@ -26,7 +27,8 @@ const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 /// Claim and claim-cursor transactions commit without waiting for the WAL
 /// flush. A claim lost to a server crash leaves its job claimable again, and
 /// any later synchronous commit flushes every earlier claim first.
-const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off";
+const CLAIM_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL synchronous_commit = off");
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
@@ -82,14 +84,16 @@ pub(crate) const DLQ_FILTER_SQL: &str = r#"($1::text IS NULL OR kind = $1)
     )"#;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
-const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const DRAIN_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
 /// How long a maintenance claim-cursor advance waits for any lock it does
 /// not take with `SKIP LOCKED` or `NOWAIT`.
 const CLAIM_CURSOR_ADVANCE_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
 // Rescue cursor scans are estimated far above their real cost, enough to
 // JIT-compile them, which takes seconds against about 100 ms of execution.
-const RESCUE_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const RESCUE_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -4200,7 +4204,7 @@ impl QueueStorage {
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        let mut install_tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut install_tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
@@ -4508,7 +4512,7 @@ impl QueueStorage {
         let schema = self.schema();
         let details = serde_json::json!({ "schema": schema });
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Mark queue storage active only after the full schema, partitions,
         // indexes, and helper functions are in place. The explicit install
@@ -4588,7 +4592,7 @@ impl QueueStorage {
 
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Drop any partial-migration leftover tables before the main
         // TRUNCATE. If `prepare_schema` crashed mid-migration, the
@@ -4812,7 +4816,7 @@ impl QueueStorage {
         // Lane locks in name order, the order enqueue batches take them in.
         let mut physical_queues = self.physical_queues_for_logical(queue);
         physical_queues.sort();
-        let mut transaction = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut transaction = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         for physical_queue in physical_queues {
             for priority in 1..=4 {
                 for shard in 0..enqueue_shards {
@@ -6719,7 +6723,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let total_rows = self
             .insert_ready_rows_tx(&mut tx, rows.clone(), Vec::new())
             .await?;
@@ -6841,7 +6845,7 @@ impl QueueStorage {
         let queues_to_notify: Vec<String> =
             ready_rows.iter().map(|row| row.queue.clone()).collect();
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
         let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
         let deferred_rows: Vec<_> = deferred_rows
@@ -6949,7 +6953,7 @@ impl QueueStorage {
         let queues_to_notify: Vec<String> =
             ready_rows.iter().map(|row| row.queue.clone()).collect();
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
         let job_ids = self
             .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
@@ -7701,7 +7705,7 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let lease_slots: Vec<i32> = claimed.iter().map(|entry| entry.lease_slot).collect();
         let queues: Vec<String> = claimed.iter().map(|entry| entry.queue.clone()).collect();
@@ -7806,7 +7810,7 @@ impl QueueStorage {
             return Ok(RuntimeBatchCompletion::default());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let (held, contended) = match locks {
             AttemptLocks::Wait => (claimed.to_vec(), Vec::new()),
             AttemptLocks::Try => match self.try_lock_runtime_attempts_tx(&mut tx, claimed).await {
@@ -8226,7 +8230,7 @@ impl QueueStorage {
         claimed: &[ClaimedRuntimeJob],
         locks: AttemptLocks,
     ) -> Result<RuntimeBatchCompletion, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         // With `Try`, the attempts this transaction could lock stay locked to
         // commit; the slow path's own `lock_receipt_attempts_tx` then takes
         // them again, which does not wait on this transaction's own locks.
@@ -8818,7 +8822,7 @@ impl QueueStorage {
         if completions.is_empty() {
             return Ok(Vec::new());
         }
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .complete_job_batch_by_id_in_tx(&mut tx, completions)
             .await?;
@@ -9440,7 +9444,7 @@ impl QueueStorage {
     }
 
     pub async fn retry_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let row = self.retry_job_tx(&mut tx, job_id).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         if let Some(row) = &row {
@@ -9466,7 +9470,7 @@ impl QueueStorage {
             return Ok((Vec::new(), 0));
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut taken = Vec::with_capacity(unique_ids.len());
         for job_id in &unique_ids {
             if let Some((ready_row, old_state)) = self.take_retry_row_tx(&mut tx, *job_id).await? {
@@ -10217,7 +10221,7 @@ impl QueueStorage {
     }
 
     pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self.cancel_job_tx(&mut tx, job_id).await?;
         self.apply_cancel_claim_changes_tx(&mut tx, result.as_slice())
             .await?;
@@ -10282,7 +10286,7 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         self.lock_claim_heads_of_jobs_tx(&mut tx, ids).await?;
         if self.lease_claim_receipts() {
             // Completion batches take these locks in one statement, in key
@@ -10478,7 +10482,7 @@ impl QueueStorage {
         let mut cursor = cursor;
         let mut fence = None;
         if cursor.before_job_id == 0 {
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
             fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
         }
@@ -11585,7 +11589,7 @@ impl QueueStorage {
             ));
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self.set_priority_tx(&mut tx, job_id, priority).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
@@ -11636,7 +11640,7 @@ impl QueueStorage {
             }
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self.move_queue_tx(&mut tx, job_id, queue, priority).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
@@ -11920,7 +11924,7 @@ impl QueueStorage {
             - TimeDelta::from_std(aging_interval)
                 .map_err(|err| AwaError::Validation(format!("invalid aging interval: {err}")))?;
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let claimed = self.ready_row_claimed_sql("ready");
 
         // Claims commit before their cursor advance. Select only a bounded
@@ -12116,7 +12120,7 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
     ) -> Result<serde_json::Value, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut row: Option<AttemptStateRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -15578,7 +15582,7 @@ impl QueueStorage {
         timeout: Duration,
     ) -> Result<Uuid, AwaError> {
         let callback_id = Uuid::new_v4();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
             .await?;
         let updated = sqlx::query(&format!(
@@ -15701,7 +15705,7 @@ impl QueueStorage {
         }
 
         let callback_id = Uuid::new_v4();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
             .await?;
         let updated = sqlx::query(&format!(
@@ -15770,7 +15774,7 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
     ) -> Result<bool, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = sqlx::query(&format!(
             r#"
             UPDATE {}
@@ -15928,7 +15932,7 @@ impl QueueStorage {
         run_lease: i64,
         callback_id: Uuid,
     ) -> Result<bool, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let entered = self
             .enter_callback_wait_in_tx(&mut tx, job_id, run_lease, callback_id)
             .await?;
@@ -16037,7 +16041,7 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .callback_job_in_tx(&mut tx, callback_id, run_lease, false)
             .await?;
@@ -16150,7 +16154,7 @@ impl QueueStorage {
         run_lease: Option<i64>,
         resume: bool,
     ) -> Result<JobRow, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .complete_external_in_tx(&mut tx, callback_id, payload, run_lease, resume)
             .await?;
@@ -16323,7 +16327,7 @@ impl QueueStorage {
         error_entry: serde_json::Value,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_external_with_error_entry_in_tx(&mut tx, callback_id, error_entry, run_lease)
             .await?;
@@ -16408,7 +16412,7 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .retry_external_in_tx(&mut tx, callback_id, run_lease)
             .await?;
@@ -16543,7 +16547,7 @@ impl QueueStorage {
         run_lease: i64,
         progress: serde_json::Value,
     ) -> Result<(), AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         if self.lease_claim_receipts() {
             self.upsert_attempt_state_progress_from_receipts_tx(
                 &mut tx,
@@ -16592,7 +16596,7 @@ impl QueueStorage {
             return Ok(0);
         }
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let pairs: Vec<(i64, i64)> = claims
             .iter()
             .map(|claim| (claim.job_id, claim.run_lease))
@@ -16722,7 +16726,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut updated = 0_usize;
         if self.lease_claim_receipts() {
             // #169 B1: in receipts mode, attempt_state is the
@@ -16781,7 +16785,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let updated = if self.lease_claim_receipts() {
             // #169 B1: receipts mode is the only supported shape for
             // the default `awa` schema. attempt_state already carries
@@ -16860,7 +16864,7 @@ impl QueueStorage {
         retry_after: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .retry_after_in_tx(&mut tx, job_id, run_lease, retry_after, progress)
             .await?;
@@ -16911,7 +16915,7 @@ impl QueueStorage {
         snooze_for: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let Some(moved) = self
             .take_running_attempt_tx(&mut tx, job_id, run_lease, "scheduled")
             .await?
@@ -16976,6 +16980,7 @@ impl QueueStorage {
         };
 
         {
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
                 .insert_deferred_rows_tx(&mut savepoint, vec![deferred.clone()], None)
@@ -17021,6 +17026,7 @@ impl QueueStorage {
         };
 
         let claimed = {
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
                 .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), None)
@@ -17305,7 +17311,7 @@ impl QueueStorage {
         reason: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .cancel_running_in_tx(&mut tx, job_id, run_lease, reason, progress)
             .await?;
@@ -17355,7 +17361,7 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_terminal_in_tx(&mut tx, job_id, run_lease, error, progress)
             .await?;
@@ -17401,7 +17407,7 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_to_dlq_in_tx(&mut tx, job_id, run_lease, dlq_reason, error, progress)
             .await?;
@@ -17451,7 +17457,7 @@ impl QueueStorage {
         dlq_reason: &str,
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
         let moved: Option<HydratedTerminalRow> = sqlx::query_as(&format!(
@@ -17516,7 +17522,7 @@ impl QueueStorage {
         queue: Option<&str>,
         dlq_reason: &str,
     ) -> Result<u64, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let moved = self
             .move_failed_rows_to_dlq_tx(&mut tx, kind, queue, dlq_reason, None)
             .await?;
@@ -17594,7 +17600,7 @@ impl QueueStorage {
         opts: &RetryFromDlqOpts,
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let moved: Option<DlqJobRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -17681,7 +17687,7 @@ impl QueueStorage {
         filter: &ListDlqFilter,
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let moved: Vec<DlqJobRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -17781,7 +17787,7 @@ impl QueueStorage {
         bulk::validate_batch_size(batch_size)?;
         let schema = self.schema();
         let mut cursor = cursor;
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
         batch.left_above_sequence = self.dlq_left_above_tx(&mut tx, fence, filter).await?;
@@ -18185,7 +18191,7 @@ impl QueueStorage {
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
         batch.left_above_sequence = self
@@ -18233,7 +18239,7 @@ impl QueueStorage {
             }
             let mut skipped = Vec::new();
             let chunk_result = async {
-                let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+                let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
                 let rows = self
                     .retry_jobs_skipping_conflicts_tx(&mut tx, chunk, &mut |job_id| {
                         skipped.push(job_id)
@@ -18300,7 +18306,7 @@ impl QueueStorage {
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
         batch.left_above_sequence = self
@@ -18348,7 +18354,7 @@ impl QueueStorage {
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
         batch.left_above_sequence = self
@@ -18378,7 +18384,7 @@ impl QueueStorage {
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
         batch.left_above_sequence = self.dlq_left_above_tx(&mut tx, fence, filter).await?;
@@ -18443,7 +18449,7 @@ impl QueueStorage {
     /// Delete every DLQ row matching `filter`, its cursor included, in one
     /// transaction, releasing their unique claims. Ignores `filter.limit`.
     pub async fn purge_dlq(&self, pool: &PgPool, filter: &ListDlqFilter) -> Result<u64, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let deleted: Vec<DeletedDlqRow> = sqlx::query_as(&format!(
             "DELETE FROM {}.dlq_entries WHERE {DLQ_FILTER_SQL} RETURNING {DELETED_DLQ_COLUMNS}",
             self.schema()
@@ -18464,7 +18470,7 @@ impl QueueStorage {
 
     /// Delete one DLQ row, releasing its unique claim.
     pub async fn purge_dlq_job(&self, pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let deleted = self.delete_dlq_rows_by_id_tx(&mut tx, &[job_id]).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(deleted > 0)
@@ -18490,7 +18496,7 @@ impl QueueStorage {
         } else {
             ""
         };
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let deleted: Vec<DeletedDlqRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -18519,7 +18525,7 @@ impl QueueStorage {
     }
 
     pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let discarded = self
             .discard_failed_rows_tx(&mut tx, kind, None, None)
             .await?;
@@ -18631,7 +18637,7 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_retryable_in_tx(&mut tx, job_id, run_lease, error, progress)
             .await?;
@@ -18772,6 +18778,7 @@ impl QueueStorage {
                 .as_ref()
                 .map(|pairs| pairs.iter().copied().unzip())
                 .unwrap_or_default();
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                 r#"
@@ -18966,6 +18973,7 @@ impl QueueStorage {
                 .as_ref()
                 .map(|pairs| pairs.iter().copied().unzip())
                 .unwrap_or_default();
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                 r#"
@@ -19159,6 +19167,7 @@ impl QueueStorage {
                 .as_ref()
                 .map(|pairs| pairs.iter().copied().unzip())
                 .unwrap_or_default();
+            // isolation: a savepoint, at the enclosing transaction's level
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                 r#"
@@ -19483,7 +19492,7 @@ impl QueueStorage {
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
     ) -> Result<Option<LanePromotion>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         match self
             .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
             .await
@@ -19757,7 +19766,7 @@ impl QueueStorage {
         relations: &[String],
     ) -> Result<Option<(i32, i64)>, AwaError> {
         let schema = self.schema();
-        let mut tx = sqlx::Connection::begin(conn)
+        let mut tx = crate::isolation::begin_read_committed_on(conn)
             .await
             .map_err(map_sqlx_error)?;
         let refs: Vec<&str> = relations.iter().map(String::as_str).collect();
@@ -19964,7 +19973,7 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
     pub async fn rotate(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
@@ -20081,7 +20090,7 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_leases")]
     pub async fn rotate_leases(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // FOR UPDATE serialises with prune_oldest_leases and parallel
         // rotators. Without it two rotators can both pass the busy-check,
@@ -20184,7 +20193,7 @@ impl QueueStorage {
     pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
         let schema = self.schema();
         let rebuild_lock_name = format!("awa.queue_storage.rebuild_terminal_counters:{schema}");
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&rebuild_lock_name)
@@ -20444,7 +20453,7 @@ impl QueueStorage {
     ) -> Result<TerminalDeltaSlotRollup, AwaError> {
         let schema = self.schema();
         let delta_child = terminal_delta_child_name(schema, slot as usize);
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let current_slot: i32 = sqlx::query_scalar(&format!(
             r#"
@@ -20671,7 +20680,7 @@ impl QueueStorage {
         failed_retention: Duration,
     ) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let state: (i32,) = sqlx::query_as(&format!(
             r#"
@@ -21160,7 +21169,7 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.queue_ring_pin")]
     pub async fn queue_ring_pin(&self, pool: &PgPool) -> Result<Option<QueueRingPin>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let target: Option<(i32, i64)> = sqlx::query_as(&format!(
@@ -21252,7 +21261,7 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_leases")]
     pub async fn prune_oldest_leases(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // `PruneLeasesPlan` in
         // `correctness/storage/AwaStorageLockOrder.tla` requires the
@@ -21386,7 +21395,7 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_claims")]
     pub async fn rotate_claims(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
@@ -21507,7 +21516,7 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_claims")]
     pub async fn prune_oldest_claims(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
