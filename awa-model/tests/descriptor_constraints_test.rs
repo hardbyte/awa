@@ -28,11 +28,16 @@ async fn pool() -> PgPool {
         .expect("connect")
 }
 
+// Retention cleanup operates on the whole catalog, so name prefixes cannot
+// isolate concurrent fixtures. Keep setup, assertions and cleanup in one guard.
+static CATALOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn with_clean_catalog<F, Fut, T>(prefix: &str, f: F) -> T
 where
     F: FnOnce(PgPool) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    let _guard = CATALOG_TEST_LOCK.lock().await;
     let p = pool().await;
     awa_model::migrations::run(&p).await.unwrap();
     sqlx::query("DELETE FROM awa.queue_descriptors WHERE queue LIKE $1")

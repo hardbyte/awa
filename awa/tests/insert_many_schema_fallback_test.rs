@@ -140,7 +140,10 @@ async fn binary_ahead_of_the_patch_falls_back_and_recovers() {
         .execute(pool)
         .await
         .expect("drop batch function");
-    assert_eq!(pending_patches(pool).await, vec![PATCH_NAME]);
+    assert_eq!(
+        pending_patches(pool).await,
+        migrations::patches_to_apply(&[PATCH_NAME])
+    );
 
     let first = insert_many(pool, &jobs("fallback_a", 0..3, false))
         .await
@@ -347,6 +350,22 @@ async fn exported_patch_reapplies_in_one_transaction() {
         .await
         .expect("apply over an installed function");
 
+    // The patches that rewrite the batch function in place run after it, as
+    // a runner applies the exported scripts in name order.
+    let rewrites: Vec<&str> = migrations::patches_to_apply(&[PATCH_NAME])
+        .into_iter()
+        .filter(|name| *name != PATCH_NAME)
+        .collect();
+    assert_eq!(pending_patches(pool).await, rewrites);
+    for (_, _, rewrite) in migrations::schema_patch_sql(migrations::SCHEMA_PATCHES)
+        .into_iter()
+        .filter(|(name, _, _)| rewrites.contains(name))
+    {
+        sqlx::raw_sql(&rewrite)
+            .execute(pool)
+            .await
+            .expect("apply a patch that rewrites the batch function");
+    }
     assert!(pending_patches(pool).await.is_empty());
     let versions_after: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM awa.schema_version ORDER BY version")
@@ -462,7 +481,10 @@ async fn an_earlier_batch_function_body_keeps_the_patch_pending() {
             .execute(pool)
             .await
             .expect("install the earlier body");
-        assert_eq!(pending_patches(pool).await, vec![PATCH_NAME]);
+        assert_eq!(
+            pending_patches(pool).await,
+            migrations::patches_to_apply(&[PATCH_NAME])
+        );
 
         let report = migrations::run_with_report(pool).await.expect("migrate");
         let patch = report
