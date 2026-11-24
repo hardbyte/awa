@@ -1,3 +1,4 @@
+use crate::advisory::SessionAdvisoryLock;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::filter::JobFilter;
 use crate::isolation::BeginReadCommitted;
