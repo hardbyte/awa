@@ -365,6 +365,7 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
+const SEARCH_PATH_EPILOGUE: &str = include_str!("../migrations/search_path_epilogue.sql");
 const SCHEMA_DISCOVERY_UP: &str = include_str!("../migrations/queue_storage_schema_discovery.sql");
 const V23_UP: &str = concat!(
     include_str!("../migrations/queue_storage_schema_discovery.sql"),
@@ -680,8 +681,8 @@ async fn apply_migrations(
             }
             info!(version, description, "Applying migration v{version}");
             let started = std::time::Instant::now();
-            for step in steps {
-                sqlx::raw_sql(*step).execute(&mut *conn).await?;
+            for step in migration_steps(steps) {
+                sqlx::raw_sql(step).execute(&mut *conn).await?;
             }
             let elapsed_ms = started.elapsed().as_millis();
             info!(
@@ -1209,7 +1210,7 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 pub fn migration_sql() -> Vec<(i32, &'static str, String)> {
     MIGRATIONS
         .iter()
-        .map(|&(v, d, steps)| (v, d, steps.join("\n")))
+        .map(|&(v, d, steps)| (v, d, migration_steps(steps).collect::<Vec<_>>().join("\n")))
         .collect()
 }
 
@@ -1219,8 +1220,16 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
     MIGRATIONS
         .iter()
         .filter(|&&(v, _, _)| v > from && v <= to)
-        .map(|&(v, d, steps)| (v, d, steps.join("\n")))
+        .map(|&(v, d, steps)| (v, d, migration_steps(steps).collect::<Vec<_>>().join("\n")))
         .collect()
+}
+
+/// A migration's SQL as it runs: its listed steps, then, for a migration that
+/// refreshes the queue-storage helpers (it includes `V23_UP`), the epilogue
+/// that pins the search_path of every function it created or replaced.
+fn migration_steps(steps: &'static [&'static str]) -> impl Iterator<Item = &'static str> {
+    let epilogue = steps.contains(&V23_UP).then_some(SEARCH_PATH_EPILOGUE);
+    steps.iter().copied().chain(epilogue)
 }
 
 #[cfg(test)]
@@ -1590,7 +1599,7 @@ mod tests {
     #[test]
     fn every_migration_step_is_transaction_safe() {
         for &(version, _, steps) in MIGRATIONS {
-            for step in steps {
+            for step in migration_steps(steps) {
                 if let Some(violation) = transaction_safety_violation(step) {
                     panic!("migration v{version}: {violation}");
                 }
@@ -1748,7 +1757,7 @@ mod tests {
     #[test]
     fn every_migration_guards_its_ddl() {
         for &(version, _, steps) in MIGRATIONS {
-            for step in steps {
+            for step in migration_steps(steps) {
                 let top = strip_to_top_level(step);
 
                 for (keywords, label) in [

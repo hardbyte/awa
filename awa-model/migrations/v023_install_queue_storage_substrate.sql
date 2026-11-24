@@ -1205,7 +1205,6 @@ DECLARE
     v_owner OID;
     v_sequence REGCLASS;
     v_function REGPROCEDURE;
-    v_ring_cursor REGPROCEDURE;
     v_object_owner OID;
     v_previous_role TEXT;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
@@ -1399,24 +1398,6 @@ BEGIN
         END IF;
     END IF;
 
-    -- A schema installed before v062 has a ring_cursor() whose search_path
-    -- leaves pg_temp out, so a temporary table would answer for its
-    -- unqualified ring_cursor_authority. The upgrade does not reinstall it. Nothing awa runs as a definer
-    -- calls it any more, so a role that cannot act as its owner leaves it as
-    -- it is, affecting only callers' own privileges.
-    v_ring_cursor := format('%I.ring_cursor(text)', p_schema)::regprocedure;
-    IF pg_has_role(
-        current_user,
-        (SELECT routine.proowner FROM pg_proc AS routine WHERE routine.oid = v_ring_cursor),
-        'USAGE'
-    ) THEN
-        EXECUTE format(
-            'ALTER FUNCTION %s SET search_path = pg_catalog, %I, pg_temp',
-            v_ring_cursor,
-            p_schema
-        );
-    END IF;
-
     -- The function runs as its owner, so its owner must be able to read the
     -- ring and the floor. If it cannot (the transfer above was not possible),
     -- the function is dropped: producers then read the cursor as they did
@@ -1449,6 +1430,131 @@ END;
 $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(TEXT) FROM PUBLIC;
+
+-- Every function in awa and in a queue-storage schema that sets its own
+-- search_path lists pg_temp last and leaves public out. A search_path that
+-- leaves pg_temp out searches the session's temporary schema first for
+-- tables, so when such a function runs with its owner's privileges, below a
+-- SECURITY DEFINER function or a trigger, a caller's temporary table or view
+-- can answer for an unqualified name. public, where a database lets roles
+-- create in it, would let them plant functions the same way. Functions that
+-- set no search_path inherit their caller's, which under a definer is the
+-- definer's pinned one.
+--
+-- Older migrations and the installer write the paths they always have; this
+-- rewrites them in place, so it runs at the end of the installer and after
+-- each migration step that refreshes these helpers. Each ALTER runs as the
+-- function's owner, by SET ROLE when the current role may only do that; a
+-- function whose owner the current role can neither act as nor become is
+-- left as it is with a warning. Altering a function takes no table locks, and
+-- a function already pinned is not touched.
+CREATE OR REPLACE FUNCTION awa.pin_function_search_paths(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $pin$
+DECLARE
+    v_routine RECORD;
+    v_entries TEXT[];
+    v_entry TEXT;
+    v_path TEXT[];
+    v_previous_role TEXT;
+    v_lent_usage BOOLEAN;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
+        RAISE EXCEPTION 'pin_function_search_paths: schema name must match ^[a-z_][a-z0-9_]*$; got %',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    FOR v_routine IN
+        SELECT routine.oid::regprocedure AS signature,
+               routine.proowner AS owner,
+               substr(setting, length('search_path=') + 1) AS search_path
+        FROM pg_proc AS routine
+        CROSS JOIN LATERAL unnest(routine.proconfig) AS setting
+        WHERE routine.pronamespace = to_regnamespace(quote_ident(p_schema))
+          AND routine.prokind IN ('f', 'p')
+          AND setting LIKE 'search_path=%'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend AS dependency
+              WHERE dependency.classid = 'pg_proc'::regclass
+                AND dependency.objid = routine.oid
+                AND dependency.deptype = 'e'
+          )
+        ORDER BY routine.oid
+    LOOP
+        v_entries := regexp_split_to_array(btrim(v_routine.search_path), '[[:space:]]*,[[:space:]]*');
+        v_path := ARRAY[]::TEXT[];
+        FOREACH v_entry IN ARRAY v_entries LOOP
+            IF v_entry !~ '^[a-z_][a-z0-9_]*$' THEN
+                RAISE WARNING 'pin_function_search_paths: % has search_path entry %, which is not a plain schema name; left as it is',
+                    v_routine.signature, quote_literal(v_entry);
+                v_path := NULL;
+                EXIT;
+            END IF;
+            IF v_entry NOT IN ('public', 'pg_temp') THEN
+                v_path := v_path || v_entry;
+            END IF;
+        END LOOP;
+        IF v_path IS NULL THEN
+            CONTINUE;
+        END IF;
+        v_path := v_path || 'pg_temp'::TEXT;
+        IF v_entries = v_path THEN
+            CONTINUE;
+        END IF;
+
+        -- One subtransaction per function, so a refusal also undoes the
+        -- role switch and the lent USAGE.
+        BEGIN
+            v_previous_role := NULL;
+            v_lent_usage := false;
+            IF NOT pg_has_role(current_user, v_routine.owner, 'USAGE') THEN
+                IF NOT pg_has_role(current_user, v_routine.owner, v_set_mode) THEN
+                    RAISE insufficient_privilege;
+                END IF;
+                -- The owner needs USAGE on the schema to name the function;
+                -- a migrator that may only SET ROLE to it lends that for the
+                -- ALTER, as awa.refresh_lane_sequence_helpers_as_migrator does.
+                IF NOT has_schema_privilege(v_routine.owner, quote_ident(p_schema), 'USAGE') THEN
+                    EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', p_schema, pg_get_userbyid(v_routine.owner));
+                    v_lent_usage := true;
+                END IF;
+                v_previous_role := current_setting('role');
+                PERFORM set_config('role', pg_get_userbyid(v_routine.owner), true);
+            END IF;
+
+            EXECUTE format(
+                'ALTER ROUTINE %s SET search_path = %s',
+                v_routine.signature,
+                array_to_string(v_path, ', ')
+            );
+
+            IF v_previous_role IS NOT NULL THEN
+                PERFORM set_config('role', v_previous_role, true);
+            END IF;
+            IF v_lent_usage THEN
+                EXECUTE format('REVOKE USAGE ON SCHEMA %I FROM %I', p_schema, pg_get_userbyid(v_routine.owner));
+            END IF;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE WARNING 'could not pin the search_path of %, owned by %: %',
+                v_routine.signature, pg_get_userbyid(v_routine.owner), SQLERRM
+                USING HINT = format(
+                    'Run SELECT awa.pin_function_search_paths(%L) as %s; that role needs USAGE on schema awa and on %I.',
+                    p_schema,
+                    quote_ident(pg_get_userbyid(v_routine.owner)),
+                    p_schema
+                );
+        END;
+    END LOOP;
+END;
+$pin$;
+
+REVOKE EXECUTE ON FUNCTION awa.pin_function_search_paths(TEXT) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
@@ -5503,6 +5609,7 @@ BEGIN
     END LOOP;
 
     PERFORM awa.refresh_ring_generation_floor_helper(p_schema);
+    PERFORM awa.pin_function_search_paths(p_schema);
 END;
 $install$;
 
