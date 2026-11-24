@@ -71,6 +71,13 @@ class TransactionIsolationTests(unittest.TestCase):
         self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")'), [1])
         self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")'), [1])
         self.assertEqual(lines('begin_with("begin isolation level read committed")'), [])
+        self.assertEqual(
+            lines('begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE /* READ ONLY is not used here */")'), [1]
+        )
+        self.assertEqual(
+            lines('begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL application_name = \'READ ONLY\'")'),
+            [1],
+        )
 
     def test_repository_is_clean(self):
         self.assertEqual(module.check(Path(__file__).parents[2]), [])

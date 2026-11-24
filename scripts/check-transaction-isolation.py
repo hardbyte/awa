@@ -25,6 +25,7 @@ POOL_BEGIN = re.compile(r"\bpool(?:\(\))?\s*\.\s*(?:try_)?begin\(\)")
 BEGIN_STATEMENT = re.compile(r'"BEGIN\b[^"]*"', re.IGNORECASE)
 READ_COMMITTED = re.compile(r"\bISOLATION\s+LEVEL\s+READ\s+COMMITTED\b", re.IGNORECASE)
 READ_ONLY = re.compile(r"\bREAD\s+ONLY\b", re.IGNORECASE)
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s")
 RUST_GLOBS = ["*/src/**/*.rs", "awa-python/src/**/*.rs"]
 MARKER = "isolation:"
@@ -94,7 +95,11 @@ def findings(path: str, text: str) -> list[tuple[str, int, str]]:
     code = blank_test_modules(strip_comments(text))
     found = []
     for match in BEGIN_STATEMENT.finditer(code):
-        statement = match.group(0)
+        # Only the BEGIN statement's own modes count: the text up to its first
+        # `;`, without comments, so a later statement or a comment that says
+        # READ ONLY does not make the transaction read-only.
+        statement = BLOCK_COMMENT.sub(" ", match.group(0)[1:-1]).split(";", 1)[0]
+        statement = statement.split("--", 1)[0]
         if READ_COMMITTED.search(statement) or READ_ONLY.search(statement):
             continue
         found.append(
