@@ -149,6 +149,40 @@ async fn enqueue_ring_cursor_never_reads_a_callers_temporary_view(pool: PgPool) 
     result
 }
 
+/// A schema installed before v062 keeps its `ring_cursor()`; the v062 upgrade
+/// pins its `search_path` so it lists `pg_temp` last too.
+#[sqlx::test(migrations = false)]
+async fn v062_pins_ring_cursor_search_path_on_an_existing_schema(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    install_custom(&pool).await?;
+    for schema in ["awa", CUSTOM] {
+        sqlx::raw_sql(audited_sql(format!(
+            "ALTER FUNCTION {schema}.ring_cursor(text) SET search_path = pg_catalog, {schema}, public"
+        )))
+        .execute(&pool)
+        .await?;
+    }
+
+    for (_, _, sql) in migrations::migration_sql_range(61, 62) {
+        sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
+    }
+
+    for schema in ["awa", CUSTOM] {
+        let path: Vec<String> = sqlx::query_scalar(audited_sql(format!(
+            "SELECT unnest(proconfig) FROM pg_proc
+             WHERE oid = '{schema}.ring_cursor(text)'::regprocedure"
+        )))
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            path,
+            vec![format!("search_path=pg_catalog, {schema}, pg_temp")],
+            "{schema}: ring_cursor's search_path after the v062 upgrade"
+        );
+    }
+    Ok(())
+}
+
 /// Every `SECURITY DEFINER` function awa installs, and `ring_cursor()`, which
 /// a definer once called, pins a `search_path` that lists `pg_temp` last, so a
 /// caller's temporary objects never take the place of an unqualified table.

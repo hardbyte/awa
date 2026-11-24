@@ -1205,6 +1205,7 @@ DECLARE
     v_owner OID;
     v_sequence REGCLASS;
     v_function REGPROCEDURE;
+    v_ring_cursor REGPROCEDURE;
     v_object_owner OID;
     v_previous_role TEXT;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
@@ -1396,6 +1397,24 @@ BEGIN
                     quote_ident(pg_get_userbyid(v_owner))
                 );
         END IF;
+    END IF;
+
+    -- A schema installed before v062 has a ring_cursor() whose search_path
+    -- leaves pg_temp out, so a temporary table would answer for its
+    -- unqualified ring_cursor_authority. The upgrade does not reinstall it. Nothing awa runs as a definer
+    -- calls it any more, so a role that cannot act as its owner leaves it as
+    -- it is, affecting only callers' own privileges.
+    v_ring_cursor := format('%I.ring_cursor(text)', p_schema)::regprocedure;
+    IF pg_has_role(
+        current_user,
+        (SELECT routine.proowner FROM pg_proc AS routine WHERE routine.oid = v_ring_cursor),
+        'USAGE'
+    ) THEN
+        EXECUTE format(
+            'ALTER FUNCTION %s SET search_path = pg_catalog, %I, pg_temp',
+            v_ring_cursor,
+            p_schema
+        );
     END IF;
 
     -- The function runs as its owner, so its owner must be able to read the
