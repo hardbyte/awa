@@ -3,6 +3,7 @@ use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{lock_progress, InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
 use sqlx::PgPool;
@@ -2018,7 +2019,10 @@ async fn reschedule_reading_successor(
     progress: Option<&serde_json::Value>,
     unique_key: Option<&[u8]>,
 ) -> Result<(RescheduleOutcome, Option<Box<JobRow>>), awa_model::AwaError> {
-    let mut tx = pool.begin().await.map_err(awa_model::map_sqlx_error)?;
+    let mut tx = pool
+        .begin_read_committed()
+        .await
+        .map_err(awa_model::map_sqlx_error)?;
     let (outcome, cancelled) =
         awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
             &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
@@ -2851,7 +2855,7 @@ async fn complete_queue_storage_with_followups(
         unique_states: queue_storage_unique_states.map(std::string::ToString::to_string),
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated = runtime
         .store
@@ -2883,7 +2887,7 @@ async fn cancel_queue_storage_with_followups(
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let Some(updated_job) = runtime
         .store
         .cancel_running_in_tx(&mut tx, job.id, job.run_lease, reason, progress_snapshot)
@@ -2910,7 +2914,7 @@ async fn retry_after_queue_storage_with_followups(
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let Some(updated_job) = runtime
         .store
         .retry_after_in_tx(
@@ -2951,7 +2955,7 @@ async fn retry_backoff_queue_storage_with_followups(
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let Some(updated_job) = runtime
         .store
         .fail_retryable_in_tx(&mut tx, job.id, job.run_lease, error_msg, progress_snapshot)
@@ -2989,7 +2993,7 @@ async fn fail_queue_storage_with_followups(
     metrics: &crate::metrics::AwaMetrics,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     // Track whether the row routed to DLQ so the metric records after a
     // successful commit only — a spec-INSERT failure rolls the whole tx
     // back, and a phantom DLQ count would lie about a transition that
@@ -3045,7 +3049,7 @@ async fn park_queue_storage_with_followups(
     callback_id: uuid::Uuid,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let entered = runtime
         .store
         .enter_callback_wait_in_tx(&mut tx, job.id, job.run_lease, callback_id)
@@ -3180,7 +3184,7 @@ async fn complete_canonical_with_followups(
     job: &JobRow,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     // `UPDATE ... RETURNING` against `awa.jobs_hot` directly (not the
     // `awa.jobs` compatibility view): in canonical-drain mode the view is
@@ -3228,7 +3232,7 @@ async fn cancel_canonical_with_followups(
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
     outcome_ctx: &crate::enqueue_specs::OutcomeContext,
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3275,7 +3279,7 @@ async fn park_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let parked_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3327,7 +3331,7 @@ async fn retry_after_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let (outcome, cancelled) =
         awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
@@ -3402,7 +3406,7 @@ async fn terminal_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3453,7 +3457,7 @@ async fn exhaust_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3502,7 +3506,7 @@ async fn retry_backoff_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let error_entry = serde_json::json!({
         "error": error_msg,
@@ -4185,7 +4189,7 @@ mod tests {
             .unwrap();
         let pair = (claimed.job.id, claimed.job.run_lease);
         let schema = runtime.store.schema();
-        let mut historical = pool.begin().await.unwrap();
+        let mut historical = pool.begin_read_committed().await.unwrap();
         sqlx::query(&format!(
             "INSERT INTO {schema}.ready_tombstones
              (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
@@ -4218,7 +4222,7 @@ mod tests {
             .flush_progress(&pool, pair.0, pair.1, progress.clone())
             .await
             .unwrap();
-        let mut blocker = pool.begin().await.unwrap();
+        let mut blocker = pool.begin_read_committed().await.unwrap();
         sqlx::query(&format!(
             "SELECT 1 FROM {schema}.queue_claim_heads
              WHERE queue=$1 AND priority=3 AND enqueue_shard=0 FOR UPDATE"

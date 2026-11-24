@@ -14,6 +14,7 @@ use awa_model::admin::{
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::{
     storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
 };
@@ -1606,6 +1607,33 @@ impl Client {
         }
     }
 
+    /// awa's own transactions name READ COMMITTED, but single statements it
+    /// runs outside one, such as heartbeats, take the session's default
+    /// isolation.
+    /// Above READ COMMITTED those fail with serialization errors under
+    /// contention instead of waiting and seeing the rows they waited for.
+    async fn warn_on_default_isolation_above_read_committed(&self) {
+        let isolation: Result<String, sqlx::Error> =
+            sqlx::query_scalar("SELECT current_setting('default_transaction_isolation')")
+                .fetch_one(&self.pool)
+                .await;
+        match isolation {
+            Ok(isolation) if isolation != "read committed" && isolation != "read uncommitted" => {
+                warn!(
+                    default_transaction_isolation = %isolation,
+                    "The worker pool's default_transaction_isolation is above read committed; \
+                     single statements outside awa's transactions run at that level and can fail with \
+                     serialization errors. Give the pool's connections \
+                     default_transaction_isolation = 'read committed'"
+                )
+            }
+            Ok(_) => {}
+            Err(err) => {
+                debug!(error = %err, "Could not read default_transaction_isolation")
+            }
+        }
+    }
+
     async fn warn_on_unsafe_prune_lock_timeout(&self) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
@@ -1709,6 +1737,7 @@ impl Client {
         self.log_transition_startup_status(&effective_storage)
             .await?;
         self.warn_on_unsafe_prune_lock_timeout().await;
+        self.warn_on_default_isolation_above_read_committed().await;
         self.warn_on_unreported_leader_opt_out().await;
 
         if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
@@ -2129,7 +2158,7 @@ impl Client {
         default_action: awa_model::DefaultAction,
         run_lease: Option<i64>,
     ) -> Result<awa_model::ResolveOutcome, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let outcome =
             admin::resolve_callback_in_tx(&mut tx, callback_id, payload, default_action, run_lease)
                 .await?;
@@ -2189,7 +2218,7 @@ impl Client {
         payload: Option<serde_json::Value>,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let job = admin::complete_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
         self.dispatch_callback_followups_in_tx(
             &mut tx,
@@ -2218,7 +2247,7 @@ impl Client {
         error: &str,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let job = admin::fail_external_in_tx(&mut tx, callback_id, error, run_lease).await?;
         let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
             error: error.to_string(),
@@ -2260,7 +2289,7 @@ impl Client {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let parked_attempt: Option<i16> = sqlx::query_scalar(
             "SELECT attempt FROM awa.jobs \
              WHERE callback_id = $1 AND state = 'waiting_external' \

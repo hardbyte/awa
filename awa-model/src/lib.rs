@@ -11,6 +11,9 @@ pub mod cron;
 pub mod dlq;
 pub mod error;
 pub mod insert;
+// Internal to awa's crates; not part of the 0.6 public API.
+#[doc(hidden)]
+pub mod isolation;
 pub mod job;
 pub mod kind;
 pub mod migrations;

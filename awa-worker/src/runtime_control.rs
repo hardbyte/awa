@@ -1,3 +1,4 @@
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::runtime_control::{self, RuntimeControl};
 use chrono::{DateTime, Utc};
 use sqlx::pool::PoolConnection;
@@ -109,7 +110,7 @@ impl PruneControl {
             return Ok(());
         }
         tokio::time::timeout(Duration::from_secs(1), async {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_read_committed().await?;
             sqlx::query("SET LOCAL statement_timeout = '1s'")
                 .execute(tx.as_mut())
                 .await?;
