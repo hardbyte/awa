@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Acquire, PgConnection, PgPool, Postgres, Transaction};
 
 use crate::error::{map_sqlx_error, AwaError};
+use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::{QueueStorage, RETRIED_DUPLICATE_ERROR, SNOOZED_DUPLICATE_ERROR};
 
@@ -129,7 +130,7 @@ pub async fn reschedule_canonical_attempt(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
 ) -> Result<RescheduleOutcome, AwaError> {
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     let outcome =
         reschedule_canonical_attempt_tx(&mut tx, job_id, run_lease, reschedule, error, progress)
             .await?;
@@ -150,7 +151,7 @@ pub async fn reschedule_canonical_attempt_with_unique(
     progress: Option<&serde_json::Value>,
     unique_key: Option<&[u8]>,
 ) -> Result<RescheduleOutcome, AwaError> {
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     let outcome = reschedule_canonical_attempt_with_unique_tx(
         &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
     )
@@ -301,6 +302,7 @@ async fn reschedule_canonical(
             .map(|outcome| (outcome, None));
     }
     {
+        // isolation: a savepoint, at the enclosing transaction's level
         let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
         match move_canonical(
             savepoint.as_mut(),

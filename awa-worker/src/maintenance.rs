@@ -3,9 +3,11 @@ use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
 use crate::runtime_control::{LeaderObserver, MaintenanceBranch, PruneControl};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::advisory::SessionAdvisoryLock;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::{
     AwaError, GatedRotateOutcome, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome,
     QueueRingPin, QueueStorage, RescueBatch, RescueBatchOptions, RescueScanProgress,
@@ -2142,18 +2144,13 @@ impl MaintenanceService {
     ///
     /// Returns a dedicated connection holding the lock on success, or `None` if
     /// another instance already holds the lock. The lock is session-scoped in
-    /// PostgreSQL, so it stays held as long as this connection is alive.
+    /// PostgreSQL, so it stays held as long as this connection is alive. The
+    /// connection closes rather than returning to the pool when it is dropped,
+    /// including when this future is dropped after the lock was granted.
     async fn try_become_leader(&self) -> Result<Option<PoolConnection<Postgres>>, sqlx::Error> {
-        let mut conn = self.pool.acquire().await?;
-        let result: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-            .bind(Self::LOCK_KEY)
-            .fetch_one(&mut *conn)
-            .await?;
-        if result.0 {
-            Ok(Some(conn))
-        } else {
-            Ok(None)
-        }
+        Ok(SessionAdvisoryLock::try_acquire(&self.pool, Self::LOCK_KEY)
+            .await?
+            .map(SessionAdvisoryLock::into_connection_closed_on_drop))
     }
 
     /// The maintenance loop of a runtime that never leads. Leaders only sync
@@ -3526,7 +3523,7 @@ impl MaintenanceService {
         if specs.is_empty() {
             return;
         }
-        let mut tx = match self.pool.begin().await {
+        let mut tx = match self.pool.begin_read_committed().await {
             Ok(tx) => tx,
             Err(err) => {
                 error!(
@@ -3930,7 +3927,7 @@ impl MaintenanceService {
         state: &'static str,
         id: i64,
     ) -> Result<PerRowPromotion, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let unique_key: Option<Option<Vec<u8>>> = sqlx::query_scalar(&format!(
             r#"
             SELECT unique_key
@@ -4008,7 +4005,7 @@ impl MaintenanceService {
         &self,
         state: &'static str,
     ) -> Result<(usize, HashSet<String>), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let promote_start = std::time::Instant::now();
         let sql = Self::promote_sql(state);
         let promoted_rows: Vec<(String,)> = sqlx::query_as(&sql)
@@ -5252,6 +5249,7 @@ mod tests {
             .await
             .unwrap();
         let mut conn = pool.acquire().await.unwrap();
+        // advisory-lock: test fixture; LeaderObserver closes this connection on drop.
         sqlx::query("SELECT pg_advisory_lock(42424242)")
             .execute(&mut *conn)
             .await
@@ -5294,6 +5292,7 @@ mod tests {
         let mut next = pool.acquire().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
+                // advisory-lock: test probe on a connection it drops when the test ends.
                 let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(42424242)")
                     .fetch_one(&mut *next)
                     .await

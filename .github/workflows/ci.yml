@@ -53,6 +53,16 @@ jobs:
           workspaces: ". -> target"
       - name: cargo fmt
         run: cargo fmt --all -- --check
+      # Session advisory locks must not outlive a cancel: in PL/pgSQL the
+      # unlock handler must name query_canceled, and from Rust they go through
+      # awa_model::advisory::SessionAdvisoryLock. awa's own transactions name
+      # READ COMMITTED rather than inheriting the session default (#847).
+      - name: Advisory-lock and transaction-isolation lints
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_check_advisory_locks.py
+          python3 scripts/check-advisory-locks.py
+          python3 -m unittest discover -s scripts/tests -p test_check_transaction_isolation.py
+          python3 scripts/check-transaction-isolation.py
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Check CI test-shard membership

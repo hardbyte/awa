@@ -1,4 +1,6 @@
+use crate::advisory::SessionAdvisoryLock;
 use crate::error::{map_sqlx_error, AwaError};
+use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
@@ -381,21 +383,16 @@ pub async fn run_one_batch_operation_chunk(
         return Ok(BatchOperationRunOutcome::default());
     }
 
-    let mut lock_conn = pool.acquire().await.map_err(map_sqlx_error)?;
-    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(BATCH_RUNNER_LOCK_KEY)
-        .fetch_one(&mut *lock_conn)
+    let Some(lock) = SessionAdvisoryLock::try_acquire(pool, BATCH_RUNNER_LOCK_KEY)
         .await
-        .map_err(map_sqlx_error)?;
-    if !locked {
+        .map_err(map_sqlx_error)?
+    else {
         return Ok(BatchOperationRunOutcome::default());
-    }
+    };
 
     let result = run_one_batch_operation_chunk_locked(pool, runner_instance, chunk_size).await;
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(BATCH_RUNNER_LOCK_KEY)
-        .execute(&mut *lock_conn)
-        .await;
+    // A failed unlock closes the lock's connection, which releases the lock.
+    let _ = lock.release().await;
     result
 }
 
@@ -642,7 +639,7 @@ async fn scan_operation(
         };
         after_job_id = last_job_id;
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         insert_operation_items(&mut tx, operation_id, &ids).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
 
@@ -815,14 +812,14 @@ async fn apply_item(
     spec: &BatchOperationSpec,
     job_id: i64,
 ) -> Result<ItemOutcome, AwaError> {
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     let outcome = match apply_to_job_tx(&mut tx, spec, job_id).await {
         Ok(true) => ItemOutcome::Processed,
         Ok(false) => ItemOutcome::Skipped,
         Err(err) => {
             tx.rollback().await.map_err(map_sqlx_error)?;
             let outcome = ItemOutcome::Errored(format!("job_id={job_id}: {err}"));
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
             record_item_outcome_tx(&mut tx, operation_id, job_id, &outcome).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(outcome);

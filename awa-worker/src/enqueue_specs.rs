@@ -198,6 +198,7 @@ async fn insert_follow_up<F: JobArgs>(
     if opts.unique.is_none() {
         return insert_with(&mut *conn, args, opts).await.map(|_| ());
     }
+    // isolation: the caller's connection or transaction, at the caller's level
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
     match insert_with(&mut *savepoint, args, opts).await {
         Ok(_) => savepoint.commit().await.map_err(map_sqlx_error),
