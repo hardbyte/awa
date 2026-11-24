@@ -186,7 +186,7 @@ jobs:
         run: cargo fmt --all -- --check
       # Session advisory locks must not outlive a cancel: in PL/pgSQL the
       # unlock handler must name query_canceled, and from Rust they go through
-      # awa_model::advisory::SessionAdvisoryLock. awa's own transactions name
+      # pg_session_lock::SessionAdvisoryLock. awa's own transactions name
       # READ COMMITTED rather than inheriting the session default (#847).
       - name: Advisory-lock and transaction-isolation lints
         run: |

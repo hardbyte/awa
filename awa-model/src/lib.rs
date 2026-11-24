@@ -1,6 +1,5 @@
 pub mod adapter;
 pub mod admin;
-pub mod advisory;
 pub mod batch_operations;
 pub mod bridge;
 pub mod callback_contract;

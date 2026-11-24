@@ -82,11 +82,7 @@ impl AwaError {
     /// `40P01`). Nothing the transaction did was applied, so a caller whose
     /// statements are idempotent may simply run it again.
     pub fn is_deadlock(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("40P01")
-        )
+        matches!(self, AwaError::Database(err) if pg_session_lock::is_deadlock(err))
     }
 
     /// Postgres aborted a `REPEATABLE READ` or `SERIALIZABLE` transaction
@@ -95,21 +91,13 @@ impl AwaError {
     /// transaction again. Under these isolation levels a race on a unique key
     /// can also surface as `40001` rather than a unique violation.
     pub fn is_serialization_failure(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("40001")
-        )
+        matches!(self, AwaError::Database(err) if pg_session_lock::is_serialization_failure(err))
     }
 
     /// Postgres cancelled the statement at its `statement_timeout` (SQLSTATE
     /// `57014`).
     pub fn is_statement_timeout(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("57014")
-        )
+        matches!(self, AwaError::Database(err) if pg_session_lock::is_query_canceled(err))
     }
 
     /// The statement named a column the table does not have (SQLSTATE 42703),

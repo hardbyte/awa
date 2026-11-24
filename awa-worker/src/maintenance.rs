@@ -2,7 +2,6 @@ use crate::executor::DlqPolicy;
 use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
-use awa_model::advisory::SessionAdvisoryLock;
 use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
@@ -16,6 +15,7 @@ use awa_model::{
 };
 use chrono::{DateTime, Utc};
 use croner::Cron;
+use pg_session_lock::SessionAdvisoryLock;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

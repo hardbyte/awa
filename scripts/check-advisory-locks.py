@@ -13,7 +13,7 @@ connection closes:
 
 * Rust. A PoolConnection that is dropped, or whose unlock fails, goes back to
   the pool still holding the lock. Session locks taken from Rust must go
-  through awa_model::advisory::SessionAdvisoryLock, which closes the
+  through pg_session_lock::SessionAdvisoryLock, which closes the
   connection unless the unlock succeeded. A lock on a dedicated, unpooled
   connection is fine; mark it with an `advisory-lock:` comment saying why.
 
@@ -38,7 +38,7 @@ MARKER = "advisory-lock:"
 SQL_GLOBS = ["awa-model/migrations/*.sql"]
 RUST_GLOBS = ["*/src/**/*.rs", "awa-python/src/**/*.rs"]
 # The guard every Rust session lock goes through.
-RUST_GUARD = "awa-model/src/advisory.rs"
+RUST_GUARD = "pg-session-lock/src/lib.rs"
 
 BLOCK_BEGIN = re.compile(r"^\s*(?:<<\w+>>\s*)?BEGIN\s*$", re.IGNORECASE)
 BLOCK_EXCEPTION = re.compile(r"^\s*EXCEPTION\b", re.IGNORECASE)
@@ -217,7 +217,7 @@ def rust_findings(path: str, text: str) -> list[tuple[str, int, str]]:
                 (
                     path,
                     index + 1,
-                    "session advisory lock outside awa_model::advisory::SessionAdvisoryLock; "
+                    "session advisory lock outside pg_session_lock::SessionAdvisoryLock; "
                     f"use the guard, or mark a dedicated connection with `// {MARKER} <why>`",
                 )
             )

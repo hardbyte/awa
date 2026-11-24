@@ -1,0 +1,104 @@
+name: pg-session-lock release
+
+# pg-session-lock is versioned on its own. Tag `pg-session-lock-vX.Y.Z` on a
+# commit whose pg-session-lock/Cargo.toml says X.Y.Z; awa's own release
+# (`v*` tags, release.yml) does not publish it.
+on:
+  push:
+    tags:
+      - "pg-session-lock-v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (pg${{ matrix.postgres }}, sqlx ${{ matrix.sqlx }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        postgres: ["17", "18"]
+        # `locked` is the workspace's Cargo.lock, the oldest sqlx 0.9 release
+        # awa builds with; `newest` is the latest 0.9.x on crates.io.
+        sqlx: [locked, newest]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pg_session_lock_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches pg-session-lock/Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${GITHUB_REF_NAME#pg-session-lock-v}"
+          actual=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "pg-session-lock"))')
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error file=pg-session-lock/Cargo.toml::version ${actual} does not match tag ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+      - name: Use the newest sqlx 0.9.x
+        if: matrix.sqlx == 'newest'
+        run: cargo update -p sqlx
+      - name: Test
+        run: |
+          cargo tree -p pg-session-lock -i sqlx --depth 0
+          cargo test -p pg-session-lock
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pg_session_lock_test
+      - name: Package (builds the crate outside the workspace)
+        run: cargo package -p pg-session-lock
+
+  # crates.io Trusted Publishing via GitHub OIDC, as in release.yml. A trusted
+  # publisher can only be added to a crate that exists, so 0.1.0 was published
+  # by hand; later versions publish here once the crate's settings on
+  # crates.io name this repository and this workflow file.
+  publish:
+    name: Publish to crates.io
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      # A version published by hand (0.1.0) or by an earlier run of this tag
+      # is left alone, so pushing its tag only runs the tests.
+      - name: Already on crates.io?
+        id: published
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#pg-session-lock-v}"
+          if curl -sSf -A "awa-release-check" -o /dev/null \
+              "https://crates.io/api/v1/crates/pg-session-lock/${version}"; then
+            echo "pg-session-lock ${version} is already on crates.io; nothing to publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Authenticate to crates.io (OIDC)
+        if: steps.published.outputs.skip != 'true'
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish pg-session-lock
+        if: steps.published.outputs.skip != 'true'
+        run: cargo publish --package pg-session-lock
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
