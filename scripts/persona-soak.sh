@@ -59,7 +59,14 @@
 #   AWA_SOAK_QUEUE_ROTATE_MS, AWA_SOAK_CLAIM_ROTATE_MS, AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS
 #                             queue and claim ring rotation intervals and the prune lock timeout
 #                             of every in-process runtime (default: the library's 1000, 1000 and 10)
-#   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0; the
+#   AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS, AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS
+#                             statement and lock timeouts of the oracle's periodic samples (default
+#                             10000 and 1000); a sample cut short is counted, not treated as missing
+#                             evidence
+#   AWA_SOAK_FINAL_STATEMENT_TIMEOUT_MS
+#                             statement and lock timeout of the final reconciliation (default 300000)
+#   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0, built by
+#                             docker/pg18-cassert/Dockerfile; the
 #                             -epqlog5 build, which logs every partition-pruning setup with its
 #                             query text, is opt-in for diagnosing pruning crashes)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings

@@ -333,10 +333,12 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     );
     let queue_names: Vec<String> = queues.iter().map(|queue| queue.name.clone()).collect();
 
-    let sampler_pool = connect_pool(
+    let sampler_pool = super::super::db::connect_sampler_pool(
         &shared.config.database_url,
         "soak_txn_sampler",
         shared.budget.reserve("txn-sampler", 1, 1),
+        shared.config.sampler_statement_timeout,
+        shared.config.sampler_lock_timeout,
     )
     .await
     .map_err(|error| error.to_string())?;

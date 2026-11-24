@@ -173,6 +173,11 @@ pub struct SoakConfig {
     pub queue_rotate_interval: Option<Duration>,
     pub claim_rotate_interval: Option<Duration>,
     pub prune_lock_timeout: Option<Duration>,
+    /// Statement and lock timeouts of the oracle's periodic samples, and the statement
+    /// timeout of its final reconciliation.
+    pub sampler_statement_timeout: Duration,
+    pub sampler_lock_timeout: Duration,
+    pub final_statement_timeout: Duration,
     /// Transactional producers: how many run concurrently, the share of their
     /// transactions that are SERIALIZABLE rather than REPEATABLE READ, and the longest
     /// pause between a transaction's first read and its enqueue.
@@ -328,6 +333,15 @@ impl SoakConfig {
                 .map(Duration::from_millis),
             prune_lock_timeout: env_parse::<u64>("AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS")
                 .map(Duration::from_millis),
+            sampler_statement_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS").unwrap_or(10_000),
+            ),
+            sampler_lock_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS").unwrap_or(1_000),
+            ),
+            final_statement_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_FINAL_STATEMENT_TIMEOUT_MS").unwrap_or(300_000),
+            ),
             txn_producers: env_parse("AWA_SOAK_TXN_PRODUCERS").unwrap_or(16),
             txn_serializable_percent: env_parse::<u64>("AWA_SOAK_TXN_SERIALIZABLE_PERCENT")
                 .unwrap_or(50)

@@ -74,6 +74,10 @@ pub struct Oracle {
     reported_duplicates: std::collections::HashSet<(i64, i64)>,
     reported_cancel: std::collections::HashSet<i64>,
     initial_stats_reset: std::sync::Mutex<Option<Option<String>>>,
+    /// Periodic samples cut short by the sampler's statement or lock timeout.
+    skipped_samples: std::sync::atomic::AtomicU64,
+    /// Set for the final reconciliation, whose queries must complete.
+    final_phase: bool,
 }
 
 impl Oracle {
@@ -87,7 +91,48 @@ impl Oracle {
             reported_duplicates: Default::default(),
             reported_cancel: Default::default(),
             initial_stats_reset: Default::default(),
+            skipped_samples: Default::default(),
+            final_phase: false,
         }
+    }
+
+    /// Runs the remaining checks on `pool`, whose queries may take as long as a
+    /// final reconciliation needs, and treats every failure from here on as
+    /// incomplete evidence.
+    pub fn begin_final_phase(&mut self, pool: PgPool) {
+        self.pool = pool;
+        self.final_phase = true;
+        let skipped = self
+            .skipped_samples
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.shared
+            .run
+            .add("oracle_samples_skipped", skipped as i64);
+        if skipped > 0 {
+            self.shared.note(
+                "oracle_samples_skipped",
+                format!(
+                    "{skipped} periodic oracle sample(s) hit the sampler's statement or lock timeout and were skipped"
+                ),
+            );
+        }
+    }
+
+    /// A failed oracle query. A periodic sample cut short by the sampler's statement
+    /// or lock timeout (SQLSTATE 57014 or 55P03) is skipped and counted, so measuring
+    /// never holds a lock prune waits for; any other failure, and any failure in the
+    /// final reconciliation, leaves the evidence incomplete.
+    fn failed(&self, what: &str, error: &sqlx::Error) {
+        let timed_out = error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .is_some_and(|code| code == "57014" || code == "55P03");
+        if timed_out && !self.final_phase {
+            self.skipped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        self.shared.incomplete(format!("{what}: {error}"), vec![]);
     }
 
     /// Runs the periodic checks until `stop`.
@@ -121,8 +166,7 @@ impl Oracle {
         let reset = match reset {
             Ok(reset) => reset,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("crash-recovery probe failed: {error}"), vec![]);
+                self.failed("crash-recovery probe failed", &error);
                 return;
             }
         };
@@ -205,9 +249,7 @@ impl Oracle {
                     );
                 }
             }
-            Err(error) => self
-                .shared
-                .incomplete(format!("terminal uniqueness query failed: {error}"), vec![]),
+            Err(error) => self.failed("terminal uniqueness query failed", &error),
         }
 
         let available = available_cte(&schema);
@@ -243,10 +285,7 @@ impl Oracle {
                 let confirmed: std::collections::HashSet<i64> = match still {
                     Ok(rows) => rows.into_iter().map(|row| row.0).collect(),
                     Err(error) => {
-                        self.shared.incomplete(
-                            format!("terminal/live confirmation failed: {error}"),
-                            vec![],
-                        );
+                        self.failed("terminal/live confirmation failed", &error);
                         Default::default()
                     }
                 };
@@ -270,9 +309,7 @@ impl Oracle {
                 }
             }
             Ok(_) => {}
-            Err(error) => self
-                .shared
-                .incomplete(format!("terminal/live query failed: {error}"), vec![]),
+            Err(error) => self.failed("terminal/live query failed", &error),
         }
         self.shared.run.observe(
             "oracle_terminal_check_ms",
@@ -297,8 +334,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                self.failed("invariant query failed", &error);
                 return;
             }
         };
@@ -373,8 +409,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                self.failed("invariant query failed", &error);
                 return;
             }
         };
@@ -393,8 +428,7 @@ impl Oracle {
         let still = match still {
             Ok(still) => still,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("promotion confirmation failed: {error}"), vec![]);
+                self.failed("promotion confirmation failed", &error);
                 return;
             }
         };
@@ -440,8 +474,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                self.failed("invariant query failed", &error);
                 return;
             }
         };
@@ -491,8 +524,7 @@ impl Oracle {
             let available = match exact {
                 Ok(available) => available,
                 Err(error) => {
-                    self.shared
-                        .incomplete(format!("exact claimable-row check failed: {error}"), vec![]);
+                    self.failed("exact claimable-row check failed", &error);
                     continue;
                 }
             };
@@ -612,8 +644,7 @@ impl Oracle {
             .fetch_one(&self.pool)
             .await;
             if let Err(error) = &live {
-                self.shared
-                    .incomplete(format!("quiescence query failed: {error}"), vec![]);
+                self.failed("quiescence query failed", error);
             }
             let mut pending_terminal_proof = 0usize;
             self.shared.ledger.for_each(|id, record| {

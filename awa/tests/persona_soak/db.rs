@@ -27,9 +27,53 @@ pub async fn connect_pool_with_timeout(
     max_connections: u32,
     statement_timeout: Option<Duration>,
 ) -> Result<PgPool, sqlx::Error> {
+    connect_pool_with_timeouts(
+        url,
+        application_name,
+        max_connections,
+        statement_timeout,
+        None,
+    )
+    .await
+}
+
+/// A pool for the oracle and samplers: every session has a `statement_timeout` and a
+/// `lock_timeout`, so a measurement neither holds a lock ring prune waits for beyond
+/// the statement bound nor queues behind one.
+pub async fn connect_sampler_pool(
+    url: &str,
+    application_name: &str,
+    max_connections: u32,
+    statement_timeout: Duration,
+    lock_timeout: Duration,
+) -> Result<PgPool, sqlx::Error> {
+    connect_pool_with_timeouts(
+        url,
+        application_name,
+        max_connections,
+        Some(statement_timeout),
+        Some(lock_timeout),
+    )
+    .await
+}
+
+async fn connect_pool_with_timeouts(
+    url: &str,
+    application_name: &str,
+    max_connections: u32,
+    statement_timeout: Option<Duration>,
+    lock_timeout: Option<Duration>,
+) -> Result<PgPool, sqlx::Error> {
     let mut options = PgConnectOptions::from_str(url)?.application_name(application_name);
+    let mut settings = Vec::new();
     if let Some(timeout) = statement_timeout {
-        options = options.options([("statement_timeout", timeout.as_millis().to_string())]);
+        settings.push(("statement_timeout", timeout.as_millis().to_string()));
+    }
+    if let Some(timeout) = lock_timeout {
+        settings.push(("lock_timeout", timeout.as_millis().to_string()));
+    }
+    if !settings.is_empty() {
+        options = options.options(settings);
     }
     PgPoolOptions::new()
         .max_connections(max_connections)
