@@ -1,4 +1,5 @@
 use crate::error::{map_sqlx_error, AwaError};
+use crate::isolation::BeginReadCommitted;
 use crate::job::{InsertOpts, InsertParams, JobRow, JobState};
 use crate::queue_storage::ordering_key_hash64;
 use crate::unique::compute_unique_key;
@@ -1072,7 +1073,7 @@ pub async fn insert_many_copy_from_pool(
         return Ok(Vec::new());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let results = insert_many_copy(&mut tx, jobs).await?;
     tx.commit().await?;
 

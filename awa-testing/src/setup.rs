@@ -1,5 +1,6 @@
 //! Common test setup utilities for Awa integration tests.
 
+use awa_model::isolation::BeginReadCommitted;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -64,7 +65,7 @@ pub async fn reset_runtime_backend(pool: &PgPool) {
 /// Force the canonical engine and clear any queue-storage runtime registration.
 pub async fn reset_to_canonical(pool: &PgPool) {
     let mut tx = pool
-        .begin()
+        .begin_read_committed()
         .await
         .expect("Failed to start runtime backend reset transaction");
 
@@ -101,7 +102,7 @@ pub async fn reset_to_canonical(pool: &PgPool) {
 /// `awa` schema (mirrors a fresh-install auto-finalize).
 pub async fn activate_queue_storage(pool: &PgPool) {
     let mut tx = pool
-        .begin()
+        .begin_read_committed()
         .await
         .expect("Failed to start queue-storage activation transaction");
 

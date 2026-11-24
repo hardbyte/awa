@@ -727,6 +727,8 @@ impl PyClient {
     fn transaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
+            // isolation: the application owns this transaction, so it keeps the
+            // session's default isolation level.
             let tx = pool.begin().await.map_err(map_sqlx_error)?;
             Ok(PyTransaction::new(tx))
         })
@@ -2693,6 +2695,8 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                // isolation: the application owns this transaction, so it keeps the
+                // session's default isolation level.
                 let tx = pool.begin().await.map_err(map_sqlx_error)?;
                 Ok(PySyncTransaction::new(tx))
             })

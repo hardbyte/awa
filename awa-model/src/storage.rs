@@ -1,5 +1,6 @@
 use crate::admin;
 use crate::error::AwaError;
+use crate::isolation::BeginReadCommitted;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection, PgExecutor, PgPool};
@@ -104,7 +105,7 @@ where
 ///
 /// Implemented without DDL so this works on an unfinalized 0.6 schema (#457).
 pub async fn enter_mixed_transition_quiesced(pool: &PgPool) -> Result<StorageStatus, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     // Serialize snapshot writes with the liveness check and routing flip. Do
     // not take the snapshot protocol advisory lock after this table lock: a
     // writer may already hold it while waiting to insert its snapshot.
@@ -521,6 +522,7 @@ async fn repair_lane_sequence_as_login_role(
     schema: &str,
     sequence_name: &str,
 ) -> Result<Option<Option<LaneSequenceRepair>>, AwaError> {
+    // isolation: the caller's connection; the transaction keeps the caller's level
     let mut transaction = conn.begin().await?;
     sqlx::query("SET LOCAL ROLE NONE")
         .execute(&mut *transaction)
