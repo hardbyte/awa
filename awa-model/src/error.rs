@@ -94,19 +94,6 @@ impl AwaError {
         matches!(self, AwaError::Database(err) if pg_session_lock::is_serialization_failure(err))
     }
 
-    /// Postgres aborted a `REPEATABLE READ` or `SERIALIZABLE` transaction
-    /// because it could not be serialized against a concurrent one (SQLSTATE
-    /// `40001`). Nothing the transaction did was applied; run the whole
-    /// transaction again. Under these isolation levels a race on a unique key
-    /// can also surface as `40001` rather than a unique violation.
-    pub fn is_serialization_failure(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("40001")
-        )
-    }
-
     /// Postgres cancelled the statement at its `statement_timeout` (SQLSTATE
     /// `57014`).
     pub fn is_statement_timeout(&self) -> bool {
