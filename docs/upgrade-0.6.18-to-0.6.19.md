@@ -96,7 +96,7 @@ A job that a stale snapshot already placed behind its lane's claim cursor before
 
 A 0.6.18 process that retries such a job, singly or in bulk, through the Rust or Python API, the CLI or the web UI, still takes the job's unique claim and fails while the newer job holds it, but it keeps the cleared mask, so the job does not hold its key if it is cancelled again. No stored form avoids this for 0.6.18.
 
-During the roll, don't retry jobs whose last error ends in `as duplicate: unique claim held by a newer job` or `as duplicate: unique claim held by another job` from a 0.6.18 process. Retry them from a 0.6.19 process, or wait until no 0.6.18 process that retries jobs is left. Only jobs whose `unique_states` include `cancelled` are affected. This is an exception to awa's rolling-upgrade policy, under which any mix of adjacent patch releases may share a database.
+During the roll, don't retry jobs whose last error ends in `unique claim held by a newer job` (a snooze, retry or rescue cancelled as a duplicate) or `unique claim held by another job` (a job cancelled at promotion) from a 0.6.18 process. Retry them from a 0.6.19 process, or wait until no 0.6.18 process that retries jobs is left. Only jobs whose `unique_states` include `cancelled` are affected. This is an exception to awa's rolling-upgrade policy, under which any mix of adjacent patch releases may share a database.
 
 A duplicate that 0.6.18 or earlier cancelled during a storage transition and stored without its unique key can no longer be retried: 0.6.19 rejects the retry with a unique conflict, and a bulk retry skips and reports it. Enqueue such a job afresh to run it again.
 
