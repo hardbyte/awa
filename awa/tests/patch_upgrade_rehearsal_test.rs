@@ -791,6 +791,21 @@ async fn strong_locks_held_by(pool: &PgPool, role: &str, relation_ids: &[i64]) -
     .unwrap()
 }
 
+/// The `ring_generation_floor` patch reads each queue-storage schema's ring
+/// state to seed the floor. `AccessShareLock` conflicts only with
+/// `ACCESS EXCLUSIVE`, which nothing takes on `queue_ring_state` while the
+/// fleet runs (only the installer alters it, and the patch does not wait for
+/// the installer's lock), so it blocks no reader or writer.
+fn ring_floor_seed_lock(lock: &str) -> bool {
+    let Some((relation, mode)) = lock.rsplit_once(' ') else {
+        return false;
+    };
+    mode == "AccessShareLock"
+        && relation
+            .split_once('.')
+            .is_some_and(|(_, table)| matches!(table, "queue_ring_state" | "queue_ring_state_pkey"))
+}
+
 /// The locks the `replica_identity` patch takes on the tables it alters, as
 /// formatted by `strong_locks_held_by`.
 fn replica_identity_lock(lock: &str) -> bool {
@@ -1105,6 +1120,7 @@ async fn released_patch_upgrade_and_rollback() {
         owner.close().await;
         let (identity_locks, other_locks): (Vec<String>, Vec<String>) = locks
             .into_iter()
+            .filter(|lock| !ring_floor_seed_lock(lock))
             .partition(|lock| replica_identity_lock(lock));
         assert!(
             other_locks.is_empty(),
