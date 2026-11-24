@@ -917,10 +917,7 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
 }
 
 fn is_lock_contention_error(err: &sqlx::Error) -> bool {
-    matches!(
-        err,
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("55P03")
-    )
+    pg_session_lock::is_lock_not_available(err)
 }
 
 async fn set_lock_timeout_tx(
