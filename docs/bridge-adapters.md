@@ -147,6 +147,10 @@ let job = tokio_pg::insert_job_raw(
 
 All functions return `awa::JobRow` with the full row from `RETURNING *` — same type as `awa::insert_with`. The only field not populated is `unique_states` (BIT(8), no direct tokio-postgres mapping). All other fields, including `errors`, are decoded from the database row.
 
+## Rust: sqlx 0.9
+
+awa 0.6 is built on sqlx 0.8. An application on sqlx 0.9 gives awa a sqlx 0.8 pool for its client and migrations, and enqueues through `awa::bridge::sqlx09`, which takes any sqlx 0.9 `PgExecutor`: a `&PgPool`, a `&mut PgConnection` or `&mut *transaction`. Unlike the other adapters it also offers `insert_many`, because it binds the same arrays as the native `insert_many`. See [Applications on sqlx 0.9](getting-started-rust.md#applications-on-sqlx-09).
+
 ## Rust: SeaORM
 
 SeaORM already sits on top of SQLx, so the integration is deliberately thin. A `sea_orm::DatabaseConnection` wraps a `sqlx::PgPool`, so for building a client, running migrations, or reading job state you can reach the pool directly (`awa_seaorm::pool(&db)` / `db.awa_pool()`) and use Awa's existing APIs unchanged.
@@ -208,5 +212,6 @@ See [Python getting started — ORM Transaction Bridging](getting-started-python
 | Feature | Crate | What it enables |
 | --- | --- | --- |
 | `tokio-postgres` | `awa` or `awa-model` | `awa::bridge::tokio_pg` adapter |
+| `sqlx09` | `awa` or `awa-model` | `awa::bridge::sqlx09` adapter for applications on sqlx 0.9 |
 | `cel` | `awa` or `awa-model` | CEL expression evaluation for callback filtering |
 | `anyhow` | `awa` | `From<anyhow::Error>` for `JobError` |

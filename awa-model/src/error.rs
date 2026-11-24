@@ -29,6 +29,10 @@ pub enum AwaError {
     #[cfg(feature = "tokio-postgres")]
     #[error("tokio-postgres error: {0}")]
     TokioPg(#[source] tokio_postgres::Error),
+
+    #[cfg(feature = "sqlx09")]
+    #[error("sqlx 0.9 error: {0}")]
+    Sqlx09(#[source] sqlx09::Error),
 }
 
 impl AwaError {
@@ -36,11 +40,16 @@ impl AwaError {
     /// `40P01`). Nothing the transaction did was applied, so a caller whose
     /// statements are idempotent may simply run it again.
     pub fn is_deadlock(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("40P01")
-        )
+        match self {
+            AwaError::Database(sqlx::Error::Database(database)) => {
+                database.code().as_deref() == Some("40P01")
+            }
+            #[cfg(feature = "sqlx09")]
+            AwaError::Sqlx09(sqlx09::Error::Database(database)) => {
+                database.code().as_deref() == Some("40P01")
+            }
+            _ => false,
+        }
     }
 }
 
