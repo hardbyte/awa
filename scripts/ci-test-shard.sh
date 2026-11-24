@@ -17,6 +17,7 @@ set -euo pipefail
 MIGRATION_PARTITIONS=4
 
 HEAVY_TESTS=(
+  bulk_rescue_test
   executor_guard_test
   lifecycle_hook_test
   queue_storage_runtime_test
