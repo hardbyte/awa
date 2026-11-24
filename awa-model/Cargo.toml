@@ -10,6 +10,7 @@ readme = "README.md"
 [features]
 cel = ["dep:cel"]
 tokio-postgres = ["dep:tokio-postgres"]
+sqlx09 = ["dep:sqlx09"]
 
 [dependencies]
 awa-macros.workspace = true
@@ -27,6 +28,8 @@ uuid.workspace = true
 hex = "0.4"
 cel = { workspace = true, optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"], optional = true }
+sqlx09 = { package = "sqlx", version = "0.9", default-features = false, features = ["postgres", "chrono", "json", "uuid"], optional = true }
 
 [dev-dependencies]
+sqlx09 = { package = "sqlx", version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 tokio = { workspace = true, features = ["full", "test-util"] }

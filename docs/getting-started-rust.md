@@ -181,6 +181,51 @@ let job = awa::insert_with(
 tx.commit().await?;
 ```
 
+## Applications on sqlx 0.9
+
+awa 0.6 is built on sqlx 0.8, and its API takes sqlx 0.8 types such as `PgPool`. An application that has moved to sqlx 0.9 can still run awa 0.6: give awa a pool of its own from sqlx 0.8, under another name, and keep sqlx 0.9 for everything else. Cargo builds both versions into the binary.
+
+```toml
+[dependencies]
+awa = { version = "0.6", features = ["sqlx09"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring", "postgres"] }
+sqlx08 = { package = "sqlx", version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+```
+
+```rust
+let app_pool = sqlx::postgres::PgPoolOptions::new().connect(&url).await?;
+let awa_pool = sqlx08::postgres::PgPoolOptions::new().connect(&url).await?;
+awa::migrations::run(&awa_pool).await?;
+let client = awa::Client::builder(awa_pool.clone())
+    .queue("welcome", awa::QueueConfig::default())
+    .register_worker(WelcomeEmailWorker)
+    .build()?;
+```
+
+awa's native insert functions take a sqlx 0.8 executor, so they cannot join a sqlx 0.9 transaction. The `sqlx09` feature adds `awa::bridge::sqlx09`, whose `insert_job`, `insert_job_with`, `insert_job_raw` and `insert_many` take a sqlx 0.9 executor and otherwise behave like `awa::insert_with` and `awa::insert_many`: unique keys, the scheduled state for a future `run_at`, and ordering keys come out the same.
+
+```rust
+use awa::bridge::sqlx09 as awa_sqlx09;
+
+let mut tx = app_pool.begin().await?;
+sqlx::query("INSERT INTO signups (email) VALUES ($1)")
+    .bind(&email)
+    .execute(&mut *tx)
+    .await?;
+awa_sqlx09::insert_job_with(
+    &mut *tx,
+    &SendWelcomeEmail { email },
+    awa::InsertOpts {
+        queue: "welcome".into(),
+        ..Default::default()
+    },
+)
+.await?;
+tx.commit().await?;
+```
+
+A duplicate unique job returns `AwaError::UniqueConflict` and aborts the transaction. The feature adds no runtime or TLS feature to sqlx 0.9; your own sqlx dependency chooses them. [`examples/sqlx-0-9-app`](../examples/sqlx-0-9-app/src/main.rs) is a complete application, which CI builds against the newest sqlx 0.9 release and runs. awa moves to sqlx 0.9 in 0.7.
+
 ## Routing related jobs to the same shard
 
 By default, a queue is strict FIFO per `(queue, priority)`. Operators can opt a contended queue into **partitioned FIFO** by raising `awa.queue_meta.enqueue_shards` — order is then preserved within each shard, but not across shards. If your producer enqueues jobs that must be processed in order (per-customer events, sequential workflow steps), pass `InsertOpts::ordering_key` so they all land on one shard:

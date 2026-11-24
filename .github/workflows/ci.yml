@@ -323,8 +323,16 @@ jobs:
         run: cargo test --package awa-model --features tokio-postgres --test bridge_tokio_pg_test
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+      - name: Run sqlx 0.9 bridge tests (awa-model)
+        run: cargo test --package awa-model --features sqlx09 --test bridge_sqlx09_test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
       - name: Verify facade re-export compiles
-        run: cargo check --package awa --features tokio-postgres
+        run: cargo check --package awa --features tokio-postgres,sqlx09
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+      - name: Application on sqlx 0.9 (examples/sqlx-0-9-app)
+        run: cargo run --manifest-path examples/sqlx-0-9-app/Cargo.toml --target-dir target
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
