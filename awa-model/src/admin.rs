@@ -1,6 +1,7 @@
 use crate::audited_sql;
 use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
+use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Duration, Utc};
@@ -893,7 +894,7 @@ pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErr
     // of `running` / `waiting_external`, NOTIFY listening workers so
     // the handler currently executing it can learn about the
     // cancellation and stop cleanly.
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let prior_state: Option<JobState> =
         sqlx::query_scalar::<_, JobState>("SELECT state FROM awa.jobs WHERE id = $1 FOR UPDATE")
@@ -4091,7 +4092,7 @@ pub async fn register_callback(
     run_lease: i64,
     timeout: std::time::Duration,
 ) -> Result<Uuid, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store
@@ -4140,7 +4141,7 @@ pub async fn complete_external(
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = complete_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4221,7 +4222,7 @@ pub async fn complete_external_with(
     callback_id: Uuid,
     opts: ExternalCompletion,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = complete_external_with_in_tx(&mut tx, callback_id, opts).await?;
     tx.commit().await?;
     Ok(row)
@@ -4248,7 +4249,7 @@ pub async fn complete_external_reporting_output(
     callback_id: Uuid,
     opts: ExternalCompletion,
 ) -> Result<(JobRow, Option<&'static str>), AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let reported = complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
     tx.commit().await?;
     Ok(reported)
@@ -4346,7 +4347,7 @@ pub async fn resume_external(
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = resume_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4448,7 +4449,7 @@ pub async fn fail_external(
     error: &str,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = fail_external_in_tx(&mut tx, callback_id, error, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4520,7 +4521,7 @@ pub async fn retry_external(
     callback_id: Uuid,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = retry_external_in_tx(&mut tx, callback_id, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4586,7 +4587,7 @@ pub async fn heartbeat_callback(
     callback_id: Uuid,
     timeout: std::time::Duration,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_queue_storage_in_tx(&mut tx, callback_id).await? {
         tx.commit().await?;
         return store.heartbeat_callback(pool, callback_id, timeout).await;
@@ -4618,7 +4619,7 @@ pub async fn heartbeat_callback(
 /// `Ok(false)` if no match (already resolved, rescued, or wrong lease).
 /// Callers should not treat `false` as an error.
 pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Result<bool, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store.cancel_callback(pool, job_id, run_lease).await;
@@ -4696,7 +4697,7 @@ pub async fn enter_callback_wait(
     run_lease: i64,
     callback_id: Uuid,
 ) -> Result<bool, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store
@@ -4733,7 +4734,7 @@ pub async fn check_callback_state(
     job_id: i64,
     callback_id: Uuid,
 ) -> Result<CallbackPollResult, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store.check_callback_state(pool, job_id, callback_id).await;
@@ -4925,7 +4926,7 @@ pub async fn register_callback_with_config(
         }
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store
@@ -4986,7 +4987,7 @@ pub async fn resolve_callback(
     default_action: DefaultAction,
     run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let outcome =
         resolve_callback_in_tx(&mut tx, callback_id, payload, default_action, run_lease).await?;
     tx.commit().await?;

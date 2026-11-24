@@ -1,7 +1,7 @@
 use crate::error::AwaError;
 use semver::Version;
 use sqlx::postgres::PgConnection;
-use sqlx::{Connection, PgPool};
+use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Current schema version.
@@ -537,7 +537,7 @@ async fn run_migration_transaction(
     // returned; the pool permit is held until the close completes.
     let mut conn = pool.acquire().await?;
     let result: Result<i32, AwaError> = async {
-        let mut tx = conn.begin().await?;
+        let mut tx = crate::isolation::begin_read_committed_on(&mut conn).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
             .execute(&mut *tx)
@@ -744,7 +744,7 @@ async fn warm_admin_metadata_cache(pool: &PgPool) {
         // that timeout fires the batch aborts and a raw trailing COMMIT would
         // never run, leaving the connection "idle in transaction (aborted)". A
         // managed transaction's guard rolls back on drop, keeping it clean.
-        if let Ok(mut tx) = conn.begin().await {
+        if let Ok(mut tx) = crate::isolation::begin_read_committed_on(&mut conn).await {
             let refreshed = sqlx::raw_sql(
                 "SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata();",
             )

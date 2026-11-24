@@ -49,6 +49,10 @@ jobs:
               - '**/*.sql'
               - '**/.sqlx/**'
               - 'scripts/ci-test-shard.sh'
+              - 'scripts/check-advisory-locks.py'
+              - 'scripts/tests/test_check_advisory_locks.py'
+              - 'scripts/check-transaction-isolation.py'
+              - 'scripts/tests/test_check_transaction_isolation.py'
               - '.github/workflows/ci.yml'
             python:
               - 'awa-python/**'
@@ -180,6 +184,16 @@ jobs:
             examples/rust-app-demo -> target
       - name: cargo fmt
         run: cargo fmt --all -- --check
+      # Session advisory locks must not outlive a cancel: in PL/pgSQL the
+      # unlock handler must name query_canceled, and from Rust they go through
+      # awa_model::advisory::SessionAdvisoryLock. awa's own transactions name
+      # READ COMMITTED rather than inheriting the session default (#847).
+      - name: Advisory-lock and transaction-isolation lints
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_check_advisory_locks.py
+          python3 scripts/check-advisory-locks.py
+          python3 -m unittest discover -s scripts/tests -p test_check_transaction_isolation.py
+          python3 scripts/check-transaction-isolation.py
       # awa-python is a separate cargo workspace, so the root `cargo fmt --all`
       # and `cargo clippy --workspace` never reached it and its formatting had
       # drifted unnoticed. Build and test coverage for that crate stays in the

@@ -19,6 +19,7 @@
 //! longer exists in any canonical table, so a late completion from a rescued
 //! attempt matches nothing and reports stale.
 
+use crate::isolation::BeginReadCommitted;
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
@@ -120,7 +121,7 @@ pub async fn reschedule_canonical_attempt(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
 ) -> Result<RescheduleOutcome, AwaError> {
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     let outcome =
         reschedule_canonical_attempt_tx(&mut tx, job_id, run_lease, reschedule, error, progress)
             .await?;

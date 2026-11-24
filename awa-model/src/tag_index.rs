@@ -169,7 +169,9 @@ async fn index_if_empty(
     if !owned || heap_bytes > EMPTY_HEAP_BYTES {
         return Ok(false);
     }
-    let mut tx = conn.begin().await.map_err(map_sqlx_error)?;
+    let mut tx = crate::isolation::begin_read_committed_on(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
     let built = build_if_empty(&mut tx, target, &relation).await;
     // Roll back explicitly on every path that does not commit: a dropped
     // transaction is only rolled back the next time its connection is used,
