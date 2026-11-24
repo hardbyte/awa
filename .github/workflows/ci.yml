@@ -151,7 +151,7 @@ jobs:
       fail-fast: false
       matrix:
         postgres: ["17", "18"]
-        released: ["0.6.9", "0.6.15", "0.6.16", "0.6.17"]
+        released: ["0.6.9", "0.6.15", "0.6.16", "0.6.17", "0.6.18"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine
