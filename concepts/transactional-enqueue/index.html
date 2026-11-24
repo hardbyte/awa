@@ -1041,6 +1041,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#isolation-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Isolation levels
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2450,6 +2461,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#isolation-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Isolation levels
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2512,6 +2534,16 @@
 <p class="admonition-title">Atomic enqueue does not make arbitrary side effects exactly once</p>
 <p>AWA commits the job atomically with data in the same PostgreSQL transaction. A handler calling an external API still needs an idempotency key or another duplicate-safe design because delivery is at least once.</p>
 </div>
+<h2 id="isolation-levels">Isolation levels<a class="headerlink" href="#isolation-levels" title="Permanent link">&para;</a></h2>
+<p>Enqueue works at every isolation level, and <code>READ COMMITTED</code>, PostgreSQL's default, is the simplest to run with.</p>
+<p>From migration v062 (0.7), an enqueue in a <code>REPEATABLE READ</code> or <code>SERIALIZABLE</code> transaction keeps its lane's jobs in order even when the transaction's snapshot predates a queue-ring rotation. Before v062, and on 0.6, such an enqueue could land in an older ring generation, where claims skipped it and prune deleted it (<a href="https://github.com/hardbyte/awa/issues/847">#847</a>). While any producer from before v062 still enqueues, keep <code>REPEATABLE READ</code> and <code>SERIALIZABLE</code> producers on <code>READ COMMITTED</code>; the <a href="../../upgrade-0.6-to-0.7/">upgrade guide</a> has the details.</p>
+<p>At <code>REPEATABLE READ</code> or <code>SERIALIZABLE</code>, expect PostgreSQL to abort some transactions with a serialization failure (SQLSTATE <code>40001</code>) and retry the whole transaction when it does:</p>
+<ul>
+<li>An enqueue updates shared rows, such as its lane's head, that concurrent producers also update, so two enqueues to the same lane can conflict.</li>
+<li>A race on a unique job key can fail with <code>40001</code> rather than a unique-key conflict, so handle both.</li>
+</ul>
+<p>In Rust, <code>AwaError::is_serialization_failure()</code> identifies the failure. In Python it comes from your driver: psycopg's <code>errors.SerializationFailure</code>, asyncpg's <code>SerializationError</code>, or a Django <code>OperationalError</code> whose cause has SQLSTATE <code>40001</code>.</p>
+<p>Workers are not affected by the level your producers use. Every transaction awa opens to write runs at <code>READ COMMITTED</code>, whatever the session default. A few read-only reads, such as loading a page of jobs, name <code>REPEATABLE READ, READ ONLY</code> to see one consistent snapshot; a transaction it hands to your code, such as the Python client's <code>transaction()</code>, keeps the session default. Single statements it runs outside a transaction, such as heartbeats, take the session's <code>default_transaction_isolation</code>. If a role or database default is above <code>READ COMMITTED</code>, give the worker pool's connections <code>default_transaction_isolation = 'read committed'</code>, for example with <code>PgConnectOptions::options</code>. The worker logs a warning at start when the default is higher.</p>
 
 
 
