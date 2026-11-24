@@ -150,6 +150,21 @@ const RELEASED: &[Released] = &[
         ],
         observes_runtime_controls: true,
     },
+    Released {
+        version: "0.6.18",
+        shipped_patches: &[
+            "wait_free_dirty_marks",
+            "prepared_lane_sequences",
+            "definer_lane_provisioning",
+            "claim_batch_job_index",
+            "insert_jobs_compat_batch",
+            "prune_controls",
+            "runtime_maintenance_eligibility",
+            "correlated_claim_tombstones",
+            "replica_identity",
+        ],
+        observes_runtime_controls: true,
+    },
 ];
 
 fn released() -> &'static Released {
@@ -1112,10 +1127,18 @@ async fn released_patch_upgrade_and_rollback() {
             "the patch locked pre-existing awa or queue-storage relations beyond the \
              replica identity targets: {other_locks:?}"
         );
-        assert!(
-            identity_locks.contains(&"awa.job_unique_claims AccessExclusiveLock".to_string()),
-            "the replica_identity patch alters awa.job_unique_claims: {identity_locks:?}"
-        );
+        if expected_pending.contains(&"replica_identity") {
+            assert!(
+                identity_locks.contains(&"awa.job_unique_claims AccessExclusiveLock".to_string()),
+                "the replica_identity patch alters awa.job_unique_claims: {identity_locks:?}"
+            );
+        } else {
+            assert!(
+                identity_locks.is_empty(),
+                "replica_identity shipped with {} and must not lock again: {identity_locks:?}",
+                released().version
+            );
+        }
         identity_locks
     };
 
