@@ -130,6 +130,8 @@ From schema v054 each queue-storage schema has `ensure_claim_batch_job_index(slo
 
 ## Custom queue-storage schemas
 
+From schema v062 each queue-storage schema has `enqueue_ring_cursor()` and the sequence `queue_ring_generation_floor` (#847). Enqueues call the function to choose the queue-ring generation they write into; it raises the floor to the generation its caller can see and returns the newer of the two. It is `SECURITY DEFINER`, owned by the owner of `queue_ring_state`, with a pinned `search_path`, and `PUBLIC` may execute it, so the runtime needs no grant on the function or the sequence. It returns only the ring cursor and cannot move the floor past a committed generation. If the migration role can neither give the function to that owner nor read the ring itself, the installer warns and leaves the function out, and enqueues read the cursor directly as before v062.
+
 Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and `TRUNCATE`, but never DDL. Check lanes in a custom schema with `awa storage lane-sequences --schema <name>`. See [Queue storage](../queue-storage-substrate.md).
 
 ## Why the grants are broad

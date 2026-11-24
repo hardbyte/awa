@@ -130,6 +130,69 @@ BEGIN
         p_schema
     );
 
+    -- set_sequence_next is defined here, beside the triggers that call it,
+    -- so a migration refreshing these helpers refreshes it too.
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next(p_seq_name TEXT, p_next BIGINT)
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_lock_key TEXT;
+        BEGIN
+            IF p_seq_name IS NULL THEN
+                RAISE EXCEPTION 'lane sequence name is NULL'
+                    USING ERRCODE = '55000';
+            END IF;
+
+            v_lock_key := format('%%I.%%I', %1$L, p_seq_name);
+
+            -- `setval` is not a compare-and-swap. Serialize it against
+            -- reservation-side block allocation so this helper's "move to at
+            -- least p_next" contract cannot rewind a hot enqueue sequence.
+            -- Every way out of the block releases the session lock,
+            -- including a cancel or statement timeout, which OTHERS does not
+            -- catch; see queue_enqueue_head_sequence_sync.
+            BEGIN
+                PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
+                p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
+
+                IF p_next <= 1 THEN
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, 1, false)',
+                        format('%%I.%%I', %1$L, p_seq_name)
+                    );
+                ELSE
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, %%s, true)',
+                        format('%%I.%%I', %1$L, p_seq_name),
+                        p_next - 1
+                    );
+                END IF;
+                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+            EXCEPTION WHEN OTHERS OR query_canceled THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_locks AS held
+                    WHERE held.locktype = 'advisory'
+                      AND held.pid = pg_backend_pid()
+                      AND held.granted
+                      AND held.objsubid = 1
+                      AND held.classid = ((hashtextextended(v_lock_key, 0) >> 32) & 4294967295)::oid
+                      AND held.objid = (hashtextextended(v_lock_key, 0) & 4294967295)::oid
+                ) THEN
+                    PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+                END IF;
+                RAISE;
+            END;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
     EXECUTE format(
         $ddl$
         CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
@@ -173,8 +236,14 @@ BEGIN
                AND NEW.next_seq > OLD.next_seq
             THEN
                 v_count := NEW.next_seq - OLD.next_seq;
-                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
+                -- A pooled connection keeps a session lock it leaks, which
+                -- would stall this lane's reservations, so every way out of
+                -- the block releases it, including a cancel or statement
+                -- timeout, which OTHERS does not catch. The lock is taken
+                -- inside the block and the handler checks pg_locks, because
+                -- the error can also come before the lock is granted.
                 BEGIN
+                    PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
                     EXECUTE format(
                         'SELECT nextval(%%L::regclass)::bigint',
                         v_qualified_seq
@@ -188,11 +257,22 @@ BEGIN
                             v_start + v_count - 1
                         );
                     END IF;
-                EXCEPTION WHEN OTHERS THEN
                     PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                EXCEPTION WHEN OTHERS OR query_canceled THEN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_locks AS held
+                        WHERE held.locktype = 'advisory'
+                          AND held.pid = pg_backend_pid()
+                          AND held.granted
+                          AND held.objsubid = 1
+                          AND held.classid = ((hashtextextended(v_qualified_seq, 0) >> 32) & 4294967295)::oid
+                          AND held.objid = (hashtextextended(v_qualified_seq, 0) & 4294967295)::oid
+                    ) THEN
+                        PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                    END IF;
                     RAISE;
                 END;
-                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
                 NEW.next_seq := v_start + v_count;
             ELSE
                 PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
@@ -409,6 +489,78 @@ END;
 $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
+
+-- Refreshes p_schema's lane helpers from a migration. They are replaced in
+-- place, which needs their owner's privileges: a migration role that may
+-- only SET ROLE to the schema's owner (PostgreSQL 16+ INHERIT FALSE) retries
+-- as that owner, lending it EXECUTE on awa.refresh_lane_sequence_helpers and
+-- USAGE on awa for the call when it lacks them and taking them back after. A
+-- role that can do neither keeps the old helpers, with a warning, and the
+-- function returns false rather than failing the migration.
+CREATE OR REPLACE FUNCTION awa.refresh_lane_sequence_helpers_as_migrator(p_schema TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $refresh$
+DECLARE
+    v_owner OID;
+    v_owner_name TEXT;
+    v_previous_role TEXT;
+    v_lent_execute BOOLEAN := false;
+    v_lent_usage BOOLEAN := false;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    BEGIN
+        PERFORM awa.refresh_lane_sequence_helpers(p_schema);
+        RETURN true;
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+
+    SELECT namespace.nspowner INTO v_owner
+    FROM pg_namespace AS namespace
+    WHERE namespace.nspname = p_schema;
+    v_owner_name := pg_get_userbyid(v_owner);
+    -- Everything here runs in one subtransaction, so a failure also undoes
+    -- the lent privileges and the role switch.
+    BEGIN
+        IF v_owner IS NULL OR NOT pg_has_role(current_user, v_owner, v_set_mode) THEN
+            RAISE insufficient_privilege;
+        END IF;
+        IF NOT has_function_privilege(v_owner, 'awa.refresh_lane_sequence_helpers(text)', 'EXECUTE') THEN
+            EXECUTE format('GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) TO %I', v_owner_name);
+            v_lent_execute := true;
+        END IF;
+        IF NOT has_schema_privilege(v_owner, 'awa', 'USAGE') THEN
+            EXECUTE format('GRANT USAGE ON SCHEMA awa TO %I', v_owner_name);
+            v_lent_usage := true;
+        END IF;
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', v_owner_name, true);
+        PERFORM awa.refresh_lane_sequence_helpers(p_schema);
+        PERFORM set_config('role', v_previous_role, true);
+        IF v_lent_execute THEN
+            EXECUTE format('REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) FROM %I', v_owner_name);
+        END IF;
+        IF v_lent_usage THEN
+            EXECUTE format('REVOKE USAGE ON SCHEMA awa FROM %I', v_owner_name);
+        END IF;
+        RETURN true;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE WARNING 'could not refresh the lane-sequence helpers of schema %: %', p_schema, SQLERRM
+            USING HINT = format(
+                'Run SELECT awa.refresh_lane_sequence_helpers(%L) as the owner of its lane functions; '
+                'that role needs USAGE on schema awa and EXECUTE on the function.',
+                p_schema
+            );
+        RETURN false;
+    END;
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers_as_migrator(TEXT) FROM PUBLIC;
 
 -- Lane sequences in p_schema (or the one named p_sequence) that are not owned
 -- by the schema owner or lack a runtime grant. A lane sequence carries a head
@@ -1011,6 +1163,256 @@ END;
 $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(TEXT) FROM PUBLIC;
+
+-- The queue-ring generation floor (#847). A producer reserves its lane
+-- positions under the lane's reservation lock and then reads the queue-ring
+-- cursor. Under REPEATABLE READ or SERIALIZABLE the cursor comes from a
+-- snapshot taken before the lock wait, so a later lane position could land in
+-- an older generation than an earlier one. Claims scan one (slot, generation)
+-- segment at a time and would move the lane's claim cursor past it.
+--
+-- <schema>.queue_ring_generation_floor is a sequence whose last value is the
+-- newest queue-ring generation some transaction has read as committed.
+-- Reading a sequence ignores the reader's snapshot. <schema>.enqueue_ring_cursor()
+-- raises the floor to the generation its caller can see and returns the newer
+-- of the two. Producers call it while holding their lane locks, so every
+-- earlier enqueue in a lane raised the floor to its own generation before it
+-- committed, and generations never go backwards in a lane. The rotator calls
+-- it after committing a rotation, so a producer whose snapshot predates many
+-- rotations still writes into the current generation rather than a slot the
+-- ring has reused. The floor only ever holds a generation that was committed,
+-- whose slot rotation has prepared, and it only moves forward (except through
+-- QueueStorage::reset, which restarts the ring).
+--
+-- enqueue_ring_cursor() is SECURITY DEFINER, owned by the owner of
+-- queue_ring_state, with a pinned search_path, and PUBLIC may execute it: it
+-- returns the cursor and can raise the floor only to a generation the caller
+-- can already see, so no runtime role needs a new grant. If its owner cannot
+-- read the ring (the migration role could not hand it to the ring's owner),
+-- it is dropped again, with a warning, and producers keep reading the cursor
+-- directly.
+-- The helper seeds the floor from the committed cursor. Replacing the function
+-- takes no table locks. The installer calls this too.
+CREATE OR REPLACE FUNCTION awa.refresh_ring_generation_floor_helper(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $refresh$
+DECLARE
+    v_owner OID;
+    v_sequence REGCLASS;
+    v_function REGPROCEDURE;
+    v_object_owner OID;
+    v_previous_role TEXT;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
+        RAISE EXCEPTION 'refresh_ring_generation_floor_helper: schema name must match ^[a-z_][a-z0-9_]*$; got %',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT state.relowner INTO v_owner
+    FROM pg_class AS state
+    WHERE state.oid = to_regclass(format('%I.queue_ring_state', p_schema));
+    IF v_owner IS NULL
+       OR to_regprocedure(format('%I.ring_cursor(text)', p_schema)) IS NULL THEN
+        RAISE EXCEPTION 'refresh_ring_generation_floor_helper: schema % has no queue ring',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- A floor left from an earlier run that could not hand it over (the
+    -- function was then left out) goes to the ring's owner first, while this
+    -- role still holds the privileges of the sequence's owner.
+    v_sequence := to_regclass(format('%I.queue_ring_generation_floor', p_schema));
+    IF v_sequence IS NOT NULL THEN
+        SELECT seq.relowner INTO v_object_owner FROM pg_class AS seq WHERE seq.oid = v_sequence;
+        IF v_object_owner <> v_owner
+           AND pg_has_role(current_user, v_object_owner, 'USAGE')
+           AND pg_has_role(current_user, v_owner, v_set_mode)
+           AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format('ALTER SEQUENCE %s OWNER TO %I', v_sequence, pg_get_userbyid(v_owner));
+        END IF;
+    END IF;
+
+    -- Create, replace and grant as the ring's owner when the migration role
+    -- may SET ROLE to it, so a migrator that does not inherit the owner's
+    -- privileges (PostgreSQL 16+ INHERIT FALSE membership) can create in the
+    -- schema and replace the function on a replay, and the objects belong to
+    -- the owner from the start.
+    IF v_owner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+       AND pg_has_role(current_user, v_owner, v_set_mode)
+       AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE')
+       AND COALESCE(
+           (SELECT routine.proowner FROM pg_proc AS routine
+            WHERE routine.oid = to_regprocedure(format('%I.enqueue_ring_cursor()', p_schema))),
+           v_owner
+       ) = v_owner THEN
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', pg_get_userbyid(v_owner), true);
+    END IF;
+
+    EXECUTE format(
+        'CREATE SEQUENCE IF NOT EXISTS %I.queue_ring_generation_floor AS BIGINT MINVALUE 0 START WITH 0',
+        p_schema
+    );
+    v_sequence := format('%I.queue_ring_generation_floor', p_schema)::regclass;
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.enqueue_ring_cursor()
+        RETURNS TABLE(slot INT, generation BIGINT)
+        LANGUAGE plpgsql
+        VOLATILE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp
+        AS $func$
+        DECLARE
+            v_slot INT;
+            v_generation BIGINT;
+            v_floor BIGINT;
+            v_lock_key BIGINT := hashtextextended(%3$L, 0);
+        BEGIN
+            SELECT rc.slot, rc.generation
+            INTO v_slot, v_generation
+            FROM %1$I.ring_cursor('queue') AS rc;
+
+            -- NULL until the first raise after creation or a reset.
+            v_floor := pg_sequence_last_value(%2$L::regclass);
+            IF v_floor IS NULL OR v_floor < v_generation THEN
+                -- setval is not a compare-and-set, so raise under a short
+                -- session lock, released before returning rather than at the
+                -- end of the caller's transaction. Only the first producer to
+                -- see each rotation gets here. A pooled connection would keep a
+                -- leaked session lock, so every way out releases it, including
+                -- a cancel or statement timeout, which OTHERS does not catch;
+                -- the handler checks pg_locks because the error may have come
+                -- before the lock was granted.
+                BEGIN
+                    PERFORM pg_advisory_lock(v_lock_key);
+                    v_floor := pg_sequence_last_value(%2$L::regclass);
+                    IF v_floor IS NULL OR v_floor < v_generation THEN
+                        PERFORM setval(%2$L::regclass, v_generation, true);
+                        v_floor := v_generation;
+                    END IF;
+                    PERFORM pg_advisory_unlock(v_lock_key);
+                EXCEPTION WHEN OTHERS OR query_canceled THEN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_locks AS held
+                        WHERE held.locktype = 'advisory'
+                          AND held.pid = pg_backend_pid()
+                          AND held.granted
+                          AND held.objsubid = 1
+                          AND held.classid = ((v_lock_key >> 32) & 4294967295)::oid
+                          AND held.objid = (v_lock_key & 4294967295)::oid
+                    ) THEN
+                        PERFORM pg_advisory_unlock(v_lock_key);
+                    END IF;
+                    RAISE;
+                END;
+            END IF;
+
+            IF v_floor > v_generation THEN
+                -- Rotation advances slot and generation together from (0, 0)
+                -- and slot_count changes only when reset restarts the ring,
+                -- so the floor's slot is its generation modulo slot_count.
+                SELECT (v_floor %% state.slot_count)::int
+                INTO v_slot
+                FROM %1$I.queue_ring_state AS state
+                WHERE state.singleton;
+                v_generation := v_floor;
+            END IF;
+
+            slot := v_slot;
+            generation := v_generation;
+            RETURN NEXT;
+        END;
+        $func$
+        $ddl$,
+        p_schema,
+        format('%I.queue_ring_generation_floor', p_schema),
+        format('awa.queue_storage.ring_generation_floor:%s', p_schema)
+    );
+    v_function := format('%I.enqueue_ring_cursor()', p_schema)::regprocedure;
+
+    -- The function reads and sets the floor with its owner's privileges, so
+    -- the floor and the function belong to the queue ring's owner.
+    SELECT seq.relowner INTO v_object_owner FROM pg_class AS seq WHERE seq.oid = v_sequence;
+    IF v_object_owner <> v_owner THEN
+        IF pg_has_role(current_user, v_object_owner, 'USAGE')
+           AND pg_has_role(current_user, v_owner, v_set_mode)
+           AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format('ALTER SEQUENCE %s OWNER TO %I', v_sequence, pg_get_userbyid(v_owner));
+        ELSE
+            RAISE WARNING '% is owned by %, not the owner % of %.queue_ring_state',
+                v_sequence, pg_get_userbyid(v_object_owner), pg_get_userbyid(v_owner), p_schema
+                USING HINT = format(
+                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                    quote_ident(pg_get_userbyid(v_owner)),
+                    quote_ident(pg_get_userbyid(v_owner))
+                );
+        END IF;
+    END IF;
+
+    SELECT routine.proowner INTO v_object_owner FROM pg_proc AS routine WHERE routine.oid = v_function;
+    IF v_object_owner <> v_owner THEN
+        IF pg_has_role(current_user, v_object_owner, 'USAGE')
+           AND pg_has_role(current_user, v_owner, v_set_mode)
+           AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format('ALTER FUNCTION %s OWNER TO %I', v_function, pg_get_userbyid(v_owner));
+            v_object_owner := v_owner;
+        ELSE
+            RAISE WARNING '% is owned by %, not the owner % of %.queue_ring_state',
+                v_function, pg_get_userbyid(v_object_owner), pg_get_userbyid(v_owner), p_schema
+                USING HINT = format(
+                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                    quote_ident(pg_get_userbyid(v_owner)),
+                    quote_ident(pg_get_userbyid(v_owner))
+                );
+        END IF;
+    END IF;
+
+    -- The function runs as its owner, so its owner must be able to read the
+    -- ring and the floor. If it cannot (the transfer above was not possible),
+    -- the function is dropped: producers then read the cursor as they did
+    -- before the floor existed, instead of failing.
+    IF has_function_privilege(
+           v_object_owner,
+           format('%I.ring_cursor(text)', p_schema)::regprocedure,
+           'EXECUTE'
+       )
+       AND has_table_privilege(v_object_owner, format('%I.ring_cursor_authority', p_schema), 'SELECT')
+       AND has_table_privilege(v_object_owner, format('%I.queue_ring_rotations', p_schema), 'SELECT')
+       AND has_table_privilege(v_object_owner, format('%I.queue_ring_state', p_schema), 'SELECT')
+       AND has_sequence_privilege(v_object_owner, v_sequence, 'SELECT')
+       AND has_sequence_privilege(v_object_owner, v_sequence, 'UPDATE') THEN
+        -- New functions are executable by PUBLIC already; this restores it
+        -- should anything have revoked it.
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', v_function);
+        -- Seed the floor from the committed cursor.
+        EXECUTE format('SELECT FROM %I.enqueue_ring_cursor()', p_schema);
+    ELSE
+        EXECUTE format('DROP FUNCTION %s', v_function);
+        RAISE WARNING '% cannot read the queue ring of schema %, so enqueues there keep writing without the generation floor (#847)',
+            pg_get_userbyid(v_object_owner), p_schema
+            USING HINT = format(
+                'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                quote_ident(pg_get_userbyid(v_owner)),
+                quote_ident(pg_get_userbyid(v_owner))
+            );
+    END IF;
+
+    IF v_previous_role IS NOT NULL THEN
+        PERFORM set_config('role', v_previous_role, true);
+    END IF;
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(TEXT) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
@@ -1983,53 +2385,6 @@ BEGIN
                 RETURN v_last + 1;
             END IF;
             RETURN v_last;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next(p_seq_name TEXT, p_next BIGINT)
-        RETURNS VOID
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_lock_key TEXT;
-        BEGIN
-            IF p_seq_name IS NULL THEN
-                RAISE EXCEPTION 'lane sequence name is NULL'
-                    USING ERRCODE = '55000';
-            END IF;
-
-            v_lock_key := format('%%I.%%I', %1$L, p_seq_name);
-
-            -- `setval` is not a compare-and-swap. Serialize it against
-            -- reservation-side block allocation so this helper's "move to at
-            -- least p_next" contract cannot rewind a hot enqueue sequence.
-            PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
-            BEGIN
-                p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
-
-                IF p_next <= 1 THEN
-                    EXECUTE format(
-                        'SELECT setval(%%L::regclass, 1, false)',
-                        format('%%I.%%I', %1$L, p_seq_name)
-                    );
-                ELSE
-                    EXECUTE format(
-                        'SELECT setval(%%L::regclass, %%s, true)',
-                        format('%%I.%%I', %1$L, p_seq_name),
-                        p_next - 1
-                    );
-                END IF;
-            EXCEPTION WHEN OTHERS THEN
-                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
-                RAISE;
-            END;
-            PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
         END;
         $func$
         $ddl$,
@@ -5107,6 +5462,8 @@ BEGIN
             p_schema, v_slot
         );
     END LOOP;
+
+    PERFORM awa.refresh_ring_generation_floor_helper(p_schema);
 END;
 $install$;
 
