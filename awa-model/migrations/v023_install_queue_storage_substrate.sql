@@ -1185,7 +1185,9 @@ REVOKE EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(TEXT) FROM P
 -- QueueStorage::reset, which restarts the ring).
 --
 -- enqueue_ring_cursor() is SECURITY DEFINER, owned by the owner of
--- queue_ring_state, with a pinned search_path, and PUBLIC may execute it: it
+-- queue_ring_state, with a pinned search_path and every table it reads
+-- schema-qualified, and it calls no function that resolves names through a
+-- search_path of its own. PUBLIC may execute it: it
 -- returns the cursor and can raise the floor only to a generation the caller
 -- can already see, so no runtime role needs a new grant. If its owner cannot
 -- read the ring (the migration role could not hand it to the ring's owner),
@@ -1271,14 +1273,34 @@ BEGIN
         SET search_path = pg_catalog, pg_temp
         AS $func$
         DECLARE
+            v_authority TEXT;
             v_slot INT;
             v_generation BIGINT;
             v_floor BIGINT;
             v_lock_key BIGINT := hashtextextended(%3$L, 0);
         BEGIN
-            SELECT rc.slot, rc.generation
-            INTO v_slot, v_generation
-            FROM %1$I.ring_cursor('queue') AS rc;
+            -- The same read as ring_cursor('queue'), done here rather than
+            -- through it. This function runs as the ring's owner for any
+            -- caller, so nothing it runs may resolve a name through a
+            -- search_path: a caller's temporary objects would answer for an
+            -- unqualified name in a function whose search_path leaves pg_temp
+            -- out, and that function would run them as the owner.
+            SELECT a.authority INTO v_authority
+            FROM %1$I.ring_cursor_authority AS a
+            WHERE a.singleton;
+
+            IF v_authority = 'ledger' THEN
+                SELECT rotation.slot, rotation.generation
+                INTO v_slot, v_generation
+                FROM %1$I.queue_ring_rotations AS rotation
+                ORDER BY rotation.generation DESC
+                LIMIT 1;
+            ELSE
+                SELECT state.current_slot, state.generation
+                INTO v_slot, v_generation
+                FROM %1$I.queue_ring_state AS state
+                WHERE state.singleton;
+            END IF;
 
             -- NULL until the first raise after creation or a reset.
             v_floor := pg_sequence_last_value(%2$L::regclass);
@@ -1380,12 +1402,7 @@ BEGIN
     -- ring and the floor. If it cannot (the transfer above was not possible),
     -- the function is dropped: producers then read the cursor as they did
     -- before the floor existed, instead of failing.
-    IF has_function_privilege(
-           v_object_owner,
-           format('%I.ring_cursor(text)', p_schema)::regprocedure,
-           'EXECUTE'
-       )
-       AND has_table_privilege(v_object_owner, format('%I.ring_cursor_authority', p_schema), 'SELECT')
+    IF has_table_privilege(v_object_owner, format('%I.ring_cursor_authority', p_schema), 'SELECT')
        AND has_table_privilege(v_object_owner, format('%I.queue_ring_rotations', p_schema), 'SELECT')
        AND has_table_privilege(v_object_owner, format('%I.queue_ring_state', p_schema), 'SELECT')
        AND has_sequence_privilege(v_object_owner, v_sequence, 'SELECT')
@@ -2099,7 +2116,10 @@ BEGIN
     -- The schema is baked into the function body as a quoted literal
     -- (`%1$L`) so the dynamic reads target this exact schema regardless of
     -- the caller's search_path (`current_schema()` here would resolve to
-    -- pg_catalog, the first search_path entry).
+    -- pg_catalog, the first search_path entry). pg_temp is listed last: left
+    -- out, it would be searched first for tables, and a temporary view named
+    -- ring_cursor_authority would answer for the real one, running with the
+    -- privileges of whichever role called this function.
     EXECUTE format(
         $fn$
         CREATE OR REPLACE FUNCTION %1$I.ring_cursor(p_ring TEXT)
@@ -2107,7 +2127,7 @@ BEGIN
         LANGUAGE plpgsql
         STABLE
         SECURITY INVOKER
-        SET search_path = pg_catalog, %1$I, public
+        SET search_path = pg_catalog, %1$I, pg_temp
         AS $body$
         DECLARE
             v_authority TEXT;
@@ -2118,7 +2138,7 @@ BEGIN
             END IF;
 
             SELECT a.authority INTO v_authority
-            FROM ring_cursor_authority AS a
+            FROM %1$I.ring_cursor_authority AS a
             WHERE a.singleton;
 
             IF v_authority = 'ledger' THEN
