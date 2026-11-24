@@ -200,3 +200,56 @@ async fn test_insert_many_in_transaction() {
     }
     cleanup_jobs(&pool, &job_ids).await;
 }
+
+/// The bridge and awa's native sqlx 0.8 path derive the same unique key, so
+/// a job enqueued through one blocks its duplicate through the other, both
+/// as a single insert and inside a batch.
+#[tokio::test]
+async fn test_unique_key_matches_the_native_insert_path() {
+    let pool = app_pool().await;
+    let native_pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
+    let opts = InsertOpts {
+        queue: "bridge_sqlx09_unique_native".into(),
+        unique: Some(UniqueOpts {
+            by_args: true,
+            ..UniqueOpts::default()
+        }),
+        ..InsertOpts::default()
+    };
+    let native_args = BridgeEmail {
+        to: unique_address("native-first"),
+        subject: "Once".into(),
+    };
+    let bridge_args = BridgeEmail {
+        to: unique_address("bridge-first"),
+        subject: "Once".into(),
+    };
+
+    let native = awa_model::insert::insert_with(&native_pool, &native_args, opts.clone())
+        .await
+        .unwrap();
+    match awa_sqlx09::insert_job_with(&pool, &native_args, opts.clone()).await {
+        Err(AwaError::UniqueConflict { .. }) => {}
+        other => panic!("bridge insert of a native job's duplicate: {other:?}"),
+    }
+    let batch = [InsertParams {
+        kind: "bridge_email".into(),
+        args: serde_json::to_value(&native_args).unwrap(),
+        opts: opts.clone(),
+    }];
+    assert!(
+        awa_sqlx09::insert_many(&pool, &batch).await.is_err(),
+        "bridge batch containing a native job's duplicate must fail"
+    );
+
+    let bridged = awa_sqlx09::insert_job_with(&pool, &bridge_args, opts.clone())
+        .await
+        .unwrap();
+    match awa_model::insert::insert_with(&native_pool, &bridge_args, opts).await {
+        Err(AwaError::UniqueConflict { .. }) => {}
+        other => panic!("native insert of a bridged job's duplicate: {other:?}"),
+    }
+
+    native_pool.close().await;
+    cleanup_jobs(&pool, &[native.id, bridged.id]).await;
+}
