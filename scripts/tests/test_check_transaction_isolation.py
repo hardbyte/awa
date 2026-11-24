@@ -65,6 +65,19 @@ class TransactionIsolationTests(unittest.TestCase):
             lines('const B: &str = "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL jit = off";'), []
         )
         self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")'), [])
+        self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")'), [])
+
+    def test_begin_statements_that_write_run_at_read_committed(self):
+        self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")'), [1])
+        self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")'), [1])
+        self.assertEqual(lines('begin_with("begin isolation level read committed")'), [])
+        self.assertEqual(
+            lines('begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE /* READ ONLY is not used here */")'), [1]
+        )
+        self.assertEqual(
+            lines('begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL application_name = \'READ ONLY\'")'),
+            [1],
+        )
 
     def test_repository_is_clean(self):
         self.assertEqual(module.check(Path(__file__).parents[2]), [])
