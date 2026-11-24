@@ -19,8 +19,12 @@ import sys
 from pathlib import Path
 
 POOL_BEGIN = re.compile(r"\bpool(?:\(\))?\s*\.\s*(?:try_)?begin\(\)")
-# A BEGIN statement in a string literal that does not name its isolation level.
-BARE_BEGIN = re.compile(r'"BEGIN\b(?![^"]*ISOLATION LEVEL)[^"]*"', re.IGNORECASE)
+# A BEGIN statement in a string literal. It must name READ COMMITTED, or be
+# READ ONLY: a read-only transaction may take a snapshot level, since it writes
+# nothing a later lock holder has to see.
+BEGIN_STATEMENT = re.compile(r'"BEGIN\b[^"]*"', re.IGNORECASE)
+READ_COMMITTED = re.compile(r"\bISOLATION\s+LEVEL\s+READ\s+COMMITTED\b", re.IGNORECASE)
+READ_ONLY = re.compile(r"\bREAD\s+ONLY\b", re.IGNORECASE)
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s")
 RUST_GLOBS = ["*/src/**/*.rs", "awa-python/src/**/*.rs"]
 MARKER = "isolation:"
@@ -89,12 +93,15 @@ def findings(path: str, text: str) -> list[tuple[str, int, str]]:
     lines = text.split("\n")
     code = blank_test_modules(strip_comments(text))
     found = []
-    for match in BARE_BEGIN.finditer(code):
+    for match in BEGIN_STATEMENT.finditer(code):
+        statement = match.group(0)
+        if READ_COMMITTED.search(statement) or READ_ONLY.search(statement):
+            continue
         found.append(
             (
                 path,
                 code.count("\n", 0, match.start()) + 1,
-                "a BEGIN statement without ISOLATION LEVEL takes the session's default; "
+                "a BEGIN statement that writes must run at READ COMMITTED; "
                 "start it with BEGIN ISOLATION LEVEL READ COMMITTED",
             )
         )
