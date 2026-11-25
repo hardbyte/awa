@@ -155,15 +155,30 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | --- | --- | --- | --- |
 | `awa.maintenance.promote_batches` | Counter | state | Promotion batches |
 | `awa.maintenance.promote_batch_size` | Histogram | state | Jobs promoted |
-| `awa.maintenance.promote_duration` | Histogram (s) | state | Promotion time |
+| `awa.maintenance.promote_duration` | Histogram (s) | state, error.type | Promotion time. A batch that failed is recorded with `error.type`; the batch counter and size count successful batches only |
+| `awa.maintenance.branch.duration` | Histogram (s) | branch, error.type | Wall-clock time of each run of a maintenance leader branch (`promote_scheduled`, `rescue_heartbeat`, `rotate_claim`, …). A run that hit an error carries `error.type`, so a branch failing on every tick is `rate(awa_maintenance_branch_duration_seconds_count{error_type!=""}[5m]) > 0`, whichever runtime leads |
 | `awa.maintenance.promote.lane_contention` | Counter | state, queue, outcome | Promotion lanes whose lock was busy: `handed_off` to a dedicated waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out` when a waiter's 30 s wait ran out |
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
 | `awa.maintenance.rescue.pass_size` | Histogram | rescue_kind, rescue_pass_end | Attempts rescued per queue-storage rescue pass, and why the pass stopped (`drained`, `time_budget`, `row_limit`, `owners_unconfirmed`, `error`) |
 | `awa.maintenance.rescue.oldest_attempt_age` | Gauge (s) | rescue_kind | Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; `0` when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader |
 | `awa.maintenance.prune.pinned_ready_age` | Gauge (s) | ring, queue, priority, enqueue_shard | Age of the first pending ready row of each lane keeping queue prune from reclaiming the oldest sealed queue ring slot (prune reason `queue.pending_ready`); `0` once the lane no longer pins it. See [queue ring stops wrapping behind an unclaimed lane](../troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane) |
 | `awa.maintenance.prune.claim_cursor_advances` | Counter | ring, outcome, queue, priority, enqueue_shard | Claim-cursor advances the maintenance leader made (`outcome` `advanced`), or failed to make (`failed`), over the moved, reprioritised, cancelled or already-claimed rows at the head of a lane pinning the oldest sealed queue ring slot; one per lane per attempt. See [queue ring stops wrapping behind an unclaimed lane](../troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane) |
+| `awa.maintenance.leader` | Gauge | — | `1` on the runtime holding the maintenance leader lock, `0` on every other runtime. Summed over a fleet it is `1`: `0` means nothing promotes, rescues or prunes, and more than `1` past a handover means two leaders |
 | `awa.maintenance.leader_eligible` | Gauge | — | `1` when this runtime contends for maintenance leadership, `0` when it was started with `maintenance_leader(false)` |
 | `awa.maintenance.leader_eligible_runtimes` | Gauge | — | Recorded only by runtimes started with `maintenance_leader(false)`: how many other live runtimes may take leadership. `0` means none will |
+
+`error.type` is a low-cardinality class, never an error message: `bind_limit` (more bind parameters than Postgres accepts), `timeout` (`statement_timeout`, a cancelled statement, or no pool connection in time), `lock_not_available` (`lock_timeout` or `NOWAIT`), `deadlock`, `serialization_failure`, `connection`, `database` for any other database error, or the `AwaError` variant (`validation`, `serialization`, …).
+
+### Queue health
+
+Published by the maintenance leader every `queue_stats_interval`.
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `awa.queue.depth` | Gauge | queue, state | Jobs per queue and state |
+| `awa.queue.lag` | Gauge (s) | queue | Age of the oldest available job |
+| `awa.queue.due.depth` | Gauge | queue, state (`scheduled`, `retryable`) | Deferred jobs whose `run_at` has passed but that are not yet promoted |
+| `awa.queue.due.lag` | Gauge (s) | queue, state (`scheduled`, `retryable`) | Age of the oldest of those, `0` when none is due: the deferred counterpart of `awa.queue.lag`. It grows when promotion stops, which `awa.queue.depth{state="scheduled"}` can't tell from work scheduled for later |
 
 ### Heartbeat
 

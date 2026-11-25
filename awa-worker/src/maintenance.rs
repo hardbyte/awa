@@ -652,17 +652,73 @@ struct BranchTimer<'a> {
 }
 
 impl<'a> BranchTimer<'a> {
-    /// Stop the timer, record the duration into both the per-branch
-    /// histogram and the tracker's state. Must be called once after the
-    /// body returns — there is no `Drop` impl so a panic-mid-body would
-    /// leave the histogram un-recorded, which is fine: a panicking
-    /// maintenance branch is a bigger story than the missing sample.
+    /// Run the branch body, then stop the timer: see [`Self::finish_with`].
+    /// A failure the body reports through [`branch_failed`] is recorded as
+    /// the sample's `error.type`.
+    async fn run<T>(self, body: impl std::future::Future<Output = T>) -> T {
+        let (value, failure) = BRANCH_FAILURE
+            .scope(std::cell::Cell::new(None), async {
+                let value = body.await;
+                (value, BRANCH_FAILURE.with(std::cell::Cell::get))
+            })
+            .await;
+        self.finish_with(failure);
+        value
+    }
+
+    #[cfg(test)]
     fn finish(self) {
+        self.finish_with(None);
+    }
+
+    /// Stop the timer, record the duration into both the per-branch
+    /// histogram, with `error_type` when the body failed, and the tracker's
+    /// state. Must be called once after the body returns — there is no
+    /// `Drop` impl so a panic-mid-body would leave the histogram
+    /// un-recorded, which is fine: a panicking maintenance branch is a
+    /// bigger story than the missing sample.
+    fn finish_with(self, error_type: Option<&'static str>) {
         let duration = self.started_at.elapsed();
         self.metrics
-            .record_maintenance_branch_duration(self.branch, duration);
+            .record_maintenance_branch_outcome(self.branch, duration, error_type);
         self.tracker.record_finish(self.branch, duration);
     }
+}
+
+tokio::task_local! {
+    /// The `error.type` of the first failure the maintenance branch body
+    /// running on this task reported, if any. Scoped by [`BranchTimer::run`].
+    static BRANCH_FAILURE: std::cell::Cell<Option<&'static str>>;
+}
+
+/// An error a maintenance branch reports, by its low-cardinality class.
+trait BranchError {
+    fn branch_error_type(&self) -> &'static str;
+}
+
+impl BranchError for AwaError {
+    fn branch_error_type(&self) -> &'static str {
+        self.error_type()
+    }
+}
+
+impl BranchError for sqlx::Error {
+    fn branch_error_type(&self) -> &'static str {
+        awa_model::sqlx_error_type(self)
+    }
+}
+
+/// Mark the maintenance branch body running on this task as failed, so its
+/// `awa.maintenance.branch.duration` sample carries `error.type`. The first
+/// failure of a run names it. Outside a branch body, such as the sync a new
+/// leader runs before its loops start, it does nothing.
+fn branch_failed(err: &impl BranchError) {
+    let error_type = err.branch_error_type();
+    let _ = BRANCH_FAILURE.try_with(|failure| {
+        if failure.get().is_none() {
+            failure.set(Some(error_type));
+        }
+    });
 }
 
 /// Owns the per-branch overrun state for the maintenance leader's loops.
@@ -1138,7 +1194,21 @@ const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
 const CRON_CATCH_UP_LIMIT: usize = 1_000;
 const TERMINAL_COUNT_ROLLUP_MAX_SLOTS_PER_TICK: usize = 4;
-type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
+type QueueStorageMetricRow = (
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<f64>,
+    i64,
+    i64,
+    Option<f64>,
+    Option<f64>,
+);
 
 /// How long a promotion transaction waits on one lane's locks before the
 /// leader hands the lane to a dedicated waiter and goes on without it.
@@ -1239,7 +1309,17 @@ impl QueueStoragePromoter {
             // Lanes commit on their own, so record the rows of lanes that
             // committed before a later lane failed.
             record_cancelled(&self.cancelled, cancelled);
-            let outcome = outcome?;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.metrics.record_promotion_batch_failure(
+                        state.as_str(),
+                        batch_started.elapsed(),
+                        err.error_type(),
+                    );
+                    return Err(err);
+                }
+            };
             self.metrics.record_promotion_batch(
                 state.as_str(),
                 outcome.promoted as u64,
@@ -1378,6 +1458,11 @@ async fn promote_waiting_lane(
                 }
             }
             Err(err) => {
+                metrics.record_promotion_batch_failure(
+                    state.as_str(),
+                    batch_started.elapsed(),
+                    err.error_type(),
+                );
                 error!(
                     queue = %lane.queue,
                     priority = lane.priority,
@@ -1689,6 +1774,7 @@ impl MaintenanceService {
         self.alive.store(true, Ordering::SeqCst);
         let _alive_guard = MaintenanceAliveGuard(self.alive.clone());
         self.leader.store(false, Ordering::SeqCst);
+        self.metrics.record_maintenance_leader(false);
 
         if !self.leader_eligible {
             self.run_ineligible().await;
@@ -1726,6 +1812,7 @@ impl MaintenanceService {
 
             debug!("Elected as maintenance leader");
             self.leader.store(true, Ordering::SeqCst);
+            self.metrics.record_maintenance_leader(true);
 
             let observer = match LeaderObserver::start(
                 leader_conn,
@@ -1739,6 +1826,7 @@ impl MaintenanceService {
                 Ok(observer) => observer,
                 Err(err) => {
                     self.leader.store(false, Ordering::SeqCst);
+                    self.metrics.record_maintenance_leader(false);
                     warn!(error = %err, "Leader observer startup failed");
                     continue;
                 }
@@ -1879,11 +1967,12 @@ impl MaintenanceService {
                             origin = heartbeat_rescue_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueHeartbeat.classification().0, self.heartbeat_rescue_interval, &self.metrics) {
-                                    let backlog = match self.control.admit(MaintenanceBranch::RescueHeartbeat) {
-                                        Some(admission) => admission.run(self.rescue_stale_heartbeats(origin)).await,
-                                        None => false,
-                                    };
-                                    timer.finish();
+                                    let backlog = timer.run(async {
+                                        match self.control.admit(MaintenanceBranch::RescueHeartbeat) {
+                                            Some(admission) => admission.run(self.rescue_stale_heartbeats(origin)).await,
+                                            None => false,
+                                        }
+                                    }).await;
                                     if backlog {
                                         heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
                                     }
@@ -1892,11 +1981,12 @@ impl MaintenanceService {
                             origin = deadline_rescue_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueDeadline.classification().0, self.deadline_rescue_interval, &self.metrics) {
-                                    let backlog = match self.control.admit(MaintenanceBranch::RescueDeadline) {
-                                        Some(admission) => admission.run(self.rescue_expired_deadlines(origin)).await,
-                                        None => false,
-                                    };
-                                    timer.finish();
+                                    let backlog = timer.run(async {
+                                        match self.control.admit(MaintenanceBranch::RescueDeadline) {
+                                            Some(admission) => admission.run(self.rescue_expired_deadlines(origin)).await,
+                                            None => false,
+                                        }
+                                    }).await;
                                     if backlog {
                                         deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
                                     }
@@ -1905,11 +1995,12 @@ impl MaintenanceService {
                             origin = callback_rescue_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueCallback.classification().0, self.callback_rescue_interval, &self.metrics) {
-                                    let backlog = match self.control.admit(MaintenanceBranch::RescueCallback) {
-                                        Some(admission) => admission.run(self.rescue_expired_callbacks(origin)).await,
-                                        None => false,
-                                    };
-                                    timer.finish();
+                                    let backlog = timer.run(async {
+                                        match self.control.admit(MaintenanceBranch::RescueCallback) {
+                                            Some(admission) => admission.run(self.rescue_expired_callbacks(origin)).await,
+                                            None => false,
+                                        }
+                                    }).await;
                                     if backlog {
                                         callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
                                     }
@@ -1918,12 +2009,13 @@ impl MaintenanceService {
                             _ = promote_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::Promote.classification().0, self.promote_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Promote) {
-                                        admission.run(async {
-                                            self.promote_scheduled(&promoters).await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::Promote) {
+                                            admission.run(async {
+                                                self.promote_scheduled(&promoters).await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                         }
@@ -1975,60 +2067,65 @@ impl MaintenanceService {
                             _ = cleanup_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Cleanup.classification().0, self.cleanup_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Cleanup) {
-                                        admission.run(async {
-                                            self.cleanup_completed().await;
-                                            self.cleanup_dlq_rows().await;
-                                            self.cleanup_batch_operations().await;
-                                            self.cleanup_stale_runtime_snapshots().await;
-                                            self.cleanup_stale_descriptors().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::Cleanup) {
+                                            admission.run(async {
+                                                self.cleanup_completed().await;
+                                                self.cleanup_dlq_rows().await;
+                                                self.cleanup_batch_operations().await;
+                                                self.cleanup_stale_runtime_snapshots().await;
+                                                self.cleanup_stale_descriptors().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = cron_sync_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::CronSync.classification().0, self.cron_sync_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::CronSync) {
-                                        admission.run(async {
-                                            self.sync_periodic_jobs_to_db().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::CronSync) {
+                                            admission.run(async {
+                                                self.sync_periodic_jobs_to_db().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = queue_stats_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::QueueHealth.classification().0, self.queue_stats_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::QueueHealth) {
-                                        admission.run(async {
-                                            self.publish_queue_health_metrics().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::QueueHealth) {
+                                            admission.run(async {
+                                                self.publish_queue_health_metrics().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = dirty_key_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::DirtyMetadata.classification().0, self.dirty_key_recompute_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::DirtyMetadata) {
-                                        admission.run(async {
-                                            self.recompute_dirty_admin_metadata().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::DirtyMetadata) {
+                                            admission.run(async {
+                                                self.recompute_dirty_admin_metadata().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = metadata_reconciliation_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RefreshMetadata.classification().0, self.metadata_reconciliation_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RefreshMetadata) {
-                                        admission.run(async {
-                                            self.refresh_admin_metadata().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::RefreshMetadata) {
+                                            admission.run(async {
+                                                self.refresh_admin_metadata().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             // Aging shares promotion's control scope but only
@@ -2036,34 +2133,37 @@ impl MaintenanceService {
                             _ = priority_aging_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Aging.classification().0, self.priority_aging_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Aging) {
-                                        admission.run(async {
-                                            self.age_waiting_priorities().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::Aging) {
+                                            admission.run(async {
+                                                self.age_waiting_priorities().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = batch_operations_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Batch.classification().0, self.batch_operations_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Batch) {
-                                        admission.run(async {
-                                            self.process_batch_operation().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::Batch) {
+                                            admission.run(async {
+                                                self.process_batch_operation().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = terminal_count_rollup_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::TerminalRollup.classification().0, self.terminal_count_rollup_interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::TerminalRollup) {
-                                        admission.run(async {
-                                            self.rollup_terminal_count_deltas().await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::TerminalRollup) {
+                                            admission.run(async {
+                                                self.rollup_terminal_count_deltas().await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = async {
@@ -2077,12 +2177,13 @@ impl MaintenanceService {
                                     .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateQueue.classification().0, interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RotateQueue) {
-                                        admission.run(async {
-                                            self.rotate_queue_storage_queue(&prune_tracker).await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::RotateQueue) {
+                                            admission.run(async {
+                                                self.rotate_queue_storage_queue(&prune_tracker).await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = async {
@@ -2096,12 +2197,13 @@ impl MaintenanceService {
                                     .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateLease.classification().0, interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RotateLease) {
-                                        admission.run(async {
-                                            self.rotate_queue_storage_leases(&prune_tracker).await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::RotateLease) {
+                                            admission.run(async {
+                                                self.rotate_queue_storage_leases(&prune_tracker).await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                             _ = async {
@@ -2115,12 +2217,13 @@ impl MaintenanceService {
                                     .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateClaim.classification().0, interval, &self.metrics) {
-                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RotateClaim) {
-                                        admission.run(async {
-                                            self.rotate_queue_storage_claims(&prune_tracker).await;
-                                        }).await;
-                                    }
-                                    timer.finish();
+                                    timer.run(async {
+                                        if let Some(admission) = self.control.admit(MaintenanceBranch::RotateClaim) {
+                                            admission.run(async {
+                                                self.rotate_queue_storage_claims(&prune_tracker).await;
+                                            }).await;
+                                        }
+                                    }).await;
                                 }
                             }
                         }
@@ -2129,6 +2232,7 @@ impl MaintenanceService {
                 tokio::join!(recovery, hygiene);
             };
             run_leader_term(observer, &self.cancel, work).await;
+            self.metrics.record_maintenance_leader(false);
             self.clear_queue_ring_pin();
             self.release_idle_check_conn().await;
             if self.cancel.is_cancelled() {
@@ -2218,6 +2322,7 @@ impl MaintenanceService {
 
         for job in self.periodic_jobs.iter() {
             if let Err(err) = upsert_cron_job(&self.pool, job).await {
+                branch_failed(&err);
                 error!(name = %job.name, error = %err, "Failed to sync periodic job");
             }
         }
@@ -2242,7 +2347,10 @@ impl MaintenanceService {
                 );
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to process batch operation chunk"),
+            Err(err) => {
+                branch_failed(&err);
+                warn!(error = %err, "failed to process batch operation chunk");
+            }
         }
     }
 
@@ -2255,6 +2363,7 @@ impl MaintenanceService {
             Ok(_) => {}
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 warn!(error = %err, "failed to clean up expired batch operations");
             }
         }
@@ -2291,6 +2400,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 warn!(error = %err, "failed to roll up terminal count deltas");
             }
         }
@@ -2653,6 +2763,7 @@ impl MaintenanceService {
                 )
             }
             Err(err) => {
+                branch_failed(&err);
                 warn!(error = %err, "Failed to read runtime snapshots for stale-heartbeat rescue");
                 (false, None)
             }
@@ -2801,6 +2912,7 @@ impl MaintenanceService {
                 self.record_rescued_dlq_moves(&rescued, dlq_runtime, "heartbeat_stale");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
             }
             _ => {}
@@ -2821,6 +2933,7 @@ impl MaintenanceService {
             }
             Ok(_) => None,
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to resolve the active queue-storage schema");
                 None
             }
@@ -2984,6 +3097,7 @@ impl MaintenanceService {
                 self.record_rescued_dlq_moves(&rescued, dlq_runtime, "deadline_exceeded");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
             }
             _ => {}
@@ -3157,6 +3271,7 @@ impl MaintenanceService {
                 self.record_rescued_dlq_moves(&rescued, dlq_runtime, "callback_timeout");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
             }
             _ => {}
@@ -3235,6 +3350,7 @@ impl MaintenanceService {
                 debug!(count = ids.len(), "Aged job priorities");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to age job priorities");
             }
             _ => {}
@@ -3320,11 +3436,13 @@ impl MaintenanceService {
                             );
                         }
                         Err(err) => {
+                            branch_failed(&err);
                             error!(job_id = id, error = %err, rescue_kind, "Failed to cancel unique-conflicted job");
                         }
                     }
                 }
                 Err(err) => {
+                    branch_failed(&err);
                     error!(job_id = id, error = %err, rescue_kind, "Per-row rescue failed");
                 }
             }
@@ -3526,6 +3644,7 @@ impl MaintenanceService {
         let mut tx = match self.pool.begin_read_committed().await {
             Ok(tx) => tx,
             Err(err) => {
+                branch_failed(&err);
                 error!(
                     job_id = job.id,
                     kind = %job.kind,
@@ -3543,6 +3662,7 @@ impl MaintenanceService {
         match result {
             Ok(()) => {
                 if let Err(err) = tx.commit().await {
+                    branch_failed(&err);
                     error!(
                         job_id = job.id,
                         kind = %job.kind,
@@ -3553,6 +3673,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(
                     job_id = job.id,
                     kind = %job.kind,
@@ -3596,6 +3717,7 @@ impl MaintenanceService {
             .promote_due_state(JobState::Scheduled, "scheduled jobs", promoters)
             .await
         {
+            branch_failed(&err);
             error!(error = %err, "Failed to promote scheduled jobs");
         }
         if let Err(err) = self
@@ -3606,6 +3728,7 @@ impl MaintenanceService {
             )
             .await
         {
+            branch_failed(&err);
             error!(error = %err, "Failed to promote retryable jobs");
         }
         self.deliver_promotion_cancellations(promoters).await;
@@ -3702,6 +3825,7 @@ impl MaintenanceService {
             if self.cancel.is_cancelled() {
                 break;
             }
+            let batch_started = Instant::now();
             let (promoted, cancelled, queues) = match self.promote_due_batch(state).await {
                 Err(err) if is_unique_violation(&err) => {
                     warn!(
@@ -3710,15 +3834,30 @@ impl MaintenanceService {
                         "Batched promotion hit a unique-claim conflict; promoting row by row"
                     );
                     let (promoted, queues, cancelled) =
-                        self.promote_canonical_per_row(state).await?;
+                        match self.promote_canonical_per_row(state).await {
+                            Ok(rows) => rows,
+                            Err(err) => {
+                                self.metrics.record_promotion_batch_failure(
+                                    state,
+                                    batch_started.elapsed(),
+                                    err.error_type(),
+                                );
+                                return Err(err);
+                            }
+                        };
                     self.handle_duplicate_cancellations("promotion", &cancelled, false)
                         .await;
                     (promoted, cancelled.len(), queues)
                 }
-                other => {
-                    let (promoted, queues) = other.map_err(AwaError::Database)?;
-                    (promoted, 0, queues)
+                Err(err) => {
+                    self.metrics.record_promotion_batch_failure(
+                        state,
+                        batch_started.elapsed(),
+                        awa_model::sqlx_error_type(&err),
+                    );
+                    return Err(AwaError::Database(err));
                 }
+                Ok((promoted, queues)) => (promoted, 0, queues),
             };
             promoted_total += promoted;
             notified_queues.extend(queues);
@@ -3908,6 +4047,7 @@ impl MaintenanceService {
                 Ok(PerRowPromotion::Cancelled(row)) => cancelled.push(*row),
                 Ok(PerRowPromotion::Skipped) => {}
                 Err(err) => {
+                    branch_failed(&err);
                     error!(job_id = id, error = %err, state, "Per-row promotion failed");
                 }
             }
@@ -4139,6 +4279,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 error!(error = %err, "Failed to rotate queue storage queue segments");
                 return;
             }
@@ -4214,6 +4355,7 @@ impl MaintenanceService {
             Err(err) => {
                 self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("queue");
+                branch_failed(&err);
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
         }
@@ -4300,6 +4442,7 @@ impl MaintenanceService {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 if self.queue_ring_advance_warn_due() {
                     warn!(
                         slot = pin.slot,
@@ -4431,6 +4574,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 error!(error = %err, "Failed to rotate queue storage lease segments");
                 return;
             }
@@ -4474,6 +4618,7 @@ impl MaintenanceService {
             Err(err) => {
                 self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("lease");
+                branch_failed(&err);
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
         }
@@ -4513,6 +4658,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 error!(error = %err, "Failed to rotate queue storage claim segments");
                 return;
             }
@@ -4556,6 +4702,7 @@ impl MaintenanceService {
             Err(err) => {
                 self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("claim");
+                branch_failed(&err);
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }
@@ -4629,6 +4776,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 error!(error = %err, "Failed to clean up old jobs (global pass)");
             }
             _ => {}
@@ -4669,6 +4817,7 @@ impl MaintenanceService {
                 }
                 Err(err) => {
                     self.control.record_reclamation_error(&err);
+                    branch_failed(&err);
                     error!(
                         queue = %queue_name,
                         error = %err,
@@ -4716,6 +4865,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
+                branch_failed(&err);
                 error!(error = %err, "Failed to clean up DLQ rows (global pass)");
             }
             _ => {}
@@ -4742,6 +4892,7 @@ impl MaintenanceService {
                 }
                 Err(err) => {
                     self.control.record_reclamation_error(&err);
+                    branch_failed(&err);
                     error!(queue, error = %err, "Failed to clean up DLQ rows");
                 }
                 _ => {}
@@ -4945,10 +5096,12 @@ impl MaintenanceService {
         .await
         {
             self.control.record_reclamation_error(&err);
+            branch_failed(&err);
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
         }
         if let Err(err) = self.control.cleanup_orphan_reports(&self.pool).await {
             self.control.record_reclamation_error(&err);
+            branch_failed(&err);
             tracing::warn!(error = %err, "Failed to clean up orphan control observations");
         }
         if let Err(err) = awa_model::admin::cleanup_runtime_maintenance_eligibility(
@@ -4957,6 +5110,7 @@ impl MaintenanceService {
         )
         .await
         {
+            branch_failed(&err);
             tracing::warn!(error = %err, "Failed to clean up orphan maintenance eligibility rows");
         }
     }
@@ -4980,6 +5134,7 @@ impl MaintenanceService {
                 Ok(_) => {}
                 Err(err) => {
                     self.control.record_reclamation_error(&err);
+                    branch_failed(&err);
                     tracing::warn!(table, error = %err, "Failed to clean up stale descriptors");
                 }
             }
@@ -4999,6 +5154,7 @@ impl MaintenanceService {
                 tracing::debug!(count, "Recomputed dirty admin metadata keys");
             }
             Err(err) => {
+                branch_failed(&err);
                 tracing::warn!(error = %err, "Failed to recompute dirty admin metadata");
             }
             _ => {}
@@ -5014,6 +5170,7 @@ impl MaintenanceService {
         }
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
             self.control.record_reclamation_error(&err);
+            branch_failed(&err);
             tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
     }
@@ -5029,6 +5186,7 @@ impl MaintenanceService {
         let stats = match awa_model::admin::queue_overviews(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
+                branch_failed(&err);
                 tracing::warn!(error = %err, "Failed to query queue stats for metrics");
                 return;
             }
@@ -5055,6 +5213,50 @@ impl MaintenanceService {
             if let Some(lag_seconds) = queue_stat.lag_seconds {
                 self.metrics.record_queue_lag(queue, lag_seconds);
             }
+        }
+
+        // Due but unpromoted deferred work, through the partial due indexes
+        // on `awa.scheduled_jobs (run_at, id, queue) WHERE state = ...`.
+        let due: Vec<(String, String, i64, f64)> = match sqlx::query_as(
+            r#"
+            SELECT queue, 'scheduled', count(*)::bigint,
+                   EXTRACT(EPOCH FROM now() - min(run_at))::double precision
+            FROM awa.scheduled_jobs
+            WHERE state = 'scheduled' AND run_at <= now()
+            GROUP BY queue
+            UNION ALL
+            SELECT queue, 'retryable', count(*)::bigint,
+                   EXTRACT(EPOCH FROM now() - min(run_at))::double precision
+            FROM awa.scheduled_jobs
+            WHERE state = 'retryable' AND run_at <= now()
+            GROUP BY queue
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                branch_failed(&err);
+                tracing::warn!(error = %err, "Failed to query due deferred jobs for metrics");
+                return;
+            }
+        };
+        let mut due: HashMap<(String, String), (i64, f64)> = due
+            .into_iter()
+            .map(|(queue, state, depth, lag)| ((queue, state), (depth, lag.max(0.0))))
+            .collect();
+        for queue_stat in &stats {
+            for state in ["scheduled", "retryable"] {
+                let (depth, lag) = due
+                    .remove(&(queue_stat.queue.clone(), state.to_string()))
+                    .unwrap_or((0, 0.0));
+                self.metrics
+                    .record_queue_due(&queue_stat.queue, state, depth, lag);
+            }
+        }
+        for ((queue, state), (depth, lag)) in due {
+            self.metrics.record_queue_due(&queue, &state, depth, lag);
         }
     }
 
@@ -5152,7 +5354,17 @@ impl MaintenanceService {
                 SELECT
                     queue,
                     count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
-                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
+                    count(*) FILTER (WHERE state = 'scheduled' AND run_at <= now())::bigint
+                        AS due_scheduled,
+                    count(*) FILTER (WHERE state = 'retryable' AND run_at <= now())::bigint
+                        AS due_retryable,
+                    EXTRACT(EPOCH FROM now() - min(run_at) FILTER (
+                        WHERE state = 'scheduled' AND run_at <= now()
+                    ))::double precision AS due_scheduled_lag,
+                    EXTRACT(EPOCH FROM now() - min(run_at) FILTER (
+                        WHERE state = 'retryable' AND run_at <= now()
+                    ))::double precision AS due_retryable_lag
                 FROM {schema}.deferred_jobs
                 GROUP BY queue
             ),
@@ -5180,7 +5392,11 @@ impl MaintenanceService {
                 COALESCE(deferred.retryable, 0)::bigint AS retryable,
                 COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
                 COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
-                lag.lag_seconds
+                lag.lag_seconds,
+                COALESCE(deferred.due_scheduled, 0)::bigint AS due_scheduled,
+                COALESCE(deferred.due_retryable, 0)::bigint AS due_retryable,
+                deferred.due_scheduled_lag,
+                deferred.due_retryable_lag
             FROM queues
             LEFT JOIN ready
               ON ready.queue = queues.queue
@@ -5202,6 +5418,7 @@ impl MaintenanceService {
         {
             Ok(rows) => rows,
             Err(err) => {
+                branch_failed(&err);
                 tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
                 return;
             }
@@ -5217,6 +5434,10 @@ impl MaintenanceService {
             failed_done,
             failed_dlq,
             lag_seconds,
+            due_scheduled,
+            due_retryable,
+            due_scheduled_lag,
+            due_retryable_lag,
         ) in rows
         {
             self.metrics
@@ -5231,6 +5452,18 @@ impl MaintenanceService {
             self.metrics
                 .record_queue_depth(&queue, "waiting_external", waiting_external);
             self.metrics.record_dlq_depth(&queue, failed_dlq);
+            self.metrics.record_queue_due(
+                &queue,
+                "scheduled",
+                due_scheduled,
+                due_scheduled_lag.unwrap_or(0.0).max(0.0),
+            );
+            self.metrics.record_queue_due(
+                &queue,
+                "retryable",
+                due_retryable,
+                due_retryable_lag.unwrap_or(0.0).max(0.0),
+            );
 
             if let Some(lag_seconds) = lag_seconds {
                 self.metrics.record_queue_lag(&queue, lag_seconds);

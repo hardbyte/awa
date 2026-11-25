@@ -15,6 +15,9 @@ Two rule sets, pick whichever matches your observability stack:
 | `awa_no_active_runtime` | critical | active runtimes = 0 for 5m | at least one runtime reporting |
 | `awa_throughput_collapsed` _(Prom only)_ | warning | completion rate < 10% of 1h baseline for 10m | rate recovers |
 | `awa_descriptor_drift_persistent` | info | descriptor drift detected for 15m | all live runtimes agree |
+| `awa_maintenance_branch_failing` _(Prom only)_ | critical | a maintenance branch's runs carry `error.type` for 5m | the branch runs cleanly |
+| `awa_promotion_due_lag_high` _(Prom only)_ | critical | a due `scheduled` or `retryable` job has waited > 10m to be promoted, for 5m | due lag drops below 10m |
+| `awa_maintenance_leader_count` _(Prom only)_ | critical | the fleet's summed `awa_maintenance_leader` is not 1 for 5m | exactly one runtime leads |
 
 Every rule's `description` annotation names the dashboard panel an operator should look at and links to the relevant awa-ui page. The 2–15 minute `for` windows deliberately skip transient spikes (rolling deploys, CI runs).
 

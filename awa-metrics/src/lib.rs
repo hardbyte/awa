@@ -45,6 +45,8 @@ pub mod names {
     pub const JOB_DLQ_DEPTH: &str = "awa.job.dlq_depth";
     pub const QUEUE_DEPTH: &str = "awa.queue.depth";
     pub const QUEUE_LAG: &str = "awa.queue.lag";
+    pub const QUEUE_DUE_LAG: &str = "awa.queue.due.lag";
+    pub const QUEUE_DUE_DEPTH: &str = "awa.queue.due.depth";
     pub const QUEUE_INFO: &str = "awa.queue.info";
     pub const JOB_KIND_INFO: &str = "awa.job_kind.info";
     pub const DISPATCH_CLAIM_BATCHES: &str = "awa.dispatch.claim_batches";
@@ -63,6 +65,7 @@ pub mod names {
     pub const MAINTENANCE_RESCUES: &str = "awa.maintenance.rescues";
     pub const MAINTENANCE_RESCUE_PASS_SIZE: &str = "awa.maintenance.rescue.pass_size";
     pub const MAINTENANCE_RESCUE_OLDEST_AGE: &str = "awa.maintenance.rescue.oldest_attempt_age";
+    pub const MAINTENANCE_LEADER: &str = "awa.maintenance.leader";
     pub const MAINTENANCE_LEADER_ELIGIBLE: &str = "awa.maintenance.leader_eligible";
     pub const MAINTENANCE_LEADER_ELIGIBLE_RUNTIMES: &str =
         "awa.maintenance.leader_eligible_runtimes";
@@ -193,6 +196,11 @@ pub struct AwaMetrics {
     /// Whether this runtime contends for maintenance leadership (1) or was
     /// started with `maintenance_leader(false)` (0).
     pub maintenance_leader_eligible: Gauge<i64>,
+    /// Whether this runtime holds the maintenance leader lock (1) or not
+    /// (0). Summed over a fleet it should be 1: 0 means no runtime runs
+    /// promotion, rescue or prune, and more than 1 for longer than a
+    /// handover means two leaders.
+    pub maintenance_leader: Gauge<i64>,
     /// Live runtimes, not shutting down, that may take maintenance
     /// leadership, as seen by a runtime that has opted out. Only opted-out
     /// runtimes record it; 0 means nothing visible will take leadership.
@@ -203,6 +211,17 @@ pub struct AwaMetrics {
     pub queue_depth: Gauge<i64>,
     /// Queue lag — age of the oldest available job per queue.
     pub queue_lag_seconds: Gauge<f64>,
+    /// Age of the oldest deferred job that is due but not yet promoted, per
+    /// queue and `awa.job.state` (`scheduled` or `retryable`); 0 when none
+    /// is due. The deferred counterpart of [`queue_lag_seconds`]: it grows
+    /// when promotion stops, which `awa.queue.depth{state="scheduled"}`
+    /// cannot tell from work scheduled for later.
+    ///
+    /// [`queue_lag_seconds`]: Self::queue_lag_seconds
+    pub queue_due_lag_seconds: Gauge<f64>,
+    /// Deferred jobs that are due but not yet promoted, per queue and
+    /// `awa.job.state` (`scheduled` or `retryable`).
+    pub queue_due_depth: Gauge<i64>,
     /// Time from job creation to claim — the user-visible queuing latency.
     pub wait_duration_seconds: Histogram<f64>,
     /// Total jobs moved into the Dead Letter Queue.
@@ -483,6 +502,13 @@ impl AwaMetrics {
                 )
                 .with_unit("s")
                 .build(),
+            maintenance_leader: meter
+                .i64_gauge(names::MAINTENANCE_LEADER)
+                .with_description(
+                    "Whether this runtime holds the maintenance leader lock (1) or not (0)",
+                )
+                .with_unit("{runtime}")
+                .build(),
             maintenance_leader_eligible: meter
                 .i64_gauge(names::MAINTENANCE_LEADER_ELIGIBLE)
                 .with_description(
@@ -510,6 +536,18 @@ impl AwaMetrics {
                 .f64_gauge(names::QUEUE_LAG)
                 .with_description("Age of the oldest available job per queue")
                 .with_unit("s")
+                .build(),
+            queue_due_lag_seconds: meter
+                .f64_gauge(names::QUEUE_DUE_LAG)
+                .with_description(
+                    "Age of the oldest due, unpromoted deferred job per queue and state; 0 when none is due",
+                )
+                .with_unit("s")
+                .build(),
+            queue_due_depth: meter
+                .i64_gauge(names::QUEUE_DUE_DEPTH)
+                .with_description("Due, unpromoted deferred jobs per queue and state")
+                .with_unit("{job}")
                 .build(),
             wait_duration_seconds: meter
                 .f64_histogram(names::JOB_WAIT_DURATION)
@@ -862,6 +900,23 @@ impl AwaMetrics {
             .record(duration.as_secs_f64(), &attrs);
     }
 
+    /// Record a promotion batch that failed, into
+    /// `awa.maintenance.promote_duration` with `error.type`. The batch
+    /// counter and size histogram keep counting successful batches only.
+    pub fn record_promotion_batch_failure(
+        &self,
+        state: &str,
+        duration: Duration,
+        error_type: &'static str,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.state", state.to_string()),
+            opentelemetry::KeyValue::new("error.type", error_type),
+        ];
+        self.promotion_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
     /// Record a promotion lane whose locks were busy past the leader's wait
     /// budget, with what became of it (`handed_off`, `waiter_limit`,
     /// `waiter_timed_out`).
@@ -904,6 +959,19 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.queue_lag_seconds.record(lag_seconds, &attrs);
+    }
+
+    /// Record the due, unpromoted deferred jobs of one queue and state
+    /// (`scheduled` or `retryable`): how many there are, and the age of the
+    /// oldest, 0 when there are none. Record every known queue on each pass,
+    /// with zeroes, so a gauge falls back to 0 once its backlog is promoted.
+    pub fn record_queue_due(&self, queue: &str, state: &str, depth: i64, lag_seconds: f64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.job.state", state.to_string()),
+        ];
+        self.queue_due_depth.record(depth, &attrs);
+        self.queue_due_lag_seconds.record(lag_seconds, &attrs);
     }
 
     /// Record job wait duration (time from creation to claim).
@@ -1094,6 +1162,11 @@ impl AwaMetrics {
         self.storage_canonical_live_backlog.record(count, &[]);
     }
 
+    /// Record whether this runtime holds the maintenance leader lock.
+    pub fn record_maintenance_leader(&self, leader: bool) {
+        self.maintenance_leader.record(i64::from(leader), &[]);
+    }
+
     /// Record whether this runtime contends for maintenance leadership.
     pub fn record_maintenance_leader_eligible(&self, eligible: bool) {
         self.maintenance_leader_eligible
@@ -1228,12 +1301,34 @@ impl AwaMetrics {
     /// `"rescue_stale_heartbeats"`) so the attribute set stays bounded.
     /// Issue #242.
     pub fn record_maintenance_branch_duration(&self, branch: &'static str, duration: Duration) {
-        let attrs = [opentelemetry::KeyValue::new(
-            "awa.maintenance.branch",
-            branch,
-        )];
-        self.maintenance_branch_duration_seconds
-            .record(duration.as_secs_f64(), &attrs);
+        self.record_maintenance_branch_outcome(branch, duration, None);
+    }
+
+    /// Record one run of a maintenance branch body into
+    /// `awa.maintenance.branch.duration`, with `error.type` when the body
+    /// failed. `error_type` is a low-cardinality class such as
+    /// [`awa_model::AwaError::error_type`] gives, never a message; a branch
+    /// that fails on every tick then shows as
+    /// `rate(awa_maintenance_branch_duration_seconds_count{error_type!=""}[5m]) > 0`.
+    pub fn record_maintenance_branch_outcome(
+        &self,
+        branch: &'static str,
+        duration: Duration,
+        error_type: Option<&'static str>,
+    ) {
+        let branch = opentelemetry::KeyValue::new("awa.maintenance.branch", branch);
+        match error_type {
+            Some(error_type) => self.maintenance_branch_duration_seconds.record(
+                duration.as_secs_f64(),
+                &[
+                    branch,
+                    opentelemetry::KeyValue::new("error.type", error_type),
+                ],
+            ),
+            None => self
+                .maintenance_branch_duration_seconds
+                .record(duration.as_secs_f64(), &[branch]),
+        }
     }
 
     /// Record one maintenance branch overrun episode — a transition from
@@ -1346,6 +1441,113 @@ mod tests {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
     use std::collections::BTreeMap;
+
+    /// Each attribute set of `name`'s data points, with its value: a gauge's
+    /// last value or a histogram's sample count.
+    fn exported_points(
+        exporter: &InMemoryMetricExporter,
+        name: &str,
+    ) -> Vec<(BTreeMap<String, String>, f64)> {
+        let mut points = Vec::new();
+        for resource in exporter.get_finished_metrics().expect("read metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                    let attrs = |kvs: &mut dyn Iterator<Item = &opentelemetry::KeyValue>| {
+                        kvs.map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                            .collect::<BTreeMap<_, _>>()
+                    };
+                    match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                            for point in histogram.data_points() {
+                                points.push((attrs(&mut point.attributes()), point.count() as f64));
+                            }
+                        }
+                        AggregatedMetrics::F64(MetricData::Gauge(gauge)) => {
+                            for point in gauge.data_points() {
+                                points.push((attrs(&mut point.attributes()), point.value()));
+                            }
+                        }
+                        AggregatedMetrics::I64(MetricData::Gauge(gauge)) => {
+                            for point in gauge.data_points() {
+                                points.push((attrs(&mut point.attributes()), point.value() as f64));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        points.sort_by(|a, b| a.0.cmp(&b.0));
+        points
+    }
+
+    fn attrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn maintenance_health_metrics_carry_their_attributes() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_maintenance_branch_duration("promote_scheduled", Duration::from_millis(5));
+        metrics.record_maintenance_branch_outcome(
+            "promote_scheduled",
+            Duration::from_millis(5),
+            Some("bind_limit"),
+        );
+        metrics.record_promotion_batch("scheduled", 10, Duration::from_millis(5));
+        metrics.record_promotion_batch_failure("scheduled", Duration::from_millis(5), "timeout");
+        metrics.record_queue_due("email", "scheduled", 3, 42.0);
+        metrics.record_maintenance_leader(true);
+        provider.force_flush().expect("flush metrics");
+
+        assert_eq!(
+            exported_points(&exporter, names::MAINTENANCE_BRANCH_DURATION),
+            vec![
+                (
+                    attrs(&[("awa.maintenance.branch", "promote_scheduled")]),
+                    1.0
+                ),
+                (
+                    attrs(&[
+                        ("awa.maintenance.branch", "promote_scheduled"),
+                        ("error.type", "bind_limit"),
+                    ]),
+                    1.0
+                ),
+            ]
+        );
+        assert_eq!(
+            exported_points(&exporter, names::MAINTENANCE_PROMOTE_DURATION),
+            vec![
+                (attrs(&[("awa.job.state", "scheduled")]), 1.0),
+                (
+                    attrs(&[("awa.job.state", "scheduled"), ("error.type", "timeout")]),
+                    1.0
+                ),
+            ]
+        );
+        let due = attrs(&[("awa.job.queue", "email"), ("awa.job.state", "scheduled")]);
+        assert_eq!(
+            exported_points(&exporter, names::QUEUE_DUE_DEPTH),
+            vec![(due.clone(), 3.0)]
+        );
+        assert_eq!(
+            exported_points(&exporter, names::QUEUE_DUE_LAG),
+            vec![(due, 42.0)]
+        );
+        assert_eq!(
+            exported_points(&exporter, names::MAINTENANCE_LEADER),
+            vec![(BTreeMap::new(), 1.0)]
+        );
+    }
 
     /// The info gauges are no-op under a default (global) meter provider —
     /// this just confirms the method signatures build and don't panic when
