@@ -1768,13 +1768,19 @@ impl MaintenanceService {
         self
     }
 
+    fn record_leader_metric(&self, leader: bool) {
+        let instance_id = self.instance_id.map(|id| id.to_string());
+        self.metrics
+            .record_maintenance_leader(instance_id.as_deref(), leader);
+    }
+
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
         self.alive.store(true, Ordering::SeqCst);
         let _alive_guard = MaintenanceAliveGuard(self.alive.clone());
         self.leader.store(false, Ordering::SeqCst);
-        self.metrics.record_maintenance_leader(false);
+        self.record_leader_metric(false);
 
         if !self.leader_eligible {
             self.run_ineligible().await;
@@ -1812,7 +1818,7 @@ impl MaintenanceService {
 
             debug!("Elected as maintenance leader");
             self.leader.store(true, Ordering::SeqCst);
-            self.metrics.record_maintenance_leader(true);
+            self.record_leader_metric(true);
 
             let observer = match LeaderObserver::start(
                 leader_conn,
@@ -1826,7 +1832,7 @@ impl MaintenanceService {
                 Ok(observer) => observer,
                 Err(err) => {
                     self.leader.store(false, Ordering::SeqCst);
-                    self.metrics.record_maintenance_leader(false);
+                    self.record_leader_metric(false);
                     warn!(error = %err, "Leader observer startup failed");
                     continue;
                 }
@@ -2232,7 +2238,7 @@ impl MaintenanceService {
                 tokio::join!(recovery, hygiene);
             };
             run_leader_term(observer, &self.cancel, work).await;
-            self.metrics.record_maintenance_leader(false);
+            self.record_leader_metric(false);
             self.clear_queue_ring_pin();
             self.release_idle_check_conn().await;
             if self.cancel.is_cancelled() {

@@ -26,7 +26,7 @@ See the [0.6.18 to 0.6.19 upgrade guide](docs/upgrade-0.6.18-to-0.6.19.md) for t
   - `awa.maintenance.branch.duration` carries `error.type` on a run that hit an error, so `rate(awa_maintenance_branch_duration_seconds_count{error_type!=""}[5m]) > 0` finds a failing branch whichever runtime leads.
   - `awa.maintenance.promote_duration` records failed promotion batches too, with `error.type`.
   - `awa.queue.due.depth` and `awa.queue.due.lag`, per queue and `scheduled` or `retryable`: due jobs not yet promoted, and the age of the oldest. Unlike `awa.queue.depth{state="scheduled"}`, they ignore work scheduled for later.
-  - `awa.maintenance.leader`: `1` on the runtime holding the leader lock, `0` elsewhere.
+  - `awa.maintenance.leader`: `1` on the runtime holding the leader lock, `0` elsewhere, by `awa.runtime.instance_id`, so `sum(awa_maintenance_leader)` counts leaders even with several clients in one process.
 
   `error.type` is a fixed class (`bind_limit`, `timeout`, `lock_not_available`, `deadlock`, `serialization_failure`, `connection`, `database`, or the `AwaError` variant), never a message; `AwaError::error_type()` and `awa_model::sqlx_error_type()` give it. The [example alert rules](docs/grafana/alerts/README.md) gain `awa_maintenance_branch_failing`, `awa_promotion_due_lag_high` and `awa_maintenance_leader_count`.
 

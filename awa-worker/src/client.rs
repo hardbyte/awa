@@ -2738,8 +2738,10 @@ impl RuntimeReporterState {
         }
         self.metrics
             .record_maintenance_leader_eligible(self.maintenance_leader);
-        self.metrics
-            .record_maintenance_leader(self.leader.load(Ordering::SeqCst));
+        self.metrics.record_maintenance_leader(
+            Some(&self.instance_id.to_string()),
+            self.leader.load(Ordering::SeqCst),
+        );
         if !self.maintenance_leader {
             self.check_eligible_leaders().await;
         }

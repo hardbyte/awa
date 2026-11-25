@@ -197,9 +197,10 @@ pub struct AwaMetrics {
     /// started with `maintenance_leader(false)` (0).
     pub maintenance_leader_eligible: Gauge<i64>,
     /// Whether this runtime holds the maintenance leader lock (1) or not
-    /// (0). Summed over a fleet it should be 1: 0 means no runtime runs
-    /// promotion, rescue or prune, and more than 1 for longer than a
-    /// handover means two leaders.
+    /// (0), by `awa.runtime.instance_id`, so several clients in one process
+    /// each keep a series of their own. Summed over a fleet it should be 1:
+    /// 0 means no runtime runs promotion, rescue or prune, and more than 1
+    /// for longer than a handover means two leaders.
     pub maintenance_leader: Gauge<i64>,
     /// Live runtimes, not shutting down, that may take maintenance
     /// leadership, as seen by a runtime that has opted out. Only opted-out
@@ -1162,9 +1163,20 @@ impl AwaMetrics {
         self.storage_canonical_live_backlog.record(count, &[]);
     }
 
-    /// Record whether this runtime holds the maintenance leader lock.
-    pub fn record_maintenance_leader(&self, leader: bool) {
-        self.maintenance_leader.record(i64::from(leader), &[]);
+    /// Record whether the runtime `instance_id` holds the maintenance leader
+    /// lock. Without an instance id, every client in the process shares one
+    /// series.
+    pub fn record_maintenance_leader(&self, instance_id: Option<&str>, leader: bool) {
+        match instance_id {
+            Some(instance_id) => self.maintenance_leader.record(
+                i64::from(leader),
+                &[opentelemetry::KeyValue::new(
+                    "awa.runtime.instance_id",
+                    instance_id.to_string(),
+                )],
+            ),
+            None => self.maintenance_leader.record(i64::from(leader), &[]),
+        }
     }
 
     /// Record whether this runtime contends for maintenance leadership.
@@ -1505,7 +1517,8 @@ mod tests {
         metrics.record_promotion_batch("scheduled", 10, Duration::from_millis(5));
         metrics.record_promotion_batch_failure("scheduled", Duration::from_millis(5), "timeout");
         metrics.record_queue_due("email", "scheduled", 3, 42.0);
-        metrics.record_maintenance_leader(true);
+        metrics.record_maintenance_leader(Some("leader"), true);
+        metrics.record_maintenance_leader(Some("follower"), false);
         provider.force_flush().expect("flush metrics");
 
         assert_eq!(
@@ -1545,7 +1558,11 @@ mod tests {
         );
         assert_eq!(
             exported_points(&exporter, names::MAINTENANCE_LEADER),
-            vec![(BTreeMap::new(), 1.0)]
+            vec![
+                (attrs(&[("awa.runtime.instance_id", "follower")]), 0.0),
+                (attrs(&[("awa.runtime.instance_id", "leader")]), 1.0),
+            ],
+            "each runtime keeps its own series, so one runtime's 0 can't hide another's 1"
         );
     }
 
