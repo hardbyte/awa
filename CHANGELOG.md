@@ -2,7 +2,9 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
-## [Unreleased]
+## [0.6.19] — 2026-11-26
+
+Recommended for everyone on 0.6.18 using queue storage, and especially if producers enqueue inside `REPEATABLE READ` or `SERIALIZABLE` transactions, you use unique jobs, or operators run bulk actions on large queues. A job enqueued in a transaction above `READ COMMITTED` could be skipped by claims and then deleted by queue prune; that is fixed, and awa's own write transactions now run at `READ COMMITTED` whatever the session default. Several deadlocks and stalls between unique jobs and inserts of the same keys are fixed, and a retry, snooze, promotion or rescue that meets a newer duplicate cancels the attempt instead of failing. Operator bulk actions run in bounded batches. Admin reads no longer keep the claim ring from rotating, rescue finds a dead worker's claims promptly after the ring rotates, and new metrics make a failing maintenance branch, stalled promotion and the maintenance leader visible. Applications on sqlx 0.9 can run awa 0.6 through the new `sqlx09` feature.
 
 ### Upgrading
 
