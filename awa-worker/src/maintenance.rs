@@ -1210,6 +1210,20 @@ type QueueStorageMetricRow = (
     Option<f64>,
 );
 
+/// Due, unpromoted deferred jobs by `(queue, state)`: how many, and the age
+/// of the oldest, summed and maxed across the storage planes a leader
+/// promotes.
+#[derive(Default)]
+struct DueWork(HashMap<(String, String), (i64, f64)>);
+
+impl DueWork {
+    fn add(&mut self, queue: String, state: String, depth: i64, lag: f64) {
+        let entry = self.0.entry((queue, state)).or_insert((0, 0.0));
+        entry.0 += depth;
+        entry.1 = entry.1.max(lag.max(0.0));
+    }
+}
+
 /// How long a promotion transaction waits on one lane's locks before the
 /// leader hands the lane to a dedicated waiter and goes on without it.
 const PROMOTE_LANE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
@@ -5221,9 +5235,29 @@ impl MaintenanceService {
             }
         }
 
-        // Due but unpromoted deferred work, through the partial due indexes
-        // on `awa.scheduled_jobs (run_at, id, queue) WHERE state = ...`.
-        let due: Vec<(String, String, i64, f64)> = match sqlx::query_as(
+        // A canonical leader also promotes the active standby queue-storage
+        // plane's backlog (#456), so its due work counts here too.
+        let mut due = DueWork::default();
+        let canonical = self.collect_canonical_due(&mut due).await;
+        let standby = match self.active_standby_queue_storage().await {
+            Some(standby) => {
+                self.collect_queue_storage_due(standby.store.schema(), &mut due)
+                    .await
+            }
+            None => Ok(()),
+        };
+        if let Err(err) = canonical.and(standby) {
+            branch_failed(&err);
+            tracing::warn!(error = %err, "Failed to query due deferred jobs for metrics");
+            return;
+        }
+        self.record_due_work(stats.iter().map(|stat| stat.queue.clone()), due);
+    }
+
+    /// Due, unpromoted canonical deferred jobs, through the partial due
+    /// indexes on `awa.scheduled_jobs (run_at, id, queue) WHERE state = ...`.
+    async fn collect_canonical_due(&self, due: &mut DueWork) -> Result<(), sqlx::Error> {
+        let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(
             r#"
             SELECT queue, 'scheduled', count(*)::bigint,
                    EXTRACT(EPOCH FROM now() - min(run_at))::double precision
@@ -5239,29 +5273,51 @@ impl MaintenanceService {
             "#,
         )
         .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                branch_failed(&err);
-                tracing::warn!(error = %err, "Failed to query due deferred jobs for metrics");
-                return;
-            }
-        };
-        let mut due: HashMap<(String, String), (i64, f64)> = due
-            .into_iter()
-            .map(|(queue, state, depth, lag)| ((queue, state), (depth, lag.max(0.0))))
-            .collect();
-        for queue_stat in &stats {
+        .await?;
+        for (queue, state, depth, lag) in rows {
+            due.add(queue, state, depth, lag);
+        }
+        Ok(())
+    }
+
+    /// Due, unpromoted deferred jobs of a queue-storage plane other than the
+    /// one whose stats query already reports them.
+    async fn collect_queue_storage_due(
+        &self,
+        schema: &str,
+        due: &mut DueWork,
+    ) -> Result<(), sqlx::Error> {
+        let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(&format!(
+            r#"
+            SELECT queue, state::text, count(*)::bigint,
+                   EXTRACT(EPOCH FROM now() - min(run_at))::double precision
+            FROM {schema}.deferred_jobs
+            WHERE state IN ('scheduled', 'retryable') AND run_at <= now()
+            GROUP BY queue, state
+            "#
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        for (queue, state, depth, lag) in rows {
+            due.add(queue, state, depth, lag);
+        }
+        Ok(())
+    }
+
+    /// Record `due` for every queue in `queues` and every queue with due work,
+    /// with zeroes where none is due, so a gauge falls back to 0 once its
+    /// backlog is promoted.
+    fn record_due_work(&self, queues: impl Iterator<Item = String>, mut due: DueWork) {
+        for queue in queues {
             for state in ["scheduled", "retryable"] {
                 let (depth, lag) = due
-                    .remove(&(queue_stat.queue.clone(), state.to_string()))
+                    .0
+                    .remove(&(queue.clone(), state.to_string()))
                     .unwrap_or((0, 0.0));
-                self.metrics
-                    .record_queue_due(&queue_stat.queue, state, depth, lag);
+                self.metrics.record_queue_due(&queue, state, depth, lag);
             }
         }
-        for ((queue, state), (depth, lag)) in due {
+        for ((queue, state), (depth, lag)) in due.0 {
             self.metrics.record_queue_due(&queue, &state, depth, lag);
         }
     }
@@ -5430,6 +5486,8 @@ impl MaintenanceService {
             }
         };
 
+        let mut due = DueWork::default();
+        let mut queues = Vec::with_capacity(rows.len());
         for (
             queue,
             available,
@@ -5458,23 +5516,38 @@ impl MaintenanceService {
             self.metrics
                 .record_queue_depth(&queue, "waiting_external", waiting_external);
             self.metrics.record_dlq_depth(&queue, failed_dlq);
-            self.metrics.record_queue_due(
-                &queue,
-                "scheduled",
-                due_scheduled,
-                due_scheduled_lag.unwrap_or(0.0).max(0.0),
-            );
-            self.metrics.record_queue_due(
-                &queue,
-                "retryable",
-                due_retryable,
-                due_retryable_lag.unwrap_or(0.0).max(0.0),
-            );
+            if due_scheduled > 0 {
+                due.add(
+                    queue.clone(),
+                    "scheduled".into(),
+                    due_scheduled,
+                    due_scheduled_lag.unwrap_or(0.0),
+                );
+            }
+            if due_retryable > 0 {
+                due.add(
+                    queue.clone(),
+                    "retryable".into(),
+                    due_retryable,
+                    due_retryable_lag.unwrap_or(0.0),
+                );
+            }
+            queues.push(queue.clone());
 
             if let Some(lag_seconds) = lag_seconds {
                 self.metrics.record_queue_lag(&queue, lag_seconds);
             }
         }
+
+        // A queue-storage leader also promotes the canonical plane while a
+        // storage transition drains it (#456), so its due work counts here
+        // too. Once the canonical tables are empty this reads nothing.
+        if let Err(err) = self.collect_canonical_due(&mut due).await {
+            branch_failed(&err);
+            tracing::warn!(error = %err, "Failed to query due canonical jobs for metrics");
+            return;
+        }
+        self.record_due_work(queues.into_iter(), due);
     }
 }
 

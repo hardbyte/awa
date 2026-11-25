@@ -682,40 +682,34 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
         .await
         .expect("test gate should be available");
     let pool = setup().await;
-    let (queue, deferred) = if queue_storage {
-        awa_testing::setup::activate_queue_storage(&pool).await;
-        ("observ_qs_promote_failure", "awa.deferred_jobs")
+    let queue = if queue_storage {
+        "observ_qs_promote_failure"
     } else {
-        ("observ_promote_failure", "awa.scheduled_jobs")
+        "observ_promote_failure"
     };
-    clean_queue(&pool, queue).await;
-    sqlx::query(&format!("DELETE FROM {deferred} WHERE queue = $1"))
-        .bind(queue)
-        .execute(&pool)
-        .await
-        .expect("Failed to clean deferred jobs");
-
-    let job = insert_with(
-        &pool,
-        &ObservableJob {
-            value: "due".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            run_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..Default::default()
-        },
+    // Every deferred table a leader promotes from: a queue-storage leader
+    // also promotes the canonical plane while a transition drains it.
+    let deferred_tables: &[&str] = if queue_storage {
+        &["awa.scheduled_jobs", "awa.deferred_jobs"]
+    } else {
+        &["awa.scheduled_jobs"]
+    };
+    // A run that failed part way can leave its triggers behind.
+    sqlx::raw_sql(
+        "DROP TRIGGER IF EXISTS observ_refuse_promotion ON awa.scheduled_jobs;
+         DROP TRIGGER IF EXISTS observ_refuse_promotion ON awa.deferred_jobs;",
     )
-    .await
-    .expect("Failed to insert job");
-    let made_due = sqlx::query(&format!(
-        "UPDATE {deferred} SET run_at = now() - interval '5 minutes' WHERE queue = $1"
-    ))
-    .bind(queue)
     .execute(&pool)
     .await
-    .expect("Failed to make the job due");
-    assert_eq!(made_due.rows_affected(), 1, "job {} is deferred", job.id);
+    .expect("Failed to remove a leftover promotion failure");
+    clean_queue(&pool, queue).await;
+    for deferred in deferred_tables {
+        sqlx::query(&format!("DELETE FROM {deferred} WHERE queue = $1"))
+            .bind(queue)
+            .execute(&pool)
+            .await
+            .expect("Failed to clean deferred jobs");
+    }
     sqlx::raw_sql(&format!(
         r#"
         CREATE OR REPLACE FUNCTION awa.observ_refuse_promotion() RETURNS trigger
@@ -727,14 +721,59 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
             RETURN OLD;
         END
         $$;
-        DROP TRIGGER IF EXISTS observ_refuse_promotion ON {deferred};
-        CREATE TRIGGER observ_refuse_promotion BEFORE DELETE ON {deferred}
-            FOR EACH ROW EXECUTE FUNCTION awa.observ_refuse_promotion();
         "#
     ))
     .execute(&pool)
     .await
-    .expect("Failed to install the promotion failure");
+    .expect("Failed to create the promotion failure");
+
+    // One due job per deferred table: the canonical one is enqueued before
+    // queue storage is activated.
+    for (index, deferred) in deferred_tables.iter().enumerate() {
+        if *deferred == "awa.deferred_jobs" {
+            awa_testing::setup::activate_queue_storage(&pool).await;
+        }
+        let job = insert_with(
+            &pool,
+            &ObservableJob {
+                value: format!("due {index}"),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                run_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert job");
+        let id_column = if *deferred == "awa.deferred_jobs" {
+            "job_id"
+        } else {
+            "id"
+        };
+        let made_due = sqlx::query(&format!(
+            "UPDATE {deferred} SET run_at = now() - interval '5 minutes' WHERE {id_column} = $1"
+        ))
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .expect("Failed to make the job due");
+        assert_eq!(
+            made_due.rows_affected(),
+            1,
+            "job {} is in {deferred}",
+            job.id
+        );
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER IF EXISTS observ_refuse_promotion ON {deferred};
+             CREATE TRIGGER observ_refuse_promotion BEFORE DELETE ON {deferred}
+                 FOR EACH ROW EXECUTE FUNCTION awa.observ_refuse_promotion();"
+        ))
+        .execute(&pool)
+        .await
+        .expect("Failed to install the promotion failure");
+    }
+    let due_jobs = deferred_tables.len() as f64;
 
     let exporter = InMemoryMetricExporter::default();
     let meter_provider = SdkMeterProvider::builder()
@@ -802,7 +841,7 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
             due("awa.queue.due.lag"),
             leader,
         );
-        if (observed.0 && observed.1 && observed.2 == Some(1.0) && observed.4 == Some(1.0))
+        if (observed.0 && observed.1 && observed.2 == Some(due_jobs) && observed.4 == Some(1.0))
             || std::time::Instant::now() > deadline
         {
             break observed;
@@ -811,21 +850,30 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
     };
 
     client.shutdown(Duration::from_secs(5)).await;
-    sqlx::raw_sql(&format!(
-        "DROP TRIGGER IF EXISTS observ_refuse_promotion ON {deferred};
-         DROP FUNCTION IF EXISTS awa.observ_refuse_promotion();
-         DELETE FROM {deferred} WHERE queue = '{queue}';"
-    ))
-    .execute(&pool)
-    .await
-    .expect("Failed to remove the promotion failure");
+    for deferred in deferred_tables {
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER IF EXISTS observ_refuse_promotion ON {deferred};
+             DELETE FROM {deferred} WHERE queue = '{queue}';"
+        ))
+        .execute(&pool)
+        .await
+        .expect("Failed to remove the promotion failure");
+    }
+    sqlx::raw_sql("DROP FUNCTION IF EXISTS awa.observ_refuse_promotion();")
+        .execute(&pool)
+        .await
+        .expect("Failed to drop the promotion failure");
     clean_queue(&pool, queue).await;
     let _ = meter_provider.shutdown();
 
     let (failed_branch, failed_batch, due_depth, due_lag, leader) = observed;
     assert!(failed_branch, "the promote branch records error.type");
     assert!(failed_batch, "the failed batch is recorded with error.type");
-    assert_eq!(due_depth, Some(1.0), "one due job waits for promotion");
+    assert_eq!(
+        due_depth,
+        Some(due_jobs),
+        "every due job the leader promotes, in either plane, waits for promotion"
+    );
     assert!(
         due_lag.is_some_and(|lag| lag >= 290.0),
         "the due job has waited about five minutes: {due_lag:?}"
