@@ -12,6 +12,9 @@ const SQL: &str = include_str!("ring_lock_capture.sql");
 const LOCK_ROWS: usize = 256;
 const BLOCKER_PIDS: usize = 64;
 const CLIENT_DEADLINE: Duration = Duration::from_millis(750);
+const CAPTURES_PER_STAGE: u8 = 12;
+const OPEN_CLAIM_GROUPS: i64 = 32;
+const OPEN_CLAIMS_DEADLINE: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
@@ -41,7 +44,7 @@ pub enum Decision {
     Exhausted(Stage),
 }
 
-/// Four slots per stage reserve half the run budget for actual violations.
+/// Each stage has its own captures, so suspected stalls never use up the violations' share.
 #[derive(Default)]
 pub struct CaptureBudget {
     episode: Option<(i64, i64)>,
@@ -75,7 +78,7 @@ impl CaptureBudget {
             return None;
         }
         self.seen[index] = true;
-        if self.used[index] < 4 {
+        if self.used[index] < CAPTURES_PER_STAGE {
             self.used[index] += 1;
             Some(Decision::Capture(stage))
         } else if !self.exhausted_reported[index] {
@@ -220,6 +223,82 @@ async fn collect(pool: &PgPool, schema: &str, slot: i32, sql: &str) -> Value {
     }
 }
 
+/// The open receipt claims in `slot`, the sealed slot prune has to clear before the ring can
+/// enter it again: by queue and kind, with how long the oldest has been claimed and how long
+/// since any of them heartbeated. Its anti-joins hold the slot's partitions while they run, so
+/// they get a short statement and lock timeout; a capture that runs out says so.
+async fn open_claims(pool: &PgPool, schema: &str, slot: i32) -> Value {
+    let claims = format!("{schema}.lease_claims_{slot}");
+    let claim_batches = format!("{schema}.lease_claim_batches_{slot}");
+    let closures = format!("{schema}.lease_claim_closures_{slot}");
+    let closure_batches = format!("{schema}.lease_claim_closure_batches_{slot}");
+    let sql = format!(
+        r#"
+        WITH claims AS (
+            SELECT receipt_id, job_id, run_lease, queue, ready_slot, ready_generation, lane_seq, claimed_at
+            FROM {claims}
+            UNION ALL
+            SELECT member.receipt_id, member.job_id, member.run_lease, batch.queue, batch.ready_slot,
+                   batch.ready_generation, member.lane_seq, batch.claimed_at
+            FROM {claim_batches} AS batch
+            CROSS JOIN LATERAL unnest(batch.receipt_ids, batch.job_ids, batch.run_leases, batch.lane_seqs)
+                AS member(receipt_id, job_id, run_lease, lane_seq)
+        ),
+        open_claims AS (
+            SELECT claims.* FROM claims
+            WHERE NOT EXISTS (SELECT 1 FROM {closures} AS closure
+                              WHERE closure.job_id = claims.job_id AND closure.run_lease = claims.run_lease)
+              AND NOT EXISTS (SELECT 1 FROM {closure_batches} AS closure_batch
+                              WHERE closure_batch.receipt_ranges @> claims.receipt_id)
+        ),
+        grouped AS (
+            SELECT open_claims.queue, COALESCE(ready.kind, '?') AS kind, count(*) AS open,
+                   EXTRACT(EPOCH FROM clock_timestamp() - min(open_claims.claimed_at))::float8 AS oldest_claimed_s,
+                   count(*) FILTER (WHERE lease.job_id IS NOT NULL) AS with_lease_row,
+                   EXTRACT(EPOCH FROM clock_timestamp()
+                       - max(COALESCE(attempt.heartbeat_at, lease.heartbeat_at)))::float8 AS latest_heartbeat_s
+            FROM open_claims
+            LEFT JOIN {schema}.ready_entries AS ready
+              ON ready.job_id = open_claims.job_id
+             AND ready.ready_slot = open_claims.ready_slot
+             AND ready.ready_generation = open_claims.ready_generation
+             AND ready.queue = open_claims.queue
+             AND ready.lane_seq = open_claims.lane_seq
+            LEFT JOIN {schema}.leases AS lease
+              ON lease.job_id = open_claims.job_id AND lease.run_lease = open_claims.run_lease
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = open_claims.job_id AND attempt.run_lease = open_claims.run_lease
+            GROUP BY 1, 2
+        )
+        SELECT COALESCE(jsonb_agg(to_jsonb(grouped) ORDER BY grouped.oldest_claimed_s DESC), '[]'::jsonb)
+        FROM (SELECT * FROM grouped ORDER BY oldest_claimed_s DESC LIMIT {OPEN_CLAIM_GROUPS}) AS grouped
+        "#
+    );
+    let result = tokio::time::timeout(OPEN_CLAIMS_DEADLINE, async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '3s'")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .execute(tx.as_mut())
+            .await?;
+        let groups: Value = sqlx::query_scalar(&sql).fetch_one(tx.as_mut()).await?;
+        tx.rollback().await?;
+        Ok::<_, sqlx::Error>(groups)
+    })
+    .await;
+    let mut value = match result {
+        Ok(Ok(groups)) => json!({"status": "ok", "groups": groups}),
+        Ok(Err(error)) => missing(error),
+        Err(_) => missing("open-claim capture exceeded its client deadline"),
+    };
+    value["slot"] = json!(slot);
+    value
+}
+
 pub async fn observe(
     shared: &Shared,
     pool: &PgPool,
@@ -260,6 +339,7 @@ pub async fn observe(
     value["next_slot"] = json!(incoming);
     value["generation"] = json!(episode.generation);
     value["next_slot_probe"] = json!(next_slot);
+    value["open_claims_in_next_slot"] = open_claims(pool, schema, incoming).await;
     shared.run.add("claim_ring_lock_capture_attempts", 1);
     if value["status"] != "ok" {
         shared.finding(
@@ -310,7 +390,8 @@ mod tests {
             budget.plan(&episode(0, false), 60_000, 120_000, false),
             None
         );
-        for generation in 1..=4 {
+        let per_stage = i64::from(CAPTURES_PER_STAGE);
+        for generation in 1..=per_stage {
             assert_eq!(
                 budget.plan(&episode(generation, false), 60_000, 120_000, true),
                 Some(Decision::Capture(Stage::Suspected))
@@ -321,11 +402,14 @@ mod tests {
             );
         }
         assert_eq!(
-            budget.plan(&episode(5, false), 60_000, 120_000, true),
+            budget.plan(&episode(per_stage + 1, false), 60_000, 120_000, true),
             Some(Decision::Exhausted(Stage::Suspected))
         );
-        assert_eq!(budget.plan(&episode(6, false), 60_000, 120_000, true), None);
-        for generation in 7..=10 {
+        assert_eq!(
+            budget.plan(&episode(per_stage + 2, false), 60_000, 120_000, true),
+            None
+        );
+        for generation in per_stage + 3..=2 * per_stage + 2 {
             assert_eq!(
                 budget.plan(&episode(generation, true), 120_001, 120_000, true),
                 Some(Decision::Capture(Stage::Violation))
@@ -336,14 +420,14 @@ mod tests {
             );
         }
         assert_eq!(
-            budget.plan(&episode(11, true), 120_001, 120_000, true),
+            budget.plan(&episode(2 * per_stage + 3, true), 120_001, 120_000, true),
             Some(Decision::Exhausted(Stage::Violation))
         );
         assert_eq!(
-            budget.plan(&episode(12, true), 120_001, 120_000, true),
+            budget.plan(&episode(2 * per_stage + 4, true), 120_001, 120_000, true),
             None
         );
-        assert_eq!(budget.used, [4, 4]);
+        assert_eq!(budget.used, [CAPTURES_PER_STAGE, CAPTURES_PER_STAGE]);
     }
 
     #[test]
@@ -517,6 +601,41 @@ mod tests {
             .unwrap()
             .iter()
             .all(|row| row["pid"] != holder_pid && row["pid"] != waiter_pid));
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn open_claim_capture_counts_only_unclosed_claims_in_the_slot() {
+        use awa_model::queue_storage::{QueueStorage, QueueStorageConfig};
+        let db = Database::create().await;
+        let store = QueueStorage::new(QueueStorageConfig::default()).expect("store");
+        store
+            .enqueue_batch(&db.pool, "ring_open", 2, 3)
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_runtime_batch(&db.pool, "ring_open", 3, Duration::from_secs(60))
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 3);
+        let slot = claimed[0].claim.claim_slot;
+        store
+            .complete_runtime_batch(&db.pool, &claimed[..1])
+            .await
+            .expect("complete one");
+
+        let value = open_claims(&db.pool, "awa", slot).await;
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(value["slot"], slot);
+        let groups = value["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{value}");
+        assert_eq!(groups[0]["queue"], "ring_open");
+        assert_eq!(groups[0]["kind"], claimed[1].job.kind);
+        assert_eq!(groups[0]["open"], 2);
+        assert!(groups[0]["oldest_claimed_s"].as_f64().unwrap() >= 0.0);
+
+        let empty = open_claims(&db.pool, "awa", (slot + 1) % 8).await;
+        assert_eq!(empty["groups"], json!([]), "{empty}");
         db.drop().await;
     }
 

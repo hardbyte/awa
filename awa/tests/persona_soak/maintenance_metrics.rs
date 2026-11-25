@@ -1,5 +1,6 @@
-//! Captures the maintenance leader's OpenTelemetry metrics of every in-process runtime
-//! and writes them to `maintenance-metrics.jsonl`, one cumulative data point per line.
+//! Captures the maintenance leader's OpenTelemetry metrics, and the due-work gauges it
+//! publishes, of every in-process runtime and writes them to `maintenance-metrics.jsonl`,
+//! one cumulative data point per line.
 //! Runtimes in their own process (the python and claim-and-abandon personas) are not
 //! covered; when one of those leads, its maintenance activity is missing from the file.
 
@@ -10,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const PREFIX: &str = "awa.maintenance.";
+const PREFIXES: [&str; 2] = ["awa.maintenance.", "awa.queue.due."];
 const EXPORT_EVERY: Duration = Duration::from_secs(10);
 
 pub struct Capture {
@@ -95,7 +96,7 @@ impl Capture {
             for scope in resource.scope_metrics() {
                 for metric in scope.metrics() {
                     let name = metric.name();
-                    if !name.starts_with(PREFIX) {
+                    if !PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
                         continue;
                     }
                     match metric.data() {
