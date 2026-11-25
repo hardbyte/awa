@@ -4501,39 +4501,59 @@ async fn queue_storage_base_kind_counts(
     Ok(counts)
 }
 
-/// The claim slots holding an open claim or a claim batch.
+/// The claim slots that may hold an open receipt claim: each installed slot
+/// whose claims the closure ledgers do not all close.
 ///
-/// Read inside a savepoint that is rolled back, so the `ACCESS SHARE` locks
-/// this statement takes on every claim partition end before the per-slot
-/// reads begin, rather than holding the sealed slot from claim prune for the
-/// rest of the read. The result is bounded by the installed claim-ring slot
-/// count, not by retained job volume. A slot with neither is not read.
+/// Each slot is checked by counts, the proof claim prune makes before it
+/// truncates a slot, rather than by the open-claim projection, whose
+/// anti-joins over a sealed slot of a million closed claims run for seconds.
+/// A slot with no claims is skipped before its closure partitions are read,
+/// and a slot whose counts match is skipped after one count. Each check runs
+/// in a savepoint that is rolled back, so it holds the slot's locks only for
+/// its own statements, and the sealed slot prune waits for costs a reader a
+/// count rather than a scan.
 async fn queue_storage_claim_slots(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     store: &QueueStorage,
 ) -> Result<Vec<usize>, AwaError> {
     let schema = store.schema();
-    sqlx::query("SAVEPOINT awa_claim_slots")
-        .execute(tx.as_mut())
-        .await?;
-    let slots: Vec<i32> = sqlx::query_scalar(&format!(
-        "SELECT claim_slot FROM {schema}.lease_claims WHERE closed_at IS NULL \
-         UNION SELECT claim_slot FROM {schema}.lease_claim_batches ORDER BY claim_slot"
+    let installed: Vec<i32> = sqlx::query_scalar(&format!(
+        "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
     ))
     .fetch_all(tx.as_mut())
     .await?;
-    sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
-        .execute(tx.as_mut())
+    let mut slots = Vec::new();
+    for slot in installed {
+        // A schema-only admin store carries the default slot count, so take
+        // the installed slot numbers as they are rather than bounding them
+        // by it.
+        let slot = crate::queue_storage::ring_slot_number(slot, "claim")?;
+        sqlx::query("SAVEPOINT awa_claim_slots")
+            .execute(tx.as_mut())
+            .await?;
+        let claimed: i64 = sqlx::query_scalar(&crate::queue_storage::claim_slot_claimed_count_sql(
+            schema, slot,
+        ))
+        .fetch_one(tx.as_mut())
         .await?;
-    sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
-        .execute(tx.as_mut())
-        .await?;
-    // A schema-only admin store carries the default slot count, so take the
-    // installed slot numbers as they are rather than bounding them by it.
-    slots
-        .into_iter()
-        .map(|slot| crate::queue_storage::ring_slot_number(slot, "claim"))
-        .collect()
+        let may_be_open = claimed > 0
+            && claimed
+                != sqlx::query_scalar::<_, i64>(
+                    &crate::queue_storage::claim_slot_closed_count_sql(schema, slot),
+                )
+                .fetch_one(tx.as_mut())
+                .await?;
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
+            .execute(tx.as_mut())
+            .await?;
+        if may_be_open {
+            slots.push(slot);
+        }
+    }
+    Ok(slots)
 }
 
 /// Receipt claims that are running without a `leases` row, as parallel
@@ -6977,6 +6997,57 @@ mod tests {
             blocked.is_err(),
             "a statement over the claim-ring parents holds the claim partitions until commit"
         );
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    /// Only claim slots whose claims the closure ledgers do not all close are
+    /// projected for open claims. A sealed slot whose claims have all
+    /// completed costs a reader one count, not the anti-joins over every
+    /// claim in it, so a large sealed slot claim prune waits for is not held
+    /// for the length of a scan.
+    #[sqlx::test(migrations = false)]
+    async fn only_claim_slots_with_unclosed_claims_are_projected(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        migrations::run(&pool).await?;
+        let schema = "closed_claim_slots";
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        })?;
+        store.install(&pool).await?;
+        store.enqueue_batch(&pool, "closed", 1, 6).await?;
+        let deadline = std::time::Duration::from_secs(60);
+        let finished = store
+            .claim_runtime_batch(&pool, "closed", 3, deadline)
+            .await?;
+        let first_slot = finished[0].claim.claim_slot;
+        store.complete_runtime_batch(&pool, &finished).await?;
+        store.rotate_claims(&pool).await?;
+        let running = store
+            .claim_runtime_batch(&pool, "closed", 2, deadline)
+            .await?;
+        let running_slot = running[0].claim.claim_slot;
+        assert_ne!(first_slot, running_slot, "the ring rotated between claims");
+
+        let mut reader = pool.acquire().await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *reader,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await?;
+        let slots = queue_storage_claim_slots(&mut tx, &store).await?;
+        assert_eq!(
+            slots,
+            vec![usize::try_from(running_slot)?],
+            "the slot whose claims all completed is not projected"
+        );
+        let open = queue_storage_open_claims(&mut tx, &store).await?;
+        assert_eq!(open.job_ids.len(), 2, "the running claims are still read");
         tx.rollback().await?;
         Ok(())
     }
