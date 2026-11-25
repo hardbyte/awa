@@ -4501,23 +4501,33 @@ async fn queue_storage_base_kind_counts(
     Ok(counts)
 }
 
-/// The installed claim slots, from `claim_ring_slots`.
+/// The claim slots holding an open claim or a claim batch.
 ///
-/// Read from the slot table rather than the claim partitions: a statement over
-/// the claim-ring parents takes `ACCESS SHARE` on every claim partition, and
-/// while an admin read holds that on the sealed slot, claim prune cannot take
-/// its `ACCESS EXCLUSIVE` lock and the claim ring stops rotating. A slot with
-/// no claims costs one empty read per caller.
+/// Read inside a savepoint that is rolled back, so the `ACCESS SHARE` locks
+/// this statement takes on every claim partition end before the per-slot
+/// reads begin, rather than holding the sealed slot from claim prune for the
+/// rest of the read. The result is bounded by the installed claim-ring slot
+/// count, not by retained job volume. A slot with neither is not read.
 async fn queue_storage_claim_slots(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     store: &QueueStorage,
 ) -> Result<Vec<usize>, AwaError> {
     let schema = store.schema();
+    sqlx::query("SAVEPOINT awa_claim_slots")
+        .execute(tx.as_mut())
+        .await?;
     let slots: Vec<i32> = sqlx::query_scalar(&format!(
-        "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
+        "SELECT claim_slot FROM {schema}.lease_claims WHERE closed_at IS NULL \
+         UNION SELECT claim_slot FROM {schema}.lease_claim_batches ORDER BY claim_slot"
     ))
     .fetch_all(tx.as_mut())
     .await?;
+    sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
+        .execute(tx.as_mut())
+        .await?;
     // A schema-only admin store carries the default slot count, so take the
     // installed slot numbers as they are rather than bounding them by it.
     slots
