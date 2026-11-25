@@ -1130,6 +1130,31 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
+/// The number of receipt claims a claim slot holds, row-local and compact.
+/// Reads only the slot's claim partitions.
+pub(crate) fn claim_slot_claimed_count_sql(schema: &str, slot: usize) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM {claims})::bigint \
+              + (SELECT COALESCE(sum(claimed_count), 0) FROM {batches})::bigint",
+        claims = claim_child_name(schema, slot),
+        batches = claim_batch_child_name(schema, slot),
+    )
+}
+
+/// The number of receipt claims the closure ledgers of a claim slot close,
+/// row-local and compact. When it equals [`claim_slot_claimed_count_sql`],
+/// every claim in the slot is closed: the proof claim prune makes before it
+/// truncates the slot (see `claim_prune_has_open_claims_tx`). Reads only the
+/// slot's closure partitions.
+pub(crate) fn claim_slot_closed_count_sql(schema: &str, slot: usize) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM {closures})::bigint \
+              + (SELECT COALESCE(sum(closed_count), 0) FROM {closure_batches})::bigint",
+        closures = closure_child_name(schema, slot),
+        closure_batches = claim_closure_batch_child_name(schema, slot),
+    )
+}
+
 pub(crate) fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
     usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
