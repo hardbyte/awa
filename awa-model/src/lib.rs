@@ -51,7 +51,7 @@ pub use batch_operations::{
 pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
 pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
-pub use error::{map_sqlx_error, AwaError};
+pub use error::{map_sqlx_error, sqlx_error_type, AwaError};
 pub use filter::{DlqPage, JobCount, JobFilter, JobPage};
 pub use insert::{
     insert, insert_many, insert_many_copy, insert_many_copy_from_pool,

@@ -1406,8 +1406,10 @@ pub enum QueueSignalReads {
 
 /// Per-queue counts that never expand terminal history, ending in a
 /// `signals` CTE with `queue`, `available`, `running`, `waiting_external`,
-/// `scheduled`, `retryable`, `failed_done`, `failed_dlq`, `lag_seconds` and
-/// `completed_last_hour`.
+/// `scheduled`, `retryable`, `failed_done`, `failed_dlq`, `lag_seconds`,
+/// `completed_last_hour`, and the due, unpromoted deferred jobs:
+/// `due_scheduled`, `due_retryable` and the age of the oldest of each,
+/// `due_scheduled_lag` and `due_retryable_lag` (NULL when none is due).
 ///
 /// With [`QueueSignalReads::Gauge`], `available` is the sequence-head signal,
 /// an upper bound as in [`QueueStorage::queue_counts_fast`]; with
@@ -1617,7 +1619,17 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             SELECT
                 queue,
                 count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
-                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
+                count(*) FILTER (WHERE state = 'scheduled' AND run_at <= now())::bigint
+                    AS due_scheduled,
+                count(*) FILTER (WHERE state = 'retryable' AND run_at <= now())::bigint
+                    AS due_retryable,
+                EXTRACT(EPOCH FROM now() - min(run_at) FILTER (
+                    WHERE state = 'scheduled' AND run_at <= now()
+                ))::double precision AS due_scheduled_lag,
+                EXTRACT(EPOCH FROM now() - min(run_at) FILTER (
+                    WHERE state = 'retryable' AND run_at <= now()
+                ))::double precision AS due_retryable_lag
             FROM {schema}.deferred_jobs
             GROUP BY queue
         ),
@@ -1654,7 +1666,11 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
                 COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
                 COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
                 lag.lag_seconds,
-                COALESCE(completed_recent.completed_last_hour, 0)::bigint AS completed_last_hour
+                COALESCE(completed_recent.completed_last_hour, 0)::bigint AS completed_last_hour,
+                COALESCE(deferred.due_scheduled, 0)::bigint AS due_scheduled,
+                COALESCE(deferred.due_retryable, 0)::bigint AS due_retryable,
+                deferred.due_scheduled_lag,
+                deferred.due_retryable_lag
             FROM queues
             LEFT JOIN ready ON ready.queue = queues.queue
             LEFT JOIN lag ON lag.queue = queues.queue
