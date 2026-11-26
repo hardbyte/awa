@@ -10672,6 +10672,18 @@ async fn test_queue_storage_rescue_skips_sealed_claim_slots_proven_closed() {
         .await
         .expect("seal the next slot");
 
+    // A rescue batch while the current slot is still empty: the current slot
+    // is never proven closed, so the claim it takes next is still found.
+    store
+        .rescue_stale_heartbeats_batch(
+            &pool,
+            Duration::from_secs(90),
+            &|_| false,
+            &awa::model::RescueBatchOptions::default(),
+        )
+        .await
+        .expect("rescue before the current slot holds a claim");
+
     // The current slot: one claim left open by a dead worker.
     let current = claim(1).await.expect("claim into the current slot");
     let current_slot = current[0].claim.claim_slot;

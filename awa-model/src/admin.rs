@@ -3646,9 +3646,12 @@ async fn queue_storage_claim_slots(
         sqlx::query("SAVEPOINT awa_claim_slots")
             .execute(tx.as_mut())
             .await?;
+        // Each statement names one slot's partitions, so it runs unprepared
+        // rather than staying in a pooled connection's statement cache.
         let claimed: i64 = sqlx::query_scalar(audited_sql(
             crate::queue_storage::claim_slot_claimed_count_sql(schema, slot),
         ))
+        .persistent(false)
         .fetch_one(tx.as_mut())
         .await?;
         let may_be_open = claimed > 0
@@ -3656,6 +3659,7 @@ async fn queue_storage_claim_slots(
                 != sqlx::query_scalar::<_, i64>(audited_sql(
                     crate::queue_storage::claim_slot_closed_count_sql(schema, slot),
                 ))
+                .persistent(false)
                 .fetch_one(tx.as_mut())
                 .await?;
         sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
@@ -3703,6 +3707,7 @@ async fn queue_storage_open_claims(
         let rows: Vec<(i64, i64, String)> = sqlx::query_as(audited_sql(format!(
             "SELECT job_id, run_lease, queue FROM ({open_running}) AS open_claims"
         )))
+        .persistent(false)
         .fetch_all(tx.as_mut())
         .await?;
         sqlx::query("ROLLBACK TO SAVEPOINT awa_open_claims")
