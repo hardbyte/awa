@@ -30216,3 +30216,44 @@ async fn test_queue_storage_flush_wakeups_sends_before_the_pool_closes() {
         .expect("listener stays connected");
     assert_eq!(notification.channel(), format!("awa:{queue}"));
 }
+
+/// `reset` truncates `queue_lanes` and keeps the enqueue heads, so the next
+/// enqueue to a lane registers it again.
+#[tokio::test]
+async fn test_enqueue_after_reset_registers_the_lane_again() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_reset_lane_registration";
+    let queue = "qs_reset_lane_registration";
+    let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    let opts = || InsertOpts {
+        queue: queue.to_string(),
+        ..Default::default()
+    };
+    enqueue_job(&pool, &store, &CompleteJob { id: 1 }, opts()).await;
+    store.reset(&pool).await.expect("reset");
+
+    let count = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT count(*) FROM {schema}.{table} WHERE queue = $1"
+            )))
+            .bind(queue)
+            .fetch_one(&pool)
+            .await
+            .expect("count lane rows")
+        }
+    };
+    assert!(
+        count("queue_enqueue_heads").await > 0,
+        "reset keeps the heads"
+    );
+    assert_eq!(count("queue_lanes").await, 0, "reset clears the lanes");
+
+    enqueue_job(&pool, &store, &CompleteJob { id: 2 }, opts()).await;
+    assert_eq!(
+        count("queue_lanes").await,
+        1,
+        "the enqueue after reset registers its lane"
+    );
+}
