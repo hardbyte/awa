@@ -1064,3 +1064,166 @@ async fn callback_carrying_job_is_not_migrated_to_queue_storage() {
         .expect("cleanup callback job");
     finalize_after_test(&pool).await;
 }
+
+/// A migrated snooze cancelled as a duplicate under a mask that claims
+/// `cancelled` keeps its unique key, so a retry of the successor re-checks
+/// ownership, and a retry restores its original mask.
+#[tokio::test]
+async fn migrated_duplicate_cancellation_keeps_its_key_for_retry() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+    use awa_model::{admin, AwaError, JobState};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    enter_mixed_transition_for_test(&pool).await;
+
+    let key = b"reschedule-dup-cancelled-mask-key";
+    // scheduled | available | cancelled; running does not claim.
+    let job = seed_canonical_running_job_with_mask(&pool, key, 8, "11000010").await;
+    let holder: i64 = 987_655;
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key.to_vec())
+        .bind(holder)
+        .execute(&pool)
+        .await
+        .expect("newer duplicate takes the claim");
+
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job,
+        8,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("duplicate-claim snooze");
+    let successor = match outcome {
+        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
+        other => panic!("expected CancelledDuplicate, got {other:?}"),
+    };
+    let stored = admin::get_job(&pool, successor)
+        .await
+        .expect("stored successor");
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert_eq!(stored.unique_key.as_deref(), Some(&key[..]));
+
+    let retried = admin::retry(&pool, successor).await;
+    assert!(
+        matches!(retried, Err(AwaError::UniqueConflict { .. })),
+        "retry while the newer job holds the key must conflict, got {retried:?}"
+    );
+    assert_eq!(claim_holder(&pool, key).await, Some(holder));
+
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(key.to_vec())
+        .execute(&pool)
+        .await
+        .expect("the newer job releases the key");
+    admin::retry(&pool, successor)
+        .await
+        .expect("retry once the key is free")
+        .expect("retried successor");
+    assert_eq!(claim_holder(&pool, key).await, Some(successor));
+    let restored: Option<String> =
+        sqlx::query_scalar("SELECT unique_states::text FROM awa.jobs WHERE id = $1")
+            .bind(successor)
+            .fetch_one(&pool)
+            .await
+            .expect("restored mask");
+    assert_eq!(
+        restored.as_deref(),
+        Some("11000010"),
+        "the original mask exactly"
+    );
+
+    // The retried job has its original mask back, so cancelling it again
+    // keeps the key as the mask says.
+    admin::cancel(&pool, successor)
+        .await
+        .expect("cancel the retried successor")
+        .expect("cancelled successor");
+    assert_eq!(
+        claim_holder(&pool, key).await,
+        Some(successor),
+        "a cancelled job whose mask claims cancelled keeps its key"
+    );
+
+    sqlx::query("SELECT awa.delete_job_compat($1)")
+        .bind(successor)
+        .execute(&pool)
+        .await
+        .expect("delete retried successor");
+    finalize_after_test(&pool).await;
+}
+
+/// A cancelled duplicate that 0.6.18 stored without its unique key cannot be
+/// retried: nothing would keep it from running beside the job holding the key.
+#[tokio::test]
+async fn retry_of_a_keyless_duplicate_cancellation_is_refused() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+    use awa_model::{admin, AwaError, JobState};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    enter_mixed_transition_for_test(&pool).await;
+
+    let key = b"reschedule-dup-legacy-keyless-key";
+    let job = seed_canonical_running_job_with_mask(&pool, key, 9, "11000010").await;
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key.to_vec())
+        .bind(987_656_i64)
+        .execute(&pool)
+        .await
+        .expect("newer duplicate takes the claim");
+    let successor = match reschedule_canonical_attempt(
+        &pool,
+        job,
+        9,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("duplicate-claim snooze")
+    {
+        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
+        other => panic!("expected CancelledDuplicate, got {other:?}"),
+    };
+    // The row as 0.6.18 wrote it: no unique key or mask, and a duplicate
+    // error entry without a recorded mask.
+    sqlx::query(
+        "UPDATE awa.done_entries
+         SET unique_key = NULL,
+             unique_states = NULL,
+             payload = jsonb_set(
+                 payload,
+                 '{errors}',
+                 jsonb_build_array(jsonb_build_object(
+                     'error', 'rescheduled as duplicate: unique claim held by a newer job',
+                     'attempt', 0,
+                     'terminal', true
+                 ))
+             )
+         WHERE job_id = $1",
+    )
+    .bind(successor)
+    .execute(&pool)
+    .await
+    .expect("strip the key as 0.6.18 did");
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(key.to_vec())
+        .execute(&pool)
+        .await
+        .expect("the newer job releases the key");
+
+    let retried = admin::retry(&pool, successor).await;
+    assert!(
+        matches!(retried, Err(AwaError::UniqueConflict { .. })),
+        "a keyless duplicate cancellation must not be revived, got {retried:?}"
+    );
+    let stored = admin::get_job(&pool, successor).await.expect("stored row");
+    assert_eq!(stored.state, JobState::Cancelled);
+
+    finalize_after_test(&pool).await;
+}
