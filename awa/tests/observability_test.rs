@@ -885,8 +885,9 @@ async fn test_queue_worker_gauges_report_slots_in_use_and_capacity() {
     let _ = meter_provider.shutdown();
 }
 
-/// The data points of `name` as (attributes, value) pairs, from the last
-/// export: gauges by value, histograms by sample count.
+/// The data points of `name` as (attributes, value) pairs, from every export
+/// so far in export order, so the latest value of a series is its last
+/// point: gauges by value, histograms by sample count.
 fn metric_points(
     resource_metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
     name: &str,
@@ -1092,6 +1093,7 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
         let due = |name: &str| {
             metric_points(&resource_metrics, name)
                 .into_iter()
+                .rev()
                 .find(|(attrs, _)| {
                     attrs.get("awa.job.queue").map(String::as_str) == Some(queue)
                         && attrs.get("awa.job.state").map(String::as_str) == Some("scheduled")
@@ -1101,7 +1103,7 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
         let leader = metric_points(&resource_metrics, "awa.maintenance.leader")
             .into_iter()
             .map(|(_, value)| value)
-            .next();
+            .next_back();
         let observed = (
             failed_branch,
             failed_batch,
