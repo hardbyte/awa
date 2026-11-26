@@ -1470,8 +1470,6 @@ async fn queue_prune_has_pending_ready_tx(
     .map_err(map_sqlx_error)
 }
 
-/// Whether a claim on a ready row in the slot is not yet proven closed. Claims
-/// of any generation count, as in [`queue_prune_has_active_leases_tx`].
 /// `claimed` without repeats of an attempt, keeping the first. Completion
 /// writes one closure per input entry, and queue prune proves a slot's
 /// claims closed by count, so an attempt passed twice would record two
@@ -1494,6 +1492,8 @@ fn unique_attempts(claimed: &[ClaimedRuntimeJob]) -> std::borrow::Cow<'_, [Claim
     )
 }
 
+/// Whether a claim on a ready row in the slot is not yet proven closed. Claims
+/// of any generation count, as in [`queue_prune_has_active_leases_tx`].
 async fn queue_prune_has_unclosed_claim_refs_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
