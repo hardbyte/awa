@@ -1153,6 +1153,9 @@ pub struct MaintenanceService {
     /// The runtime this service belongs to, which keys its
     /// `awa.maintenance.leader` series.
     instance_id: Option<Uuid>,
+    /// The `(queue, state)` keys the last queue-health pass recorded due
+    /// gauges for; see [`DueWork::points`].
+    due_recorded: std::sync::Mutex<HashSet<(String, String)>>,
     pool: PgPool,
     metrics: crate::metrics::AwaMetrics,
     cancel: CancellationToken,
@@ -1269,6 +1272,42 @@ impl DueWork {
         let entry = self.0.entry((queue, state)).or_insert((0, 0.0));
         entry.0 += depth;
         entry.1 = entry.1.max(lag.max(0.0));
+    }
+
+    /// The `(queue, state, depth, lag)` points to record: both states of
+    /// every queue in `queues` and every queue with due work, with zeroes
+    /// where none is due, and zeroes for each key in `recorded`, the keys the
+    /// previous pass recorded, that this pass would leave out. Without the
+    /// last, a queue that drops out of the queue list, such as a canonical
+    /// queue once a storage transition has drained it, would keep its last
+    /// depth and lag. `recorded` becomes this pass's keys.
+    fn points(
+        mut self,
+        queues: impl Iterator<Item = String>,
+        recorded: &mut HashSet<(String, String)>,
+    ) -> Vec<(String, String, i64, f64)> {
+        let mut points = Vec::new();
+        for queue in queues {
+            for state in ["scheduled", "retryable"] {
+                let key = (queue.clone(), state.to_string());
+                let (depth, lag) = self.0.remove(&key).unwrap_or((0, 0.0));
+                points.push((key.0, key.1, depth, lag));
+            }
+        }
+        for ((queue, state), (depth, lag)) in self.0 {
+            points.push((queue, state, depth, lag));
+        }
+        let current: HashSet<(String, String)> = points
+            .iter()
+            .map(|(queue, state, _, _)| (queue.clone(), state.clone()))
+            .collect();
+        for (queue, state) in recorded.drain() {
+            if !current.contains(&(queue.clone(), state.clone())) {
+                points.push((queue, state, 0, 0.0));
+            }
+        }
+        *recorded = current;
+        points
     }
 }
 
@@ -1564,6 +1603,7 @@ impl MaintenanceService {
     ) -> Self {
         Self {
             instance_id: None,
+            due_recorded: std::sync::Mutex::new(HashSet::new()),
             pool,
             metrics,
             cancel,
@@ -4964,20 +5004,19 @@ impl MaintenanceService {
         Ok(())
     }
 
-    /// Record `due` for every queue in `queues` and every queue with due work,
-    /// with zeroes where none is due, so a gauge falls back to 0 once its
-    /// backlog is promoted.
-    fn record_due_work(&self, queues: impl Iterator<Item = String>, mut due: DueWork) {
-        for queue in queues {
-            for state in ["scheduled", "retryable"] {
-                let (depth, lag) = due
-                    .0
-                    .remove(&(queue.clone(), state.to_string()))
-                    .unwrap_or((0, 0.0));
-                self.metrics.record_queue_due(&queue, state, depth, lag);
-            }
-        }
-        for ((queue, state), (depth, lag)) in due.0 {
+    /// Record `due` for every queue in `queues`, every queue with due work
+    /// and every queue recorded last pass, with zeroes where none is due, so
+    /// a gauge falls back to 0 once its backlog is promoted or its queue is
+    /// gone. See [`DueWork::points`].
+    fn record_due_work(&self, queues: impl Iterator<Item = String>, due: DueWork) {
+        let points = {
+            let mut recorded = self
+                .due_recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            due.points(queues, &mut recorded)
+        };
+        for (queue, state, depth, lag) in points {
             self.metrics.record_queue_due(&queue, &state, depth, lag);
         }
     }
@@ -5548,6 +5587,49 @@ mod tests {
                 .await
                 .expect("count leftover canonical hot rows");
         assert_eq!(leftover, 0, "no stuck canonical rows may remain");
+    }
+
+    /// A queue/state whose due work was recorded, and which then drops out
+    /// of both the queue list and the due rows, is recorded once more at 0,
+    /// so its gauges do not keep the last depth and lag.
+    #[test]
+    fn due_gauges_of_a_vanished_queue_fall_back_to_zero() {
+        let mut recorded = HashSet::new();
+        let mut due = DueWork::default();
+        due.add("canonical_only".into(), "scheduled".into(), 3, 600.0);
+        let mut first = due.points(std::iter::once("kept".to_string()), &mut recorded);
+        first.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        assert_eq!(
+            first,
+            vec![
+                ("canonical_only".into(), "scheduled".into(), 3, 600.0),
+                ("kept".into(), "retryable".into(), 0, 0.0),
+                ("kept".into(), "scheduled".into(), 0, 0.0),
+            ]
+        );
+
+        let mut second =
+            DueWork::default().points(std::iter::once("kept".to_string()), &mut recorded);
+        second.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        assert_eq!(
+            second,
+            vec![
+                ("canonical_only".into(), "scheduled".into(), 0, 0.0),
+                ("kept".into(), "retryable".into(), 0, 0.0),
+                ("kept".into(), "scheduled".into(), 0, 0.0),
+            ],
+            "the vanished queue is set back to 0"
+        );
+
+        let third = DueWork::default().points(std::iter::empty(), &mut recorded);
+        assert_eq!(
+            third.len(),
+            2,
+            "each key is zeroed once after it vanishes: {third:?}"
+        );
+        assert!(DueWork::default()
+            .points(std::iter::empty(), &mut recorded)
+            .is_empty());
     }
 
     #[test]

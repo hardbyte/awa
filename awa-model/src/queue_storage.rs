@@ -5685,6 +5685,12 @@ impl QueueStorage {
             .lock()
             .expect("claimer gate cache poisoned")
             .clear();
+        // Generations restart at zero, so a proof kept from before the reset
+        // could match a slot's new generation.
+        self.claim_slot_proofs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.reset_rotation_observations();
         Ok(())
     }

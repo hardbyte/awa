@@ -913,8 +913,9 @@ groups:
           description: |
             Summed over the fleet, awa_maintenance_leader should be 1. At 0, no
             runtime promotes due jobs, rescues stuck attempts or prunes the rings:
-            check that some runtime is running and can reach Postgres. Above 1
-            past a handover, two runtimes believe they lead.
+            check that some runtime is running and can reach Postgres. A fleet
+            with no runtime reporting the metric counts as 0. Above 1 past a
+            handover, two runtimes believe they lead.
         data:
           - refId: A
             relativeTimeRange: { from: 600, to: 0 }
@@ -923,7 +924,7 @@ groups:
               refId: A
               datasource: { type: prometheus, uid: DS_PROMETHEUS }
               expr: |
-                sum(awa_maintenance_leader)
+                sum(awa_maintenance_leader) or vector(0)
               instant: true
               intervalMs: 1000
               maxDataPoints: 43200
