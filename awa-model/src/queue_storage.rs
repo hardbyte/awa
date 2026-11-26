@@ -1162,6 +1162,31 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
+/// The number of receipt claims a claim slot holds, row-local and compact.
+/// Reads only the slot's claim partitions.
+pub(crate) fn claim_slot_claimed_count_sql(schema: &str, slot: usize) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM {claims})::bigint \
+              + (SELECT COALESCE(sum(claimed_count), 0) FROM {batches})::bigint",
+        claims = claim_child_name(schema, slot),
+        batches = claim_batch_child_name(schema, slot),
+    )
+}
+
+/// The number of receipt claims the closure ledgers of a claim slot close,
+/// row-local and compact. When it equals [`claim_slot_claimed_count_sql`],
+/// every claim in the slot is closed: the proof claim prune makes before it
+/// truncates the slot (see `claim_prune_has_open_claims_tx`). Reads only the
+/// slot's closure partitions.
+pub(crate) fn claim_slot_closed_count_sql(schema: &str, slot: usize) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM {closures})::bigint \
+              + (SELECT COALESCE(sum(closed_count), 0) FROM {closure_batches})::bigint",
+        closures = closure_child_name(schema, slot),
+        closure_batches = claim_closure_batch_child_name(schema, slot),
+    )
+}
+
 pub(crate) fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
     usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
@@ -4326,12 +4351,35 @@ pub struct QueueStorage {
     /// once instead of each probing again during an outage.
     job_output_probe_failed_at: Mutex<Option<std::time::Instant>>,
     job_output_probes: AtomicU64,
+    /// Whether each sealed claim slot's claims were all closed when rescue
+    /// last counted them; see [`Self::rescue_slot_order_tx`].
+    claim_slot_proofs: Mutex<HashMap<i32, ClaimSlotProof>>,
 }
 
 /// How long a negative answer about the output columns is trusted before
 /// the catalog is checked again, so a binary that started before the
 /// migration picks the columns up without a restart.
 const JOB_OUTPUT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether a sealed claim slot's claims were all closed, by the counts claim
+/// prune proves before it truncates a slot, at its ring generation.
+#[derive(Debug, Clone, Copy)]
+struct ClaimSlotProof {
+    generation: i64,
+    closed: bool,
+    proven_at: Instant,
+}
+
+/// How long rescue trusts a sealed claim slot's [`ClaimSlotProof`] before it
+/// counts the slot again.
+///
+/// A claim reads the current claim slot without a lock, so a claim
+/// transaction in flight when the ring rotates can still commit into the slot
+/// just sealed. A slot proven closed before such a claim commits looks closed
+/// to rescue until it is counted again, so the claim's rescue waits at most
+/// this long. Prune does not use these proofs: it counts under its
+/// `ACCESS EXCLUSIVE` lock, which waits for every such claim.
+const CLAIM_SLOT_PROOF_TTL: Duration = Duration::from_secs(30);
 
 impl QueueStorage {
     pub fn new(config: QueueStorageConfig) -> Result<Self, AwaError> {
@@ -4386,6 +4434,7 @@ impl QueueStorage {
             job_output_probe: tokio::sync::Mutex::new(()),
             job_output_probe_failed_at: Mutex::new(None),
             job_output_probes: AtomicU64::new(0),
+            claim_slot_proofs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -14877,7 +14926,130 @@ impl QueueStorage {
             }
         }
         slots.retain(|slot| !options.skip_slots.contains(slot));
+        let closed = self.closed_sealed_claim_slots_tx(tx, &slots).await?;
+        slots.retain(|slot| !closed.contains(slot));
         Ok(slots)
+    }
+
+    /// The sealed slots among `slots` whose claims are all closed, so rescue
+    /// has nothing to find in them.
+    ///
+    /// Each rotation leaves a sealed slot of every claim taken in it, most of
+    /// them closed, and the slot stays until prune reclaims it. Rescue walks a
+    /// slot's claims from a cursor, a bounded window per batch, so without
+    /// this it walked the closed claims of every large sealed slot ahead of
+    /// the slot holding a dead worker's claims, and found those minutes late.
+    ///
+    /// A slot is proven by counts, as claim prune proves it before truncating:
+    /// claims in the slot against closures in its ledgers. Each count runs in
+    /// a savepoint rolled back at once, so the slot's partitions are not held
+    /// for the rest of the rescue transaction. A proof is kept for its slot's
+    /// generation for [`CLAIM_SLOT_PROOF_TTL`]. The current slot is never
+    /// skipped.
+    async fn closed_sealed_claim_slots_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slots: &[i32],
+    ) -> Result<HashSet<i32>, AwaError> {
+        let schema = self.schema();
+        let current_slot: Option<i32> = sqlx::query_scalar(audited_sql(format!(
+            "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE"
+        )))
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let generations: HashMap<i32, i64> = sqlx::query_as::<_, (i32, i64)>(audited_sql(format!(
+            "SELECT slot, generation FROM {schema}.claim_ring_slots WHERE slot = ANY($1)"
+        )))
+        .bind(slots)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?
+        .into_iter()
+        .collect();
+
+        let mut closed = HashSet::new();
+        for &slot in slots {
+            if Some(slot) == current_slot {
+                continue;
+            }
+            let Some(&generation) = generations.get(&slot) else {
+                continue;
+            };
+            let cached = self
+                .claim_slot_proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&slot)
+                .copied()
+                .filter(|proof| {
+                    proof.generation == generation
+                        && proof.proven_at.elapsed() < CLAIM_SLOT_PROOF_TTL
+                });
+            let is_closed = match cached {
+                Some(proof) => proof.closed,
+                None => {
+                    let is_closed = self.claim_slot_proven_closed_tx(tx, slot).await?;
+                    self.claim_slot_proofs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            slot,
+                            ClaimSlotProof {
+                                generation,
+                                closed: is_closed,
+                                proven_at: Instant::now(),
+                            },
+                        );
+                    is_closed
+                }
+            };
+            if is_closed {
+                closed.insert(slot);
+            }
+        }
+        Ok(closed)
+    }
+
+    /// Whether every claim in claim slot `slot` is closed, by counts: see
+    /// [`claim_slot_closed_count_sql`]. A slot with no claims is closed
+    /// without reading its closure partitions.
+    async fn claim_slot_proven_closed_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slot: i32,
+    ) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        let slot_index = ring_slot_number(slot, "claim")?;
+        sqlx::query("SAVEPOINT awa_rescue_slot_proof")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let proven = async {
+            let claimed: i64 = sqlx::query_scalar(audited_sql(claim_slot_claimed_count_sql(
+                schema, slot_index,
+            )))
+            .fetch_one(tx.as_mut())
+            .await?;
+            if claimed == 0 {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            let closed: i64 =
+                sqlx::query_scalar(audited_sql(claim_slot_closed_count_sql(schema, slot_index)))
+                    .fetch_one(tx.as_mut())
+                    .await?;
+            Ok(claimed == closed)
+        }
+        .await;
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_rescue_slot_proof")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        sqlx::query("RELEASE SAVEPOINT awa_rescue_slot_proof")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        proven.map_err(map_sqlx_error)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -10611,6 +10611,115 @@ async fn test_rescue_stale_heartbeat_cutoff_holds_while_the_transaction_waits() 
     single.close().await;
 }
 
+/// Rescue does not walk a sealed claim slot whose claims are all closed. Each
+/// rotation leaves such a slot behind until prune reclaims it, and walking
+/// their closed claims every batch made rescue reach a dead worker's claims
+/// minutes late. A sealed slot that still holds an open claim, and the current
+/// slot, are walked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_rescue_skips_sealed_claim_slots_proven_closed() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_rescue_closed_slots";
+    let schema = "awa_qs_runtime_rescue_closed_slots";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 4,
+        },
+    )
+    .await;
+    for id in 0..5 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let deadline = Duration::from_secs(30);
+    let claim = |count| store.claim_runtime_batch(&pool, queue, count, deadline);
+
+    // The oldest slot: every claim completed.
+    let closed = claim(2).await.expect("claim into the oldest slot");
+    let closed_slot = closed[0].claim.claim_slot;
+    store
+        .complete_runtime_batch(&pool, &closed)
+        .await
+        .expect("complete the oldest slot's claims");
+    store
+        .rotate_claims(&pool)
+        .await
+        .expect("seal the oldest slot");
+
+    // The next slot: one claim completed, one left open by a dead worker.
+    let partly = claim(2).await.expect("claim into the next slot");
+    let partly_slot = partly[0].claim.claim_slot;
+    store
+        .complete_runtime_batch(&pool, &partly[..1])
+        .await
+        .expect("complete one claim");
+    store
+        .rotate_claims(&pool)
+        .await
+        .expect("seal the next slot");
+
+    // The current slot: one claim left open by a dead worker.
+    let current = claim(1).await.expect("claim into the current slot");
+    let current_slot = current[0].claim.claim_slot;
+    assert_eq!(
+        [closed_slot, partly_slot, current_slot]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "three distinct claim slots"
+    );
+    for dead in [&partly[1], &current[0]] {
+        age_receipt_claim(
+            &pool,
+            &store,
+            dead.job.id,
+            dead.job.run_lease,
+            Duration::from_secs(300),
+        )
+        .await;
+    }
+
+    let batch = store
+        .rescue_stale_heartbeats_batch(
+            &pool,
+            Duration::from_secs(90),
+            &|_| false,
+            &awa::model::RescueBatchOptions::default(),
+        )
+        .await
+        .expect("rescue stale claims");
+    let mut rescued: Vec<i64> = batch.rescued.iter().map(|job| job.id).collect();
+    rescued.sort_unstable();
+    let mut dead: Vec<i64> = vec![partly[1].job.id, current[0].job.id];
+    dead.sort_unstable();
+    assert_eq!(rescued, dead, "both dead claims are rescued in one batch");
+    let walked: std::collections::BTreeSet<i32> = batch
+        .scan_progress
+        .iter()
+        .map(|progress| progress.slot)
+        .collect();
+    assert_eq!(
+        walked,
+        [partly_slot, current_slot].into_iter().collect(),
+        "the sealed slot whose claims all closed is not walked"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
     let (_db_guard, pool) = setup_pool(10).await;
