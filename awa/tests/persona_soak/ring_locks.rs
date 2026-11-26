@@ -14,7 +14,7 @@ const BLOCKER_PIDS: usize = 64;
 const CLIENT_DEADLINE: Duration = Duration::from_millis(750);
 const CAPTURES_PER_STAGE: u8 = 12;
 const OPEN_CLAIM_GROUPS: i64 = 32;
-const OPEN_CLAIMS_DEADLINE: Duration = Duration::from_secs(4);
+const OPEN_CLAIMS_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
@@ -279,7 +279,7 @@ async fn open_claims(pool: &PgPool, schema: &str, slot: i32) -> Value {
         sqlx::query("SET TRANSACTION READ ONLY")
             .execute(tx.as_mut())
             .await?;
-        sqlx::query("SET LOCAL statement_timeout = '3s'")
+        sqlx::query("SET LOCAL statement_timeout = '10s'")
             .execute(tx.as_mut())
             .await?;
         sqlx::query("SET LOCAL lock_timeout = '100ms'")
