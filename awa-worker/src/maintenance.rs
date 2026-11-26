@@ -7,7 +7,10 @@ use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
 use awa_model::isolation::BeginReadCommitted;
-use awa_model::queue_storage::{DlqExpiry, PROMOTED_DUPLICATE_ERROR};
+use awa_model::queue_storage::{
+    DlqExpiry, PROMOTED_DUPLICATE_ERROR, RESCUED_EXPIRED_DUPLICATE_ERROR,
+    RESCUED_STALE_DUPLICATE_ERROR, RESCUED_TIMED_OUT_DUPLICATE_ERROR,
+};
 use awa_model::{
     AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
     RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
@@ -2852,7 +2855,7 @@ impl MaintenanceService {
                     HEARTBEAT_RESCUE_PER_ROW_SQL,
                     Some(staleness_ms),
                     "running",
-                    "rescued as duplicate: heartbeat stale and unique claim held by a newer job",
+                    RESCUED_STALE_DUPLICATE_ERROR,
                     "heartbeat",
                 )
                 .await
@@ -3038,7 +3041,7 @@ impl MaintenanceService {
                     DEADLINE_RESCUE_PER_ROW_SQL,
                     None,
                     "running",
-                    "rescued as duplicate: deadline expired and unique claim held by a newer job",
+                    RESCUED_EXPIRED_DUPLICATE_ERROR,
                     "deadline",
                 )
                 .await
@@ -3208,7 +3211,7 @@ impl MaintenanceService {
                     CALLBACK_RESCUE_PER_ROW_SQL,
                     None,
                     "waiting_external",
-                    "rescued as duplicate: callback timed out and unique claim held by a newer job",
+                    RESCUED_TIMED_OUT_DUPLICATE_ERROR,
                     "callback_timeout",
                 )
                 .await
@@ -3501,9 +3504,10 @@ impl MaintenanceService {
 
     /// Terminal fallback for a job whose rescue transition conflicts with a
     /// unique claim: the newer claim holder wins, this job is cancelled with
-    /// an error entry naming why. `cancelled` sits outside the default
-    /// unique-states mask, so this transition normally releases nothing and
-    /// claims nothing.
+    /// an error entry naming why. `cancelled` is cleared from the row's mask
+    /// so the cancellation claims nothing even when the mask names it, and
+    /// the original mask is recorded in the error entry for a retry to
+    /// restore; the row keeps its unique key.
     async fn cancel_unique_conflicted_job(
         &self,
         job_id: i64,
@@ -3526,8 +3530,10 @@ impl MaintenanceService {
                 errors = errors || jsonb_build_object(
                     'error', $3::text,
                     'attempt', attempt,
-                    'at', now()
-                )::jsonb
+                    'at', now(),
+                    'duplicate_unique_states', unique_states::text
+                )::jsonb,
+                unique_states = set_bit(unique_states, 6, 0)
             WHERE id = $1 AND state = $2::awa.job_state
             RETURNING *
             "#,

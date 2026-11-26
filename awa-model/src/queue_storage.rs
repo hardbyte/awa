@@ -50,6 +50,17 @@ pub(crate) const RESCHEDULED_DUPLICATE_ERROR: &str =
 #[doc(hidden)]
 pub const PROMOTED_DUPLICATE_ERROR: &str =
     "promoted as duplicate: unique claim held by another job";
+/// The errors canonical rescue writes when it cancels a stale, expired or
+/// timed-out attempt as a duplicate.
+#[doc(hidden)]
+pub const RESCUED_STALE_DUPLICATE_ERROR: &str =
+    "rescued as duplicate: heartbeat stale and unique claim held by a newer job";
+#[doc(hidden)]
+pub const RESCUED_EXPIRED_DUPLICATE_ERROR: &str =
+    "rescued as duplicate: deadline expired and unique claim held by a newer job";
+#[doc(hidden)]
+pub const RESCUED_TIMED_OUT_DUPLICATE_ERROR: &str =
+    "rescued as duplicate: callback timed out and unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
@@ -2611,12 +2622,15 @@ pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "duplicate_unique_states";
 
 /// The messages of the error entries awa writes when it cancels a job as a
 /// duplicate. A recorded mask is trusted only on an entry with one of them.
-pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 5] = [
+pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 8] = [
     SNOOZED_DUPLICATE_ERROR,
     RETRIED_DUPLICATE_ERROR,
     RESCUED_DUPLICATE_ERROR,
     RESCHEDULED_DUPLICATE_ERROR,
     PROMOTED_DUPLICATE_ERROR,
+    RESCUED_STALE_DUPLICATE_ERROR,
+    RESCUED_EXPIRED_DUPLICATE_ERROR,
+    RESCUED_TIMED_OUT_DUPLICATE_ERROR,
 ];
 
 /// The messages releases before 0.6.19 wrote when they cancelled a duplicate
@@ -19123,21 +19137,6 @@ impl QueueStorage {
         done.into_job_row()
     }
 
-    /// Settle attempts that maintenance rescued (stale heartbeat, expired
-    /// deadline or callback timeout): back to `retryable` with backoff while
-    /// attempts remain, `failed` once the rescued attempt was the last. A job
-    /// that kills or hangs its worker every time therefore stops after
-    /// `max_attempts`, like one whose handler returns an error. Each batch
-    /// pairs rescued attempts with the error recorded on them.
-    ///
-    /// An exhausted attempt on a queue whose DLQ is enabled goes straight to
-    /// `dlq_entries` in this transaction, as `fail_to_dlq` does for a handler
-    /// error, so there is no window in which it sits `failed` outside the DLQ.
-    ///
-    /// Every batch's unique claims change in one key-ordered pass. An attempt
-    /// whose outcome claims a key a newer duplicate holds is cancelled
-    /// instead: the claim holder wins, and one poisoned row must not abort
-    /// the whole rescue transaction.
     /// Write `deferred` as the successor of the attempt `row`, or, when
     /// another job holds its unique key, finish the attempt as a cancelled
     /// duplicate with `duplicate_error` instead: the claim holder wins. The
@@ -19161,7 +19160,13 @@ impl QueueStorage {
             return deferred.into_job_row();
         }
         let old_state = row.state;
-        let finalized_at = Utc::now().trunc_subsecs(6);
+        // The cancelled row takes the time the caller stamped the successor
+        // with, truncated to what PostgreSQL stores so the returned row
+        // matches the committed one.
+        let finalized_at = deferred
+            .finalized_at
+            .unwrap_or_else(Utc::now)
+            .trunc_subsecs(6);
         let (done, cleared) =
             duplicate_cancelled_row(row, deferred.payload, duplicate_error, finalized_at)?;
         // As in rescue: a row whose mask was cleared is written
@@ -19172,6 +19177,21 @@ impl QueueStorage {
         done.into_job_row()
     }
 
+    /// Settle attempts that maintenance rescued (stale heartbeat, expired
+    /// deadline or callback timeout): back to `retryable` with backoff while
+    /// attempts remain, `failed` once the rescued attempt was the last. A job
+    /// that kills or hangs its worker every time therefore stops after
+    /// `max_attempts`, like one whose handler returns an error. Each batch
+    /// pairs rescued attempts with the error recorded on them.
+    ///
+    /// An exhausted attempt on a queue whose DLQ is enabled goes straight to
+    /// `dlq_entries` in this transaction, as `fail_to_dlq` does for a handler
+    /// error, so there is no window in which it sits `failed` outside the DLQ.
+    ///
+    /// Every batch's unique claims change in one key-ordered pass. An attempt
+    /// whose outcome claims a key a newer duplicate holds is cancelled
+    /// instead: the claim holder wins, and one poisoned row must not abort
+    /// the whole rescue transaction.
     async fn settle_rescued_attempts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -21259,7 +21279,7 @@ impl QueueStorage {
         duplicates: Vec<(ExistingReadyRow, DateTime<Utc>)>,
     ) -> Result<Vec<JobRow>, AwaError> {
         let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
-        let finalized_at = Utc::now();
+        let finalized_at = Utc::now().trunc_subsecs(6);
         let done: Vec<DoneJobRow> = duplicates
             .into_iter()
             .map(|(row, due_run_at)| {
@@ -23827,6 +23847,9 @@ mod revived_unique_states_tests {
             SNOOZED_DUPLICATE_ERROR,
             RETRIED_DUPLICATE_ERROR,
             PROMOTED_DUPLICATE_ERROR,
+            RESCUED_STALE_DUPLICATE_ERROR,
+            RESCUED_EXPIRED_DUPLICATE_ERROR,
+            RESCUED_TIMED_OUT_DUPLICATE_ERROR,
         ] {
             assert_eq!(
                 admin.matches(&format!("'{message}'")).count(),
