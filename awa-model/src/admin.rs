@@ -3,7 +3,7 @@ use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
-use crate::queue_storage::QueueStorage;
+use crate::queue_storage::{QueueStorage, CAPTURED_LANE_HEADS_SQL};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -330,6 +330,20 @@ async fn callback_job_queue_storage_in_tx(
 /// forms of their own; this is the definition they must agree with.
 #[doc(hidden)]
 pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
+    current_jobs_cte(
+        schema,
+        &format!("{schema}.queue_claim_heads AS claims"),
+        &format!("{schema}.sequence_next_value(claims.seq_name)"),
+        &queue_storage_current_open_claims_sql(schema),
+    )
+}
+
+/// `current_jobs` with `open_claims` spliced in after the lease rows: either
+/// the receipt-claim branches that read the claim ring, or a source of
+/// running rows read some other way. Available rows are those at or past
+/// `claim_seq` in their lane, for each lane of `claim_heads`, a relation
+/// aliased `claims` with `queue`, `priority` and `enqueue_shard`.
+fn current_jobs_cte(schema: &str, claim_heads: &str, claim_seq: &str, open_claims: &str) -> String {
     format!(
         r#"
         WITH current_available AS (
@@ -342,11 +356,11 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                 ready.run_at,
                 NULL::timestamptz AS finalized_at
             FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
+            JOIN {claim_heads}
               ON claims.queue = ready.queue
              AND claims.priority = ready.priority
              AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+            WHERE ready.lane_seq >= {claim_seq}
               AND NOT EXISTS (
                   SELECT 1 FROM {schema}.ready_tombstones AS tomb
                   WHERE tomb.ready_slot = ready.ready_slot
@@ -393,6 +407,31 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                    AND tomb.enqueue_shard = ready.enqueue_shard
                    AND tomb.lane_seq = ready.lane_seq
              )
+{open_claims}            UNION ALL
+            SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
+            FROM {schema}.terminal_jobs
+            UNION ALL
+            SELECT
+                job_id,
+                kind,
+                queue,
+                'failed'::awa.job_state AS state,
+                created_at,
+                run_at,
+                finalized_at
+            FROM {schema}.dlq_entries
+        )
+        "#
+    )
+}
+
+/// The receipt-claim legs of [`queue_storage_current_jobs_cte`], each starting
+/// with `UNION ALL`. One statement over the claim-ring parents: see
+/// [`queue_storage_open_claims`] for reads polled often enough to need them
+/// slot by slot.
+fn queue_storage_current_open_claims_sql(schema: &str) -> String {
+    format!(
+        r#"
             UNION ALL
             -- Receipt claims that have not materialised into `leases` are
             -- running too (#246 / #416). They live on legacy row-local
@@ -534,22 +573,21 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                   WHERE dlq.job_id = items.job_id
                     AND dlq.run_lease = items.run_lease
               )
-            UNION ALL
-            SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
-            FROM {schema}.terminal_jobs
-            UNION ALL
-            SELECT
-                job_id,
-                kind,
-                queue,
-                'failed'::awa.job_state AS state,
-                created_at,
-                run_at,
-                finalized_at
-            FROM {schema}.dlq_entries
-        )
         "#
     )
+}
+
+/// Binds [`LaneHeads`] as `$1` to `$5` of a query with no other binds yet.
+macro_rules! bind_lane_heads {
+    ($query:expr, $heads:expr) => {{
+        let heads: LaneHeads = $heads;
+        $query
+            .bind(heads.queues)
+            .bind(heads.priorities)
+            .bind(heads.enqueue_shards)
+            .bind(heads.claim_seqs)
+            .bind(heads.next_seqs)
+    }};
 }
 
 /// Jobs created at or after `since` (a bind such as `$1`), each in its
@@ -560,9 +598,11 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
 /// cursor through its segments, and terminal rows only from done rows and completion batches
 /// finalised since `since`, as a job finishes after it is created. `since`
 /// must be a bind rather than an expression such as `clock_timestamp()`,
-/// which Postgres can't push into a bound on `finalized_at`.
+/// which Postgres can't push into a bound on `finalized_at`. `$1` to `$5` are
+/// the lane heads (see [`CAPTURED_LANE_HEADS_SQL`]) and `$7` the `job_id` of
+/// each open receipt claim, a `bigint[]` from [`queue_storage_open_claims`]:
+/// the statement itself reads no claim-ring partition.
 fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
-    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     let available = crate::queue_storage::available_lane_rows_sql(
         schema,
         "head_signal",
@@ -571,19 +611,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
     );
     format!(
         r#"
-        WITH head_signal AS (
-            SELECT
-                claims.queue,
-                claims.priority,
-                claims.enqueue_shard,
-                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
-            FROM {schema}.queue_claim_heads AS claims
-            JOIN {schema}.queue_enqueue_heads AS enqueues
-              ON enqueues.queue = claims.queue
-             AND enqueues.priority = claims.priority
-             AND enqueues.enqueue_shard = claims.enqueue_shard
-        ),
+        WITH head_signal AS ({CAPTURED_LANE_HEADS_SQL}),
         recent_jobs AS (
             SELECT ready.created_at, 'available'::awa.job_state AS state
             FROM head_signal
@@ -622,7 +650,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
             -- A queue or priority move copies the row with its times, so
             -- any one of a job's ready rows gives its creation time.
             SELECT created.created_at, 'running'::awa.job_state
-            FROM ({open_running}) AS open_claims
+            FROM unnest($7::bigint[]) AS open_claims(job_id)
             CROSS JOIN LATERAL (
                 SELECT ready.created_at
                 FROM {schema}.ready_entries AS ready
@@ -2860,19 +2888,22 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
             )
         );
 
-        // JIT compiles this statement for longer than it runs (about 1.2 s
-        // against 0.35 s with 100k retained completions).
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        let rows = sqlx::query_as::<_, QueueOverview>(audited_sql(sql))
-            .fetch_all(tx.as_mut())
-            .await?;
-        tx.commit().await?;
-        drop(begin_guard);
+        // Open receipt claims are counted slot by slot first; see
+        // `queue_storage_open_claims`.
+        let rows = queue_storage_read_with_open_claims(&store, pool, |conn, heads, open| {
+            let sql = sql.clone();
+            let heads = heads.clone();
+            let queues = open.queues.clone();
+            Box::pin(async move {
+                Ok(
+                    bind_lane_heads!(sqlx::query_as::<_, QueueOverview>(audited_sql(sql)), heads)
+                        .bind(queues)
+                        .fetch_all(conn)
+                        .await?,
+                )
+            })
+        })
+        .await?;
         return Ok(rows);
     }
 
@@ -3378,7 +3409,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
                 COALESCE((SELECT sum(available)::bigint FROM ({available}) AS lanes), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0)
-                  + COALESCE((SELECT count(*)::bigint FROM ({open_running}) AS open_running), 0) AS running,
+                  + $6::bigint AS running,
                 -- A completion batch carries its size, so completed jobs are
                 -- counted without expanding batches through `terminal_jobs`.
                 -- Tombstones mark batch members deleted or retried since.
@@ -3403,11 +3434,11 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                 -- publish_queue_storage_health_metrics.)
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
             "#,
-            available = crate::queue_storage::available_by_queue_sql(store.schema()),
+            available = crate::queue_storage::available_by_queue_sql_from(
+                store.schema(),
+                CAPTURED_LANE_HEADS_SQL
+            ),
             schema = store.schema(),
-            // Compact receipt claims (#246) live in `lease_claim_batches` until
-            // materialised; count them as running alongside the `leases` leg.
-            open_running = crate::queue_storage::open_receipt_running_claims_sql(store.schema()),
         );
 
         let (
@@ -3419,21 +3450,22 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             failed,
             cancelled,
             waiting_external,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
-            // As in `queue_overviews`: compiling costs more than running.
-            let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-            let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
-            begin_guard.begin_pending = false;
-            sqlx::query("SET LOCAL jit = off")
-                .execute(tx.as_mut())
-                .await?;
-            let counts = sqlx::query_as(audited_sql(sql))
-                .fetch_one(tx.as_mut())
-                .await?;
-            tx.commit().await?;
-            drop(begin_guard);
-            counts
-        };
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) =
+            // Compact receipt claims (#246) live in `lease_claim_batches` until
+            // materialised; they are counted as running alongside the `leases`
+            // leg, slot by slot first: see `queue_storage_open_claims`.
+            queue_storage_read_with_open_claims(&store, pool, |conn, heads, open| {
+                let sql = sql.clone();
+                let heads = heads.clone();
+                let running_claims = open.job_ids.len() as i64;
+                Box::pin(async move {
+                    Ok(bind_lane_heads!(sqlx::query_as(audited_sql(sql)), heads)
+                        .bind(running_claims)
+                        .fetch_one(conn)
+                        .await?)
+                })
+            })
+            .await?;
 
         return Ok(HashMap::from([
             (JobState::Scheduled, scheduled),
@@ -3482,7 +3514,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
 }
 
 #[derive(sqlx::FromRow)]
-struct KindCountHead {
+struct LaneHead {
     queue: String,
     priority: i16,
     enqueue_shard: i16,
@@ -3490,17 +3522,17 @@ struct KindCountHead {
     next_seq: i64,
 }
 
-// Sequence values do not obey MVCC. Capture them with the first read's
-// snapshot instead of letting later claims advance them during receipt phases.
-async fn queue_storage_kind_heads(
+/// Each lane's claim and enqueue head sequences, read as the first statement
+/// of a snapshot read; see [`CAPTURED_LANE_HEADS_SQL`].
+async fn queue_storage_lane_heads(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     store: &QueueStorage,
-) -> Result<Vec<KindCountHead>, sqlx::Error> {
+) -> Result<Vec<LaneHead>, sqlx::Error> {
     let schema = store.schema();
     sqlx::query("SAVEPOINT awa_kind_heads")
         .execute(tx.as_mut())
         .await?;
-    let heads = sqlx::query_as::<_, KindCountHead>(audited_sql(format!(
+    let heads = sqlx::query_as::<_, LaneHead>(audited_sql(format!(
         r#"
             SELECT
                 claims.queue,
@@ -3526,23 +3558,36 @@ async fn queue_storage_kind_heads(
     Ok(heads)
 }
 
+/// [`LaneHead`]s as parallel columns, bound as `$1` to `$5` of
+/// [`CAPTURED_LANE_HEADS_SQL`].
+#[derive(Debug, Default, Clone)]
+struct LaneHeads {
+    queues: Vec<String>,
+    priorities: Vec<i16>,
+    enqueue_shards: Vec<i16>,
+    claim_seqs: Vec<i64>,
+    next_seqs: Vec<i64>,
+}
+
+impl From<Vec<LaneHead>> for LaneHeads {
+    fn from(heads: Vec<LaneHead>) -> Self {
+        let mut columns = Self::default();
+        for head in heads {
+            columns.queues.push(head.queue);
+            columns.priorities.push(head.priority);
+            columns.enqueue_shards.push(head.enqueue_shard);
+            columns.claim_seqs.push(head.claim_seq);
+            columns.next_seqs.push(head.next_seq);
+        }
+        columns
+    }
+}
+
 async fn queue_storage_base_kind_counts(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     store: &QueueStorage,
-    heads: Vec<KindCountHead>,
+    heads: LaneHeads,
 ) -> Result<Vec<(String, String, i64, i64)>, sqlx::Error> {
-    let mut head_queues = Vec::with_capacity(heads.len());
-    let mut head_priorities = Vec::with_capacity(heads.len());
-    let mut head_shards = Vec::with_capacity(heads.len());
-    let mut claim_seqs = Vec::with_capacity(heads.len());
-    let mut next_seqs = Vec::with_capacity(heads.len());
-    for head in heads {
-        head_queues.push(head.queue);
-        head_priorities.push(head.priority);
-        head_shards.push(head.enqueue_shard);
-        claim_seqs.push(head.claim_seq);
-        next_seqs.push(head.next_seq);
-    }
     let mut counts = Vec::new();
     for source in [
         KindCountSource::Available,
@@ -3558,12 +3603,7 @@ async fn queue_storage_base_kind_counts(
             .await?;
         let mut query = sqlx::query_as::<_, (String, String, i64, i64)>(audited_sql(sql));
         if source == KindCountSource::Available {
-            query = query
-                .bind(&head_queues)
-                .bind(&head_priorities)
-                .bind(&head_shards)
-                .bind(&claim_seqs)
-                .bind(&next_seqs);
+            query = bind_lane_heads!(query, heads.clone());
         }
         counts.extend(query.fetch_all(tx.as_mut()).await?);
         sqlx::query("ROLLBACK TO SAVEPOINT awa_kind_source")
@@ -3576,34 +3616,150 @@ async fn queue_storage_base_kind_counts(
     Ok(counts)
 }
 
-// The result is bounded by the installed claim-ring slot count, not by
-// retained job volume. Include all populated slots, including old generations.
-async fn queue_storage_populated_claim_slots(
+/// The claim slots that may hold an open receipt claim: each installed slot
+/// whose claims the closure ledgers do not all close.
+///
+/// Each slot is checked by counts, the proof claim prune makes before it
+/// truncates a slot, rather than by the open-claim projection, whose
+/// anti-joins over a sealed slot of a million closed claims run for seconds.
+/// A slot with no claims is skipped before its closure partitions are read,
+/// and a slot whose counts match is skipped after one count. Each check runs
+/// in a savepoint that is rolled back, so it holds the slot's locks only for
+/// its own statements, and the sealed slot prune waits for costs a reader a
+/// count rather than a scan.
+async fn queue_storage_claim_slots(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     store: &QueueStorage,
 ) -> Result<Vec<usize>, AwaError> {
     let schema = store.schema();
-    sqlx::query("SAVEPOINT awa_claim_slots")
-        .execute(tx.as_mut())
-        .await?;
-    let slots: Vec<i32> = sqlx::query_scalar(audited_sql(format!(
-        "SELECT claim_slot FROM {schema}.lease_claims WHERE closed_at IS NULL \
-         UNION SELECT claim_slot FROM {schema}.lease_claim_batches ORDER BY claim_slot"
+    let installed: Vec<i32> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
     )))
     .fetch_all(tx.as_mut())
     .await?;
-    sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
+    let mut slots = Vec::new();
+    for slot in installed {
+        // A schema-only admin store carries the default slot count, so take
+        // the installed slot numbers as they are rather than bounding them
+        // by it.
+        let slot = crate::queue_storage::ring_slot_number(slot, "claim")?;
+        sqlx::query("SAVEPOINT awa_claim_slots")
+            .execute(tx.as_mut())
+            .await?;
+        let claimed: i64 = sqlx::query_scalar(audited_sql(
+            crate::queue_storage::claim_slot_claimed_count_sql(schema, slot),
+        ))
+        .fetch_one(tx.as_mut())
+        .await?;
+        let may_be_open = claimed > 0
+            && claimed
+                != sqlx::query_scalar::<_, i64>(audited_sql(
+                    crate::queue_storage::claim_slot_closed_count_sql(schema, slot),
+                ))
+                .fetch_one(tx.as_mut())
+                .await?;
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
+            .execute(tx.as_mut())
+            .await?;
+        if may_be_open {
+            slots.push(slot);
+        }
+    }
+    Ok(slots)
+}
+
+/// Receipt claims that are running without a `leases` row, as parallel
+/// columns ready to bind as arrays.
+#[derive(Debug, Default)]
+struct OpenClaims {
+    job_ids: Vec<i64>,
+    run_leases: Vec<i64>,
+    queues: Vec<String>,
+}
+
+/// The open receipt claims, read one claim slot at a time.
+///
+/// Each slot is read inside a savepoint that is then rolled back, which
+/// releases the locks on that slot's partitions before the next slot is read.
+/// One statement over the claim-ring parents would hold `ACCESS SHARE` on every
+/// claim partition until the transaction ends; admin reads polled back to back
+/// then leave claim prune no moment to lock the sealed slot, and once the ring
+/// stalls the growing current slot makes each read slower still.
+async fn queue_storage_open_claims(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    store: &QueueStorage,
+) -> Result<OpenClaims, AwaError> {
+    let schema = store.schema();
+    let mut open = OpenClaims::default();
+    for slot in queue_storage_claim_slots(tx, store).await? {
+        let open_running =
+            crate::queue_storage::open_receipt_running_claims_sql_in_slot(schema, slot);
+        sqlx::query("SAVEPOINT awa_open_claims")
+            .execute(tx.as_mut())
+            .await?;
+        let rows: Vec<(i64, i64, String)> = sqlx::query_as(audited_sql(format!(
+            "SELECT job_id, run_lease, queue FROM ({open_running}) AS open_claims"
+        )))
+        .fetch_all(tx.as_mut())
+        .await?;
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_open_claims")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT awa_open_claims")
+            .execute(tx.as_mut())
+            .await?;
+        for (job_id, run_lease, queue) in rows {
+            open.job_ids.push(job_id);
+            open.run_leases.push(run_lease);
+            open.queues.push(queue);
+        }
+    }
+    Ok(open)
+}
+
+/// The future one [`queue_storage_read_with_open_claims`] read returns.
+type OpenClaimsRead<'t, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AwaError>> + Send + 't>>;
+
+/// Runs `read` in a repeatable-read, read-only snapshot, after the lane heads
+/// and the open receipt claims of the same snapshot have been read: the heads
+/// first, which takes the snapshot (see [`CAPTURED_LANE_HEADS_SQL`]), then the
+/// claims slot by slot (see [`queue_storage_open_claims`]). `read` gets both
+/// to bind, so its own statement neither reads a head sequence live nor
+/// touches the claim-ring partitions.
+async fn queue_storage_read_with_open_claims<T, F>(
+    store: &QueueStorage,
+    pool: &PgPool,
+    read: F,
+) -> Result<T, AwaError>
+where
+    F: for<'t> Fn(
+        &'t mut sqlx::PgConnection,
+        &'t LaneHeads,
+        &'t OpenClaims,
+    ) -> OpenClaimsRead<'t, T>,
+{
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+    let mut tx = sqlx::Connection::begin_with(
+        &mut *begin_guard.connection,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .await?;
+    begin_guard.begin_pending = false;
+    // JIT compiles these statements for longer than they run (about 1.2 s
+    // against 0.35 s for `queue_overviews` with 100k retained completions).
+    sqlx::query("SET LOCAL jit = off")
         .execute(tx.as_mut())
         .await?;
-    sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
-        .execute(tx.as_mut())
-        .await?;
-    // A schema-only admin store carries the default slot count, so take the
-    // installed slot numbers as they are rather than bounding them by it.
-    slots
-        .into_iter()
-        .map(|slot| crate::queue_storage::ring_slot_number(slot, "claim"))
-        .collect()
+    let heads = LaneHeads::from(queue_storage_lane_heads(&mut tx, store).await?);
+    let open = queue_storage_open_claims(&mut tx, store).await?;
+    let value = read(tx.as_mut(), &heads, &open).await?;
+    tx.commit().await?;
+    drop(begin_guard);
+    Ok(value)
 }
 
 // Keep only per-kind, per-queue aggregates in Rust, not every claim identity.
@@ -3612,7 +3768,7 @@ async fn queue_storage_running_kind_counts(
     store: &QueueStorage,
 ) -> Result<Vec<(String, String, i64)>, AwaError> {
     let schema = store.schema();
-    let slots = queue_storage_populated_claim_slots(tx, store).await?;
+    let slots = queue_storage_claim_slots(tx, store).await?;
     let mut counts = Vec::new();
     for slot in slots {
         let open_running =
@@ -3714,8 +3870,8 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
-        let heads = queue_storage_kind_heads(&mut tx, &store).await?;
-        let mut sources = queue_storage_base_kind_counts(&mut tx, &store, heads).await?;
+        let heads = queue_storage_lane_heads(&mut tx, &store).await?;
+        let mut sources = queue_storage_base_kind_counts(&mut tx, &store, heads.into()).await?;
         sources.extend(
             queue_storage_running_kind_counts(&mut tx, &store)
                 .await?
@@ -3843,17 +3999,42 @@ pub async fn job_kind_overview(
 /// Reads from the `job_kind_catalog` cache table.
 pub async fn distinct_kinds(pool: &PgPool) -> Result<Vec<String>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
+        // Open receipt claims are read slot by slot and their kinds added
+        // here, rather than through `current_jobs`' claim legs; see
+        // `queue_storage_open_claims`.
         let sql = format!(
             "{} \
-             SELECT DISTINCT kind \
-             FROM current_jobs \
+             SELECT kind FROM current_jobs \
+             UNION \
+             SELECT created.kind \
+             FROM {} \
              ORDER BY kind",
-            queue_storage_current_jobs_cte(store.schema())
+            current_jobs_cte(
+                store.schema(),
+                &format!("({CAPTURED_LANE_HEADS_SQL}) AS claims"),
+                "claims.claim_seq",
+                "",
+            ),
+            open_claims_with_kind_sql(store.schema()),
         );
-        return sqlx::query_scalar(audited_sql(sql))
-            .fetch_all(pool)
-            .await
-            .map_err(AwaError::from);
+        return queue_storage_read_with_open_claims(&store, pool, |conn, heads, open| {
+            let sql = sql.clone();
+            let heads = heads.clone();
+            let job_ids = open.job_ids.clone();
+            let run_leases = open.run_leases.clone();
+            let queues = open.queues.clone();
+            Box::pin(async move {
+                Ok(
+                    bind_lane_heads!(sqlx::query_scalar(audited_sql(sql)), heads)
+                        .bind(job_ids)
+                        .bind(run_leases)
+                        .bind(queues)
+                        .fetch_all(conn)
+                        .await?,
+                )
+            })
+        })
+        .await;
     }
 
     let rows = sqlx::query_scalar::<_, String>(
@@ -3865,22 +4046,75 @@ pub async fn distinct_kinds(pool: &PgPool) -> Result<Vec<String>, AwaError> {
     Ok(rows)
 }
 
+/// The open receipt claims bound as `$6` (`job_id`), `$7` (`run_lease`) and
+/// `$8` (`queue`), each with the `kind` of its current ready attempt, as
+/// `open_claims` and `created`. A claim whose ready attempt is gone or
+/// tombstoned is left out, as `current_jobs` leaves it out.
+fn open_claims_with_kind_sql(schema: &str) -> String {
+    format!(
+        r#"unnest($6::bigint[], $7::bigint[], $8::text[]) AS open_claims(job_id, run_lease, queue)
+        CROSS JOIN LATERAL (
+            SELECT ready.kind
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.job_id = open_claims.job_id
+              AND ready.run_lease + 1 = open_claims.run_lease
+              AND ready.queue = open_claims.queue
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+                    OFFSET 0
+              )
+            LIMIT 1
+        ) AS created"#
+    )
+}
+
 /// Return all distinct queue names.
 ///
 /// Reads from the `job_queue_catalog` cache table.
 pub async fn distinct_queues(pool: &PgPool) -> Result<Vec<String>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
+        // Open receipt claims are read slot by slot and their queues added
+        // here, rather than through `current_jobs`' claim legs; see
+        // `queue_storage_open_claims`.
         let sql = format!(
             "{} \
-             SELECT DISTINCT queue \
-             FROM current_jobs \
+             SELECT queue FROM current_jobs \
+             UNION \
+             SELECT open_claims.queue \
+             FROM {} \
              ORDER BY queue",
-            queue_storage_current_jobs_cte(store.schema())
+            current_jobs_cte(
+                store.schema(),
+                &format!("({CAPTURED_LANE_HEADS_SQL}) AS claims"),
+                "claims.claim_seq",
+                "",
+            ),
+            open_claims_with_kind_sql(store.schema()),
         );
-        return sqlx::query_scalar(audited_sql(sql))
-            .fetch_all(pool)
-            .await
-            .map_err(AwaError::from);
+        return queue_storage_read_with_open_claims(&store, pool, |conn, heads, open| {
+            let sql = sql.clone();
+            let heads = heads.clone();
+            let job_ids = open.job_ids.clone();
+            let run_leases = open.run_leases.clone();
+            let queues = open.queues.clone();
+            Box::pin(async move {
+                Ok(
+                    bind_lane_heads!(sqlx::query_scalar(audited_sql(sql)), heads)
+                        .bind(job_ids)
+                        .bind(run_leases)
+                        .bind(queues)
+                        .fetch_all(conn)
+                        .await?,
+                )
+            })
+        })
+        .await;
     }
 
     let rows = sqlx::query_scalar::<_, String>(
@@ -4018,29 +4252,35 @@ pub async fn state_timeseries(
              FROM recent_jobs \
              GROUP BY bucket, state \
              ORDER BY bucket",
-            queue_storage_recent_jobs_cte(store.schema(), "$1")
+            queue_storage_recent_jobs_cte(store.schema(), "$6")
         );
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        // The window is measured on the database's clock, as on the canonical
-        // engine, but bound as a value: Postgres won't push an expression
-        // like `clock_timestamp()` into a bound on `finalized_at`.
-        let since: chrono::DateTime<chrono::Utc> =
-            sqlx::query_scalar("SELECT clock_timestamp() - make_interval(mins => $1)")
-                .bind(minutes)
-                .fetch_one(tx.as_mut())
-                .await?;
-        let rows =
-            sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(audited_sql(sql))
+        let rows = queue_storage_read_with_open_claims(&store, pool, |conn, heads, open| {
+            let sql = sql.clone();
+            let heads = heads.clone();
+            let job_ids = open.job_ids.clone();
+            Box::pin(async move {
+                // The window is measured on the database's clock, as on the
+                // canonical engine, but bound as a value: Postgres won't push
+                // an expression like `clock_timestamp()` into a bound on
+                // `finalized_at`.
+                let since: chrono::DateTime<chrono::Utc> =
+                    sqlx::query_scalar("SELECT clock_timestamp() - make_interval(mins => $1)")
+                        .bind(minutes)
+                        .fetch_one(&mut *conn)
+                        .await?;
+                Ok(bind_lane_heads!(
+                    sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(
+                        audited_sql(sql)
+                    ),
+                    heads
+                )
                 .bind(since)
-                .fetch_all(tx.as_mut())
-                .await?;
-        tx.commit().await?;
-        drop(begin_guard);
+                .bind(job_ids)
+                .fetch_all(&mut *conn)
+                .await?)
+            })
+        })
+        .await?;
 
         return Ok(rows
             .into_iter()
@@ -5379,5 +5619,223 @@ mod callback_poll_delay_tests {
         assert_eq!(callback_poll_delay(5), Duration::from_millis(3200));
         assert_eq!(callback_poll_delay(6), CALLBACK_POLL_MAX_DELAY);
         assert_eq!(callback_poll_delay(u32::MAX), CALLBACK_POLL_MAX_DELAY);
+    }
+}
+
+#[cfg(test)]
+mod open_claim_read_tests {
+    use super::{
+        queue_storage_claim_slots, queue_storage_open_claims, queue_storage_read_with_open_claims,
+        LaneHeads, CAPTURED_LANE_HEADS_SQL,
+    };
+    use crate::audited_sql;
+    use crate::queue_storage::{QueueStorage, QueueStorageConfig};
+    use sqlx::PgPool;
+
+    /// Claim prune needs `ACCESS EXCLUSIVE` on the sealed claim slot's
+    /// partitions. Once an admin read has read the open receipt claims, its
+    /// transaction holds no lock on any claim partition, so reads polled back
+    /// to back still leave prune a moment to take it. One statement over the
+    /// claim-ring parents, as these reads used to run, holds every claim
+    /// partition until its transaction ends.
+    #[sqlx::test(migrations = false)]
+    async fn open_claims_are_read_without_holding_claim_partition_locks(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        crate::migrations::run(&pool).await?;
+        let schema = "open_claim_locks";
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        })?;
+        store.install(&pool).await?;
+        store.enqueue_batch(&pool, "locks", 1, 5).await?;
+        let claimed = store
+            .claim_runtime_batch(&pool, "locks", 3, std::time::Duration::from_secs(60))
+            .await?;
+        assert_eq!(claimed.len(), 3);
+
+        let partitions: Vec<String> = sqlx::query_scalar(
+            "SELECT child.oid::regclass::text
+             FROM pg_catalog.pg_inherits AS inheritance
+             JOIN pg_catalog.pg_class AS child ON child.oid = inheritance.inhrelid
+             WHERE inheritance.inhparent = ANY (
+                 ARRAY(SELECT to_regclass($1 || '.' || parent)
+                       FROM unnest(ARRAY['lease_claims', 'lease_claim_batches',
+                                         'lease_claim_closures', 'lease_claim_closure_batches'])
+                            AS parent)::oid[]
+             )",
+        )
+        .bind(schema)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(partitions.len(), 8, "two claim slots of four tables");
+        let lock_all = format!(
+            "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE NOWAIT",
+            partitions.join(", ")
+        );
+
+        let mut reader = pool.acquire().await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *reader,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await?;
+        let open = queue_storage_open_claims(&mut tx, &store).await?;
+        assert_eq!(open.job_ids.len(), 3);
+        assert_eq!(open.queues, vec!["locks".to_string(); 3]);
+
+        let mut prune = pool.begin().await?;
+        sqlx::query(audited_sql(lock_all.clone()))
+            .execute(&mut *prune)
+            .await?;
+        prune.rollback().await?;
+
+        sqlx::query(audited_sql(format!(
+            "SELECT count(*) FROM ({}) AS open_claims",
+            crate::queue_storage::open_receipt_running_claims_sql(schema)
+        )))
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut prune = pool.begin().await?;
+        let blocked = sqlx::query(audited_sql(lock_all))
+            .execute(&mut *prune)
+            .await;
+        prune.rollback().await?;
+        assert!(
+            blocked.is_err(),
+            "a statement over the claim-ring parents holds the claim partitions until commit"
+        );
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    /// Only claim slots whose claims the closure ledgers do not all close are
+    /// projected for open claims. A sealed slot whose claims have all
+    /// completed costs a reader one count, not the anti-joins over every
+    /// claim in it, so a large sealed slot claim prune waits for is not held
+    /// for the length of a scan.
+    #[sqlx::test(migrations = false)]
+    async fn only_claim_slots_with_unclosed_claims_are_projected(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        crate::migrations::run(&pool).await?;
+        let schema = "closed_claim_slots";
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        })?;
+        store.install(&pool).await?;
+        store.enqueue_batch(&pool, "closed", 1, 6).await?;
+        let deadline = std::time::Duration::from_secs(60);
+        let finished = store
+            .claim_runtime_batch(&pool, "closed", 3, deadline)
+            .await?;
+        let first_slot = finished[0].claim.claim_slot;
+        store.complete_runtime_batch(&pool, &finished).await?;
+        store.rotate_claims(&pool).await?;
+        let running = store
+            .claim_runtime_batch(&pool, "closed", 2, deadline)
+            .await?;
+        let running_slot = running[0].claim.claim_slot;
+        assert_ne!(first_slot, running_slot, "the ring rotated between claims");
+
+        let mut reader = pool.acquire().await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *reader,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await?;
+        let slots = queue_storage_claim_slots(&mut tx, &store).await?;
+        assert_eq!(
+            slots,
+            vec![usize::try_from(running_slot)?],
+            "the slot whose claims all completed is not projected"
+        );
+        let open = queue_storage_open_claims(&mut tx, &store).await?;
+        assert_eq!(open.job_ids.len(), 2, "the running claims are still read");
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    /// A job claimed after a snapshot read has captured its lane heads and
+    /// open claims, but before its main statement runs, is still counted
+    /// once: as available, from the heads its snapshot captured. Reading the
+    /// head sequences live in that statement would see the claim advance
+    /// them while the snapshot cannot see the claim, so the job would be
+    /// neither available nor running.
+    #[sqlx::test(migrations = false)]
+    async fn a_claim_during_a_snapshot_read_is_counted_once(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        crate::migrations::run(&pool).await?;
+        let schema = "snapshot_claim_race";
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        })?);
+        store.install(&pool).await?;
+        store.enqueue_batch(&pool, "race", 1, 5).await?;
+        let claimed = store
+            .claim_runtime_batch(&pool, "race", 1, std::time::Duration::from_secs(60))
+            .await?;
+        assert_eq!(claimed.len(), 1);
+
+        let captured_sql = format!(
+            "SELECT COALESCE(sum(available), 0)::bigint FROM ({}) AS by_queue",
+            crate::queue_storage::available_by_queue_sql_from(schema, CAPTURED_LANE_HEADS_SQL)
+        );
+        let live_sql = format!(
+            "SELECT COALESCE(sum(available), 0)::bigint FROM ({}) AS by_queue",
+            crate::queue_storage::available_by_queue_sql(schema)
+        );
+        let leased_sql = format!("SELECT count(*)::bigint FROM {schema}.leases");
+        let (captured, live, leased, open) =
+            queue_storage_read_with_open_claims(&store, &pool, |conn, heads, open| {
+                let (pool, store) = (pool.clone(), store.clone());
+                let (captured_sql, live_sql, leased_sql) =
+                    (captured_sql.clone(), live_sql.clone(), leased_sql.clone());
+                let heads: LaneHeads = heads.clone();
+                let open = open.job_ids.len() as i64;
+                Box::pin(async move {
+                    let claimed = store
+                        .claim_runtime_batch(&pool, "race", 1, std::time::Duration::from_secs(60))
+                        .await?;
+                    assert_eq!(claimed.len(), 1, "claimed after the snapshot");
+                    let captured: i64 =
+                        bind_lane_heads!(sqlx::query_scalar(audited_sql(captured_sql)), heads)
+                            .fetch_one(&mut *conn)
+                            .await?;
+                    let live: i64 = sqlx::query_scalar(audited_sql(live_sql))
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    let leased: i64 = sqlx::query_scalar(audited_sql(leased_sql))
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    Ok((captured, live, leased, open))
+                })
+            })
+            .await?;
+        assert_eq!(
+            (open, leased),
+            (1, 0),
+            "the claim before the snapshot is open"
+        );
+        assert_eq!(captured + open + leased, 5, "every job counted once");
+        assert_eq!(
+            live,
+            captured - 1,
+            "live head sequences drop the job claimed after the snapshot"
+        );
+        Ok(())
     }
 }

@@ -1296,14 +1296,15 @@ fn receipt_evidence_sql(
 /// `oldest_run_at` is the earliest `run_at` among those rows, not the first
 /// row's: a queue move or priority aging appends an older job behind newer
 /// ones.
+///
+/// This form reads each lane's head sequences live; the admin reads bind
+/// heads captured earlier in their snapshot through
+/// [`available_by_queue_sql_from`].
 pub fn available_by_queue_sql(schema: &str) -> String {
-    format!(
-        r#"
-        SELECT
-            heads.queue,
-            COALESCE(sum(lane.available), 0)::bigint AS available,
-            min(lane.oldest_run_at) AS oldest_run_at
-        FROM (
+    available_by_queue_sql_from(
+        schema,
+        &format!(
+            r#"
             SELECT
                 claims.queue,
                 claims.priority,
@@ -1315,7 +1316,35 @@ pub fn available_by_queue_sql(schema: &str) -> String {
               ON enqueues.queue = claims.queue
              AND enqueues.priority = claims.priority
              AND enqueues.enqueue_shard = claims.enqueue_shard
-        ) AS heads
+            "#
+        ),
+    )
+}
+
+/// Each lane's head sequences captured earlier in a snapshot read, bound as
+/// `$1` to `$5`, as rows of `(queue, priority, enqueue_shard, claim_seq,
+/// next_seq)`.
+///
+/// Sequence values do not obey MVCC: a statement that reads them live in a
+/// snapshot taken earlier sees claims advance them that its snapshot cannot
+/// see, and a job claimed in between is neither available nor running. A
+/// read that runs several statements in one snapshot captures the heads in
+/// its first, which also takes the snapshot, and binds them to the rest.
+pub(crate) const CAPTURED_LANE_HEADS_SQL: &str =
+    "SELECT queue, priority, enqueue_shard, claim_seq, next_seq \
+     FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[], $5::bigint[]) \
+     AS captured(queue, priority, enqueue_shard, claim_seq, next_seq)";
+
+/// [`available_by_queue_sql`] over the lanes and head sequences of `heads`,
+/// a query yielding `(queue, priority, enqueue_shard, claim_seq, next_seq)`.
+pub(crate) fn available_by_queue_sql_from(schema: &str, heads: &str) -> String {
+    format!(
+        r#"
+        SELECT
+            heads.queue,
+            COALESCE(sum(lane.available), 0)::bigint AS available,
+            min(lane.oldest_run_at) AS oldest_run_at
+        FROM ({heads}) AS heads
         CROSS JOIN LATERAL (
             {lane_rows}
         ) AS lane
@@ -1401,6 +1430,11 @@ pub enum QueueSignalReads {
     /// Counts available rows exactly, and also counts receipt-backed running
     /// claims and completions in the last hour from completion batches and
     /// `done_entries`. For the admin queue views.
+    ///
+    /// Reads no claim-ring partition and no head sequence itself: `$1` to
+    /// `$5` are the lane heads captured earlier in the read's snapshot (see
+    /// [`CAPTURED_LANE_HEADS_SQL`]), and `$6` is the queue of each open
+    /// receipt claim, a `text[]` read one claim slot at a time.
     Admin,
 }
 
@@ -1417,8 +1451,23 @@ pub enum QueueSignalReads {
 /// whose completion batches expand and join back to `ready_entries`, so the
 /// cost follows live work rather than retained history.
 pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
-    let (ready, lag, receipt_running, completed_recent) = match reads {
+    let (head_signal, ready, lag, receipt_running, completed_recent) = match reads {
         QueueSignalReads::Gauge => (
+            format!(
+                r#"
+            SELECT
+                enqueues.queue,
+                enqueues.priority,
+                enqueues.enqueue_shard,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq
+            FROM {schema}.queue_enqueue_heads AS enqueues
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = enqueues.queue
+             AND claims.priority = enqueues.priority
+             AND claims.enqueue_shard = enqueues.enqueue_shard
+            "#
+            ),
             // Enqueued minus claimed: an upper bound, since a tombstoned
             // row or a sequence gap still counts until the claimer passes.
             r#"
@@ -1483,7 +1532,8 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             "SELECT NULL::text AS queue, 0::bigint AS completed_last_hour WHERE false".to_string(),
         ),
         QueueSignalReads::Admin => (
-            available_by_queue_sql(schema),
+            CAPTURED_LANE_HEADS_SQL.to_string(),
+            available_by_queue_sql_from(schema, CAPTURED_LANE_HEADS_SQL),
             // The oldest available job, as before queue storage: it reads the
             // same backlog rows the exact count already reads.
             r#"
@@ -1495,10 +1545,11 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             WHERE oldest_run_at IS NOT NULL
             "#
             .to_string(),
-            format!(
-                "SELECT queue, count(*)::bigint AS running FROM ({}) AS open_claims GROUP BY queue",
-                open_receipt_running_claims_sql(schema)
-            ),
+            // Open receipt claims, read slot by slot beforehand and bound
+            // as `$6` (see `admin::queue_storage_open_claims`).
+            "SELECT queue, count(*)::bigint AS running \
+             FROM unnest($6::text[]) AS open_claims(queue) GROUP BY queue"
+                .to_string(),
             format!(
                 r#"
                 WITH recent_tombstones AS MATERIALIZED (
@@ -1560,17 +1611,7 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
     format!(
         r#"
         WITH head_signal AS (
-            SELECT
-                enqueues.queue,
-                enqueues.priority,
-                enqueues.enqueue_shard,
-                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
-                {schema}.sequence_next_value(claims.seq_name) AS claim_seq
-            FROM {schema}.queue_enqueue_heads AS enqueues
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = enqueues.queue
-             AND claims.priority = enqueues.priority
-             AND claims.enqueue_shard = enqueues.enqueue_shard
+            {head_signal}
         ),
         queues AS (
             SELECT DISTINCT queue
