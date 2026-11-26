@@ -20,9 +20,10 @@
 
 mod ci_timing;
 
+use awa::audited_sql;
 use awa::model::queue_storage::{ClaimedRuntimeJob, PromotionLane};
 use awa::model::{admin, dlq, JobFilter};
-use awa::{insert_many, JobRow, UniqueOpts};
+use awa::{insert_many, insert_many_copy_from_pool, JobRow, UniqueOpts};
 use awa::{AwaError, InsertOpts, InsertParams, JobState, QueueStorage, QueueStorageConfig};
 use awa_testing::setup;
 use sqlx::PgPool;
@@ -1075,4 +1076,409 @@ async fn discard_failed_releases_keys_in_key_order() {
     assert_eq!(claim_holders(&pool, &keys).await, [None, None]);
 
     setup::clean_queue(&pool, &queue).await;
+}
+
+fn unique_insert(queue: &str, n: i64) -> InsertParams {
+    InsertParams {
+        kind: "claim_lane_job".to_string(),
+        args: serde_json::json!({ "queue": queue, "n": n }),
+        opts: InsertOpts {
+            queue: queue.to_string(),
+            priority: PRIORITY,
+            unique: Some(UniqueOpts::default()),
+            ..Default::default()
+        },
+    }
+}
+
+fn unique_key_of(params: &InsertParams) -> Vec<u8> {
+    awa::model::prepare_raw_job_insert(
+        params.kind.clone(),
+        params.args.clone(),
+        params.opts.clone(),
+    )
+    .expect("prepare insert")
+    .unique_key()
+    .expect("unique key")
+    .to_vec()
+}
+
+/// `insert_many` reserves its rows' lane before it claims the second row's
+/// key unless it takes every key first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_many_and_fresh_enqueue_of_one_key_do_not_deadlock() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_insert_many");
+    provision_lane(&pool, &queue).await;
+    let rows = vec![unique_insert(&queue, 1), unique_insert(&queue, 2)];
+    let first_key = unique_key_of(&rows[0]);
+    let key = unique_key_of(&rows[1]);
+
+    let result = race_fresh_enqueue(&pool, &queue, &key, {
+        let pool = pool.clone();
+        async move { insert_many(&pool, &rows).await }
+    })
+    .await;
+    match &result {
+        Err(AwaError::Database(sqlx::Error::Database(err))) => assert_eq!(
+            err.code().as_deref(),
+            Some("23505"),
+            "insert_many should lose the key to the fresh enqueue, got {err:?}"
+        ),
+        other => panic!("insert_many should lose the key to the fresh enqueue, got {other:?}"),
+    }
+    let inserted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND kind = 'claim_lane_job'",
+    )
+    .bind(&queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count jobs");
+    assert_eq!(inserted, 0, "the failed insert_many leaves no job");
+    let first_claimed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM awa.job_unique_claims WHERE unique_key = $1)",
+    )
+    .bind(&first_key)
+    .fetch_one(&pool)
+    .await
+    .expect("first claim");
+    assert!(!first_claimed, "the failed insert_many leaves no claim");
+
+    drop_claim(&pool, &key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// Without a conflict, `insert_many` inserts every unique row, holding each
+/// row's own claim and no placeholder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_many_claims_each_unique_row_once() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_insert_many_ok");
+    let rows: Vec<InsertParams> = (0..4).map(|n| unique_insert(&queue, n)).collect();
+    let inserted = insert_many(&pool, &rows).await.expect("insert_many");
+    assert_eq!(inserted.len(), rows.len());
+    for (row, job) in rows.iter().zip(&inserted) {
+        let key = unique_key_of(row);
+        assert_eq!(job.unique_key.as_deref(), Some(key.as_slice()));
+        let holders: Vec<i64> =
+            sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+                .bind(&key)
+                .fetch_all(&pool)
+                .await
+                .expect("claim holders");
+        assert_eq!(holders, vec![job.id]);
+    }
+    let duplicate = insert_many(&pool, &[unique_insert(&queue, 9), unique_insert(&queue, 0)]).await;
+    assert!(
+        matches!(&duplicate, Err(AwaError::Database(sqlx::Error::Database(err))) if err.code().as_deref() == Some("23505")),
+        "{duplicate:?}"
+    );
+    let placeholders: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.job_unique_claims WHERE job_id = 0")
+            .fetch_one(&pool)
+            .await
+            .expect("placeholder claims");
+    assert_eq!(placeholders, 0);
+
+    for row in &rows {
+        drop_claim(&pool, &unique_key_of(row)).await;
+    }
+    setup::clean_queue(&pool, &queue).await;
+}
+
+const BATCH_FUNCTION: &str = "awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)";
+
+/// `insert_many_copy` on a schema without the batch function inserts a row
+/// at a time, and takes every key before the first row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_by_row_copy_and_fresh_enqueue_of_one_key_do_not_deadlock() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_copy_rows");
+    provision_lane(&pool, &queue).await;
+    let rows = vec![unique_insert(&queue, 1), unique_insert(&queue, 2)];
+    let key = unique_key_of(&rows[1]);
+    let hidden = BATCH_FUNCTION.replacen(
+        "insert_jobs_compat_batch",
+        "insert_jobs_compat_batch_hidden",
+        1,
+    );
+    sqlx::query(audited_sql(format!("DROP FUNCTION IF EXISTS {hidden}")))
+        .execute(&pool)
+        .await
+        .expect("drop a batch function an earlier run left hidden");
+
+    sqlx::query(audited_sql(format!(
+        "ALTER FUNCTION {BATCH_FUNCTION} RENAME TO insert_jobs_compat_batch_hidden"
+    )))
+    .execute(&pool)
+    .await
+    .expect("hide the batch function");
+    let result = race_fresh_enqueue(&pool, &queue, &key, {
+        let pool = pool.clone();
+        let rows = rows.clone();
+        async move { insert_many_copy_from_pool(&pool, &rows).await }
+    })
+    .await;
+    sqlx::query(audited_sql(format!(
+        "ALTER FUNCTION {hidden} RENAME TO insert_jobs_compat_batch"
+    )))
+    .execute(&pool)
+    .await
+    .expect("restore the batch function");
+
+    let inserted = result.expect("the copy skips the row whose key the fresh enqueue took");
+    assert_eq!(inserted.len(), 1, "{inserted:?}");
+    assert_eq!(
+        inserted[0].unique_key.as_deref(),
+        Some(unique_key_of(&rows[0]).as_slice())
+    );
+
+    drop_claim(&pool, &unique_key_of(&rows[0])).await;
+    drop_claim(&pool, &key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+fn plain_insert(queue: &str, n: i64) -> InsertParams {
+    let mut params = unique_insert(queue, n);
+    params.opts.unique = None;
+    params
+}
+
+async fn backend_pid(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("backend pid")
+}
+
+/// Whether any backend waits on `holder`.
+async fn waits_on(pool: &PgPool, holder: i32) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_stat_activity
+             WHERE $1 = ANY(pg_blocking_pids(pid))
+         )",
+    )
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .expect("read lock waits")
+}
+
+/// The interleaving of review comment 4610275002. A batch holds `lanes[0]`
+/// and waits for `lanes[1]`, which a blocker holds, before it reaches its row
+/// in `lanes[2]` whose key another job holds. The holder then releases the
+/// key, a fresh enqueue claims it and waits for `lanes[0]`, and the blocker
+/// lets go. A batch that tries the key now waits for the fresh enqueue while
+/// holding the lane it waits for, and PostgreSQL aborts one with 40P01.
+///
+/// Returns the batch's result, whether it ever waited on the blocker, and
+/// the fresh enqueue's result when it ran.
+async fn held_key_released_mid_batch<T, F>(
+    pool: &PgPool,
+    lanes: &[String; 3],
+    key: &[u8],
+    batch: F,
+) -> (T, bool, Option<Result<(), sqlx::Error>>)
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    // The key's committed holder.
+    sqlx::query(
+        "INSERT INTO awa.job_unique_claims (unique_key, job_id) \
+         VALUES ($1, nextval('awa.job_id_seq'))",
+    )
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("holder claims the key");
+
+    let mut blocker = pool.begin().await.expect("begin blocker");
+    let blocker_pid = backend_pid(&mut blocker).await;
+    sqlx::query("SELECT awa.reserve_enqueue_seq($1, $2, 0::smallint, 1)")
+        .bind(&lanes[1])
+        .bind(PRIORITY)
+        .execute(&mut *blocker)
+        .await
+        .expect("blocker reserves the middle lane");
+
+    let batch = tokio::spawn(batch);
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    let mut waited = false;
+    while !batch.is_finished() {
+        if waits_on(pool, blocker_pid).await {
+            waited = true;
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the batch neither finished nor waited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut fresh_result = None;
+    if waited {
+        drop_claim(pool, key).await;
+        let fresh = FreshEnqueue::claim(pool, key).await;
+        let fresh_pid = fresh.pid;
+        let first_lane = lanes[0].clone();
+        let fresh = tokio::spawn(async move { fresh.reserve_and_commit(&first_lane).await });
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+        while !fresh.is_finished() && !waits_on_any(pool, fresh_pid).await {
+            assert!(
+                Instant::now() < deadline,
+                "the fresh enqueue neither finished nor waited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        blocker.rollback().await.expect("blocker lets go");
+        fresh_result = Some(
+            tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(15)), fresh)
+                .await
+                .expect("the fresh enqueue finishes")
+                .expect("join fresh enqueue"),
+        );
+    } else {
+        blocker.rollback().await.expect("blocker lets go");
+    }
+    let result = tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(15)), batch)
+        .await
+        .expect("the batch finishes")
+        .expect("join batch");
+    (result, waited, fresh_result)
+}
+
+async fn waits_on_any(pool: &PgPool, waiter: i32) -> bool {
+    sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1)) > 0")
+        .bind(waiter)
+        .fetch_one(pool)
+        .await
+        .expect("read lock waits")
+}
+
+fn is_deadlock<T: std::fmt::Debug>(result: &Result<T, AwaError>) -> bool {
+    matches!(result, Err(AwaError::Database(sqlx::Error::Database(err))) if err.code().as_deref() == Some("40P01"))
+}
+
+fn held_key_lanes() -> [String; 3] {
+    let base = unique_queue("claim_lane_held");
+    [
+        format!("{base}_a"),
+        format!("{base}_b"),
+        format!("{base}_c"),
+    ]
+}
+
+/// A key a committed job holds fails a multi-row `insert_many` before it
+/// reserves any lane, so the holder releasing the key mid-batch cannot leave
+/// the batch waiting for the key while it holds a lane (review comment
+/// 4610275002).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_many_fails_on_a_held_key_before_any_lane() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let lanes = held_key_lanes();
+    for lane in &lanes {
+        provision_lane(&pool, lane).await;
+    }
+    let rows = vec![
+        plain_insert(&lanes[0], 1),
+        plain_insert(&lanes[1], 2),
+        unique_insert(&lanes[2], 3),
+    ];
+    let key = unique_key_of(&rows[2]);
+
+    let (result, waited, fresh) = held_key_released_mid_batch(&pool, &lanes, &key, {
+        let pool = pool.clone();
+        async move { insert_many(&pool, &rows).await }
+    })
+    .await;
+    assert!(!is_deadlock(&result), "insert_many deadlocked: {result:?}");
+    assert!(
+        !matches!(&fresh, Some(Err(err)) if err.as_database_error().and_then(|err| err.code()).as_deref() == Some("40P01")),
+        "the fresh enqueue deadlocked: {fresh:?}"
+    );
+    assert!(
+        matches!(&result, Err(AwaError::Database(sqlx::Error::Database(err))) if err.code().as_deref() == Some("23505") && err.constraint() == Some("idx_awa_jobs_unique")),
+        "insert_many fails on the held key: {result:?}"
+    );
+    assert!(!waited, "insert_many fails before it reserves a lane");
+
+    drop_claim(&pool, &key).await;
+    for lane in &lanes {
+        setup::clean_queue(&pool, lane).await;
+    }
+}
+
+/// The row-by-row `insert_many_copy` fallback skips a row whose key a
+/// committed job holds when it takes its keys, instead of trying it after it
+/// has reserved lanes (review comment 4610275002).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_by_row_copy_skips_a_held_key_without_waiting_for_it() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let lanes = held_key_lanes();
+    for lane in &lanes {
+        provision_lane(&pool, lane).await;
+    }
+    let rows = vec![
+        plain_insert(&lanes[0], 1),
+        plain_insert(&lanes[1], 2),
+        unique_insert(&lanes[2], 3),
+    ];
+    let key = unique_key_of(&rows[2]);
+    let hidden = BATCH_FUNCTION.replacen(
+        "insert_jobs_compat_batch",
+        "insert_jobs_compat_batch_hidden",
+        1,
+    );
+    sqlx::query(audited_sql(format!("DROP FUNCTION IF EXISTS {hidden}")))
+        .execute(&pool)
+        .await
+        .expect("drop a batch function an earlier run left hidden");
+    sqlx::query(audited_sql(format!(
+        "ALTER FUNCTION {BATCH_FUNCTION} RENAME TO insert_jobs_compat_batch_hidden"
+    )))
+    .execute(&pool)
+    .await
+    .expect("hide the batch function");
+
+    let (result, waited, fresh) = held_key_released_mid_batch(&pool, &lanes, &key, {
+        let pool = pool.clone();
+        let rows = rows.clone();
+        async move { insert_many_copy_from_pool(&pool, &rows).await }
+    })
+    .await;
+    sqlx::query(audited_sql(format!(
+        "ALTER FUNCTION {hidden} RENAME TO insert_jobs_compat_batch"
+    )))
+    .execute(&pool)
+    .await
+    .expect("restore the batch function");
+
+    assert!(
+        waited,
+        "the copy reserves its first lane and waits for the second"
+    );
+    assert!(!is_deadlock(&result), "the copy deadlocked: {result:?}");
+    let fresh = fresh.expect("the fresh enqueue ran");
+    assert!(fresh.is_ok(), "the fresh enqueue commits: {fresh:?}");
+    let inserted = result.expect("the copy skips the held key's row");
+    assert_eq!(
+        inserted
+            .iter()
+            .map(|job| job.queue.as_str())
+            .collect::<Vec<_>>(),
+        vec![lanes[0].as_str(), lanes[1].as_str()]
+    );
+
+    drop_claim(&pool, &key).await;
+    for lane in &lanes {
+        setup::clean_queue(&pool, lane).await;
+    }
 }
