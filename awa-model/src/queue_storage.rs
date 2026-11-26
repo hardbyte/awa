@@ -46,6 +46,10 @@ pub(crate) const RETRIED_DUPLICATE_ERROR: &str =
     "retried as duplicate: unique claim held by a newer job";
 pub(crate) const RESCHEDULED_DUPLICATE_ERROR: &str =
     "rescheduled as duplicate: unique claim held by a newer job";
+/// The error a promotion writes when it cancels a due job as a duplicate.
+#[doc(hidden)]
+pub const PROMOTED_DUPLICATE_ERROR: &str =
+    "promoted as duplicate: unique claim held by another job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
@@ -2607,11 +2611,12 @@ pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "duplicate_unique_states";
 
 /// The messages of the error entries awa writes when it cancels a job as a
 /// duplicate. A recorded mask is trusted only on an entry with one of them.
-pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 4] = [
+pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 5] = [
     SNOOZED_DUPLICATE_ERROR,
     RETRIED_DUPLICATE_ERROR,
     RESCUED_DUPLICATE_ERROR,
     RESCHEDULED_DUPLICATE_ERROR,
+    PROMOTED_DUPLICATE_ERROR,
 ];
 
 /// The messages releases before 0.6.19 wrote when they cancelled a duplicate
@@ -4142,6 +4147,13 @@ struct ExistingReadyRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+/// What one lane's promotion transaction did.
+#[derive(Debug, Default)]
+struct LanePromotion {
+    promoted: usize,
+    cancelled: Vec<JobRow>,
 }
 
 /// Which of a lane's due rows one promotion transaction takes.
@@ -7310,13 +7322,28 @@ impl QueueStorage {
             .sync_reenqueue_unique_claims(tx, &rows, skip_conflicts)
             .await?;
 
-        let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
+        let mut claimed = Vec::with_capacity(rows.len());
         let mut skipped = Vec::with_capacity(conflicts.len());
         for (row, _) in rows {
             if conflicts.contains(&row.job_id) {
                 skipped.push(row.job_id);
-                continue;
+            } else {
+                claimed.push(row);
             }
+        }
+        let inserted = self.insert_claimed_ready_rows_tx(tx, claimed).await?;
+        Ok((inserted, skipped))
+    }
+
+    /// Reserve lane positions for `rows` and write them to the ready ring.
+    /// Their unique claims must already be synced.
+    async fn insert_claimed_ready_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<ExistingReadyRow>,
+    ) -> Result<usize, AwaError> {
+        let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
+        for row in rows {
             grouped
                 .entry((row.queue.clone(), row.priority))
                 .or_default()
@@ -7367,12 +7394,12 @@ impl QueueStorage {
         }
 
         if ready_rows.is_empty() {
-            return Ok((0, skipped));
+            return Ok(0);
         }
         let ring = self.current_queue_ring(tx).await?;
         self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
         self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
-        Ok((ready_rows.len(), skipped))
+        Ok(ready_rows.len())
     }
 
     /// Sync the unique claims of rows moving to `available` through
@@ -20886,6 +20913,9 @@ impl QueueStorage {
     /// transaction runs under that `lock_timeout`; a lane that hits it rolls
     /// back, keeps its rows deferred and is reported in
     /// [`PromoteOutcome::contended`], and the remaining lanes go ahead.
+    ///
+    /// A due row whose unique key another live job holds is cancelled as a
+    /// duplicate in its lane's transaction instead of being promoted.
     pub async fn promote_due_lanes(
         &self,
         pool: &PgPool,
@@ -20894,8 +20924,33 @@ impl QueueStorage {
         lane_lock_timeout: Option<Duration>,
         skip: &[PromotionLane],
     ) -> Result<PromoteOutcome, AwaError> {
+        self.promote_due_lanes_with_cancelled(
+            pool,
+            state,
+            batch_size,
+            lane_lock_timeout,
+            skip,
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::promote_due_lanes`], also appending to `cancelled` the rows it
+    /// cancelled as duplicates. Each lane commits on its own, so the rows of
+    /// lanes that committed are appended even when a later lane returns an
+    /// error.
+    #[doc(hidden)]
+    pub async fn promote_due_lanes_with_cancelled(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        skip: &[PromotionLane],
+        cancelled: &mut Vec<JobRow>,
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(PromoteOutcome::default());
+            return Ok(Default::default());
         }
 
         let schema = self.schema();
@@ -20955,8 +21010,9 @@ impl QueueStorage {
                 .await;
             match promoted {
                 Ok(Some(promoted)) => {
-                    outcome.promoted += promoted;
-                    if promoted > 0 {
+                    outcome.promoted += promoted.promoted;
+                    cancelled.extend(promoted.cancelled);
+                    if promoted.promoted > 0 {
                         promoted_queues.insert(lane.queue);
                     }
                 }
@@ -20983,8 +21039,31 @@ impl QueueStorage {
         batch_size: i64,
         lane_lock_timeout: Option<Duration>,
     ) -> Result<PromoteOutcome, AwaError> {
+        self.promote_due_lane_with_cancelled(
+            pool,
+            state,
+            lane,
+            batch_size,
+            lane_lock_timeout,
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::promote_due_lane`], also appending to `cancelled` the rows it
+    /// cancelled as duplicates.
+    #[doc(hidden)]
+    pub async fn promote_due_lane_with_cancelled(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        cancelled: &mut Vec<JobRow>,
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(PromoteOutcome::default());
+            return Ok(Default::default());
         }
         let promoted = self
             .promote_lane(
@@ -20995,15 +21074,22 @@ impl QueueStorage {
                 lane_lock_timeout,
             )
             .await?;
-        if promoted.is_some_and(|promoted| promoted > 0) {
+        if promoted
+            .as_ref()
+            .is_some_and(|promoted| promoted.promoted > 0)
+        {
             self.notify_promoted_queues(pool, [lane.queue.clone()]);
         }
         Ok(match promoted {
-            Some(promoted) => PromoteOutcome {
-                promoted,
-                selected: promoted,
-                contended: Vec::new(),
-            },
+            Some(promoted) => {
+                let selected = promoted.promoted + promoted.cancelled.len();
+                cancelled.extend(promoted.cancelled);
+                PromoteOutcome {
+                    promoted: promoted.promoted,
+                    selected,
+                    contended: Vec::new(),
+                }
+            }
             None => PromoteOutcome {
                 contended: vec![lane.clone()],
                 ..PromoteOutcome::default()
@@ -21020,7 +21106,7 @@ impl QueueStorage {
         lane: &PromotionLane,
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
-    ) -> Result<Option<usize>, AwaError> {
+    ) -> Result<Option<LanePromotion>, AwaError> {
         let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         match self
             .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
@@ -21045,7 +21131,7 @@ impl QueueStorage {
         lane: &PromotionLane,
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
-    ) -> Result<usize, AwaError> {
+    ) -> Result<LanePromotion, AwaError> {
         if let Some(timeout) = lock_timeout {
             set_lock_timeout_tx(tx, timeout).await?;
         }
@@ -21102,34 +21188,121 @@ impl QueueStorage {
         let mut moved: Vec<DeferredJobRow> =
             query.fetch_all(tx.as_mut()).await.map_err(map_sqlx_error)?;
         if moved.is_empty() {
-            return Ok(0);
+            return Ok(LanePromotion::default());
         }
         // DELETE ... RETURNING has no order; lane sequence follows due order.
         moved.sort_unstable_by_key(|row| (row.run_at, row.job_id));
 
-        let promoted = moved.len();
-        let ready_rows: Vec<ExistingReadyRow> = moved
+        let mut due_run_ats = Vec::with_capacity(moved.len());
+        let rows: Vec<(ExistingReadyRow, Option<JobState>)> = moved
             .into_iter()
-            .map(|row| ExistingReadyRow {
-                job_id: row.job_id,
-                kind: row.kind,
-                queue: row.queue,
-                args: row.args,
-                priority: row.priority,
-                attempt: row.attempt,
-                run_lease: row.run_lease,
-                max_attempts: row.max_attempts,
-                run_at: Utc::now(),
-                attempted_at: row.attempted_at,
-                created_at: row.created_at,
-                unique_key: row.unique_key,
-                unique_states: row.unique_states,
-                payload: row.payload,
+            .map(|row| {
+                due_run_ats.push(row.run_at);
+                let ready = ExistingReadyRow {
+                    job_id: row.job_id,
+                    kind: row.kind,
+                    queue: row.queue,
+                    args: row.args,
+                    priority: row.priority,
+                    attempt: row.attempt,
+                    run_lease: row.run_lease,
+                    max_attempts: row.max_attempts,
+                    run_at: Utc::now(),
+                    attempted_at: row.attempted_at,
+                    created_at: row.created_at,
+                    unique_key: row.unique_key,
+                    unique_states: row.unique_states,
+                    payload: row.payload,
+                };
+                (ready, Some(state))
             })
             .collect();
-        self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
+        let conflicts = self.sync_reenqueue_unique_claims(tx, &rows, true).await?;
+        if conflicts.is_empty() {
+            let ready_rows = rows.into_iter().map(|(row, _)| row).collect();
+            let promoted = self.insert_claimed_ready_rows_tx(tx, ready_rows).await?;
+            return Ok(LanePromotion {
+                promoted,
+                cancelled: Vec::new(),
+            });
+        }
+
+        let mut ready_rows = Vec::with_capacity(rows.len());
+        let mut duplicates = Vec::with_capacity(conflicts.len());
+        for ((row, _), due_run_at) in rows.into_iter().zip(due_run_ats) {
+            if conflicts.contains(&row.job_id) {
+                duplicates.push((row, due_run_at));
+            } else {
+                ready_rows.push(row);
+            }
+        }
+        let cancelled = self
+            .cancel_promoted_duplicates_tx(tx, state, lane, duplicates)
             .await?;
-        Ok(promoted)
+        let promoted = self.insert_claimed_ready_rows_tx(tx, ready_rows).await?;
+        Ok(LanePromotion {
+            promoted,
+            cancelled,
+        })
+    }
+
+    /// Cancel due rows whose promotion lost their unique key to another job.
+    /// The cancelled row keeps its unique key with `cancelled` cleared from
+    /// its mask and the original mask recorded in its error entry, so it
+    /// never holds the key and a later retry restores the mask and re-checks
+    /// ownership.
+    async fn cancel_promoted_duplicates_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        state: JobState,
+        lane: &PromotionLane,
+        duplicates: Vec<(ExistingReadyRow, DateTime<Utc>)>,
+    ) -> Result<Vec<JobRow>, AwaError> {
+        let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
+        let finalized_at = Utc::now();
+        let done: Vec<DoneJobRow> = duplicates
+            .into_iter()
+            .map(|(row, due_run_at)| {
+                let mut payload = RuntimePayload::from_json(row.payload)?;
+                payload.push_error(lifecycle_error(PROMOTED_DUPLICATE_ERROR, row.attempt, true));
+                let mut done = DoneJobRow {
+                    ready_slot,
+                    ready_generation,
+                    job_id: row.job_id,
+                    kind: row.kind,
+                    queue: row.queue,
+                    args: row.args,
+                    state: JobState::Cancelled,
+                    priority: row.priority,
+                    attempt: row.attempt,
+                    run_lease: row.run_lease,
+                    max_attempts: row.max_attempts,
+                    lane_seq: -row.job_id,
+                    enqueue_shard: 0,
+                    run_at: due_run_at,
+                    attempted_at: row.attempted_at,
+                    finalized_at,
+                    created_at: row.created_at,
+                    unique_key: row.unique_key,
+                    unique_states: row.unique_states,
+                    payload: payload.into_json(),
+                    output: None,
+                };
+                // The row keeps its key, so a retry restores the mask and
+                // re-checks ownership; without `cancelled` in its mask the
+                // cancelled row never holds the key.
+                if unique_state_claims(done.unique_states.as_deref(), JobState::Cancelled) {
+                    clear_cancelled_claim(&mut done)?;
+                }
+                Ok(done)
+            })
+            .collect::<Result<_, AwaError>>()?;
+        self.ensure_lane(tx, &lane.queue, lane.priority, 0).await?;
+        // No claim changes: the due row held no claim, since its promotion's
+        // claim conflicted, and its cancelled state claims nothing. Writing
+        // the rows directly keeps every claim change ahead of the lane locks.
+        self.write_done_rows_tx(tx, &done, Some(state)).await?;
+        done.into_iter().map(DoneJobRow::into_job_row).collect()
     }
 
     /// Wake claimers of queues whose promotion has committed.
@@ -23650,7 +23823,11 @@ mod revived_unique_states_tests {
     #[test]
     fn canonical_revive_sql_names_every_canonical_duplicate_message() {
         let admin = include_str!("admin.rs");
-        for message in [SNOOZED_DUPLICATE_ERROR, RETRIED_DUPLICATE_ERROR] {
+        for message in [
+            SNOOZED_DUPLICATE_ERROR,
+            RETRIED_DUPLICATE_ERROR,
+            PROMOTED_DUPLICATE_ERROR,
+        ] {
             assert_eq!(
                 admin.matches(&format!("'{message}'")).count(),
                 2,

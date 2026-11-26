@@ -875,7 +875,8 @@ pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErro
                      FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
                      WHERE entry->>'error' IN (
                            'snoozed as duplicate: unique claim held by a newer job',
-                           'retried as duplicate: unique claim held by a newer job'
+                           'retried as duplicate: unique claim held by a newer job',
+                           'promoted as duplicate: unique claim held by another job'
                        )
                        AND entry->>'duplicate_unique_states' IS NOT NULL
                      ORDER BY n DESC
@@ -3981,7 +3982,8 @@ pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaEr
                      FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
                      WHERE entry->>'error' IN (
                            'snoozed as duplicate: unique claim held by a newer job',
-                           'retried as duplicate: unique claim held by a newer job'
+                           'retried as duplicate: unique claim held by a newer job',
+                           'promoted as duplicate: unique claim held by another job'
                        )
                        AND entry->>'duplicate_unique_states' IS NOT NULL
                      ORDER BY n DESC
