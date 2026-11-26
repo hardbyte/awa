@@ -378,6 +378,18 @@ async fn run(
         errors.contains(duplicate_error),
         "cancelled job should record why: {errors}"
     );
+    let last_entry_terminal: Option<String> = sqlx::query_scalar(
+        "SELECT errors[array_length(errors, 1)]->>'terminal' FROM awa.jobs WHERE id = $1",
+    )
+    .bind(job_a)
+    .fetch_one(&pool)
+    .await
+    .expect("last error entry");
+    assert_eq!(
+        last_entry_terminal.as_deref(),
+        Some("true"),
+        "the duplicate cancellation's error entry is terminal: {errors}"
+    );
     if matches!(outcome, Outcome::RetryableError) {
         assert!(
             errors.contains("transient failure"),

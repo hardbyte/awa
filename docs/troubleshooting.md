@@ -191,7 +191,20 @@ WHERE j.state = 'running';
 
 Cancel the `stuck_job` (cancelled is outside the default mask, so the transition succeeds). Delete a claim row only after proving its recorded holder no longer exists; deleting a live holder's claim admits a duplicate.
 
-Promotion meets the same race when a scheduled or retryable job's mask leaves out the state it waits in: it holds no claim, a newer job takes the key, and the job then falls due. Up to 0.6.18 promotion failed on it every tick (`Failed to promote scheduled jobs` or `Failed to promote retryable jobs`, with `idx_awa_jobs_unique` or `unique conflict`), and the other due jobs in its batch (canonical storage) or in its lane and the lanes after it (queue storage) stayed scheduled. From 0.6.19 and 0.7.0 promotion cancels the job with `promoted as duplicate` and promotes the rest in the same pass. On an older build, find it by replacing `awa.jobs_hot` and `'running'` in the query above with `awa.jobs` and `'scheduled'` (or `'retryable'`), and cancel it.
+Promotion meets the same race when a scheduled or retryable job's mask leaves out the state it waits in: it holds no claim, a newer job takes the key, and the job then falls due. Up to 0.6.18 promotion failed on it every tick (`Failed to promote scheduled jobs` or `Failed to promote retryable jobs`, with `idx_awa_jobs_unique` or `unique conflict`), and the other due jobs in its batch (canonical storage) or in its lane and the lanes after it (queue storage) stayed scheduled. From 0.6.19 and 0.7.0 promotion cancels the job with `promoted as duplicate` and promotes the rest in the same pass. On an older build, find the due jobs whose mask claims `available` but not the state they wait in, while another job holds their key:
+
+```sql
+SELECT j.id AS stuck_job, j.kind, j.queue, j.state, j.unique_states,
+       c.job_id AS claim_holder
+FROM awa.jobs j
+JOIN awa.job_unique_claims c ON c.unique_key = j.unique_key AND c.job_id <> j.id
+WHERE j.state IN ('scheduled', 'retryable')
+  AND j.run_at <= now()
+  AND awa.job_state_in_bitmask(j.unique_states, 'available')
+  AND NOT awa.job_state_in_bitmask(j.unique_states, j.state);
+```
+
+Cancel a `stuck_job` whose mask leaves out `cancelled`. When the mask claims `cancelled`, the cancellation conflicts the same way; upgrade instead and let promotion cancel it.
 
 Prevention: choose `unique_states` masks that are *closed under runtime transitions* — retry/rescue move `running -> retryable`, snooze moves `running -> scheduled`, and promotion moves `retryable -> available` or `scheduled -> available`. A mask a transition can enter from outside (for example `{scheduled, available, retryable}` without `running`) intentionally permits a newer enqueue during execution, so the superseded old attempt can end in a fallback cancellation. `{}` (no dedup) and the full non-terminal set `{scheduled, available, running, retryable}` avoid that race; pair the full mask with a short `by_period` bucket if you need "a change during a run still gets a fresh run" semantics.
 

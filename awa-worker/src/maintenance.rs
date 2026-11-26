@@ -63,6 +63,14 @@ fn is_unique_claim_conflict(err: &awa_model::AwaError) -> bool {
 /// table triggers keep unique claims and admin dirty keys in sync, so the
 /// #388 unique-claim conflict semantics are unchanged.
 ///
+/// What still makes a canonical attempt eligible for each rescue, rechecked
+/// by the duplicate cancellation that follows a conflicted per-row rescue.
+/// `$4` is the heartbeat staleness in milliseconds.
+const HEARTBEAT_RESCUE_ELIGIBLE: &str = "heartbeat_at < now() - ($4 * interval '1 millisecond')";
+const DEADLINE_RESCUE_ELIGIBLE: &str = "deadline_at IS NOT NULL AND deadline_at < now()";
+const CALLBACK_RESCUE_ELIGIBLE: &str =
+    "callback_timeout_at IS NOT NULL AND callback_timeout_at < now()";
+
 /// Single-row variants of the batched canonical rescue statements, used by
 /// the #388 fallback. Bodies mirror the batch statements exactly; only the
 /// WHERE clause narrows to one id (re-checking the staleness predicate so a
@@ -2855,6 +2863,7 @@ impl MaintenanceService {
                     HEARTBEAT_RESCUE_PER_ROW_SQL,
                     Some(staleness_ms),
                     "running",
+                    HEARTBEAT_RESCUE_ELIGIBLE,
                     RESCUED_STALE_DUPLICATE_ERROR,
                     "heartbeat",
                 )
@@ -3041,6 +3050,7 @@ impl MaintenanceService {
                     DEADLINE_RESCUE_PER_ROW_SQL,
                     None,
                     "running",
+                    DEADLINE_RESCUE_ELIGIBLE,
                     RESCUED_EXPIRED_DUPLICATE_ERROR,
                     "deadline",
                 )
@@ -3211,6 +3221,7 @@ impl MaintenanceService {
                     CALLBACK_RESCUE_PER_ROW_SQL,
                     None,
                     "waiting_external",
+                    CALLBACK_RESCUE_ELIGIBLE,
                     RESCUED_TIMED_OUT_DUPLICATE_ERROR,
                     "callback_timeout",
                 )
@@ -3358,12 +3369,14 @@ impl MaintenanceService {
     /// wins), and a row that can't even be cancelled (its mask claims
     /// `cancelled` too) is skipped with a loud log so it never blocks the
     /// rest of the batch.
+    #[allow(clippy::too_many_arguments)]
     async fn rescue_canonical_per_row(
         &self,
         candidates_sql: &str,
         per_row_sql: &str,
         staleness_ms: Option<i64>,
         from_state: &str,
+        still_eligible: &'static str,
         duplicate_error: &str,
         rescue_kind: &'static str,
     ) -> Result<Vec<JobRow>, awa_model::AwaError> {
@@ -3407,7 +3420,13 @@ impl MaintenanceService {
                          cancelling the superseded job (#388)"
                     );
                     match self
-                        .cancel_unique_conflicted_job(id, from_state, duplicate_error)
+                        .cancel_unique_conflicted_job(
+                            id,
+                            from_state,
+                            still_eligible,
+                            staleness_ms,
+                            duplicate_error,
+                        )
                         .await
                     {
                         Ok(Some(row)) => rescued.push(row),
@@ -3508,13 +3527,21 @@ impl MaintenanceService {
     /// so the cancellation claims nothing even when the mask names it, and
     /// the original mask is recorded in the error entry for a retry to
     /// restore; the row keeps its unique key.
+    ///
+    /// The failed rescue statement released its row lock, so the attempt can
+    /// change before this runs: a worker can heartbeat again, or the job can
+    /// be rescued and claimed anew. `still_eligible` is the rescue's own
+    /// condition (`$4` is the staleness in milliseconds, when given), so an
+    /// attempt that no longer meets it is left alone.
     async fn cancel_unique_conflicted_job(
         &self,
         job_id: i64,
         from_state: &str,
+        still_eligible: &'static str,
+        staleness_ms: Option<i64>,
         error_message: &str,
     ) -> Result<Option<JobRow>, awa_model::AwaError> {
-        let row = sqlx::query_as::<_, JobRow>(
+        let query = sqlx::query_as::<_, JobRow>(audited_sql(format!(
             r#"
             UPDATE awa.jobs_hot
             SET state = 'cancelled',
@@ -3531,19 +3558,22 @@ impl MaintenanceService {
                     'error', $3::text,
                     'attempt', attempt,
                     'at', now(),
+                    'terminal', true,
                     'duplicate_unique_states', unique_states::text
                 )::jsonb,
                 unique_states = set_bit(unique_states, 6, 0)
-            WHERE id = $1 AND state = $2::awa.job_state
+            WHERE id = $1 AND state = $2::awa.job_state AND ({still_eligible})
             RETURNING *
             "#,
-        )
+        )))
         .bind(job_id)
         .bind(from_state)
-        .bind(error_message)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        .bind(error_message);
+        let query = match staleness_ms {
+            Some(ms) => query.bind(ms),
+            None => query,
+        };
+        Ok(query.fetch_optional(&self.pool).await?)
     }
 
     /// Signal cancellation to any rescued jobs that are still running on this instance.
@@ -3966,6 +3996,7 @@ impl MaintenanceService {
                     'error', $2::text,
                     'attempt', attempt,
                     'at', now(),
+                    'terminal', true,
                     'duplicate_unique_states', unique_states::text
                 )::jsonb,
                 metadata,
@@ -3989,6 +4020,9 @@ impl MaintenanceService {
     /// Promote one batch of due `state` rows a statement per row, cancelling
     /// each row whose promotion conflicts with a unique key another job
     /// holds. Returns the rows promoted, their queues and the cancelled rows.
+    /// Like the batched selection, it passes over rows another transaction
+    /// holds, so a locked prefix cannot fill the batch; its row locks end
+    /// with the selecting statement.
     async fn promote_canonical_per_row(
         &self,
         state: &'static str,
@@ -4001,6 +4035,7 @@ impl MaintenanceService {
               AND run_at <= now()
             ORDER BY run_at ASC, id ASC
             LIMIT $1
+            FOR UPDATE SKIP LOCKED
             "#
         )))
         .bind(PROMOTE_BATCH_SIZE)
@@ -5388,6 +5423,86 @@ mod tests {
     /// A canonical promotion pass whose first batch meets a unique duplicate
     /// cancels it and goes on to promote the rest of a backlog larger than
     /// one batch.
+    /// A conflicted per-row rescue releases its row lock before the
+    /// duplicate cancellation runs, so the attempt can heartbeat in between.
+    /// The cancellation rechecks the rescue's condition and leaves a
+    /// refreshed attempt running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn canonical_rescue_duplicate_cancellation_leaves_a_refreshed_attempt_running() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+
+        let id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO awa.jobs_hot (
+                kind, queue, args, state, priority, attempt, max_attempts,
+                run_at, heartbeat_at, attempted_at, created_at, errors, metadata,
+                tags, unique_key, unique_states, run_lease
+            )
+            VALUES (
+                'rescue_recheck', 'rescue_recheck', '{}'::jsonb, 'running', 2, 1, 25,
+                now(), now(), now(), now(), ARRAY[]::jsonb[], '{}'::jsonb,
+                ARRAY[]::text[], NULL, NULL, 1
+            )
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed running attempt");
+
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::Canonical,
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        );
+        let cancel = || {
+            service.cancel_unique_conflicted_job(
+                id,
+                "running",
+                HEARTBEAT_RESCUE_ELIGIBLE,
+                Some(60_000),
+                RESCUED_STALE_DUPLICATE_ERROR,
+            )
+        };
+        let state = || async {
+            sqlx::query_scalar::<_, String>("SELECT state::text FROM awa.jobs_hot WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("job state")
+        };
+
+        let refreshed = cancel().await.expect("cancel a refreshed attempt");
+        assert!(refreshed.is_none(), "a fresh heartbeat is not rescued");
+        assert_eq!(state().await, "running");
+
+        sqlx::query(
+            "UPDATE awa.jobs_hot SET heartbeat_at = now() - interval '10 minutes' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("make the heartbeat stale");
+        let stale = cancel()
+            .await
+            .expect("cancel a stale attempt")
+            .expect("a stale attempt is cancelled");
+        assert_eq!(stale.state, JobState::Cancelled);
+        assert_eq!(state().await, "cancelled");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn canonical_promotion_pass_continues_past_a_batch_with_a_duplicate() {
         let _guard = db_test_mutex().lock().await;

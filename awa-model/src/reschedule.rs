@@ -342,7 +342,7 @@ async fn reschedule_canonical(
             progress = $5,
             errors = CASE WHEN $3::jsonb IS NULL THEN errors ELSE errors || $3::jsonb END
                 || jsonb_build_object(
-                    'error', $4::text, 'attempt', attempt, 'at', now(),
+                    'error', $4::text, 'attempt', attempt, 'at', now(), 'terminal', true,
                     'duplicate_unique_states', unique_states::text
                 )
         WHERE id = $1 AND state = 'running' AND run_lease = $2
@@ -565,6 +565,7 @@ async fn migrate_to_queue_storage(
             successor,
             job.unique_states,
             crate::queue_storage::RESCHEDULED_DUPLICATE_ERROR,
+            job.attempt,
         )
         .await?;
 

@@ -710,7 +710,14 @@ storage.queue_storage().is_some(),
                             .await
                         };
                         if !output_kept.into_inner() {
-                            if matches!(outcome, Ok(FinalizeAck { outcome: CompletionOutcome::Applied { .. }, .. })) {
+                            if matches!(
+                                outcome,
+                                Ok(FinalizeAck {
+                                    outcome: CompletionOutcome::Applied { .. }
+                                        | CompletionOutcome::CancelledDuplicate { .. },
+                                    ..
+                                })
+                            ) {
                                 record_output_dropped(&metrics, &job.kind, &job.queue, "schema_missing");
                             }
                             job.output = None;
@@ -797,6 +804,9 @@ storage.queue_storage().is_some(),
                                 outcome: CompletionOutcome::CancelledDuplicate { .. },
                                 ..
                             }) => {
+                                // The cancelled row keeps the attempt's output
+                                // in its error history.
+                                record_output_published(&metrics, &job, &result, true);
                                 metrics.jobs_cancelled.add(
                                     1,
                                     &[
@@ -2374,6 +2384,7 @@ fn duplicate_cancelled_event_row(
         "error": reschedule.duplicate_error(),
         "attempt": job.attempt,
         "at": now.to_rfc3339(),
+        "terminal": true,
     }));
     row
 }

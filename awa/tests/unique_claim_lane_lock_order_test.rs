@@ -1190,6 +1190,60 @@ async fn insert_many_claims_each_unique_row_once() {
 
 const BATCH_FUNCTION: &str = "awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)";
 
+fn hidden_batch_function() -> String {
+    BATCH_FUNCTION.replacen(
+        "insert_jobs_compat_batch",
+        "insert_jobs_compat_batch_hidden",
+        1,
+    )
+}
+
+/// Put `awa.insert_jobs_compat_batch` back if a run hid it: rename a hidden
+/// copy back when the function is missing, and drop a stray hidden copy
+/// otherwise.
+async fn restore_batch_function(pool: &PgPool) {
+    let hidden = hidden_batch_function();
+    sqlx::raw_sql(audited_sql(format!(
+        r#"
+        DO $$
+        BEGIN
+            IF to_regprocedure('{hidden}') IS NOT NULL THEN
+                IF to_regprocedure('{BATCH_FUNCTION}') IS NULL THEN
+                    ALTER FUNCTION {hidden} RENAME TO insert_jobs_compat_batch;
+                ELSE
+                    DROP FUNCTION {hidden};
+                END IF;
+            END IF;
+        END $$
+        "#
+    )))
+    .execute(pool)
+    .await
+    .expect("restore the batch function");
+}
+
+/// Run `run` with `awa.insert_jobs_compat_batch` hidden, and restore the
+/// function afterwards even when `run` panics.
+async fn without_batch_function<T, F>(pool: &PgPool, run: F) -> T
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    restore_batch_function(pool).await;
+    sqlx::query(audited_sql(format!(
+        "ALTER FUNCTION {BATCH_FUNCTION} RENAME TO insert_jobs_compat_batch_hidden"
+    )))
+    .execute(pool)
+    .await
+    .expect("hide the batch function");
+    let outcome = tokio::spawn(run).await;
+    restore_batch_function(pool).await;
+    match outcome {
+        Ok(value) => value,
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
+    }
+}
+
 /// `insert_many_copy` on a schema without the batch function inserts a row
 /// at a time, and takes every key before the first row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1200,34 +1254,20 @@ async fn row_by_row_copy_and_fresh_enqueue_of_one_key_do_not_deadlock() {
     provision_lane(&pool, &queue).await;
     let rows = vec![unique_insert(&queue, 1), unique_insert(&queue, 2)];
     let key = unique_key_of(&rows[1]);
-    let hidden = BATCH_FUNCTION.replacen(
-        "insert_jobs_compat_batch",
-        "insert_jobs_compat_batch_hidden",
-        1,
-    );
-    sqlx::query(audited_sql(format!("DROP FUNCTION IF EXISTS {hidden}")))
-        .execute(&pool)
-        .await
-        .expect("drop a batch function an earlier run left hidden");
-
-    sqlx::query(audited_sql(format!(
-        "ALTER FUNCTION {BATCH_FUNCTION} RENAME TO insert_jobs_compat_batch_hidden"
-    )))
-    .execute(&pool)
-    .await
-    .expect("hide the batch function");
-    let result = race_fresh_enqueue(&pool, &queue, &key, {
+    let result = without_batch_function(&pool, {
         let pool = pool.clone();
+        let queue = queue.clone();
+        let key = key.clone();
         let rows = rows.clone();
-        async move { insert_many_copy_from_pool(&pool, &rows).await }
+        async move {
+            race_fresh_enqueue(&pool, &queue, &key, {
+                let pool = pool.clone();
+                async move { insert_many_copy_from_pool(&pool, &rows).await }
+            })
+            .await
+        }
     })
     .await;
-    sqlx::query(audited_sql(format!(
-        "ALTER FUNCTION {hidden} RENAME TO insert_jobs_compat_batch"
-    )))
-    .execute(&pool)
-    .await
-    .expect("restore the batch function");
 
     let inserted = result.expect("the copy skips the row whose key the fresh enqueue took");
     assert_eq!(inserted.len(), 1, "{inserted:?}");
@@ -1432,34 +1472,20 @@ async fn row_by_row_copy_skips_a_held_key_without_waiting_for_it() {
         unique_insert(&lanes[2], 3),
     ];
     let key = unique_key_of(&rows[2]);
-    let hidden = BATCH_FUNCTION.replacen(
-        "insert_jobs_compat_batch",
-        "insert_jobs_compat_batch_hidden",
-        1,
-    );
-    sqlx::query(audited_sql(format!("DROP FUNCTION IF EXISTS {hidden}")))
-        .execute(&pool)
-        .await
-        .expect("drop a batch function an earlier run left hidden");
-    sqlx::query(audited_sql(format!(
-        "ALTER FUNCTION {BATCH_FUNCTION} RENAME TO insert_jobs_compat_batch_hidden"
-    )))
-    .execute(&pool)
-    .await
-    .expect("hide the batch function");
-
-    let (result, waited, fresh) = held_key_released_mid_batch(&pool, &lanes, &key, {
+    let (result, waited, fresh) = without_batch_function(&pool, {
         let pool = pool.clone();
+        let lanes = lanes.clone();
+        let key = key.clone();
         let rows = rows.clone();
-        async move { insert_many_copy_from_pool(&pool, &rows).await }
+        async move {
+            held_key_released_mid_batch(&pool, &lanes, &key, {
+                let pool = pool.clone();
+                async move { insert_many_copy_from_pool(&pool, &rows).await }
+            })
+            .await
+        }
     })
     .await;
-    sqlx::query(audited_sql(format!(
-        "ALTER FUNCTION {hidden} RENAME TO insert_jobs_compat_batch"
-    )))
-    .execute(&pool)
-    .await
-    .expect("restore the batch function");
 
     assert!(
         waited,

@@ -316,9 +316,25 @@ async fn test_canonical_rescue_duplicate_with_cancelled_claiming_mask_keeps_its_
     .expect("claim probe");
     assert_eq!(holder, job_b, "the newer job keeps the key");
 
+    let refused = awa_model::admin::retry(&pool, job_a).await;
     assert!(
-        awa_model::admin::retry(&pool, job_a).await.is_err(),
-        "a retry is refused while the newer job holds the key"
+        match &refused {
+            Err(awa_model::AwaError::Database(sqlx::Error::Database(db))) => {
+                db.code().as_deref() == Some("23505")
+                    && db.constraint() == Some("idx_awa_jobs_unique")
+            }
+            _ => false,
+        },
+        "a retry is refused on the unique claim while the newer job holds the key: {refused:?}"
+    );
+    let state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
+        .bind(job_a)
+        .fetch_one(&pool)
+        .await
+        .expect("state probe");
+    assert_eq!(
+        state, "cancelled",
+        "the refused retry leaves the job cancelled"
     );
     sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
         .bind(job_b)

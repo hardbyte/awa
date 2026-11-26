@@ -856,22 +856,36 @@ async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
         !deferred_exists,
         "the claim-losing successor must never remain executable"
     );
-    let (terminal_state, terminal_payload): (String, serde_json::Value) =
-        sqlx::query_as("SELECT state::text, payload FROM awa.terminal_jobs WHERE job_id = $1")
-            .bind(successor2)
-            .fetch_one(&pool)
-            .await
-            .expect("cancelled duplicate terminal row");
+    let (terminal_state, terminal_attempt, terminal_payload): (String, i16, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT state::text, attempt, payload FROM awa.terminal_jobs WHERE job_id = $1",
+        )
+        .bind(successor2)
+        .fetch_one(&pool)
+        .await
+        .expect("cancelled duplicate terminal row");
     assert_eq!(terminal_state, "cancelled");
+    // The snooze successor would not count the attempt, but the cancelled row
+    // records the attempt that ran.
+    assert_eq!(
+        terminal_attempt, 1,
+        "the cancelled row keeps the attempt that ran"
+    );
     let terminal_errors = terminal_payload["errors"]
         .as_array()
         .expect("terminal payload errors");
-    assert!(
-        terminal_errors.iter().any(|entry| entry["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("unique claim held by a newer job"))),
-        "cancelled duplicate must retain the claim-conflict reason: {terminal_errors:?}"
-    );
+    let duplicate_entry = terminal_errors
+        .iter()
+        .find(|entry| {
+            entry["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unique claim held by a newer job"))
+        })
+        .unwrap_or_else(|| {
+            panic!("cancelled duplicate must retain the claim-conflict reason: {terminal_errors:?}")
+        });
+    assert_eq!(duplicate_entry["attempt"], 1);
+    assert_eq!(duplicate_entry["terminal"], true);
 
     // ── RetryAfter honours the caller delay; heartbeat/deadline cleared ──
     let key3 = b"reschedule-retryafter-key";

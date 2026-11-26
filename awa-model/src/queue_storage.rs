@@ -19041,6 +19041,7 @@ impl QueueStorage {
         row: JobRow,
         unique_states: Option<String>,
         duplicate_error: &str,
+        ran_attempt: i16,
     ) -> Result<JobRow, AwaError> {
         let payload = Self::payload_from_parts(row.metadata, row.tags, row.errors, row.progress)?;
         let deferred = DeferredJobRow {
@@ -19080,7 +19081,7 @@ impl QueueStorage {
         }
 
         let mut cancelled_payload = RuntimePayload::from_json(deferred.payload.clone())?;
-        cancelled_payload.push_error(lifecycle_error(duplicate_error, deferred.attempt, true));
+        cancelled_payload.push_error(lifecycle_error(duplicate_error, ran_attempt, true));
         let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
         let mut done = DoneJobRow {
             ready_slot,
@@ -19091,7 +19092,9 @@ impl QueueStorage {
             args: deferred.args,
             state: JobState::Cancelled,
             priority: deferred.priority,
-            attempt: deferred.attempt,
+            // The cancelled row records the attempt that ran, not a snooze
+            // successor's decremented one.
+            attempt: ran_attempt,
             run_lease: deferred.run_lease,
             max_attempts: deferred.max_attempts,
             // The successor never entered a ready lane. Mirror deferred-job
