@@ -107,7 +107,7 @@ awa batch-ops submit --op-kind move_to_dlq --filter '{"queue":"billing"}' --spec
 
 The same kinds are in the admin UI's batch operations page, `POST /api/batch-ops` and the Python client's `submit_batch_operation`. See [ADR-030](adr/030-batch-operations.md#bulk-action-operations) for each kind's eligible jobs.
 
-The admin UI's DLQ page submits its **Retry matching** and **Purge matching** actions as `retry_from_dlq` and `purge_dlq` batch operations, and links to the batch operations page to follow them. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` do the same: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge` and the Python client's `purge_dlq` still act in one transaction and report a count.
+The admin UI's DLQ page submits its **Retry matching** and **Purge matching** actions as `retry_from_dlq` and `purge_dlq` batch operations, and links to the batch operations page to follow them. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` do the same: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge` and the Python client's `purge_dlq_before` still act in one transaction and report a count.
 
 ## Retention
 
@@ -117,7 +117,7 @@ The maintenance leader periodically prunes DLQ rows older than the configured re
 
 Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the facade crate, for DLQ list, retry, move, and purge helpers. Admin helpers such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and `bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
 
-Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and `purge_dlq_job`. `bulk_retry_from_dlq(...)` submits a `retry_from_dlq` batch operation (`submitted_by: "python"`) and returns it as `submit_batch_operation` does; follow it with `get_batch_operation`. `purge_dlq(...)` is the bulk purge helper and returns the number of rows it deleted; `purge_dlq_job(...)` purges one DLQ row by job ID.
+Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, `purge_dlq_before`, and `purge_dlq_job`. `bulk_retry_from_dlq(...)` and `purge_dlq(...)` submit a `retry_from_dlq` or `purge_dlq` batch operation (`submitted_by: "python"`) and return it as `submit_batch_operation` does; follow it with `get_batch_operation`. `purge_dlq_before(...)` deletes, in one transaction, the matching rows that sort before a `(before_dlq_at, before_id)` cursor from `list_dlq` and returns the count; it needs at least one of `before_id` and `before_dlq_at`. `purge_dlq_job(...)` purges one DLQ row by job ID.
 
 ## See also
 

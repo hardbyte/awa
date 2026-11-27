@@ -112,10 +112,13 @@ def test_dlq_helpers_take_the_filter(client):
     for unscoped in ({"dead_lettered": True}, {"state": "failed"}):
         with pytest.raises(Exception, match="allow_all"):
             client.purge_dlq(filter=unscoped)
-    assert client.purge_dlq(filter={"queue": queue, "tag": "order:1"}) == 1
+    operation = client.purge_dlq(filter={"queue": queue, "tag": "order:1"})
+    _delete_batch_operation(client, operation["id"])
+    assert operation["op_kind"] == "purge_dlq"
+    assert operation["filter"] == {"queue": queue, "tag": "order:1"}
     newest = client.list_dlq(filter={"queue": queue}, limit=1)[0]
     assert (
-        client.purge_dlq(
+        client.purge_dlq_before(
             filter={"queue": queue, "created_at_lt": "2000-01-01T00:00:00Z"},
             before_id=newest.job.id,
             before_dlq_at=newest.dlq_at,
@@ -126,7 +129,7 @@ def test_dlq_helpers_take_the_filter(client):
     _delete_batch_operation(client, operation["id"])
     assert operation["op_kind"] == "retry_from_dlq"
     assert operation["filter"] == {"queue": queue, "tag": "order:3"}
-    assert client.dlq_depth(queue=queue) == 5
+    assert client.dlq_depth(queue=queue) == 6
 
 
 def test_batch_preview_uses_the_same_population(client):

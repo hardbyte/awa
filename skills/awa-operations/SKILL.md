@@ -244,6 +244,10 @@ awa dlq purge --kind SendEmail --wait    # wait for the batch operation to finis
   worker's maintenance leader applies it. Follow it with
   `awa batch-ops get <id>`, or pass `--wait` to poll until it finishes and
   print processed/skipped/errored (non-zero exit if it fails).
+- Python's `bulk_retry_from_dlq` and `purge_dlq` submit the same operations
+  (`submitted_by: "python"`) and return them. `purge_dlq_before` purges in one
+  transaction up to a `before_id` / `before_dlq_at` cursor (one is required)
+  and returns a count.
 - `retry-bulk`, `purge`, and `move` require `--all` when no filter is given —
   the guard against reviving or wiping the whole DLQ. Purge is unrecoverable;
   prefer `retry-bulk` if you might want the data back.

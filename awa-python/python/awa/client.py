@@ -736,12 +736,29 @@ class AsyncClient:
         queue: str | None = None,
         tag: str | None = None,
         filter: JobFilter | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a `purge_dlq` batch operation for the DLQ rows matching the
+        filter and return it; the maintenance leader applies it."""
+        return await self._raw.purge_dlq(
+            kind=kind, queue=queue, tag=tag, filter=filter, allow_all=allow_all
+        )
+
+    async def purge_dlq_before(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        filter: JobFilter | None = None,
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
     ) -> int:
-        """Bulk-delete DLQ rows matching the filter."""
-        return await self._raw.purge_dlq(
+        """Delete, in one transaction, the DLQ rows matching the filter that
+        sort before the `(before_dlq_at, before_id)` cursor. Needs at least
+        one of `before_id` / `before_dlq_at`. Returns the deleted count."""
+        return await self._raw.purge_dlq_before(
             kind=kind,
             queue=queue,
             tag=tag,
@@ -1694,12 +1711,29 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         filter: JobFilter | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a `purge_dlq` batch operation for the DLQ rows matching the
+        filter and return it; the maintenance leader applies it."""
+        return self._raw.purge_dlq_sync(
+            kind=kind, queue=queue, tag=tag, filter=filter, allow_all=allow_all
+        )
+
+    def purge_dlq_before(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        filter: JobFilter | None = None,
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
     ) -> int:
-        """Bulk-delete DLQ rows matching the filter."""
-        return self._raw.purge_dlq_sync(
+        """Delete, in one transaction, the DLQ rows matching the filter that
+        sort before the `(before_dlq_at, before_id)` cursor. Needs at least
+        one of `before_id` / `before_dlq_at`. Returns the deleted count."""
+        return self._raw.purge_dlq_before_sync(
             kind=kind,
             queue=queue,
             tag=tag,

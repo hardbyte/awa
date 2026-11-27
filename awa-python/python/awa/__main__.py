@@ -435,6 +435,13 @@ async def _queue_stats(client: "awa.AsyncClient") -> None:
 # ── dlq ─────────────────────────────────────────────────────────────────
 
 
+def _print_submitted(operation: "awa.BatchOperation") -> None:
+    print(
+        f"Submitted {operation['op_kind']} batch operation {operation['id']} "
+        f"({operation['state']})."
+    )
+
+
 async def _dispatch_dlq(client: "awa.AsyncClient", args: argparse.Namespace) -> None:
     dc = args.dlq_cmd
     if dc == "list":
@@ -482,18 +489,15 @@ async def _dispatch_dlq(client: "awa.AsyncClient", args: argparse.Namespace) -> 
             tag=args.tag,
             allow_all=args.all,
         )
-        print(
-            f"Submitted {operation['op_kind']} batch operation {operation['id']} "
-            f"({operation['state']})."
-        )
+        _print_submitted(operation)
     elif dc == "purge":
-        count = await client.purge_dlq(
+        operation = await client.purge_dlq(
             kind=args.kind,
             queue=args.queue,
             tag=args.tag,
             allow_all=args.all,
         )
-        print(f"Purged {count} DLQ rows.")
+        _print_submitted(operation)
     else:
         print("usage: awa dlq {list,depth,retry,retry-all,purge}", file=sys.stderr)
         sys.exit(1)

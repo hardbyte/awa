@@ -370,14 +370,17 @@ def test_dlq_list_renders_nested_job_fields(sync_client_qs):
     assert "datetime.datetime" not in result.stdout
 
     # Cleanup so reruns stay idempotent.
-    sync_client_qs.purge_dlq(queue=queue)
+    assert sync_client_qs.purge_dlq_job(job.id)
 
 
-def test_dlq_retry_all_submits_a_batch_operation(sync_client_qs):
-    queue = "pydlq_cli_retry_all"
-    result = _cli("--database-url", DATABASE_URL, "dlq", "retry-all", "--queue", queue)
+@pytest.mark.parametrize(
+    ("command", "op_kind"), [("retry-all", "retry_from_dlq"), ("purge", "purge_dlq")]
+)
+def test_dlq_bulk_commands_submit_a_batch_operation(sync_client_qs, command, op_kind):
+    queue = f"pydlq_cli_{op_kind}"
+    result = _cli("--database-url", DATABASE_URL, "dlq", command, "--queue", queue)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.startswith("Submitted retry_from_dlq batch operation "), result.stdout
+    assert result.stdout.startswith(f"Submitted {op_kind} batch operation "), result.stdout
     operation_id = result.stdout.split()[4]
     operation = sync_client_qs.get_batch_operation(operation_id)
     tx = sync_client_qs.transaction()

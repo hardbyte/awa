@@ -548,11 +548,29 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         filter: dict[str, Any] | None = None,
+        allow_all: bool = False,
+    ) -> dict[str, Any]: ...
+    async def purge_dlq_before(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         before_id: int | None = None,
         before_dlq_at: datetime.datetime | None = None,
         allow_all: bool = False,
     ) -> int: ...
     def purge_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        filter: dict[str, Any] | None = None,
+        allow_all: bool = False,
+    ) -> dict[str, Any]: ...
+    def purge_dlq_before_sync(
         self,
         *,
         kind: str | None = None,
