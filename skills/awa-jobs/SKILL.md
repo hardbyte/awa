@@ -166,6 +166,14 @@ cross-language golden tests; the default state set includes `completed`, so a
 still-retained completed job suppresses a re-insert with the same args. Scope
 uniqueness with `by_period`, or drop `completed` from the state set, if that is
 not what you want.
+A state set that leaves out `running`, or the state a job waits in, lets a
+newer job take the key. When the older job then snoozes, retries, falls due or
+is rescued into a state the set includes, it would need the key back, so it is
+cancelled as a duplicate instead (error `... as duplicate: unique claim held
+by ...`) and the newer job keeps the key. A move into a state the set leaves
+out, such as rescue into `failed`, takes no key and is not cancelled. Retrying
+the cancelled job fails with a unique conflict until the newer one leaves a
+claiming state.
 
 ## Retry, Snooze, Cancel
 
