@@ -487,7 +487,8 @@ upgrade supporting a mixed 0.6.2/0.7 fleet.
 > modifying them, and refuses to restart after the authority flip. Do not run a
 > 0.7 migration while a 0.6.0 or 0.6.1 binary can invoke `awa migrate`; those
 > releases contain the destructive newer-schema misclassification fixed by
-> [#392](https://github.com/hardbyte/awa/issues/392).
+> [#392](https://github.com/hardbyte/awa/issues/392). 0.6.19 is recommended: it is the
+> release the release gate rehearses the rolling upgrade from.
 
 `awa migrate` enforces this stepping-stone: v043 is refused while any runtime with a
 fresh heartbeat reports a version below 0.6.2 or an unparseable version. The
@@ -537,8 +538,9 @@ orders are supported:
 If you migrate first, roll 0.7 workers promptly. An all-0.6.2 fleet on v043 remains safe:
 crash and heartbeat rescue are batch-aware, but 0.6.2's deadline-rescue sweep does not read
 the v042 compact claim batches used for newly claimed deadline jobs. Deadline-based rescue
-for those jobs resumes when a 0.7 runtime takes maintenance leadership. Roll the
-0.6 maintenance leader promptly after migrating. Awa's built-in
+for those jobs resumes when a 0.7 runtime takes maintenance leadership. This holds for
+released 0.6.12 and older; from 0.6.13 the released fleet drops the overdue handler and its
+heartbeat rescue retries the job. Roll the 0.6 maintenance leader promptly after migrating. Awa's built-in
 migrator applies v041-v043 in one transaction, so other sessions see v040 or v043, never an
 intermediate version. An external migration runner that commits each version separately can
 expose v041/v042; a restarting 0.6.2 worker refuses those transient schemas and connects

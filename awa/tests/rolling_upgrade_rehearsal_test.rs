@@ -1052,9 +1052,18 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
     report.finish();
 }
 
+/// Migrate-first with a released worker holding a deadline-bound job past its
+/// deadline. Released 0.6.12 and older never rescue the expired compact claim
+/// (their deadline sweep reads only row-local claims), so the current
+/// runtime's deadline rescue closes it once it takes maintenance leadership.
+/// From 0.6.13 the released worker drops the overdue handler and its own
+/// heartbeat rescue retries the job. Either way the expired attempt must be
+/// rescued exactly once, its successor must start only after the released
+/// process is gone, and the job must complete on attempt 2. Which runtime
+/// rescued is recorded in the report, not asserted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires a released awa-pg 0.6.19 environment"]
-async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
+async fn test_migrate_first_expired_deadline_claim_rescued_once_in_mixed_fleet() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("migrate_first_deadline_rescue_handoff");
     report.phase("start");
@@ -1063,8 +1072,8 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     let queue = format!("upgrade_deadline_{}", Uuid::new_v4().simple());
     let seq = 1;
 
-    // Keep the released handler alive beyond its deadline. Its runtime
-    // heartbeat and maintenance loops continue while the job is running.
+    // The released handler sleeps far past its 300ms deadline, so only a
+    // rescue can end attempt 1.
     let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300), false).await;
     assert_eq!(schema_version(&pool).await, 40);
 
@@ -1089,79 +1098,16 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     wait_for_expired_compact_claim(&pool, inserted.id, Duration::from_secs(10)).await;
     report.phase("compact_claim_expired_under_released_leader");
 
-    // The released runtime runs its deadline maintenance every 100ms, but
-    // that implementation only scans row-local claims. The v043 SQL claim
-    // path writes this job to a compact batch, so it remains on attempt 1.
-    tokio::time::sleep(Duration::from_secs(1)).await;
     let store = QueueStorage::new(QueueStorageConfig {
         schema: "awa".to_string(),
         ..Default::default()
     })
     .expect("queue storage");
-    let pending = store
-        .load_job(&pool, inserted.id)
-        .await
-        .expect("load expired compact claim")
-        .expect("expired compact claim must remain visible");
-    // This assert failed once in CI (nightly 33314091717, #434) with the job
-    // already Retryable, and the panic destroyed the evidence of *which* path
-    // rescued it: `load_job` only reports Retryable for a job with an open
-    // compact claim once a `deferred_jobs` row exists for the same
-    // `run_lease`, so the writer was a claims-aware rescue/supersession, not
-    // a producer insert. Before failing, dump the rows that identify the
-    // writer — the deferred row's `errors`/`attempt` and any closure carry
-    // each rescue path's distinct fingerprint.
-    if pending.state != JobState::Running || pending.attempt != 1 {
-        let deferred: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(d) FROM awa.deferred_jobs AS d WHERE d.job_id = $1",
-        )
-        .bind(inserted.id)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_else(|e| vec![serde_json::json!({ "deferred_query_error": e.to_string() })]);
-        let closures: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT run_lease, outcome FROM awa.lease_claim_closures WHERE job_id = $1",
-        )
-        .bind(inserted.id)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_else(|e| vec![(-1, e.to_string())]);
-        let batch_closures: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(c) FROM awa.lease_claim_batches AS batches \
-             CROSS JOIN LATERAL unnest(batches.job_ids, batches.receipt_ids) AS items(job_id, receipt_id) \
-             JOIN awa.lease_claim_closure_batches AS c \
-               ON c.claim_slot = batches.claim_slot AND items.receipt_id <@ c.receipt_ranges \
-             WHERE items.job_id = $1",
-        )
-        .bind(inserted.id)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_else(|e| vec![serde_json::json!({ "batch_closure_query_error": e.to_string() })]);
-        eprintln!(
-            "[diag] job {} state={:?} attempt={} errors={:?}\n[diag] deferred={deferred:?}\n[diag] closures={closures:?}\n[diag] batch_closures={batch_closures:?}",
-            inserted.id, pending.state, pending.attempt, pending.errors
-        );
-    }
-    assert_eq!(pending.state, JobState::Running);
-    assert_eq!(pending.attempt, 1);
-    let heartbeat_is_fresh: bool = sqlx::query_scalar(
-        "SELECT heartbeat_at > clock_timestamp() - interval '500 milliseconds' \
-         FROM awa.attempt_state WHERE job_id = $1 AND run_lease = $2",
-    )
-    .bind(inserted.id)
-    .bind(pending.run_lease)
-    .fetch_one(&pool)
-    .await
-    .expect("read released attempt heartbeat");
-    assert!(
-        heartbeat_is_fresh,
-        "deadline boundary must be observed while the released worker is healthy"
-    );
 
+    // Current joins as a worker while the released runtime stays leader.
+    // Its heartbeat rescue is kept out of the race, so a rescue by current
+    // can only come from its deadline sweep after it takes leadership.
     let current_completed = Arc::new(Mutex::new(HashSet::new()));
-    // Keep heartbeat rescue out of this cell's race. Once current owns
-    // maintenance leadership, the expired compact deadline must be the
-    // reason the claim is force-closed.
     let current = current_client_with_heartbeat_rescue(
         pool.clone(),
         &queue,
@@ -1173,21 +1119,40 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
         .await
         .expect("start current maintenance runtime");
 
-    // Maintenance is leader-owned. Starting a current worker does not make
-    // it sweep deadlines while the released runtime remains leader.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let still_pending = store
-        .load_job(&pool, inserted.id)
-        .await
-        .expect("load claim during mixed-version leadership")
-        .expect("claim must remain visible during mixed-version leadership");
-    assert_eq!(still_pending.state, JobState::Running);
-    assert_eq!(still_pending.attempt, 1);
-    report.phase("claim_pending_while_released_holds_leadership");
+    // Give the released fleet time to rescue attempt 1 itself (0.6.13+).
+    // Stop as soon as attempt 1 is closed: the retry's backoff (at least 1s)
+    // leaves room to remove the released worker before attempt 2 is due.
+    let window = Instant::now();
+    let closed_under_released = loop {
+        let job = store
+            .load_job(&pool, inserted.id)
+            .await
+            .expect("load claim during mixed-version leadership")
+            .expect("claim must remain visible during mixed-version leadership");
+        if job.state != JobState::Running || job.attempt != 1 {
+            assert_eq!(
+                (job.state, job.attempt),
+                (JobState::Retryable, 1),
+                "a released rescue must leave attempt 1 retryable, not start a successor"
+            );
+            break true;
+        }
+        if window.elapsed() >= Duration::from_secs(5) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    report.phase("observed_released_leadership_window");
 
-    // Hard-kill the released maintenance leader mid-job. Current must take
-    // leadership and rescue the expired compact claim via the deadline path.
+    // Hard-kill the released runtime. Any successor attempt must start after
+    // this point, so it never overlaps a released attempt.
     old_worker.shutdown().await;
+    let released_gone_at: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .expect("read kill timestamp");
+    report.phase("released_worker_killed");
+
     let start = Instant::now();
     loop {
         if current_completed.lock().unwrap().contains(&seq) {
@@ -1195,7 +1160,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(20),
-            "current runtime did not rescue and complete the expired batch claim"
+            "current runtime did not complete the rescued job"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1207,17 +1172,63 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
         .await
         .expect("load rescued terminal job")
         .expect("rescued job must remain visible");
+    let errors = completed.errors.clone().unwrap_or_default();
+    // Claim closures for this job, row-local and compact, in claim order.
+    let closures: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM ( \
+           SELECT run_lease AS ord, outcome FROM awa.lease_claim_closures WHERE job_id = $1 \
+           UNION ALL \
+           SELECT c.batch_id, c.outcome FROM awa.lease_claim_batches AS batches \
+           CROSS JOIN LATERAL unnest(batches.job_ids, batches.receipt_ids) AS items(job_id, receipt_id) \
+           JOIN awa.lease_claim_closure_batches AS c \
+             ON c.claim_slot = batches.claim_slot AND items.receipt_id <@ c.receipt_ranges \
+           WHERE items.job_id = $1 \
+         ) AS closed ORDER BY ord",
+    )
+    .bind(inserted.id)
+    .fetch_all(&pool)
+    .await
+    .expect("read claim closures");
+    eprintln!(
+        "[diag] job {} state={:?} attempt={} attempted_at={:?} released_gone_at={released_gone_at} errors={errors:?} closures={closures:?}",
+        inserted.id, completed.state, completed.attempt, completed.attempted_at
+    );
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(
         completed.attempt, 2,
         "expired compact claim must be rescued exactly once"
     );
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one rescue must be recorded against attempt 1: {errors:?}"
+    );
+    assert_eq!(errors[0]["attempt"], serde_json::json!(1));
+    let successor_started = completed
+        .attempted_at
+        .expect("completed attempt records its start");
+    assert!(
+        successor_started > released_gone_at,
+        "attempt 2 started at {successor_started} while the released worker was live (killed at {released_gone_at})"
+    );
     assert!(
         !old_worker.completed().contains(&seq),
-        "released worker must not report a competing completion"
+        "released worker must not report a completion"
     );
-    report.phase("rescued_exactly_once_by_current_leader");
+    report.phase("rescued_exactly_once_and_completed");
+
+    let rescue_error = errors[0]["error"].as_str().unwrap_or_default().to_string();
     report.fact("rescued_attempt", 2);
+    report.fact(
+        "rescued_by",
+        if closed_under_released {
+            "released_fleet"
+        } else {
+            "current_leader"
+        },
+    );
+    report.fact("rescue_error", rescue_error);
+    report.fact("claim_closures", closures);
     report.finish();
 }
 
