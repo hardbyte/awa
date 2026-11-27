@@ -38,6 +38,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   could act on more rows there (a filter beside `all: true` would act on the
   whole DLQ); it answers the new paths with 405, and a v0.6.9 server was
   checked to.
+- **HTTP: `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` submit a batch operation and answer `202 Accepted` with it,** where they retried or purged the matching rows in one transaction and answered `{"count": n}`. The body and its validation are unchanged; the operation (`retry_from_dlq` or `purge_dlq`, `submitted_by: "http"`) has the shape `GET /api/batch-ops/{id}` returns, and the maintenance leader applies it a chunk at a time, so callers follow its `state` and `processed`, `skipped` and `errored` counters there instead of reading a count. Batch-operation submit rules now apply: a filter whose `state` names anything but `failed`, or with `dead_lettered: false`, is refused where it matched nothing or only the failed rows, and one with `dead_lettered: true`, several tags or several states is refused while a runtime older than 0.7.0-alpha.2 is live. The admin UI's DLQ bulk actions submit through them and link to the batch operations page. `/api/dlq/bulk-retry` and `/bulk-purge` still answer with a count.
 - **Finding, counting and batch-operating on jobs by filter require queue
   storage.** On the deprecated canonical engine (ADR-037), `find_jobs`,
   `count_jobs`, the deprecated `list_jobs`, `GET /api/jobs`, `awa job list`

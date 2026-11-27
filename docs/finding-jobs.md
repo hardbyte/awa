@@ -35,12 +35,7 @@ pass over candidates and every load of their rows. A filter that needs longer
 fails with an error asking to narrow it. Batch operations scan without that
 budget, since a failed scan fails the operation.
 
-A DLQ purge or bulk retry, and a batch operation, needs a field that picks
-out particular jobs (kind, queue, tag, ids or a created bound), or
-`allow_all`. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes
-to `POST /api/dlq/retry-matching` or `/api/dlq/purge-matching`:
-`{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`, or
-`{"filter": {}, "all": true}` for the whole DLQ.
+A DLQ purge or bulk retry, and a batch operation, needs a field that picks out particular jobs (kind, queue, tag, ids or a created bound), or `allow_all`. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes to `POST /api/dlq/retry-matching` or `/api/dlq/purge-matching`: `{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`, or `{"filter": {}, "all": true}` for the whole DLQ. Each submits a `retry_from_dlq` or `purge_dlq` batch operation with that filter and answers `202 Accepted` with it, as `GET /api/batch-ops/{id}` returns it.
 
 Each job appears once, in its current state. Listing is newest first; page by
 passing the last id you saw as `before_id`. A job whose claim is in flight
