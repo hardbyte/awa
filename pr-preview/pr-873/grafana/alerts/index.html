@@ -2543,6 +2543,24 @@
 <td>the oldest open transaction on the database is older than 5m, for 2m</td>
 <td>it commits or aborts</td>
 </tr>
+<tr>
+<td><code>awa_maintenance_branch_failing</code> <em>(Prom only)</em></td>
+<td>critical</td>
+<td>a maintenance branch's runs carry <code>error.type</code> for 5m</td>
+<td>the branch runs cleanly</td>
+</tr>
+<tr>
+<td><code>awa_promotion_due_lag_high</code> <em>(Prom only)</em></td>
+<td>critical</td>
+<td>a due <code>scheduled</code> or <code>retryable</code> job has waited &gt; 10m to be promoted, for 5m</td>
+<td>due lag drops below 10m</td>
+</tr>
+<tr>
+<td><code>awa_maintenance_leader_count</code> <em>(Prom only)</em></td>
+<td>critical</td>
+<td>the fleet's summed <code>awa_maintenance_leader</code> is not 1 for 5m, counting no reporting runtime as 0</td>
+<td>exactly one runtime leads</td>
+</tr>
 </tbody>
 </table>
 <p>The ring rules read awa's maintenance counters. A lease or claim ring cannot rotate past an attempt that is still running, so workloads whose jobs routinely run longer than 15 minutes should lengthen <code>awa_ring_rotation_stalled</code>'s window or its <code>for</code>.</p>
