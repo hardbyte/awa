@@ -1,8 +1,9 @@
 ---- MODULE AwaCanonicalUniqueRescue ----
 EXTENDS TLC
 
-\* Focused model for #388: the canonical rescue sweep versus the unique-claim
-\* trigger (`awa.sync_job_unique_claims`).
+\* Focused model for #388: the rescue sweep versus the unique-claim rule, on
+\* the canonical engine (`awa.sync_job_unique_claims` trigger) and on queue
+\* storage (`QueueStorage::settle_rescued_attempts_tx`).
 \*
 \* Shape: job J1 is a unique job with a "pending-only" unique-states mask
 \* (claims `available`/`retryable`, but NOT `running` or `cancelled`), stuck
@@ -16,13 +17,22 @@ EXTENDS TLC
 \* holds it. Rescue moves `running -> retryable`, which enters J1's mask —
 \* refused forever while J2 holds the claim.
 \*
-\* With PerRowFallback = FALSE the model has only the batched sweep, which
-\* is enabled only when every stale row can transition: J1's conflict blocks
-\* it permanently and J3 starves — the Convergence liveness property fails
-\* (this is the production wedge, kept as an expected counterexample).
-\* With PerRowFallback = TRUE the per-row actions rescue J3 and cancel J1
-\* (`cancelled` is outside the mask, so no claim is taken), and Convergence
-\* holds. ClaimConsistency holds in both configurations.
+\* Engine selects the rescue the model runs:
+\*   "batch_only": only the pre-#388 batched sweep, which is enabled only
+\*     when every stale row can transition. J1's conflict blocks it
+\*     permanently and J3 starves; the Convergence liveness property fails
+\*     (the production wedge, kept as an expected counterexample).
+\*   "canonical": the canonical engine's per-row fallback. Each row rescues
+\*     in its own step; a row whose rescue conflicts is cancelled
+\*     (`cancelled` is outside the mask, so no claim is taken).
+\*   "queue_storage": queue storage settles every rescued attempt of the
+\*     transaction in one pass. It applies all claim changes at once, in key
+\*     order, skipping the claims another job holds, and turns each skipped
+\*     attempt into a duplicate cancellation in the same transaction; there
+\*     is no savepoint or per-row retry. One atomic step resolves every
+\*     stale row.
+\* Convergence holds for "canonical" and "queue_storage". ClaimConsistency
+\* holds in every configuration.
 \*
 \* Since #546 a rescued attempt that was the job's last fails in place
 \* (`running -> failed`) instead of moving to `retryable`. Whether each stuck
@@ -30,7 +40,9 @@ EXTENDS TLC
 \* mask, so an exhausted J1 never conflicts; a mask that claimed `failed`
 \* would conflict the same way `retryable` does and take the same fallback.
 
-CONSTANT PerRowFallback
+CONSTANT Engine
+
+EngineOK == Engine \in {"batch_only", "canonical", "queue_storage"}
 
 JobStates == {"running_stale", "retryable", "failed", "cancelled"}
 Holders == {"none", "j1", "j2"}
@@ -72,7 +84,7 @@ J1HolderAfter(to) ==
 
 \* The pre-#388 batched sweep: one statement rescues every stale row or none.
 RescueBatch ==
-    /\ ~PerRowFallback
+    /\ Engine = "batch_only"
     /\ s1 = "running_stale" \/ s3 = "running_stale"
     /\ s1 = "running_stale" => J1CanEnter(T1)
     /\ s1' = IF s1 = "running_stale" THEN T1 ELSE s1
@@ -82,13 +94,13 @@ RescueBatch ==
 
 \* Per-row fallback (#388 fix): each row rescues independently…
 RescueRowJ3 ==
-    /\ PerRowFallback
+    /\ Engine = "canonical"
     /\ s3 = "running_stale"
     /\ s3' = T3
     /\ UNCHANGED <<s1, holder, last1, last3>>
 
 RescueRowJ1 ==
-    /\ PerRowFallback
+    /\ Engine = "canonical"
     /\ s1 = "running_stale"
     /\ J1CanEnter(T1)
     /\ s1' = T1
@@ -98,7 +110,7 @@ RescueRowJ1 ==
 \* …and a row whose rescue conflicts is cancelled instead — the claim
 \* holder (the duplicate that superseded it) wins.
 CancelRowJ1 ==
-    /\ PerRowFallback
+    /\ Engine = "canonical"
     /\ s1 = "running_stale"
     /\ ~J1CanEnter(T1)
     /\ J1CanEnter("cancelled")
@@ -106,13 +118,30 @@ CancelRowJ1 ==
     /\ holder' = J1HolderAfter("cancelled")
     /\ UNCHANGED <<s3, last1, last3>>
 
-Progress == RescueBatch \/ RescueRowJ3 \/ RescueRowJ1 \/ CancelRowJ1
+\* Queue storage: one settle pass over every stale row. A row whose claim
+\* another job holds is cancelled as a duplicate; every other row is
+\* rescued. The pass commits or aborts as a whole, so it is one step.
+SettleSinglePass ==
+    /\ Engine = "queue_storage"
+    /\ s1 = "running_stale" \/ s3 = "running_stale"
+    /\ s3' = IF s3 = "running_stale" THEN T3 ELSE s3
+    /\ s1' = IF s1 # "running_stale" THEN s1
+             ELSE IF J1CanEnter(T1) THEN T1
+             ELSE "cancelled"
+    /\ holder' = IF s1 # "running_stale" THEN holder
+                 ELSE IF J1CanEnter(T1) THEN J1HolderAfter(T1)
+                 ELSE J1HolderAfter("cancelled")
+    /\ UNCHANGED <<last1, last3>>
+
+Progress ==
+    RescueBatch \/ RescueRowJ3 \/ RescueRowJ1 \/ CancelRowJ1 \/ SettleSinglePass
 
 Next == Progress \/ UNCHANGED vars
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Progress)
 
 TypeOK ==
+    /\ EngineOK
     /\ s1 \in JobStates
     /\ s3 \in JobStates
     /\ holder \in Holders

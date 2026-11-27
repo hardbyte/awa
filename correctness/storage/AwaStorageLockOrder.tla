@@ -173,6 +173,14 @@ ClaimChildResource(s) == [k |-> "claim_child", s |-> s]
 ClaimBatchChildResource(s) == [k |-> "claim_batch_child", s |-> s]
 ClosureChildResource(s) == [k |-> "closure_child", s |-> s]
 ClosureBatchChildResource(s) == [k |-> "closure_batch_child", s |-> s]
+\* The `awa.job_unique_claims` row of one unique key. An uncommitted insert
+\* of the key, the row lock `ON CONFLICT DO UPDATE` takes on an existing
+\* claim, and an uncommitted release (`DELETE`) each make every other
+\* claimant or releaser of the key wait for the transaction.
+UniqueClaimResource(u) == [k |-> "unique_claim", u |-> u]
+
+\* Two keys, ordered 1 < 2 as their bytes sort.
+UniqueKeys == {1, 2}
 
 LaneResources == { LaneResource(q, p) : q \in Queues, p \in Priorities }
 LaneRowResources == { LaneRowResource(q, p) : q \in Queues, p \in Priorities }
@@ -193,6 +201,7 @@ ClaimChildResources == { ClaimChildResource(s) : s \in ClaimSlots }
 ClaimBatchChildResources == { ClaimBatchChildResource(s) : s \in ClaimSlots }
 ClosureChildResources == { ClosureChildResource(s) : s \in ClaimSlots }
 ClosureBatchChildResources == { ClosureBatchChildResource(s) : s \in ClaimSlots }
+UniqueClaimResources == { UniqueClaimResource(u) : u \in UniqueKeys }
 
 Resources ==
     LaneResources \cup
@@ -226,7 +235,8 @@ Resources ==
     ClaimChildResources \cup
     ClaimBatchChildResources \cup
     ClosureChildResources \cup
-    ClosureBatchChildResources
+    ClosureBatchChildResources \cup
+    UniqueClaimResources
 
 \* A plan step names a resource, mode, and whether contention waits.
 Step(res, mode) == [res |-> res, mode |-> mode, wait |-> TRUE]
@@ -292,6 +302,81 @@ OldQueueStorageProvisionLanePlan(q, p) ==
     << Step(LaneProvisionResource(q, p), ModeExclusive),
        Step(LaneRowResource(q, p), ModeExclusive),
        Step(LaneResource(q, p), ModeExclusive) >>
+
+\* Enqueue of a job with a unique key, fresh or re-enqueued, takes the key's
+\* claim before the lane's enqueue lock:
+\*   fresh: `awa.insert_job_compat` (claim, then reserve_enqueue_seq);
+\*     `insert_jobs_compat_batch`, `QueueStorage::insert_ready_rows_tx` and
+\*     `insert_ready_rows_copy_tx` (every claim in key order, then lanes)
+\*   re-enqueue: `QueueStorage::insert_existing_ready_rows_inner_tx`
+\*     (promotion, callback resume, admin retry, DLQ retry single, legacy
+\*     bulk and batched, priority aging) syncs every claim in key order
+\*     before `ensure_lane` / `advance_enqueue_head`
+\*   deferred cancel and migrated-reschedule cancellation release or claim
+\*     the key before `ensure_lane` provisions shard 0
+UniqueEnqueuePlan(u, q, p) ==
+    << Step(UniqueClaimResource(u), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
+\* A batch whose rows carry both keys and land on both stripes: claims in
+\* key order, then lanes in canonical order.
+UniqueBatchEnqueuePlan(p) ==
+    << Step(UniqueClaimResource(1), ModeExclusive),
+       Step(UniqueClaimResource(2), ModeExclusive),
+       Step(LaneResource(StripeA, p), ModeExclusive),
+       Step(LaneResource(StripeB, p), ModeExclusive) >>
+
+\* Key-order rule: within one transaction every change to
+\* `awa.job_unique_claims`, claim or release, happens in bytewise key order,
+\* and all of them happen before any lane lock. A claim and a release of a
+\* key both hold the key's row exclusively until commit, so the model does
+\* not tell them apart.
+\*
+\* A transaction that releases or claims several jobs' keys in one pass
+\* (`QueueStorage::apply_unique_claim_changes_tx`), then may ensure a lane:
+\*   bulk cancel (`cancel_jobs_by_ids`, `cancel_job`, `cancel_job_in_tx`:
+\*     one pass over every cancelled job's change, then `ensure_lane` for
+\*     cancelled deferred jobs)
+\*   drain chunks (`cancel_deferred_chunk_tx` then `ensure_lane`;
+\*     `cancel_available_chunk_tx`)
+\*   batch completion (`complete_claimed_batch`,
+\*     `complete_runtime_batch_slow_in_tx` across its receipt and
+\*     materialized groups, `complete_job_batch_by_id_in_tx`)
+\*   claim (`claim_runtime_batch_with_aging_physical`), rescue
+\*     (`settle_rescued_attempts_tx` across every batch, retry, failure and
+\*     DLQ outcome), `discard_failed_by_kind` across done and DLQ rows,
+\*     `bulk_move_failed_to_dlq`, and every single-row `insert_*_rows_tx`
+UniqueClaimPassPlan(q, p) ==
+    << Step(UniqueClaimResource(1), ModeExclusive),
+       Step(UniqueClaimResource(2), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
+\* A transition that also enqueues ADR-029 follow-ups in its transaction
+\* (`complete_queue_storage_with_followups` and the other executor
+\* `*_with_followups` paths) makes two claim passes: the parent's
+\* transition changes its claim, then each follow-up insert
+\* (`awa.insert_job_compat`) claims the follow-up's key and takes its lane.
+\* The key-order rule holds within each pass but not across them, so a
+\* parent releasing key `a` with a follow-up claiming key `b < a` breaks it.
+\* Not part of `Next`: this is a known gap, checked only by the
+\* counterexample harness below.
+CompleteWithFollowUpPlan(a, b, q, p) ==
+    << Step(UniqueClaimResource(a), ModeExclusive),
+       Step(UniqueClaimResource(b), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
+\* Through 0.6.18 those paths changed claims in row order, one pass per
+\* group of rows. Kept only as a negative regression harness.
+OldRowOrderClaimPassPlan ==
+    << Step(UniqueClaimResource(2), ModeExclusive),
+       Step(UniqueClaimResource(1), ModeExclusive) >>
+
+\* Re-enqueue through 0.6.18 reserved the lane before syncing the row's
+\* claim, the reverse of a fresh enqueue. Kept only as a negative
+\* regression harness.
+OldReEnqueueUniquePlan(u, q, p) ==
+    << Step(LaneResource(q, p), ModeExclusive),
+       Step(UniqueClaimResource(u), ModeExclusive) >>
 
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
@@ -875,6 +960,36 @@ StartProvisionLane(t, q, p) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
+StartUniqueEnqueue(t, u, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ u \in UniqueKeys
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = UniqueEnqueuePlan(u, q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+StartUniqueBatchEnqueue(t, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = UniqueBatchEnqueuePlan(p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+StartUniqueClaimPass(t, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = UniqueClaimPassPlan(q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
 StartComplete(t, claimSlot, readySlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -1135,6 +1250,11 @@ Next ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
     \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities : StartProvisionLane(t, q, p)
+    \/ \E t \in TxIds, u \in UniqueKeys, q \in Queues, p \in Priorities :
+          StartUniqueEnqueue(t, u, q, p)
+    \/ \E t \in TxIds, p \in Priorities : StartUniqueBatchEnqueue(t, p)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities :
+          StartUniqueClaimPass(t, q, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -1306,6 +1426,99 @@ NextOldLaneProvisioningDeadlockDemo ==
 
 SpecOldLaneProvisioningDeadlockDemo ==
     ConfigOK /\ Init /\ [][NextOldLaneProvisioningDeadlockDemo]_vars
+
+\* ---- Historical re-enqueue unique-claim deadlock harness ----
+\*
+\* A 0.6.18 re-enqueue holds the lane and waits for a fresh enqueue's
+\* uncommitted claim of the same key, while the fresh enqueue holds the
+\* claim and waits for the lane. TLC is expected to flag NoDeadlock on this
+\* spec. It is also the mixed-version shape while 0.6.18 and later runtimes
+\* share a database.
+
+StartOldReEnqueueUnique(t, u, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ u \in UniqueKeys
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldReEnqueueUniquePlan(u, q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+NextOldReEnqueueUniqueDeadlockDemo ==
+    \/ \E t \in TxIds, u \in UniqueKeys, q \in Queues, p \in Priorities :
+          StartUniqueEnqueue(t, u, q, p)
+    \/ \E t \in TxIds, u \in UniqueKeys, q \in Queues, p \in Priorities :
+          StartOldReEnqueueUnique(t, u, q, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldReEnqueueUniqueDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldReEnqueueUniqueDeadlockDemo]_vars
+
+\* ---- Historical row-order claim-pass deadlock harness ----
+\*
+\* A 0.6.18 bulk cancel releases key 2 and waits on key 1, whose row a
+\* fresh enqueue of both keys holds; the enqueue then waits on the
+\* uncommitted release of key 2. TLC is expected to flag NoDeadlock.
+
+StartOldRowOrderClaimPass(t) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldRowOrderClaimPassPlan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+NextOldRowOrderClaimPassDeadlockDemo ==
+    \/ \E t \in TxIds, p \in Priorities : StartUniqueBatchEnqueue(t, p)
+    \/ \E t \in TxIds : StartOldRowOrderClaimPass(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldRowOrderClaimPassDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldRowOrderClaimPassDeadlockDemo]_vars
+
+\* ---- Completion follow-up deadlock harness (known gap) ----
+\*
+\* Two parents, holding keys 1 and 2, each complete with a mask that releases
+\* on completion and register a uniquely keyed follow-up for the other's key.
+\* Each releases its own key, then waits to claim the key the other has just
+\* released and not committed. TLC is expected to flag NoDeadlock: the
+\* key-order rule covers one claim pass, and a transition with follow-ups
+\* takes two.
+
+StartCompleteWithFollowUp(t, a, b, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ a \in UniqueKeys
+    /\ b \in UniqueKeys
+    /\ a # b
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = CompleteWithFollowUpPlan(a, b, q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+NextCompletionFollowUpDeadlockDemo ==
+    \/ \E t \in TxIds, a, b \in UniqueKeys, q \in Queues, p \in Priorities :
+          StartCompleteWithFollowUp(t, a, b, q, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecCompletionFollowUpDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextCompletionFollowUpDeadlockDemo]_vars
 
 \* ---- Invariants ----
 

@@ -13678,6 +13678,208 @@ async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_or
     assert_eq!(claimed, expected);
 }
 
+async fn unique_claim_holders(pool: &sqlx::PgPool, job_id: i64, store: &QueueStorage) -> Vec<i64> {
+    sqlx::query_scalar(audited_sql(format!(
+        r#"
+        SELECT claims.job_id
+        FROM awa.job_unique_claims AS claims
+        WHERE claims.unique_key = (
+            SELECT unique_key FROM {schema}.ready_entries WHERE job_id = $1
+        )
+        ORDER BY claims.job_id
+        "#,
+        schema = store.schema()
+    )))
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .expect("read unique claim holders")
+}
+
+async fn promote_unique_conflict_case(unique_states: u8, schema: &str) {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_promote_unique_conflict";
+    let store = create_store(&pool, schema).await;
+    let due = Utc::now() - chrono::Duration::seconds(60);
+    let unique_opts = |run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        run_at,
+        unique: Some(UniqueOpts {
+            states: unique_states,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let duplicate_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        unique_opts(Some(due - chrono::Duration::seconds(1))),
+    )
+    .await;
+    let holder_id = enqueue_job(&pool, &store, &CompleteJob { id: 1 }, unique_opts(None)).await;
+    let other_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            run_at: Some(due),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let outcome = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
+        .await
+        .expect("a unique conflict must not fail promotion");
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert_eq!(outcome.selected, 2, "{outcome:?}");
+    assert!(outcome.contended.is_empty(), "{outcome:?}");
+
+    let duplicate = store
+        .load_job(&pool, duplicate_id)
+        .await
+        .expect("load duplicate")
+        .expect("duplicate exists");
+    assert_eq!(duplicate.state, JobState::Cancelled);
+    let errors = serde_json::to_string(&duplicate.errors).expect("render errors");
+    assert!(
+        errors.contains("promoted as duplicate: unique claim held by another job"),
+        "{errors}"
+    );
+    let other = store
+        .load_job(&pool, other_id)
+        .await
+        .expect("load other")
+        .expect("other exists");
+    assert_eq!(other.state, JobState::Available);
+    let holder = store
+        .load_job(&pool, holder_id)
+        .await
+        .expect("load holder")
+        .expect("holder exists");
+    assert_eq!(holder.state, JobState::Available);
+    assert_eq!(
+        unique_claim_holders(&pool, holder_id, &store).await,
+        vec![holder_id]
+    );
+
+    // The cancelled row keeps its key, with `cancelled` cleared from its
+    // mask, so it holds no claim and a retry still checks the key.
+    let (duplicate_key, duplicate_states): (Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as(audited_sql(format!(
+            "SELECT unique_key, unique_states::text FROM {}.done_entries WHERE job_id = $1",
+            store.schema()
+        )))
+        .bind(duplicate_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read cancelled row");
+    assert!(duplicate_key.is_some());
+    let expected_states = unique_states & !(1 << JobState::Cancelled.bit_position());
+    let expected_states: String = (0..8)
+        .map(|bit| {
+            if expected_states & (1 << bit) != 0 {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .collect();
+    assert_eq!(duplicate_states.as_deref(), Some(expected_states.as_str()));
+
+    let again = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
+        .await
+        .expect("promote again");
+    assert_eq!(again, Default::default());
+
+    // Retrying the duplicate while the holder owns the key conflicts.
+    let err = admin::retry(&pool, duplicate_id)
+        .await
+        .expect_err("retry while the holder owns the key must conflict");
+    assert!(matches!(err, AwaError::UniqueConflict { .. }), "{err:?}");
+    assert_eq!(
+        unique_claim_holders(&pool, holder_id, &store).await,
+        vec![holder_id]
+    );
+
+    // Once the holder completes and releases the key, the retry succeeds
+    // and takes the claim.
+    let completed: Vec<i64> = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+        .await
+        .iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert!(completed.contains(&holder_id), "{completed:?}");
+    let retried = admin::retry(&pool, duplicate_id)
+        .await
+        .expect("retry after the holder leaves")
+        .expect("retried row");
+    assert_eq!(retried.state, JobState::Available);
+    assert_eq!(
+        unique_claim_holders(&pool, duplicate_id, &store).await,
+        vec![duplicate_id]
+    );
+
+    // The retry restored the original mask: cancelling the job again keeps
+    // its key exactly when that mask claims `cancelled`.
+    let key = sqlx::query_scalar::<_, Vec<u8>>(audited_sql(format!(
+        "SELECT unique_key FROM {}.ready_entries WHERE job_id = $1",
+        store.schema()
+    )))
+    .bind(duplicate_id)
+    .fetch_one(&pool)
+    .await
+    .expect("retried key");
+    admin::cancel(&pool, duplicate_id)
+        .await
+        .expect("cancel the retried job")
+        .expect("cancelled row");
+    let holders: Vec<i64> =
+        sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+            .bind(&key)
+            .fetch_all(&pool)
+            .await
+            .expect("claim holders");
+    let claims_cancelled = unique_states & (1 << JobState::Cancelled.bit_position()) != 0;
+    assert_eq!(
+        holders,
+        if claims_cancelled {
+            vec![duplicate_id]
+        } else {
+            Vec::new()
+        }
+    );
+}
+
+/// A due row whose unique key another live job holds is cancelled as a
+/// duplicate in the same pass that promotes the other due rows of its lane.
+/// The job holding the key keeps it.
+#[tokio::test]
+async fn test_queue_storage_promotion_cancels_a_unique_duplicate_and_promotes_its_lane() {
+    promote_unique_conflict_case(
+        1 << JobState::Available.bit_position(),
+        "awa_qs_promote_unique_conflict",
+    )
+    .await;
+}
+
+/// A duplicate whose mask also claims `cancelled` is cancelled with its key
+/// and `cancelled` cleared from its mask, so the cancelled row holds no claim
+/// and a retry of it still conflicts while the holder owns the key.
+#[tokio::test]
+async fn test_queue_storage_promotion_cancels_a_duplicate_whose_mask_claims_cancelled() {
+    promote_unique_conflict_case(
+        (1 << JobState::Available.bit_position()) | (1 << JobState::Cancelled.bit_position()),
+        "awa_qs_promote_unique_conflict_cancelled",
+    )
+    .await;
+}
+
 /// Holds PostgreSQL's cluster-wide notify-queue lock for about `commits` ×
 /// 100 ms. A transaction that issued NOTIFY takes that lock at COMMIT and
 /// keeps it until its commit record is flushed, which `commit_delay` stretches.
@@ -30215,4 +30417,45 @@ async fn test_queue_storage_flush_wakeups_sends_before_the_pool_closes() {
         .expect("the flushed wake-up was delivered")
         .expect("listener stays connected");
     assert_eq!(notification.channel(), format!("awa:{queue}"));
+}
+
+/// `reset` truncates `queue_lanes` and keeps the enqueue heads, so the next
+/// enqueue to a lane registers it again.
+#[tokio::test]
+async fn test_enqueue_after_reset_registers_the_lane_again() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_reset_lane_registration";
+    let queue = "qs_reset_lane_registration";
+    let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    let opts = || InsertOpts {
+        queue: queue.to_string(),
+        ..Default::default()
+    };
+    enqueue_job(&pool, &store, &CompleteJob { id: 1 }, opts()).await;
+    store.reset(&pool).await.expect("reset");
+
+    let count = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT count(*) FROM {schema}.{table} WHERE queue = $1"
+            )))
+            .bind(queue)
+            .fetch_one(&pool)
+            .await
+            .expect("count lane rows")
+        }
+    };
+    assert!(
+        count("queue_enqueue_heads").await > 0,
+        "reset keeps the heads"
+    );
+    assert_eq!(count("queue_lanes").await, 0, "reset clears the lanes");
+
+    enqueue_job(&pool, &store, &CompleteJob { id: 2 }, opts()).await;
+    assert_eq!(
+        count("queue_lanes").await,
+        1,
+        "the enqueue after reset registers its lane"
+    );
 }
