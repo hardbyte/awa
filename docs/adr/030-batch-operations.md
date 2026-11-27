@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. The initial implementation scope is the framework plus `set_priority` and `move_queue` operation kinds. Amended by [ADR-049](049-job-filter-and-indexed-tags.md): the batch-operation filter becomes `JobFilter`, shared with listing, counting and the DLQ. Existing synchronous bulk retry, bulk cancel, and DLQ bulk endpoints stay synchronous, and moving them onto the framework is deferred. In 0.7, ADR-049 changes the filter the DLQ bulk endpoints take; bulk retry and bulk cancel by selected ids are unchanged.
+Accepted. The initial implementation scope is the framework plus `set_priority` and `move_queue` operation kinds. Amended by [ADR-049](049-job-filter-and-indexed-tags.md): the batch-operation filter becomes `JobFilter`, shared with listing, counting and the DLQ. Existing synchronous bulk retry, bulk cancel, and DLQ bulk endpoints stay synchronous. In 0.7, ADR-049 changes the filter the DLQ bulk endpoints take; bulk retry and bulk cancel by selected ids are unchanged. Also in 0.7, the operator bulk actions become batch operation kinds as well (`retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq`, `purge_dlq`; see [Bulk-action operations](#bulk-action-operations)), so a large set can be acted on in bounded transactions; the synchronous library functions and endpoints are unchanged.
 
 ## Context
 
@@ -221,6 +221,29 @@ If the destination insert conflicts on uniqueness, the row-level mutation fails 
 
 Lane move helpers must be written with explicit lock ordering or retry-on-deadlock behavior. Concurrent inverse moves such as `A -> B` and `B -> A` must not be able to corrupt storage; at worst one chunk transaction aborts, records or retries the row, and the operation continues.
 
+### Bulk-action operations
+
+0.7 adds the operator bulk actions as operation kinds. None takes a spec field except `move_to_dlq`'s optional `reason`:
+
+| `op_kind` | Acts on | Effect | Synchronous counterpart |
+| --- | --- | --- | --- |
+| `retry` | `failed`, `cancelled`; not dead-lettered | back to `available` with `attempt = 0` | `admin::retry_failed_by_kind` / `_by_queue`, `admin::bulk_retry` |
+| `cancel` | `available`, `scheduled`, `retryable`, `running`, `waiting_external` | `cancelled`; a running attempt is signalled as by `admin::cancel` | `admin::bulk_cancel` |
+| `discard` | `failed`; not dead-lettered | deleted | `admin::discard_failed` |
+| `move_to_dlq` | `failed`; not dead-lettered | into the DLQ with `reason`, default `batch operation` | `dlq::bulk_move_failed_to_dlq` |
+| `retry_from_dlq` | dead-lettered | back to `available` in its own queue and priority | `dlq::bulk_retry_from_dlq_matching` |
+| `purge_dlq` | dead-lettered | deleted from the DLQ | `dlq::purge_dlq_matching` |
+
+```json
+{ "op_kind": "move_to_dlq", "spec": { "reason": "bad payload, see incident 42" } }
+```
+
+The kind's states are its eligible set for preview, scan and validation: a `state` filter outside them is refused at submit and preview. `retry`, `discard` and `move_to_dlq` never select dead-lettered jobs, and `dead_lettered: true` in their filter is refused. `retry_from_dlq` and `purge_dlq` select only dead-lettered jobs: their filter's `dead_lettered` is read as `true`, and `false` is refused. Like the other kinds, they need an active queue-storage backend (ADR-037).
+
+These kinds apply a whole chunk in one `READ COMMITTED` transaction rather than a job per transaction. The transaction calls the queue-storage by-ids helper for the chunk, which changes every unique claim the chunk moves in one key-ordered pass before it reserves or locks any lane, the order every enqueue path takes, and records each item's outcome in the same transaction: `processed` when the action reached the job, `skipped` when the job was no longer in an eligible state. Purging DLQ rows releases their unique claims, as the synchronous purge does. If the chunk transaction fails, for example with a unique conflict because a job being retried has a key that a newer job now holds, it rolls back and the chunk is applied one job per transaction instead: the job that fails is recorded `errored` with its message in `last_error`, the newer job keeps its key, and the rest of the chunk applies. A running attempt that stays busy when cancelled is left running and counted as skipped.
+
+Migration v063 widens the `op_kind` check constraint on `awa.batch_operations` to the new kinds. A runner older than this release cannot read them and fails such an operation rather than running it, so submit them once every runtime runs this release.
+
 ### Retention and cleanup
 
 Batch operation retention is configurable with `AWA_BATCH_OP_RETENTION_DAYS`, with a conservative default of 90 days. Finalized rows get `retention_until = finalized_at + configured_retention`. Maintenance deletes finalized operations whose retention has expired.
@@ -289,10 +312,10 @@ This adds one table and one runner lane, then amortizes that cost across priorit
 ## Relationship to other ADRs
 
 - **ADR-019** (Queue Storage Engine). Batch operation handlers must use queue-storage lane, tombstone, deferred, and uniqueness invariants rather than rewriting `ready_entries` directly.
-- **ADR-020** (Dead Letter Queue). Existing DLQ bulk retry/purge/move endpoints remain synchronous in `0.6`; migrating them to batch operations is a future compatibility/UX decision.
+- **ADR-020** (Dead Letter Queue). Existing DLQ bulk retry/purge/move endpoints remain synchronous. From 0.7 the same actions are also available as the `move_to_dlq`, `retry_from_dlq` and `purge_dlq` batch operation kinds.
 - **ADR-023** (Receipt Plane Ring Partitioning). Running and waiting rows are not mutated by `set_priority` or `move_queue` in `0.6`; active attempts remain guarded by receipt/lease semantics.
 - **ADR-025** (Sharded Enqueue Heads). Queue moves must resolve against the destination queue's `enqueue_shards` configuration and assign a destination lane sequence there. They never copy an out-of-range source shard; ADR-033 retained routes use modulo the destination width.
-- **ADR-026** (Narrow Terminal History). Terminal rows are not eligible for the initial operations; history remains immutable operator evidence.
+- **ADR-026** (Narrow Terminal History). Terminal rows are not eligible for `set_priority` or `move_queue`. The 0.7 bulk-action kinds retry, discard or dead-letter failed and cancelled terminal rows through the same storage helpers as the synchronous admin and DLQ functions.
 - **ADR-028** (Maintenance-only runtime role). Batch operation execution is another maintenance-owned responsibility. A maintenance-only runtime must run it; a callback-only or read-only UI must not.
 - **ADR-029** (Transactional follow-up jobs). Batch operations are not follow-up jobs. They are internal control-plane work that may later emit observation events or follow-up jobs, but their execution is owned by maintenance.
 

@@ -382,6 +382,10 @@ v062 also refreshes the lane-sequence helpers in every queue-storage schema thro
 
 Binaries before v062 keep reading the cursor directly and behave as before, including their `REPEATABLE READ` producers, so they can run before or after the migration and rolling back needs no schema change. The floor protects a lane only when every producer writing to it raises the floor, so while binaries before v062 still enqueue, a `REPEATABLE READ` or `SERIALIZABLE` producer on this release can still land behind one of their jobs in an older generation, in the moment between a rotation committing and the floor catching up. Keep such producers on `READ COMMITTED`, or hold them back, until every producer runs this release. Under 0.6-style compat ring authority, a 0.6 rotator does not raise the floor; producers still do, so lane order holds, but a snapshot older than a whole turn of the ring is protected only once rotation is done by this release.
 
+## v063: bulk-action batch operations
+
+v063 widens the `op_kind` check constraint on `awa.batch_operations` to the new batch operation kinds `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` and `purge_dlq` ([ADR-030](adr/030-batch-operations.md#bulk-action-operations)). It drops and re-adds the constraint, which holds an `ACCESS EXCLUSIVE` lock on `awa.batch_operations` only, a small control table, while the new constraint checks its rows. No job or queue-storage table is touched. Binaries before v063 never write the new kinds, so they can run before or after it. A maintenance leader before this release cannot read an operation of a new kind and marks it failed, so submit them once every runtime runs this release. External migration runners apply `awa migrate --sql --from 62 --to 63`.
+
 ## Tag indexes (ADR-049)
 
 Tags become the indexed way to find jobs on queue storage. There is no
