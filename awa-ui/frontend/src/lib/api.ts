@@ -224,7 +224,15 @@ export interface Capabilities {
   peers: PeerLink[];
 }
 
-export type BatchOperationKind = "set_priority" | "move_queue";
+export type BatchOperationKind =
+  | "set_priority"
+  | "move_queue"
+  | "retry"
+  | "cancel"
+  | "discard"
+  | "move_to_dlq"
+  | "retry_from_dlq"
+  | "purge_dlq";
 export type BatchOperationState =
   | "pending"
   | "scanning"

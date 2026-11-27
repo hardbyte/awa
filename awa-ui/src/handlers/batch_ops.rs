@@ -33,30 +33,23 @@ impl BatchOperationPayload {
         ),
         ApiError,
     > {
-        let spec = match self.op_kind {
-            BatchOperationKind::SetPriority => {
-                #[derive(Deserialize)]
-                struct SetPrioritySpec {
-                    priority: i16,
-                }
-                let spec: SetPrioritySpec = serde_json::from_value(self.spec)?;
-                BatchOperationSpec::SetPriority {
-                    priority: spec.priority,
-                }
-            }
-            BatchOperationKind::MoveQueue => {
-                #[derive(Deserialize)]
-                struct MoveQueueSpec {
-                    queue: String,
-                    priority: Option<i16>,
-                }
-                let spec: MoveQueueSpec = serde_json::from_value(self.spec)?;
-                BatchOperationSpec::MoveQueue {
-                    queue: spec.queue,
-                    priority: spec.priority,
-                }
+        let mut spec = match self.spec {
+            serde_json::Value::Object(spec) => spec,
+            _ => {
+                return Err(awa_model::AwaError::Validation(
+                    "spec must be a JSON object".to_string(),
+                )
+                .into())
             }
         };
+        if spec.contains_key("op_kind") {
+            return Err(awa_model::AwaError::Validation(
+                "spec must not repeat op_kind".to_string(),
+            )
+            .into());
+        }
+        spec.insert("op_kind".to_string(), self.op_kind.as_str().into());
+        let spec: BatchOperationSpec = serde_json::from_value(serde_json::Value::Object(spec))?;
         Ok((spec, self.filter, self.submitted_by, self.all))
     }
 }

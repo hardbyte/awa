@@ -157,7 +157,7 @@ When the target queue is itself paused, the row shows a "queue paused" badge alo
 
 Operator surface for durable async mutations recorded in `awa.batch_operations`.
 
-- **New operation form** — choose `set_priority` or `move_queue`, filter by queue, kind, or explicit ids, then preview before submitting.
+- **New operation form** — choose `set_priority`, `move_queue`, `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` or `purge_dlq`, filter by queue, kind, or explicit ids, then preview before submitting. The state filter offers the states the chosen kind acts on.
 - **Preview** — calls `/api/batch-ops/preview` and reports the eligible row count. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation.
 - **History table** — lists recent operations with id, kind, state, progress, error count, and submitted age.
 - **Cancellation** — active `pending`, `scanning`, and `running` operations expose a Cancel action, which requests cooperative cancellation at chunk boundaries.

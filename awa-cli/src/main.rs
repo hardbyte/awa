@@ -569,33 +569,13 @@ fn parse_batch_operation_spec(
     op_kind: &str,
     spec: &str,
 ) -> Result<awa_model::batch_operations::BatchOperationSpec, Box<dyn std::error::Error>> {
-    match op_kind {
-        "set_priority" => {
-            #[derive(serde::Deserialize)]
-            struct SetPrioritySpec {
-                priority: i16,
-            }
-            let spec: SetPrioritySpec = serde_json::from_str(spec)?;
-            Ok(
-                awa_model::batch_operations::BatchOperationSpec::SetPriority {
-                    priority: spec.priority,
-                },
-            )
-        }
-        "move_queue" => {
-            #[derive(serde::Deserialize)]
-            struct MoveQueueSpec {
-                queue: String,
-                priority: Option<i16>,
-            }
-            let spec: MoveQueueSpec = serde_json::from_str(spec)?;
-            Ok(awa_model::batch_operations::BatchOperationSpec::MoveQueue {
-                queue: spec.queue,
-                priority: spec.priority,
-            })
-        }
-        _ => Err(format!("unknown batch operation kind: {op_kind}").into()),
+    let kind = awa_model::batch_operations::BatchOperationKind::try_from(op_kind)?;
+    let mut spec: serde_json::Map<String, serde_json::Value> = serde_json::from_str(spec)?;
+    if spec.contains_key("op_kind") {
+        return Err("the spec must not repeat op_kind; pass it with --op-kind".into());
     }
+    spec.insert("op_kind".to_string(), kind.as_str().into());
+    Ok(serde_json::from_value(serde_json::Value::Object(spec))?)
 }
 
 #[derive(Subcommand)]
@@ -745,11 +725,13 @@ enum BatchOpsCommands {
     Get { id: uuid::Uuid },
     /// Preview a batch operation without submitting it
     Preview {
-        /// Operation kind: set_priority or move_queue
+        /// Operation kind: set_priority, move_queue, retry, cancel, discard,
+        /// move_to_dlq, retry_from_dlq or purge_dlq
         #[arg(long)]
         op_kind: String,
-        /// JSON spec, e.g. '{"priority":1}' or '{"queue":"escalations"}'
-        #[arg(long)]
+        /// JSON spec, e.g. '{"priority":1}', '{"queue":"escalations"}' or
+        /// '{"reason":"triage"}' for move_to_dlq; '{}' for the other kinds
+        #[arg(long, default_value = "{}")]
         spec: String,
         /// JSON filter, e.g. '{"queue":"default"}'
         #[arg(long, default_value = "{}")]
@@ -757,11 +739,13 @@ enum BatchOpsCommands {
     },
     /// Submit a batch operation
     Submit {
-        /// Operation kind: set_priority or move_queue
+        /// Operation kind: set_priority, move_queue, retry, cancel, discard,
+        /// move_to_dlq, retry_from_dlq or purge_dlq
         #[arg(long)]
         op_kind: String,
-        /// JSON spec, e.g. '{"priority":1}' or '{"queue":"escalations"}'
-        #[arg(long)]
+        /// JSON spec, e.g. '{"priority":1}', '{"queue":"escalations"}' or
+        /// '{"reason":"triage"}' for move_to_dlq; '{}' for the other kinds
+        #[arg(long, default_value = "{}")]
         spec: String,
         /// JSON filter, e.g. '{"kind":"send_email"}'
         #[arg(long, default_value = "{}")]
@@ -2525,5 +2509,44 @@ mod tests {
             ]),
             Mutating
         );
+    }
+
+    #[test]
+    fn batch_operation_specs_parse_for_every_kind() {
+        use awa_model::batch_operations::BatchOperationSpec;
+        let parse = |kind: &str, spec: &str| parse_batch_operation_spec(kind, spec).unwrap();
+        assert_eq!(
+            parse("set_priority", r#"{"priority":1}"#),
+            BatchOperationSpec::SetPriority { priority: 1 }
+        );
+        assert_eq!(
+            parse("move_queue", r#"{"queue":"escalations"}"#),
+            BatchOperationSpec::MoveQueue {
+                queue: "escalations".into(),
+                priority: None
+            }
+        );
+        assert_eq!(parse("retry", "{}"), BatchOperationSpec::Retry);
+        assert_eq!(parse("cancel", "{}"), BatchOperationSpec::Cancel);
+        assert_eq!(parse("discard", "{}"), BatchOperationSpec::Discard);
+        assert_eq!(
+            parse("move_to_dlq", "{}"),
+            BatchOperationSpec::MoveToDlq { reason: None }
+        );
+        assert_eq!(
+            parse("move_to_dlq", r#"{"reason":"triage"}"#),
+            BatchOperationSpec::MoveToDlq {
+                reason: Some("triage".into())
+            }
+        );
+        assert_eq!(
+            parse("retry_from_dlq", "{}"),
+            BatchOperationSpec::RetryFromDlq
+        );
+        assert_eq!(parse("purge_dlq", "{}"), BatchOperationSpec::PurgeDlq);
+
+        assert!(parse_batch_operation_spec("bogus", "{}").is_err());
+        assert!(parse_batch_operation_spec("set_priority", "{}").is_err());
+        assert!(parse_batch_operation_spec("retry", r#"{"op_kind":"cancel"}"#).is_err());
     }
 }

@@ -1122,6 +1122,87 @@ async fn test_batch_ops_api_preview_submit_and_cancel() {
     assert_eq!(patch_response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_batch_ops_api_accepts_bulk_action_kinds() {
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
+    let queue = "api_batch_bulk";
+    insert_job(&pool, "api_batch_bulk_job", queue, 2).await;
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    for (op_kind, spec, matched) in [
+        ("cancel", serde_json::json!({}), 1),
+        ("retry", serde_json::json!({}), 0),
+        ("discard", serde_json::json!({}), 0),
+        ("move_to_dlq", serde_json::json!({ "reason": "triage" }), 0),
+        ("retry_from_dlq", serde_json::json!({}), 0),
+        ("purge_dlq", serde_json::json!({}), 0),
+    ] {
+        let payload = serde_json::json!({
+            "op_kind": op_kind,
+            "filter": { "queue": queue },
+            "spec": spec,
+        });
+        let (status, preview) = post_json(&app, "/api/batch-ops/preview", payload).await;
+        assert_eq!(status, StatusCode::OK, "{op_kind}: {preview}");
+        assert_eq!(
+            preview["total_matched"],
+            serde_json::json!(matched),
+            "{op_kind}"
+        );
+    }
+
+    let (status, operation) = post_json(
+        &app,
+        "/api/batch-ops",
+        serde_json::json!({
+            "op_kind": "move_to_dlq",
+            "filter": { "queue": queue },
+            "spec": { "reason": "triage" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{operation}");
+    assert_eq!(operation["op_kind"], serde_json::json!("move_to_dlq"));
+    assert_eq!(
+        operation["spec"],
+        serde_json::json!({ "op_kind": "move_to_dlq", "reason": "triage" })
+    );
+
+    // A filter outside the kind's states or DLQ scope is refused.
+    for (op_kind, filter) in [
+        (
+            "retry",
+            serde_json::json!({ "queue": queue, "state": "available" }),
+        ),
+        (
+            "purge_dlq",
+            serde_json::json!({ "queue": queue, "dead_lettered": false }),
+        ),
+    ] {
+        let status = post_status(
+            &app,
+            "/api/batch-ops",
+            serde_json::json!({ "op_kind": op_kind, "filter": filter, "spec": {} }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{op_kind}");
+    }
+    let status = post_status(
+        &app,
+        "/api/batch-ops",
+        serde_json::json!({
+            "op_kind": "retry",
+            "filter": { "queue": queue },
+            "spec": { "op_kind": "purge_dlq" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 async fn post_status(app: &axum::Router, path: &str, payload: Value) -> StatusCode {
     app.clone()
         .oneshot(

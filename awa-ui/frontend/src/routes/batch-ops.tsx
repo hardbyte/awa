@@ -55,11 +55,46 @@ function parsePriority(value: string): number | null {
   return priority;
 }
 
+interface KindOption {
+  kind: BatchOperationKind;
+  label: string;
+  /** The job states the kind acts on. */
+  states: string[];
+  /** The jobs a filter without a state selects, in words. */
+  scope: string;
+}
+
+/** Every operation kind and the jobs it acts on (ADR-030). */
+const KIND_OPTIONS: KindOption[] = [
+  { kind: "set_priority", label: "Set priority", states: ["available", "scheduled"], scope: "available or scheduled" },
+  { kind: "move_queue", label: "Move queue", states: ["available", "scheduled"], scope: "available or scheduled" },
+  { kind: "retry", label: "Retry", states: ["failed", "cancelled"], scope: "failed or cancelled" },
+  {
+    kind: "cancel",
+    label: "Cancel",
+    states: ["available", "scheduled", "retryable", "running", "waiting_external"],
+    scope: "available, scheduled, retryable, running or waiting",
+  },
+  { kind: "discard", label: "Discard failed", states: ["failed"], scope: "failed" },
+  { kind: "move_to_dlq", label: "Move failed to DLQ", states: ["failed"], scope: "failed" },
+  { kind: "retry_from_dlq", label: "Retry from DLQ", states: [], scope: "dead-lettered" },
+  { kind: "purge_dlq", label: "Purge DLQ", states: [], scope: "dead-lettered" },
+];
+
+function kindOption(kind: BatchOperationKind): KindOption {
+  const option = KIND_OPTIONS.find((candidate) => candidate.kind === kind);
+  if (!option) throw new Error(`unknown batch operation kind: ${kind}`);
+  return option;
+}
+
 function isPayloadFormValid(form: BatchForm): boolean {
   const priority = parsePriority(form.priority);
   if (form.opKind === "set_priority") return priority !== null;
-  if (!form.destinationQueue.trim()) return false;
-  return !form.priority.trim() || priority !== null;
+  if (form.opKind === "move_queue") {
+    if (!form.destinationQueue.trim()) return false;
+    return !form.priority.trim() || priority !== null;
+  }
+  return true;
 }
 
 interface BatchForm {
@@ -69,12 +104,14 @@ interface BatchForm {
   ids: string;
   /** Comma-separated; every tag must match. */
   tags: string;
-  /** "" for both eligible states. */
-  state: "" | "available" | "scheduled";
+  /** "" for every state the operation kind acts on. */
+  state: string;
   createdGte: string;
   createdLt: string;
   priority: string;
   destinationQueue: string;
+  /** move_to_dlq's reason; "" for the server's default. */
+  reason: string;
 }
 
 function splitList(value: string): string[] {
@@ -110,34 +147,65 @@ function buildFilter(form: BatchForm): BatchOperationFilter {
 
 function buildPayload(form: BatchForm): BatchOperationPayload {
   const filter = buildFilter(form);
-  if (form.opKind === "set_priority") {
-    const priority = parsePriority(form.priority);
-    return {
-      op_kind: "set_priority",
-      filter,
-      spec: { priority: priority ?? 1 },
-      submitted_by: "ui",
-    };
-  }
   const priority = parsePriority(form.priority);
-  return {
-    op_kind: "move_queue",
-    filter,
-    spec: {
-      queue: form.destinationQueue.trim(),
-      ...(priority !== null ? { priority } : {}),
-    },
-    submitted_by: "ui",
-  };
+  switch (form.opKind) {
+    case "set_priority":
+      return {
+        op_kind: "set_priority",
+        filter,
+        spec: { priority: priority ?? 1 },
+        submitted_by: "ui",
+      };
+    case "move_queue":
+      return {
+        op_kind: "move_queue",
+        filter,
+        spec: {
+          queue: form.destinationQueue.trim(),
+          ...(priority !== null ? { priority } : {}),
+        },
+        submitted_by: "ui",
+      };
+    case "move_to_dlq": {
+      const reason = form.reason.trim();
+      return {
+        op_kind: "move_to_dlq",
+        filter,
+        spec: reason ? { reason } : {},
+        submitted_by: "ui",
+      };
+    }
+    default:
+      return { op_kind: form.opKind, filter, spec: {}, submitted_by: "ui" };
+  }
 }
 
 /** What submitting does, in words, for the confirm step. */
 function describeOperation(payload: BatchOperationPayload, preview: BatchOperationPreview): string {
-  const jobs = `${formatCount(previewCount(preview))} ${describeFilter(payload.filter)}`;
+  const jobs = `${formatCount(previewCount(preview))} ${describeFilter(
+    payload.filter,
+    kindOption(payload.op_kind).scope
+  )}`;
   const priority = payload.spec.priority as number | undefined;
-  if (payload.op_kind === "set_priority") return `Set priority to ${priority} on ${jobs}.`;
-  const atPriority = priority === undefined ? "" : ` at priority ${priority}`;
-  return `Move ${jobs} to queue ${String(payload.spec.queue)}${atPriority}.`;
+  switch (payload.op_kind) {
+    case "set_priority":
+      return `Set priority to ${priority} on ${jobs}.`;
+    case "move_queue": {
+      const atPriority = priority === undefined ? "" : ` at priority ${priority}`;
+      return `Move ${jobs} to queue ${String(payload.spec.queue)}${atPriority}.`;
+    }
+    case "retry":
+    case "retry_from_dlq":
+      return `Retry ${jobs}.`;
+    case "cancel":
+      return `Cancel ${jobs}.`;
+    case "discard":
+      return `Delete ${jobs}.`;
+    case "move_to_dlq":
+      return `Move ${jobs} to the DLQ.`;
+    case "purge_dlq":
+      return `Delete ${jobs} from the DLQ.`;
+  }
 }
 
 /** Form fields pre-filled from the jobs page's "batch change" link. The
@@ -156,6 +224,7 @@ function initialForm(search: Record<string, unknown>): BatchForm {
     createdLt: text(search.created_at_lt),
     priority: "1",
     destinationQueue: "",
+    reason: "",
   };
 }
 
@@ -164,24 +233,28 @@ export function BatchOpsPage() {
   const readOnly = useReadOnly();
   const search = useSearch({ strict: false }) as Record<string, unknown>;
   const [form, setForm] = useState<BatchForm>(() => initialForm(search));
-  // A preview holds the filter it was taken with: it stands for the form
-  // only while the form's filter is the same.
+  // A preview holds the operation kind and filter it was taken with: it
+  // stands for the form only while both are the same.
   const [preview, setPreview] = useState<{
+    opKind: BatchOperationKind;
     filter: BatchOperationFilter;
     result: BatchOperationPreview;
   } | null>(null);
   const [confirming, setConfirming] = useState(false);
   const formFilterError = useMemo(() => filterError(form), [form]);
+  const selectedKind = kindOption(form.opKind);
   const payload = useMemo(() => buildPayload(form), [form]);
   const narrowing = isNarrowing(payload.filter);
   const isPayloadValid = isPayloadFormValid(form) && formFilterError === null && narrowing;
   const currentPreview =
-    preview && sameFilter(preview.filter, payload.filter) ? preview.result : null;
+    preview && preview.opKind === payload.op_kind && sameFilter(preview.filter, payload.filter)
+      ? preview.result
+      : null;
   const currentCount = currentPreview ? previewCount(currentPreview) : null;
   const submitHint = !isPayloadValid || currentPreview
     ? null
     : preview
-      ? "Filter changed; preview again"
+      ? "Operation or filter changed; preview again"
       : "Preview first";
 
   const operationsQuery = useManagedQuery({
@@ -195,7 +268,7 @@ export function BatchOpsPage() {
       return previewBatchOperation(previewed);
     },
     onSuccess: (result, previewed) => {
-      setPreview({ filter: previewed.filter, result });
+      setPreview({ opKind: previewed.op_kind, filter: previewed.filter, result });
       toast.success(`Preview matched ${formatCount(previewCount(result))} job(s)`);
     },
     onError: (error) => toast.error(error.message),
@@ -230,7 +303,7 @@ export function BatchOpsPage() {
       <div>
         <Heading level={1}>Batch Operations</Heading>
         <p className="mt-2 text-sm text-muted-fg">
-          Preview, submit, and monitor durable bulk mutations for queued jobs.
+          Preview, submit, and monitor durable bulk mutations, applied a chunk at a time.
         </p>
       </div>
 
@@ -242,10 +315,18 @@ export function BatchOpsPage() {
             <select
               className="w-full rounded-lg border border-input bg-bg px-3 py-2 text-sm"
               value={form.opKind}
-              onChange={(event) => setForm((current) => ({ ...current, opKind: event.target.value as BatchOperationKind }))}
+              onChange={(event) => {
+                const opKind = event.target.value as BatchOperationKind;
+                setForm((current) => ({
+                  ...current,
+                  opKind,
+                  state: kindOption(opKind).states.includes(current.state) ? current.state : "",
+                }));
+              }}
             >
-              <option value="set_priority">Set priority</option>
-              <option value="move_queue">Move queue</option>
+              {KIND_OPTIONS.map((option) => (
+                <option key={option.kind} value={option.kind}>{option.label}</option>
+              ))}
             </select>
           </label>
           <label className="space-y-1 text-sm">
@@ -269,11 +350,13 @@ export function BatchOpsPage() {
             <select
               className="w-full rounded-lg border border-input bg-bg px-3 py-2 text-sm"
               value={form.state}
-              onChange={(event) => setForm((current) => ({ ...current, state: event.target.value as BatchForm["state"] }))}
+              onChange={(event) => setForm((current) => ({ ...current, state: event.target.value }))}
             >
-              <option value="">Available or scheduled</option>
-              <option value="available">Available</option>
-              <option value="scheduled">Scheduled</option>
+              <option value="">{selectedKind.scope.charAt(0).toUpperCase() + selectedKind.scope.slice(1)}</option>
+              {selectedKind.states.length > 1 &&
+                selectedKind.states.map((state) => (
+                  <option key={state} value={state}>{state.charAt(0).toUpperCase() + state.slice(1).replace(/_/g, " ")}</option>
+                ))}
             </select>
           </label>
           <label className="space-y-1 text-sm">
@@ -284,10 +367,18 @@ export function BatchOpsPage() {
             <span className="font-medium">Created before</span>
             <Input value={form.createdLt} onChange={(event) => setForm((current) => ({ ...current, createdLt: event.target.value }))} placeholder="2026-10-02" />
           </label>
-          <label className="space-y-1 text-sm">
-            <span className="font-medium">Priority</span>
-            <Input value={form.priority} onChange={(event) => setForm((current) => ({ ...current, priority: event.target.value }))} placeholder="1" />
-          </label>
+          {(form.opKind === "set_priority" || form.opKind === "move_queue") && (
+            <label className="space-y-1 text-sm">
+              <span className="font-medium">Priority</span>
+              <Input value={form.priority} onChange={(event) => setForm((current) => ({ ...current, priority: event.target.value }))} placeholder="1" />
+            </label>
+          )}
+          {form.opKind === "move_to_dlq" && (
+            <label className="space-y-1 text-sm">
+              <span className="font-medium">DLQ reason</span>
+              <Input value={form.reason} onChange={(event) => setForm((current) => ({ ...current, reason: event.target.value }))} placeholder="batch operation" />
+            </label>
+          )}
           {form.opKind === "move_queue" && (
             <label className="space-y-1 text-sm md:col-span-3">
               <span className="font-medium">Destination queue</span>
@@ -296,8 +387,8 @@ export function BatchOpsPage() {
           )}
         </div>
         <p className="mt-3 text-xs text-muted-fg">
-          Batch operations act only on available and scheduled jobs; running,
-          waiting and finished jobs in the same filter are left alone.
+          {selectedKind.label} acts only on {selectedKind.scope} jobs; other jobs
+          in the same filter are left alone.
         </p>
         {formFilterError && (
           <p className="mt-2 text-sm text-danger" role="alert">
@@ -348,7 +439,7 @@ export function BatchOpsPage() {
           {operations.map((operation) => (
             <TableRow key={operation.id}>
               <TableCell className="font-mono text-xs">{operation.id.slice(0, 8)}</TableCell>
-              <TableCell>{operation.op_kind.replace("_", " ")}</TableCell>
+              <TableCell>{operation.op_kind.replace(/_/g, " ")}</TableCell>
               <TableCell><Badge intent={stateTone(operation.state)}>{operation.state}</Badge></TableCell>
               <TableCell>{progressText(operation)}</TableCell>
               <TableCell>{operation.errored}</TableCell>

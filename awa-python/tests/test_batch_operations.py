@@ -169,3 +169,36 @@ async def test_async_batch_operation_helpers_accept_datetime_filters(async_clien
 
     cancelled = await async_client.cancel_batch_operation(operation["id"])
     assert cancelled["state"] == "cancelling"
+
+
+def test_sync_bulk_action_kinds_preview_submit_and_validate(sync_client):
+    queue = "pybatch_bulk"
+    job = sync_client.insert(BatchPyJob("bulk"), queue=queue, priority=2)
+
+    preview = sync_client.preview_batch_operation("cancel", filter={"queue": queue})
+    assert preview["total_matched"] == 1
+    assert [row["id"] for row in preview["sample"]] == [job.id]
+    for op_kind in ("retry", "discard", "move_to_dlq", "retry_from_dlq", "purge_dlq"):
+        preview = sync_client.preview_batch_operation(op_kind, filter={"queue": queue})
+        assert preview["total_matched"] == 0, op_kind
+
+    operation = sync_client.submit_batch_operation(
+        "move_to_dlq",
+        spec={"reason": "triage"},
+        filter={"queue": queue},
+    )
+    assert operation["op_kind"] == "move_to_dlq"
+    assert operation["spec"] == {"op_kind": "move_to_dlq", "reason": "triage"}
+
+    operation = sync_client.submit_batch_operation("cancel", filter={"queue": queue})
+    assert operation["op_kind"] == "cancel"
+    assert operation["spec"] == {"op_kind": "cancel"}
+
+    with pytest.raises(awa.ValidationError, match="only supports failed or cancelled"):
+        sync_client.submit_batch_operation(
+            "retry", filter={"queue": queue, "state": "available"}
+        )
+    with pytest.raises(awa.ValidationError, match="acts only on dead-lettered jobs"):
+        sync_client.submit_batch_operation(
+            "purge_dlq", filter={"queue": queue, "dead_lettered": False}
+        )

@@ -2,7 +2,7 @@ use crate::error::{map_sqlx_error, AwaError};
 use crate::filter::JobFilter;
 use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
-use crate::queue_storage::QueueStorage;
+use crate::queue_storage::{BulkActionOutcome, QueueStorage};
 use chrono::{DateTime, Utc};
 use pg_session_lock::SessionAdvisoryLock;
 use serde::{Deserialize, Serialize};
@@ -10,12 +10,15 @@ use sqlx::postgres::PgRow;
 use sqlx::types::Json;
 use sqlx::{FromRow, Row};
 use sqlx::{PgPool, Postgres, Transaction};
+use std::borrow::Cow;
 use uuid::Uuid;
 
 const DEFAULT_CHUNK_SIZE: i64 = 100;
 const PREVIEW_SAMPLE_LIMIT: i64 = 10;
 const SCAN_PAGE_SIZE: i64 = 10_000;
 const BATCH_RUNNER_LOCK_KEY: i64 = 0x4157_415f_4241_5443;
+const DEFAULT_DLQ_REASON: &str = "batch operation";
+const MAX_DLQ_REASON_CHARS: usize = 1000;
 
 fn default_retention_days() -> i64 {
     std::env::var("AWA_BATCH_OP_RETENTION_DAYS")
@@ -30,14 +33,66 @@ fn default_retention_days() -> i64 {
 pub enum BatchOperationKind {
     SetPriority,
     MoveQueue,
+    Retry,
+    Cancel,
+    Discard,
+    MoveToDlq,
+    RetryFromDlq,
+    PurgeDlq,
+}
+
+/// Whether a batch operation acts on dead-lettered jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DlqScope {
+    /// Never; a filter with `dead_lettered: true` is rejected.
+    Excluded,
+    /// Only; a filter with `dead_lettered: false` is rejected.
+    Only,
 }
 
 impl BatchOperationKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SetPriority => "set_priority",
             Self::MoveQueue => "move_queue",
+            Self::Retry => "retry",
+            Self::Cancel => "cancel",
+            Self::Discard => "discard",
+            Self::MoveToDlq => "move_to_dlq",
+            Self::RetryFromDlq => "retry_from_dlq",
+            Self::PurgeDlq => "purge_dlq",
         }
+    }
+
+    /// The job states this kind acts on. Preview, scan and validation all
+    /// select jobs among these.
+    pub fn eligible_states(self) -> &'static [JobState] {
+        match self {
+            Self::SetPriority | Self::MoveQueue => &[JobState::Available, JobState::Scheduled],
+            Self::Retry => &[JobState::Failed, JobState::Cancelled],
+            Self::Cancel => &[
+                JobState::Available,
+                JobState::Scheduled,
+                JobState::Retryable,
+                JobState::Running,
+                JobState::WaitingExternal,
+            ],
+            Self::Discard | Self::MoveToDlq | Self::RetryFromDlq | Self::PurgeDlq => {
+                &[JobState::Failed]
+            }
+        }
+    }
+
+    fn dlq_scope(self) -> DlqScope {
+        match self {
+            Self::RetryFromDlq | Self::PurgeDlq => DlqScope::Only,
+            _ => DlqScope::Excluded,
+        }
+    }
+
+    /// True for kinds applied a whole chunk per transaction.
+    fn applies_per_chunk(self) -> bool {
+        !matches!(self, Self::SetPriority | Self::MoveQueue)
     }
 }
 
@@ -48,6 +103,12 @@ impl TryFrom<&str> for BatchOperationKind {
         match value {
             "set_priority" => Ok(Self::SetPriority),
             "move_queue" => Ok(Self::MoveQueue),
+            "retry" => Ok(Self::Retry),
+            "cancel" => Ok(Self::Cancel),
+            "discard" => Ok(Self::Discard),
+            "move_to_dlq" => Ok(Self::MoveToDlq),
+            "retry_from_dlq" => Ok(Self::RetryFromDlq),
+            "purge_dlq" => Ok(Self::PurgeDlq),
             _ => Err(AwaError::Validation(format!(
                 "unknown batch operation kind: {value}"
             ))),
@@ -103,9 +164,6 @@ impl BatchOperationState {
 /// ADR-030's batch-operation filter, now the shared [`JobFilter`] (ADR-049).
 pub type BatchOperationFilter = JobFilter;
 
-/// States a batch operation can act on: both kinds move ready work.
-const ELIGIBLE_STATES: [JobState; 2] = [JobState::Available, JobState::Scheduled];
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op_kind")]
 pub enum BatchOperationSpec {
@@ -116,6 +174,21 @@ pub enum BatchOperationSpec {
         queue: String,
         priority: Option<i16>,
     },
+    /// Retry failed and cancelled jobs. Dead-lettered jobs are not selected.
+    Retry,
+    /// Cancel available, scheduled, retryable, running and waiting jobs.
+    Cancel,
+    /// Delete failed jobs. Dead-lettered jobs are not selected.
+    Discard,
+    /// Move failed jobs into the DLQ with `reason`, or "batch operation".
+    MoveToDlq {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Move dead-lettered jobs back to ready in their own queue.
+    RetryFromDlq,
+    /// Delete dead-lettered jobs.
+    PurgeDlq,
 }
 
 impl BatchOperationSpec {
@@ -123,6 +196,12 @@ impl BatchOperationSpec {
         match self {
             Self::SetPriority { .. } => BatchOperationKind::SetPriority,
             Self::MoveQueue { .. } => BatchOperationKind::MoveQueue,
+            Self::Retry => BatchOperationKind::Retry,
+            Self::Cancel => BatchOperationKind::Cancel,
+            Self::Discard => BatchOperationKind::Discard,
+            Self::MoveToDlq { .. } => BatchOperationKind::MoveToDlq,
+            Self::RetryFromDlq => BatchOperationKind::RetryFromDlq,
+            Self::PurgeDlq => BatchOperationKind::PurgeDlq,
         }
     }
 
@@ -140,6 +219,22 @@ impl BatchOperationSpec {
                 }
                 Ok(())
             }
+            Self::MoveToDlq {
+                reason: Some(reason),
+            } => {
+                if reason.is_empty() || reason.chars().count() > MAX_DLQ_REASON_CHARS {
+                    return Err(AwaError::Validation(format!(
+                        "DLQ reason must be 1..={MAX_DLQ_REASON_CHARS} characters"
+                    )));
+                }
+                Ok(())
+            }
+            Self::Retry
+            | Self::Cancel
+            | Self::Discard
+            | Self::MoveToDlq { reason: None }
+            | Self::RetryFromDlq
+            | Self::PurgeDlq => Ok(()),
         }
     }
 }
@@ -350,13 +445,15 @@ pub async fn preview_batch_operation(
     spec.validate()?;
     validate_filter_for_spec(&spec, &filter)?;
     filter.validate()?;
-    let total_matched = crate::job_query::count(pool, &filter, &ELIGIBLE_STATES, None)
+    let eligible = spec.kind().eligible_states();
+    let filter = query_filter(&spec, &filter);
+    let total_matched = crate::job_query::count(pool, &filter, eligible, None)
         .await?
         .value();
     let sample = crate::job_query::find(
         pool,
         &filter,
-        &ELIGIBLE_STATES,
+        eligible,
         crate::job_query::Window::OldestFirst {
             after_id: 0,
             max_id: i64::MAX,
@@ -473,22 +570,15 @@ async fn run_one_batch_operation_chunk_locked(
         });
     }
 
-    let mut processed = 0;
-    let mut skipped = 0;
-    let mut errored = 0;
-
-    for job_id in job_ids {
-        match apply_item(pool, operation.id, &operation.spec.0, job_id).await {
-            Ok(ItemOutcome::Processed) => processed += 1,
-            Ok(ItemOutcome::Skipped) => skipped += 1,
-            Ok(ItemOutcome::Errored(_)) => {
-                errored += 1;
-            }
-            Err(_) => {
-                errored += 1;
-            }
-        }
-    }
+    let ChunkCounts {
+        processed,
+        skipped,
+        errored,
+    } = if operation.op_kind.applies_per_chunk() {
+        apply_chunk(pool, operation.id, &operation.spec.0, &job_ids).await?
+    } else {
+        apply_items(pool, operation.id, &operation.spec.0, &job_ids).await
+    };
 
     let pending_count: i64 = sqlx::query_scalar(
         r#"
@@ -648,8 +738,9 @@ async fn scan_operation(
         fail_operation(pool, operation.id, err.to_string()).await?;
         return get_batch_operation(pool, operation.id).await;
     }
-    let filter = operation.filter.0.clone();
-    let max_job_id = crate::job_query::max_id(pool, &filter, &ELIGIBLE_STATES)
+    let eligible = operation.op_kind.eligible_states();
+    let filter = query_filter(&operation.spec.0, &operation.filter.0).into_owned();
+    let max_job_id = crate::job_query::max_id(pool, &filter, eligible)
         .await?
         .unwrap_or(0);
     // The candidates frozen into the item table. One whose job has moved on
@@ -661,7 +752,7 @@ async fn scan_operation(
         let ids = crate::job_query::scan_ids(
             pool,
             &filter,
-            &ELIGIBLE_STATES,
+            eligible,
             after_job_id,
             max_job_id,
             SCAN_PAGE_SIZE,
@@ -771,26 +862,51 @@ async fn insert_operation_items(
     Ok(())
 }
 
+/// The next chunk of pending items: untried items in job-id order, then, to
+/// fill the chunk, items an earlier chunk tried and left pending, least
+/// recently tried first. A pending item's `processed_at` is the time it was
+/// last tried.
 async fn claim_pending_items(
     pool: &PgPool,
     operation_id: Uuid,
     limit: i64,
 ) -> Result<Vec<i64>, AwaError> {
-    sqlx::query_scalar(
+    let limit = limit.max(1);
+    let mut job_ids: Vec<i64> = sqlx::query_scalar(
         r#"
         SELECT job_id
         FROM awa.batch_operation_items
-        WHERE operation_id = $1 AND state = 'pending'
+        WHERE operation_id = $1 AND state = 'pending' AND processed_at IS NULL
         ORDER BY job_id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
         "#,
     )
     .bind(operation_id)
-    .bind(limit.max(1))
+    .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(map_sqlx_error)
+    .map_err(map_sqlx_error)?;
+    let remaining = limit - job_ids.len() as i64;
+    if remaining > 0 {
+        let tried: Vec<i64> = sqlx::query_scalar(
+            r#"
+            SELECT job_id
+            FROM awa.batch_operation_items
+            WHERE operation_id = $1 AND state = 'pending' AND processed_at IS NOT NULL
+            ORDER BY processed_at ASC, job_id ASC
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(operation_id)
+        .bind(remaining)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        job_ids.extend(tried);
+    }
+    Ok(job_ids)
 }
 
 async fn skip_pending_items(pool: &PgPool, operation_id: Uuid) -> Result<i64, AwaError> {
@@ -823,22 +939,59 @@ fn validate_filter_for_spec(
     spec: &BatchOperationSpec,
     filter: &BatchOperationFilter,
 ) -> Result<(), AwaError> {
-    match spec {
-        BatchOperationSpec::SetPriority { .. } | BatchOperationSpec::MoveQueue { .. } => {
-            if filter
-                .states
-                .iter()
-                .any(|state| !ELIGIBLE_STATES.contains(state))
-                || filter.dead_lettered == Some(true)
-            {
-                return Err(AwaError::Validation(format!(
-                    "{} only supports available or scheduled state filters",
-                    spec.kind().as_str()
-                )));
-            }
-        }
+    let kind = spec.kind();
+    let eligible = kind.eligible_states();
+    let states_ok = filter.states.iter().all(|state| eligible.contains(state));
+    let dlq_ok = match kind.dlq_scope() {
+        DlqScope::Excluded => filter.dead_lettered != Some(true),
+        DlqScope::Only => filter.dead_lettered != Some(false),
+    };
+    if !states_ok || (!dlq_ok && !kind.applies_per_chunk()) {
+        return Err(AwaError::Validation(format!(
+            "{} only supports {} state filters",
+            kind.as_str(),
+            state_list(eligible)
+        )));
+    }
+    if !dlq_ok {
+        return Err(AwaError::Validation(match kind.dlq_scope() {
+            DlqScope::Excluded => format!(
+                "{} does not act on dead-lettered jobs; use retry_from_dlq or purge_dlq",
+                kind.as_str()
+            ),
+            DlqScope::Only => format!(
+                "{} acts only on dead-lettered jobs; leave dead_lettered unset or true",
+                kind.as_str()
+            ),
+        }));
     }
     Ok(())
+}
+
+/// `states` joined for a message: "a", "a or b", "a, b or c".
+fn state_list(states: &[JobState]) -> String {
+    let names: Vec<String> = states.iter().map(ToString::to_string).collect();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// The filter preview and scan select jobs with. The bulk-action kinds pin
+/// `dead_lettered` to their DLQ scope, so a failed-state filter reads only
+/// done rows or only DLQ rows; the other kinds use the stored filter as is.
+fn query_filter<'a>(
+    spec: &BatchOperationSpec,
+    filter: &'a BatchOperationFilter,
+) -> Cow<'a, BatchOperationFilter> {
+    let kind = spec.kind();
+    if !kind.applies_per_chunk() {
+        return Cow::Borrowed(filter);
+    }
+    let mut filter = filter.clone();
+    filter.dead_lettered = Some(kind.dlq_scope() == DlqScope::Only);
+    Cow::Owned(filter)
 }
 
 #[derive(Debug, Clone)]
@@ -846,6 +999,241 @@ enum ItemOutcome {
     Processed,
     Skipped,
     Errored(String),
+    /// Not reached but still eligible, so left pending for a later chunk.
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChunkCounts {
+    processed: i64,
+    skipped: i64,
+    errored: i64,
+}
+
+/// Apply `spec` to each of `job_ids` in a transaction of its own.
+async fn apply_items(
+    pool: &PgPool,
+    operation_id: Uuid,
+    spec: &BatchOperationSpec,
+    job_ids: &[i64],
+) -> ChunkCounts {
+    let mut counts = ChunkCounts::default();
+    for &job_id in job_ids {
+        match apply_item(pool, operation_id, spec, job_id).await {
+            Ok(ItemOutcome::Processed) => counts.processed += 1,
+            Ok(ItemOutcome::Skipped) => counts.skipped += 1,
+            Ok(ItemOutcome::Pending) => {}
+            Ok(ItemOutcome::Errored(_)) | Err(_) => counts.errored += 1,
+        }
+    }
+    counts
+}
+
+/// Apply a bulk-action `spec` to the whole chunk in one READ COMMITTED
+/// transaction that also records the items the action reached as processed.
+/// Each item it did not reach is then recorded as skipped if its job is no
+/// longer eligible, or left pending for a later chunk if it still is, as
+/// when another transaction held its row. If the chunk transaction fails,
+/// for example on a unique-claim conflict, it rolls back and each item is
+/// applied in a transaction of its own, so a failing job is recorded as
+/// errored and the rest still apply.
+async fn apply_chunk(
+    pool: &PgPool,
+    operation_id: Uuid,
+    spec: &BatchOperationSpec,
+    job_ids: &[i64],
+) -> Result<ChunkCounts, AwaError> {
+    let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+    match apply_chunk_tx(&mut tx, operation_id, spec, job_ids).await {
+        Ok((store, outcome, mut counts)) => {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            let unreached: Vec<i64> = job_ids
+                .iter()
+                .copied()
+                .filter(|job_id| !outcome.job_ids.contains(job_id))
+                .collect();
+            store.finish_bulk_action(pool, outcome).await;
+            counts.skipped =
+                settle_unreached(pool, &store, operation_id, spec.kind(), &unreached).await?;
+            Ok(counts)
+        }
+        Err(_) => {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            Ok(apply_items(pool, operation_id, spec, job_ids).await)
+        }
+    }
+}
+
+async fn apply_chunk_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: Uuid,
+    spec: &BatchOperationSpec,
+    job_ids: &[i64],
+) -> Result<(QueueStorage, BulkActionOutcome, ChunkCounts), AwaError> {
+    let store = active_store_in_tx(tx).await?;
+    let outcome = apply_bulk_action_tx(tx, &store, spec, job_ids).await?;
+    let processed: Vec<i64> = job_ids
+        .iter()
+        .copied()
+        .filter(|job_id| outcome.job_ids.contains(job_id))
+        .collect();
+    let processed_count: i64 = sqlx::query_scalar(
+        r#"
+        WITH recorded AS (
+            UPDATE awa.batch_operation_items AS items
+            SET state = 'processed',
+                error = NULL,
+                processed_at = clock_timestamp()
+            WHERE items.operation_id = $1
+              AND items.job_id = ANY($2::bigint[])
+              AND items.state = 'pending'
+            RETURNING items.job_id
+        ),
+        counts AS (
+            SELECT count(*)::bigint AS processed FROM recorded
+        )
+        UPDATE awa.batch_operations AS op
+        SET processed = op.processed + counts.processed,
+            updated_at = clock_timestamp()
+        FROM counts
+        WHERE op.id = $1
+        RETURNING counts.processed
+        "#,
+    )
+    .bind(operation_id)
+    .bind(&processed)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok((
+        store,
+        outcome,
+        ChunkCounts {
+            processed: processed_count,
+            skipped: 0,
+            errored: 0,
+        },
+    ))
+}
+
+/// Record the items among `job_ids` that a bulk action did not reach: as
+/// skipped when the job's current row is gone or outside `kind`'s eligible
+/// states and DLQ scope, and otherwise left pending with `processed_at` set
+/// to now, so the runner tries untried items before revisiting them. The
+/// current rows are read without waiting on row locks. Returns how many were
+/// skipped.
+async fn settle_unreached(
+    pool: &PgPool,
+    store: &QueueStorage,
+    operation_id: Uuid,
+    kind: BatchOperationKind,
+    job_ids: &[i64],
+) -> Result<i64, AwaError> {
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    let eligible: Vec<i64> = store
+        .load_jobs_without_output(pool, job_ids, None)
+        .await?
+        .into_iter()
+        .filter(|(job, dead_lettered)| {
+            kind.eligible_states().contains(&job.state)
+                && match kind.dlq_scope() {
+                    DlqScope::Excluded => !dead_lettered,
+                    DlqScope::Only => *dead_lettered,
+                }
+        })
+        .map(|(job, _)| job.id)
+        .collect();
+    sqlx::query_scalar(
+        r#"
+        WITH outcomes AS (
+            SELECT job_id, job_id = ANY($3::bigint[]) AS eligible
+            FROM unnest($2::bigint[]) AS job_id
+        ),
+        tried AS (
+            UPDATE awa.batch_operation_items AS items
+            SET processed_at = clock_timestamp()
+            FROM outcomes
+            WHERE items.operation_id = $1
+              AND items.job_id = outcomes.job_id
+              AND items.state = 'pending'
+              AND outcomes.eligible
+            RETURNING items.job_id
+        ),
+        skipped AS (
+            UPDATE awa.batch_operation_items AS items
+            SET state = 'skipped',
+                error = NULL,
+                processed_at = clock_timestamp()
+            FROM outcomes
+            WHERE items.operation_id = $1
+              AND items.job_id = outcomes.job_id
+              AND items.state = 'pending'
+              AND NOT outcomes.eligible
+            RETURNING items.job_id
+        ),
+        counts AS (
+            SELECT count(*)::bigint AS skipped FROM skipped
+        )
+        UPDATE awa.batch_operations AS op
+        SET skipped = op.skipped + counts.skipped,
+            updated_at = clock_timestamp()
+        FROM counts
+        WHERE op.id = $1
+        RETURNING counts.skipped
+        "#,
+    )
+    .bind(operation_id)
+    .bind(job_ids)
+    .bind(&eligible)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)
+}
+
+async fn apply_bulk_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    store: &QueueStorage,
+    spec: &BatchOperationSpec,
+    job_ids: &[i64],
+) -> Result<BulkActionOutcome, AwaError> {
+    match spec {
+        BatchOperationSpec::Retry => store.retry_terminal_jobs_by_ids_tx(tx, job_ids).await,
+        BatchOperationSpec::Cancel => store.cancel_jobs_by_ids_tx(tx, job_ids).await,
+        BatchOperationSpec::Discard => store.discard_failed_by_ids_tx(tx, job_ids).await,
+        BatchOperationSpec::MoveToDlq { reason } => {
+            store
+                .move_failed_to_dlq_by_ids_tx(
+                    tx,
+                    job_ids,
+                    reason.as_deref().unwrap_or(DEFAULT_DLQ_REASON),
+                )
+                .await
+        }
+        BatchOperationSpec::RetryFromDlq => store.retry_from_dlq_by_ids_tx(tx, job_ids).await,
+        BatchOperationSpec::PurgeDlq => store.purge_dlq_by_ids_tx(tx, job_ids).await,
+        BatchOperationSpec::SetPriority { .. } | BatchOperationSpec::MoveQueue { .. } => {
+            Err(AwaError::Validation(format!(
+                "{} is applied one job at a time",
+                spec.kind().as_str()
+            )))
+        }
+    }
+}
+
+async fn active_store_in_tx(tx: &mut Transaction<'_, Postgres>) -> Result<QueueStorage, AwaError> {
+    QueueStorage::active_schema_in_tx(tx)
+        .await?
+        .map(QueueStorage::from_existing_schema)
+        .transpose()?
+        .ok_or_else(|| {
+            AwaError::Validation(
+                "batch operations require an active queue_storage backend; \
+                 the canonical engine is deprecated (ADR-037)"
+                    .to_string(),
+            )
+        })
 }
 
 async fn apply_item(
@@ -855,9 +1243,20 @@ async fn apply_item(
     job_id: i64,
 ) -> Result<ItemOutcome, AwaError> {
     let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
-    let outcome = match apply_to_job_tx(&mut tx, spec, job_id).await {
-        Ok(true) => ItemOutcome::Processed,
-        Ok(false) => ItemOutcome::Skipped,
+    let (outcome, finish) = match apply_to_job_tx(&mut tx, spec, job_id).await {
+        Ok((true, finish)) => (ItemOutcome::Processed, finish),
+        Ok((false, Some((store, finish)))) => {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            store.finish_bulk_action(pool, finish).await;
+            let skipped =
+                settle_unreached(pool, &store, operation_id, spec.kind(), &[job_id]).await?;
+            return Ok(if skipped > 0 {
+                ItemOutcome::Skipped
+            } else {
+                ItemOutcome::Pending
+            });
+        }
+        Ok((false, None)) => (ItemOutcome::Skipped, None),
         Err(err) => {
             tx.rollback().await.map_err(map_sqlx_error)?;
             let outcome = ItemOutcome::Errored(format!("job_id={job_id}: {err}"));
@@ -869,6 +1268,9 @@ async fn apply_item(
     };
     record_item_outcome_tx(&mut tx, operation_id, job_id, &outcome).await?;
     tx.commit().await.map_err(map_sqlx_error)?;
+    if let Some((store, finish)) = finish {
+        store.finish_bulk_action(pool, finish).await;
+    }
     Ok(outcome)
 }
 
@@ -882,6 +1284,7 @@ async fn record_item_outcome_tx(
         ItemOutcome::Processed => ("processed", None, 1_i64, 0_i64, 0_i64),
         ItemOutcome::Skipped => ("skipped", None, 0_i64, 1_i64, 0_i64),
         ItemOutcome::Errored(error) => ("errored", Some(error.as_str()), 0_i64, 0_i64, 1_i64),
+        ItemOutcome::Pending => return Ok(()),
     };
     sqlx::query(
         r#"
@@ -921,30 +1324,28 @@ async fn record_item_outcome_tx(
     Ok(())
 }
 
+/// Apply `spec` to one job. Returns whether the job was acted on, and for a
+/// bulk-action kind the work [`QueueStorage::finish_bulk_action`] does once
+/// the transaction commits.
 async fn apply_to_job_tx(
     tx: &mut Transaction<'_, Postgres>,
     spec: &BatchOperationSpec,
     job_id: i64,
-) -> Result<bool, AwaError> {
-    if let Some(store) = QueueStorage::active_schema_in_tx(tx)
-        .await?
-        .map(QueueStorage::from_existing_schema)
-        .transpose()?
-    {
-        return match spec {
-            BatchOperationSpec::SetPriority { priority } => {
-                store.set_priority_tx(tx, job_id, *priority).await
-            }
-            BatchOperationSpec::MoveQueue { queue, priority } => {
-                store.move_queue_tx(tx, job_id, queue, *priority).await
-            }
-        };
+) -> Result<(bool, Option<(QueueStorage, BulkActionOutcome)>), AwaError> {
+    let store = active_store_in_tx(tx).await?;
+    match spec {
+        BatchOperationSpec::SetPriority { priority } => {
+            Ok((store.set_priority_tx(tx, job_id, *priority).await?, None))
+        }
+        BatchOperationSpec::MoveQueue { queue, priority } => Ok((
+            store.move_queue_tx(tx, job_id, queue, *priority).await?,
+            None,
+        )),
+        _ => {
+            let outcome = apply_bulk_action_tx(tx, &store, spec, &[job_id]).await?;
+            Ok((outcome.job_ids.contains(&job_id), Some((store, outcome))))
+        }
     }
-    Err(AwaError::Validation(
-        "batch operations require an active queue_storage backend; \
-         the canonical engine is deprecated (ADR-037)"
-            .to_string(),
-    ))
 }
 
 pub async fn run_one_default_chunk(
