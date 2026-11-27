@@ -10732,6 +10732,79 @@ async fn test_queue_storage_rescue_skips_sealed_claim_slots_proven_closed() {
     );
 }
 
+/// Under compat ring authority a 0.6 rotator advances only the claim ring's
+/// singleton columns, so the rotation ledger lags the cursor. Rescue takes the
+/// current slot from the cursor the authority names, and does not prove the
+/// slot a 0.6 rotator made current closed while it is still empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_rescue_walks_the_current_slot_a_0_6_rotator_advanced_to() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_rescue_compat_current_slot";
+    let schema = "awa_qs_runtime_rescue_compat_current_slot";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 4,
+        },
+    )
+    .await;
+    set_ring_authority(&pool, schema, "columns").await;
+    sqlx::raw_sql(audited_sql(format!(
+        "UPDATE {schema}.claim_ring_state SET current_slot = 1, generation = 1 WHERE singleton; \
+         UPDATE {schema}.claim_ring_slots SET generation = 1 WHERE slot = 1"
+    )))
+    .execute(&pool)
+    .await
+    .expect("advance the claim cursor as a 0.6 rotator does");
+
+    let options = awa::model::RescueBatchOptions::default();
+    let rescue = || {
+        store.rescue_stale_heartbeats_batch(&pool, Duration::from_secs(90), &|_| false, &options)
+    };
+    rescue()
+        .await
+        .expect("rescue before the current slot holds a claim");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 0 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim into the current slot");
+    assert_eq!(
+        claimed[0].claim.claim_slot, 1,
+        "claims follow the column cursor"
+    );
+    age_receipt_claim(
+        &pool,
+        &store,
+        claimed[0].job.id,
+        claimed[0].job.run_lease,
+        Duration::from_secs(300),
+    )
+    .await;
+
+    let batch = rescue().await.expect("rescue the dead claim");
+    assert_eq!(
+        batch.rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id],
+        "the dead claim in the current slot is rescued"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
     let (_db_guard, pool) = setup_pool(10).await;

@@ -15443,38 +15443,38 @@ impl QueueStorage {
         slots: &[i32],
     ) -> Result<HashSet<i32>, AwaError> {
         let schema = self.schema();
-        // The claim ring's cursor and each slot's generation come from the
-        // `claim_ring_rotations` ledger, as in `claim_slots_by_age_tx`: once
-        // the ring cursor authority is the ledger, `claim_ring_state` and
-        // `claim_ring_slots.generation` hold -1. Without a cursor, nothing is
-        // skipped. A slot with no ledger row has never been current, so it
-        // takes generation -1 until the ring first rotates into it.
-        let current_slot: Option<i32> = sqlx::query_scalar(audited_sql(format!(
-            "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-        )))
-        .fetch_optional(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        let Some(current_slot) = current_slot else {
-            return Ok(HashSet::new());
+        // A slot at or past the cursor read here is current or became current
+        // during this call, so it is never proven. Under ledger authority a
+        // slot with no ledger row has never been current and takes
+        // generation -1 until the ring first rotates into it.
+        let authority = self.ring_authority_tx(tx).await?;
+        let (current_slot, current_generation) = self
+            .ring_cursor_tx(tx, RingFamily::Claim, authority)
+            .await?;
+        let generations_sql = match authority {
+            RingAuthority::Ledger => format!(
+                "SELECT slot, max(generation) FROM {schema}.claim_ring_rotations \
+                 WHERE slot = ANY($1) GROUP BY slot"
+            ),
+            RingAuthority::Columns => format!(
+                "SELECT slot, generation FROM {schema}.claim_ring_slots WHERE slot = ANY($1)"
+            ),
         };
-        let generations: HashMap<i32, i64> = sqlx::query_as::<_, (i32, i64)>(audited_sql(format!(
-            "SELECT slot, max(generation) FROM {schema}.claim_ring_rotations \
-             WHERE slot = ANY($1) GROUP BY slot"
-        )))
-        .bind(slots)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?
-        .into_iter()
-        .collect();
+        let generations: HashMap<i32, i64> =
+            sqlx::query_as::<_, (i32, i64)>(audited_sql(generations_sql))
+                .bind(slots)
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?
+                .into_iter()
+                .collect();
 
         let mut closed = HashSet::new();
         for &slot in slots {
-            if slot == current_slot {
+            let generation = generations.get(&slot).copied().unwrap_or(-1);
+            if slot == current_slot || generation >= current_generation {
                 continue;
             }
-            let generation = generations.get(&slot).copied().unwrap_or(-1);
             let cached = self
                 .claim_slot_proofs
                 .lock()
