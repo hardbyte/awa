@@ -178,6 +178,13 @@ pub struct SoakConfig {
     pub sampler_statement_timeout: Duration,
     pub sampler_lock_timeout: Duration,
     pub final_statement_timeout: Duration,
+    /// Largest share, in percent, of one check's periodic samples that may be skipped
+    /// by a timeout before the run is incomplete.
+    pub sampler_max_skip_percent: u64,
+    /// Statement and lock timeouts of diagnostic reads that can hold a lock ring prune
+    /// waits for: the txn persona's samples and the open-claims capture.
+    pub diag_statement_timeout: Duration,
+    pub diag_lock_timeout: Duration,
     /// Transactional producers: how many run concurrently, the share of their
     /// transactions that are SERIALIZABLE rather than REPEATABLE READ, and the longest
     /// pause between a transaction's first read and its enqueue.
@@ -341,6 +348,15 @@ impl SoakConfig {
             ),
             final_statement_timeout: Duration::from_millis(
                 env_parse("AWA_SOAK_FINAL_STATEMENT_TIMEOUT_MS").unwrap_or(300_000),
+            ),
+            sampler_max_skip_percent: env_parse::<u64>("AWA_SOAK_SAMPLER_MAX_SKIP_PERCENT")
+                .unwrap_or(20)
+                .min(100),
+            diag_statement_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_DIAG_STATEMENT_TIMEOUT_MS").unwrap_or(2_000),
+            ),
+            diag_lock_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_DIAG_LOCK_TIMEOUT_MS").unwrap_or(100),
             ),
             txn_producers: env_parse("AWA_SOAK_TXN_PRODUCERS").unwrap_or(16),
             txn_serializable_percent: env_parse::<u64>("AWA_SOAK_TXN_SERIALIZABLE_PERCENT")

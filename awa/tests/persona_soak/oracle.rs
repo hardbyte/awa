@@ -74,8 +74,6 @@ pub struct Oracle {
     reported_duplicates: std::collections::HashSet<(i64, i64)>,
     reported_cancel: std::collections::HashSet<i64>,
     initial_stats_reset: std::sync::Mutex<Option<Option<String>>>,
-    /// Periodic samples cut short by the sampler's statement or lock timeout.
-    skipped_samples: std::sync::atomic::AtomicU64,
     /// Set for the final reconciliation, whose queries must complete.
     final_phase: bool,
 }
@@ -91,7 +89,6 @@ impl Oracle {
             reported_duplicates: Default::default(),
             reported_cancel: Default::default(),
             initial_stats_reset: Default::default(),
-            skipped_samples: Default::default(),
             final_phase: false,
         }
     }
@@ -102,37 +99,19 @@ impl Oracle {
     pub fn begin_final_phase(&mut self, pool: PgPool) {
         self.pool = pool;
         self.final_phase = true;
-        let skipped = self
-            .skipped_samples
-            .load(std::sync::atomic::Ordering::Relaxed);
-        self.shared
-            .run
-            .add("oracle_samples_skipped", skipped as i64);
-        if skipped > 0 {
-            self.shared.note(
-                "oracle_samples_skipped",
-                format!(
-                    "{skipped} periodic oracle sample(s) hit the sampler's statement or lock timeout and were skipped"
-                ),
-            );
+    }
+
+    /// Counts a periodic sample of `check`; the final reconciliation is not sampled.
+    fn attempted(&self, check: &str) {
+        if !self.final_phase {
+            self.shared.sample_attempted(check);
         }
     }
 
-    /// A failed oracle query. A periodic sample cut short by the sampler's statement
-    /// or lock timeout (SQLSTATE 57014 or 55P03) is skipped and counted, so measuring
-    /// never holds a lock prune waits for; any other failure, and any failure in the
-    /// final reconciliation, leaves the evidence incomplete.
-    fn failed(&self, what: &str, error: &sqlx::Error) {
-        let timed_out = error
-            .as_database_error()
-            .and_then(|db| db.code())
-            .is_some_and(|code| code == "57014" || code == "55P03");
-        if timed_out && !self.final_phase {
-            self.skipped_samples
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        self.shared.incomplete(format!("{what}: {error}"), vec![]);
+    /// A failed oracle query; see [`Shared::sample_failed`].
+    fn failed(&self, check: &str, what: &str, error: &sqlx::Error) {
+        self.shared
+            .sample_failed(check, what, error, self.final_phase);
     }
 
     /// Runs the periodic checks until `stop`.
@@ -159,6 +138,7 @@ impl Oracle {
     /// Crash recovery discards the cumulative statistics, so a changed reset time means the
     /// server restarted its processes even though the postmaster, and its start time, survived.
     async fn probe_stats_reset(&self) {
+        self.attempted("crash_probe");
         let reset: Result<Option<String>, _> =
             sqlx::query_scalar("SELECT stats_reset::text FROM pg_stat_bgwriter")
                 .fetch_one(&self.pool)
@@ -166,7 +146,7 @@ impl Oracle {
         let reset = match reset {
             Ok(reset) => reset,
             Err(error) => {
-                self.failed("crash-recovery probe failed", &error);
+                self.failed("crash_probe", "crash-recovery probe failed", &error);
                 return;
             }
         };
@@ -220,6 +200,7 @@ impl Oracle {
         let terminal = terminal_cte(&schema);
         let started = std::time::Instant::now();
 
+        self.attempted("terminal_uniqueness");
         let duplicates: Result<Vec<(i64, i64, Vec<String>)>, _> = sqlx::query_as(&format!(
             "WITH {terminal}
              SELECT job_id, run_lease, array_agg(src ORDER BY src)
@@ -249,10 +230,15 @@ impl Oracle {
                     );
                 }
             }
-            Err(error) => self.failed("terminal uniqueness query failed", &error),
+            Err(error) => self.failed(
+                "terminal_uniqueness",
+                "terminal uniqueness query failed",
+                &error,
+            ),
         }
 
         let available = available_cte(&schema);
+        self.attempted("terminal_live");
         let overlap: Result<Vec<(i64, String, i64, i64)>, _> = sqlx::query_as(&format!(
             "WITH {terminal}, {available}
              SELECT t.job_id, 'available'::text, t.run_lease, a.run_lease
@@ -273,6 +259,7 @@ impl Oracle {
                 // repeat that still shows the overlap is not a race with this probe.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let ids: Vec<i64> = rows.iter().map(|row| row.0).collect();
+                self.attempted("terminal_live_confirmation");
                 let still: Result<Vec<(i64, String)>, _> = sqlx::query_as(&format!(
                     "WITH {terminal}, {available}
                      SELECT t.job_id, 'available'::text FROM terminal t JOIN available a ON a.job_id = t.job_id AND a.run_lease <= t.run_lease WHERE t.job_id = ANY($1)
@@ -285,7 +272,11 @@ impl Oracle {
                 let confirmed: std::collections::HashSet<i64> = match still {
                     Ok(rows) => rows.into_iter().map(|row| row.0).collect(),
                     Err(error) => {
-                        self.failed("terminal/live confirmation failed", &error);
+                        self.failed(
+                            "terminal_live_confirmation",
+                            "terminal/live confirmation failed",
+                            &error,
+                        );
                         Default::default()
                     }
                 };
@@ -309,7 +300,7 @@ impl Oracle {
                 }
             }
             Ok(_) => {}
-            Err(error) => self.failed("terminal/live query failed", &error),
+            Err(error) => self.failed("terminal_live", "terminal/live query failed", &error),
         }
         self.shared.run.observe(
             "oracle_terminal_check_ms",
@@ -323,6 +314,7 @@ impl Oracle {
         let schema = schema(&self.shared);
         let since_ms = self.last_cancel_scan_ms;
         let scan_started_ms = self.shared.now_ms();
+        self.attempted("unexplained_cancels");
         let rows: Result<Vec<(i64, String, i64)>, _> = sqlx::query_as(&format!(
             "SELECT job_id, queue, run_lease FROM {schema}.done_entries
              WHERE state = 'cancelled' AND finalized_at > now() - make_interval(secs => $1)"
@@ -330,11 +322,13 @@ impl Oracle {
         .bind(((scan_started_ms - since_ms) as f64 / 1000.0 + 15.0).max(20.0))
         .fetch_all(&self.pool)
         .await;
-        self.last_cancel_scan_ms = scan_started_ms;
         let rows = match rows {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                self.last_cancel_scan_ms = scan_started_ms;
+                rows
+            }
             Err(error) => {
-                self.failed("invariant query failed", &error);
+                self.failed("unexplained_cancels", "invariant query failed", &error);
                 return;
             }
         };
@@ -397,6 +391,7 @@ impl Oracle {
         if self.shared.chaos_active() {
             threshold += self.shared.chaos_slack();
         }
+        self.attempted("promotion");
         let rows: Result<Vec<(i64, String, f64)>, _> = sqlx::query_as(&format!(
             "SELECT job_id, queue, extract(epoch FROM now() - run_at)::float8
              FROM {schema}.deferred_jobs
@@ -409,7 +404,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.failed("invariant query failed", &error);
+                self.failed("promotion", "invariant query failed", &error);
                 return;
             }
         };
@@ -419,6 +414,7 @@ impl Oracle {
         // Re-read so that a job promoted a moment ago is not reported.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let ids: Vec<i64> = rows.iter().map(|row| row.0).collect();
+        self.attempted("promotion_confirmation");
         let still: Result<Vec<i64>, _> = sqlx::query_scalar(&format!(
             "SELECT job_id FROM {schema}.deferred_jobs WHERE job_id = ANY($1) AND state IN ('scheduled','retryable')"
         ))
@@ -428,7 +424,11 @@ impl Oracle {
         let still = match still {
             Ok(still) => still,
             Err(error) => {
-                self.failed("promotion confirmation failed", &error);
+                self.failed(
+                    "promotion_confirmation",
+                    "promotion confirmation failed",
+                    &error,
+                );
                 return;
             }
         };
@@ -460,6 +460,7 @@ impl Oracle {
 
     async fn check_stall(&mut self) {
         let schema = schema(&self.shared);
+        self.attempted("stall");
         let rows: Result<Vec<(String, i64, i64)>, _> = sqlx::query_as(&format!(
             "SELECT c.queue,
                     COALESCE(sum({schema}.sequence_next_value(e.seq_name) - {schema}.sequence_next_value(c.seq_name)), 0)::bigint,
@@ -474,7 +475,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.failed("invariant query failed", &error);
+                self.failed("stall", "invariant query failed", &error);
                 return;
             }
         };
@@ -514,6 +515,7 @@ impl Oracle {
             }
         }
         for (queue_name, backlog, cursor, since, capacity, in_flight) in candidates {
+            self.attempted("stall_exact");
             let exact: Result<i64, _> = sqlx::query_scalar(&format!(
                 "WITH {} SELECT count(*)::bigint FROM available WHERE queue = $1",
                 available_cte(&schema)
@@ -524,7 +526,7 @@ impl Oracle {
             let available = match exact {
                 Ok(available) => available,
                 Err(error) => {
-                    self.failed("exact claimable-row check failed", &error);
+                    self.failed("stall_exact", "exact claimable-row check failed", &error);
                     continue;
                 }
             };
@@ -636,6 +638,7 @@ impl Oracle {
         let deadline = std::time::Instant::now() + timeout;
         let mut quiet_polls = 0;
         loop {
+            self.attempted("quiescence");
             let live: Result<i64, _> = sqlx::query_scalar(&format!(
                 "WITH {} SELECT (SELECT count(*) FROM available) + (SELECT count(*) FROM {schema}.leases)
                        + (SELECT count(*) FROM {schema}.deferred_jobs WHERE run_at < now() + interval '1 second')",
@@ -644,7 +647,7 @@ impl Oracle {
             .fetch_one(&self.pool)
             .await;
             if let Err(error) = &live {
-                self.failed("quiescence query failed", error);
+                self.failed("quiescence", "quiescence query failed", error);
             }
             let mut pending_terminal_proof = 0usize;
             self.shared.ledger.for_each(|id, record| {
@@ -1183,6 +1186,31 @@ mod tests {
             .iter()
             .filter(|violation| violation.kind == kind)
             .count()
+    }
+
+    #[test]
+    fn skipped_samples_are_judged_per_check_against_the_threshold() {
+        let shared = cancel_fixture();
+        let limit = shared.config.sampler_max_skip_percent as i64;
+        for _ in 0..100 {
+            shared.sample_attempted("stall");
+            shared.sample_attempted("promotion");
+        }
+        shared.run.add("sampler_skips.stall", limit);
+        shared.run.add("sampler_skips.promotion", limit + 1);
+        shared.evaluate_sample_skips();
+        let incomplete = shared.violations.lock().expect("violations");
+        let summaries: Vec<_> = incomplete
+            .iter()
+            .filter(|violation| violation.kind == "oracle_incomplete")
+            .map(|violation| violation.summary.clone())
+            .collect();
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert!(
+            summaries[0].starts_with("promotion skipped"),
+            "{summaries:?}"
+        );
+        assert_eq!(shared.run.get("oracle_samples_skipped"), 2 * limit + 1);
     }
 
     /// Cancellation of a running handler is cooperative, so the attempt the

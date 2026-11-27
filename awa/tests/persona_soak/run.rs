@@ -287,6 +287,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
     }
     super::gate_metrics::reconcile(&shared);
+    shared.evaluate_sample_skips();
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
