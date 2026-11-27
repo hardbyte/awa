@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
-  <title id="title">AWA</title>
-  <!-- One continuous work stream: deliberately simple at the header's 24px size. -->
-  <path d="M6 36c9-20 18-20 27 0s17 20 25-1" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round"/>
-  <circle cx="32" cy="33" r="4.5" fill="#8de2b1"/>
-</svg>
