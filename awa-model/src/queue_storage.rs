@@ -13824,14 +13824,18 @@ impl QueueStorage {
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
         // The lease cursor the schema's authority names: the ledger's
         // max-generation row, or under compat authority the singleton
-        // columns a 0.6 rotator advances without touching the ledger. Both
-        // reads are plain SELECTs that take no row or advisory lock, so this
+        // columns a 0.6 rotator advances without touching the ledger. The
+        // authority and the cursor are read in one statement, so a flip that
+        // commits mid-transaction cannot pair compat authority with the
+        // fenced columns. The read takes no row or advisory lock, so this
         // path never waits on a rotator or prune holding the lease-ring
         // serializer.
-        let authority = self.ring_authority_tx(tx).await?;
-        let (lease_slot, lease_generation) = self
-            .ring_cursor_tx(tx, RingFamily::Lease, authority)
-            .await?;
+        let (lease_slot, lease_generation, _) = sqlx::query_as::<_, (i32, i64, i32)>(audited_sql(
+            ring_cursor_with_slot_count_sql(schema, RingFamily::Lease),
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
         let inserted: i64 = sqlx::query_scalar(audited_sql(format!(
             r#"
             WITH inflight(job_id, run_lease) AS (
