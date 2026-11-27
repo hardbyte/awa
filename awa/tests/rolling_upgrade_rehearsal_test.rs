@@ -311,7 +311,7 @@ impl ReleasedWorker {
 }
 
 async fn spawn_released_worker(queue: &str) -> ReleasedWorker {
-    spawn_released_worker_with(queue, 80, None, false).await
+    spawn_released_worker_with(queue, 80, None, false, None).await
 }
 
 async fn spawn_released_worker_with(
@@ -319,6 +319,7 @@ async fn spawn_released_worker_with(
     sleep_ms: u64,
     deadline_duration_ms: Option<u64>,
     schema_already_current: bool,
+    queue_rotate_interval: Option<Duration>,
 ) -> ReleasedWorker {
     let python = released_python();
     assert!(
@@ -343,6 +344,12 @@ async fn spawn_released_worker_with(
         .kill_on_drop(true);
     if schema_already_current {
         command.env("MIXED_SKIP_MIGRATE", "1");
+    }
+    if let Some(interval) = queue_rotate_interval {
+        command.env(
+            "MIXED_QUEUE_ROTATE_INTERVAL_MS",
+            interval.as_millis().to_string(),
+        );
     }
     if let Some(deadline_duration_ms) = deadline_duration_ms {
         command.env(
@@ -1074,7 +1081,7 @@ async fn test_migrate_first_expired_deadline_claim_rescued_once_in_mixed_fleet()
 
     // The released handler sleeps far past its 300ms deadline, so only a
     // rescue can end attempt 1.
-    let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300), false).await;
+    let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300), false, None).await;
     assert_eq!(schema_version(&pool).await, 40);
 
     report.phase("released_v040_installed");
@@ -1870,7 +1877,11 @@ async fn test_migrate_first_mixed_fleet_job_output() {
         }
     };
 
-    let mut old_worker = spawn_released_worker(&queue).await;
+    // A slow queue ring keeps either leader from pruning the cell's own
+    // completed jobs before the cell reads their outputs.
+    let queue_rotate_interval = Duration::from_secs(600);
+    let mut old_worker =
+        spawn_released_worker_with(&queue, 80, None, false, Some(queue_rotate_interval)).await;
     assert_eq!(schema_version(&pool).await, 40);
     migrations::run(&pool)
         .await
@@ -1882,6 +1893,14 @@ async fn test_migrate_first_mixed_fleet_job_output() {
     let current_completed = Arc::new(Mutex::new(HashSet::new()));
     let current_attempted = Arc::new(Mutex::new(HashSet::new()));
     let current = current_builder(pool.clone(), &queue, Duration::from_millis(100))
+        .queue_storage(
+            QueueStorageConfig {
+                schema: "awa".to_string(),
+                ..Default::default()
+            },
+            queue_rotate_interval,
+            Duration::from_millis(50),
+        )
         .register_worker(OutputRecordingWorker {
             completed: current_completed.clone(),
             attempted: current_attempted.clone(),
@@ -1994,7 +2013,8 @@ async fn test_migrate_first_mixed_fleet_job_output() {
 
     // Phase 4: a released worker runs the next attempt of every job whose
     // previous attempt recorded an output.
-    let mut old_worker = spawn_released_worker_with(&queue, 80, None, true).await;
+    let mut old_worker =
+        spawn_released_worker_with(&queue, 80, None, true, Some(queue_rotate_interval)).await;
     let mut resumed = retry_ids.clone();
     resumed.extend(&failed_ids);
     let resumed_rows = wait_for_job_states(
