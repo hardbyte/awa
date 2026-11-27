@@ -14,7 +14,6 @@ const BLOCKER_PIDS: usize = 64;
 const CLIENT_DEADLINE: Duration = Duration::from_millis(750);
 const CAPTURES_PER_STAGE: u8 = 12;
 const OPEN_CLAIM_GROUPS: i64 = 32;
-const OPEN_CLAIMS_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
@@ -227,7 +226,13 @@ async fn collect(pool: &PgPool, schema: &str, slot: i32, sql: &str) -> Value {
 /// enter it again: by queue and kind, with how long the oldest has been claimed and how long
 /// since any of them heartbeated. Its anti-joins hold the slot's partitions while they run, so
 /// they get a short statement and lock timeout; a capture that runs out says so.
-async fn open_claims(pool: &PgPool, schema: &str, slot: i32) -> Value {
+async fn open_claims(
+    pool: &PgPool,
+    schema: &str,
+    slot: i32,
+    statement_timeout: Duration,
+    lock_timeout: Duration,
+) -> Value {
     let claims = format!("{schema}.lease_claims_{slot}");
     let claim_batches = format!("{schema}.lease_claim_batches_{slot}");
     let closures = format!("{schema}.lease_claim_closures_{slot}");
@@ -256,7 +261,7 @@ async fn open_claims(pool: &PgPool, schema: &str, slot: i32) -> Value {
                    EXTRACT(EPOCH FROM clock_timestamp() - min(open_claims.claimed_at))::float8 AS oldest_claimed_s,
                    count(*) FILTER (WHERE lease.job_id IS NOT NULL) AS with_lease_row,
                    EXTRACT(EPOCH FROM clock_timestamp()
-                       - max(COALESCE(attempt.heartbeat_at, lease.heartbeat_at)))::float8 AS latest_heartbeat_s
+                       - max(GREATEST(attempt.heartbeat_at, lease.heartbeat_at)))::float8 AS latest_heartbeat_s
             FROM open_claims
             LEFT JOIN {schema}.ready_entries AS ready
               ON ready.job_id = open_claims.job_id
@@ -274,17 +279,23 @@ async fn open_claims(pool: &PgPool, schema: &str, slot: i32) -> Value {
         FROM (SELECT * FROM grouped ORDER BY oldest_claimed_s DESC LIMIT {OPEN_CLAIM_GROUPS}) AS grouped
         "#
     );
-    let result = tokio::time::timeout(OPEN_CLAIMS_DEADLINE, async {
+    let result = tokio::time::timeout(statement_timeout + Duration::from_secs(2), async {
         let mut tx = pool.begin().await?;
         sqlx::query("SET TRANSACTION READ ONLY")
             .execute(tx.as_mut())
             .await?;
-        sqlx::query("SET LOCAL statement_timeout = '10s'")
-            .execute(tx.as_mut())
-            .await?;
-        sqlx::query("SET LOCAL lock_timeout = '100ms'")
-            .execute(tx.as_mut())
-            .await?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {}",
+            statement_timeout.as_millis()
+        ))
+        .execute(tx.as_mut())
+        .await?;
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = {}",
+            lock_timeout.as_millis()
+        ))
+        .execute(tx.as_mut())
+        .await?;
         let groups: Value = sqlx::query_scalar(&sql).fetch_one(tx.as_mut()).await?;
         tx.rollback().await?;
         Ok::<_, sqlx::Error>(groups)
@@ -334,12 +345,19 @@ pub async fn observe(
     let mut value = collect(pool, schema, incoming, SQL).await;
     value["stage"] = json!(stage.name());
     value["started_at_ms"] = json!(now);
-    value["finished_at_ms"] = json!(shared.now_ms());
     value["current_slot"] = json!(episode.slot);
     value["next_slot"] = json!(incoming);
     value["generation"] = json!(episode.generation);
     value["next_slot_probe"] = json!(next_slot);
-    value["open_claims_in_next_slot"] = open_claims(pool, schema, incoming).await;
+    value["open_claims_in_next_slot"] = open_claims(
+        pool,
+        schema,
+        incoming,
+        shared.config.diag_statement_timeout,
+        shared.config.diag_lock_timeout,
+    )
+    .await;
+    value["finished_at_ms"] = json!(shared.now_ms());
     shared.run.add("claim_ring_lock_capture_attempts", 1);
     if value["status"] != "ok" {
         shared.finding(
@@ -624,7 +642,14 @@ mod tests {
             .await
             .expect("complete one");
 
-        let value = open_claims(&db.pool, "awa", slot).await;
+        let value = open_claims(
+            &db.pool,
+            "awa",
+            slot,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        )
+        .await;
         assert_eq!(value["status"], "ok", "{value}");
         assert_eq!(value["slot"], slot);
         let groups = value["groups"].as_array().unwrap();
@@ -634,7 +659,14 @@ mod tests {
         assert_eq!(groups[0]["open"], 2);
         assert!(groups[0]["oldest_claimed_s"].as_f64().unwrap() >= 0.0);
 
-        let empty = open_claims(&db.pool, "awa", (slot + 1) % 8).await;
+        let empty = open_claims(
+            &db.pool,
+            "awa",
+            (slot + 1) % 8,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        )
+        .await;
         assert_eq!(empty["groups"], json!([]), "{empty}");
         db.drop().await;
     }

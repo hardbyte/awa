@@ -8,9 +8,10 @@
 //!
 //! Stresses the ready-ring generation an enqueue writes when its snapshot predates a
 //! ring rotation and a lane-lock wait: a job placed in an older generation than a job
-//! ahead of it in the same lane can be passed by claims and pruned unrun. A sampler
-//! counts such misplaced ready rows while the load runs; the oracle reports any
-//! committed job that never ran.
+//! ahead of it in the same lane can be passed by claims and pruned unrun. Each producer
+//! checks the placement of its own rows right after every commit, and a sampler counts
+//! misplaced ready rows across the queues once a second; the oracle reports any committed
+//! job that never ran.
 
 use super::super::config::Persona;
 use super::super::db::{connect_pool, ClientFactory};
@@ -27,7 +28,7 @@ use awa::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -183,9 +184,108 @@ async fn transaction(
 /// Committed job ids and the isolation level of the transaction that wrote them.
 type Committed = Arc<Mutex<HashMap<i64, Isolation>>>;
 
+/// Lane-placement evidence gathered through short, bounded reads: the rows found in an
+/// older ring generation than an earlier row of their lane.
+struct Placement {
+    pool: PgPool,
+    schema: String,
+    misplaced: Mutex<HashSet<i64>>,
+}
+
+impl Placement {
+    fn record(&self, shared: &Shared, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut misplaced = self.misplaced.lock().expect("txn misplaced");
+        let first = misplaced.is_empty();
+        misplaced.extend(ids);
+        drop(misplaced);
+        if first {
+            shared.note(
+                "txn",
+                "a ready row sits in an older ring generation than an earlier row of its lane",
+            );
+        }
+    }
+
+    /// Checks the rows a producer just committed: each one is misplaced when an earlier row
+    /// of its lane sits in a newer ring generation. Rows already pruned cannot be checked
+    /// and are counted apart. A read cut short by its timeout is a skipped sample.
+    async fn check_batch(&self, shared: &Shared, ids: &[i64]) {
+        let stats = shared.stats(Persona::Txn);
+        shared.sample_attempted("txn_placement");
+        let schema = &self.schema;
+        let rows: Result<Vec<(i64, bool)>, _> = sqlx::query_as(&format!(
+            "SELECT r.job_id,
+                    EXISTS (SELECT 1 FROM {schema}.ready_entries p
+                            WHERE p.queue = r.queue AND p.priority = r.priority
+                              AND p.enqueue_shard = r.enqueue_shard
+                              AND p.lane_seq < r.lane_seq
+                              AND p.ready_generation > r.ready_generation)
+             FROM {schema}.ready_entries r WHERE r.job_id = ANY($1)"
+        ))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await;
+        match rows {
+            Ok(rows) => {
+                let found: HashSet<i64> = rows.iter().map(|(id, _)| *id).collect();
+                stats.add("placement_batches_checked", 1);
+                stats.add("placement_rows_checked", found.len() as i64);
+                stats.add(
+                    "placement_rows_not_checked",
+                    ids.len().saturating_sub(found.len()) as i64,
+                );
+                self.record(
+                    shared,
+                    rows.into_iter()
+                        .filter_map(|(id, misplaced)| misplaced.then_some(id))
+                        .collect(),
+                );
+            }
+            Err(error) => {
+                shared.sample_failed("txn_placement", "txn placement check failed", &error, false)
+            }
+        }
+    }
+
+    /// Ready rows of this persona's queues placed in an older ring generation than a row
+    /// at an earlier position of the same lane. Returns whether the sample completed.
+    async fn sample(&self, shared: &Shared, queues: &[String], is_final: bool) -> bool {
+        if !is_final {
+            shared.sample_attempted("txn_sampler");
+        }
+        let schema = &self.schema;
+        let misplaced: Result<Vec<i64>, _> = sqlx::query_scalar(&format!(
+            "SELECT job_id FROM (
+                SELECT job_id, ready_generation,
+                       max(ready_generation) OVER (
+                           PARTITION BY queue, priority, enqueue_shard ORDER BY lane_seq
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS newest_before
+                FROM {schema}.ready_entries WHERE queue = ANY($1)
+             ) lanes WHERE ready_generation < newest_before"
+        ))
+        .bind(queues)
+        .fetch_all(&self.pool)
+        .await;
+        match misplaced {
+            Ok(ids) => {
+                self.record(shared, ids);
+                true
+            }
+            Err(error) => {
+                shared.sample_failed("txn_sampler", "txn lane sampler failed", &error, is_final);
+                false
+            }
+        }
+    }
+}
+
 async fn produce(
     shared: Arc<Shared>,
     pool: PgPool,
+    placement: Arc<Placement>,
     queues: Arc<Vec<Arc<QueueInfo>>>,
     committed: Committed,
     producer: u64,
@@ -258,6 +358,8 @@ async fn produce(
                         }
                     }
                     register_rows(&shared, persona, &rows, |_| expect::COMPLETED, 0);
+                    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+                    placement.check_batch(&shared, &ids).await;
                     break;
                 }
                 Err(error) if is_serialization_failure(&error) => {
@@ -282,47 +384,6 @@ async fn produce(
     }
 }
 
-/// Ready rows of this persona's queues placed in an older ring generation than a row
-/// at an earlier position of the same lane.
-async fn sample_misplaced(
-    shared: &Shared,
-    pool: &PgPool,
-    schema: &str,
-    queues: &[String],
-    seen: &mut HashSet<i64>,
-) {
-    let misplaced: Result<Vec<i64>, _> = sqlx::query_scalar(&format!(
-        "SELECT job_id FROM (
-            SELECT job_id, ready_generation,
-                   max(ready_generation) OVER (
-                       PARTITION BY queue, priority, enqueue_shard ORDER BY lane_seq
-                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS newest_before
-            FROM {schema}.ready_entries WHERE queue = ANY($1)
-         ) lanes WHERE ready_generation < newest_before"
-    ))
-    .bind(queues)
-    .fetch_all(pool)
-    .await;
-    match misplaced {
-        Ok(ids) => {
-            let before = seen.len();
-            seen.extend(ids);
-            if before == 0 && !seen.is_empty() {
-                shared.note(
-                    "txn",
-                    "a ready row sits in an older ring generation than an earlier row of its lane",
-                );
-            }
-        }
-        Err(error) => {
-            shared.stats(Persona::Txn).add("misplaced_sample_errors", 1);
-            if shared.stats(Persona::Txn).get("misplaced_sample_errors") <= 3 {
-                shared.note("txn", format!("misplaced-row sample failed: {error}"));
-            }
-        }
-    }
-}
-
 pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     let persona = Persona::Txn;
     let queues: Arc<Vec<Arc<QueueInfo>>> = Arc::new(
@@ -333,12 +394,12 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     );
     let queue_names: Vec<String> = queues.iter().map(|queue| queue.name.clone()).collect();
 
-    let sampler_pool = super::super::db::connect_sampler_pool(
+    let diag_pool = super::super::db::connect_sampler_pool(
         &shared.config.database_url,
-        "soak_txn_sampler",
-        shared.budget.reserve("txn-sampler", 1, 1),
-        shared.config.sampler_statement_timeout,
-        shared.config.sampler_lock_timeout,
+        "soak_txn_diagnostics",
+        shared.budget.reserve("txn-diagnostics", 5, 2),
+        shared.config.diag_statement_timeout,
+        shared.config.diag_lock_timeout,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -348,7 +409,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     )
     .bind(SHARDED_QUEUE)
     .bind(ENQUEUE_SHARDS)
-    .execute(&sampler_pool)
+    .execute(&diag_pool)
     .await
     .map_err(|error| format!("set enqueue_shards: {error}"))?;
 
@@ -368,13 +429,19 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     .await?;
 
     let producers = shared.config.txn_producers.max(1);
-    let producer_pool = connect_pool(
+    let producer_pool = match connect_pool(
         &shared.config.database_url,
         "soak_txn_producer",
         shared.budget.reserve("txn-producer", producers as u32, 2),
     )
     .await
-    .map_err(|error| error.to_string())?;
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            fleet.shutdown_all(Duration::from_secs(20), &shared).await;
+            return Err(error.to_string());
+        }
+    };
     shared.note(
         "txn",
         format!(
@@ -384,12 +451,23 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         ),
     );
 
+    let schema = shared
+        .info
+        .queue_storage_schema
+        .clone()
+        .unwrap_or_else(|| "awa".to_string());
+    let placement = Arc::new(Placement {
+        pool: diag_pool.clone(),
+        schema,
+        misplaced: Mutex::new(HashSet::new()),
+    });
     let committed: Committed = Arc::new(Mutex::new(HashMap::new()));
     let tasks: Vec<_> = (0..producers)
         .map(|producer| {
             tokio::spawn(produce(
                 shared.clone(),
                 producer_pool.clone(),
+                placement.clone(),
                 queues.clone(),
                 committed.clone(),
                 producer,
@@ -397,40 +475,30 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         })
         .collect();
 
-    let schema = shared
-        .info
-        .queue_storage_schema
-        .clone()
-        .unwrap_or_else(|| "awa".to_string());
-    let mut misplaced = HashSet::new();
+    let mut completed_samples = 0u64;
     while !shared.load_stop.sleep(Duration::from_secs(1)).await {
-        sample_misplaced(
-            &shared,
-            &sampler_pool,
-            &schema,
-            &queue_names,
-            &mut misplaced,
-        )
-        .await;
+        completed_samples += u64::from(placement.sample(&shared, &queue_names, false).await);
     }
+    let mut producer_failure = None;
     for task in tasks {
-        task.await
-            .map_err(|error| format!("txn producer: {error}"))?;
+        if let Err(error) = task.await {
+            producer_failure.get_or_insert(format!("txn producer: {error}"));
+        }
     }
-    sample_misplaced(
-        &shared,
-        &sampler_pool,
-        &schema,
-        &queue_names,
-        &mut misplaced,
-    )
-    .await;
-    sampler_pool.close().await;
+    completed_samples += u64::from(placement.sample(&shared, &queue_names, true).await);
+    if completed_samples == 0 {
+        shared.incomplete("the txn lane sampler never completed a sample", vec![]);
+    }
+    diag_pool.close().await;
     producer_pool.close().await;
+    if let Some(error) = producer_failure {
+        fleet.shutdown_all(Duration::from_secs(20), &shared).await;
+        return Err(error);
+    }
+    let misplaced = std::mem::take(&mut *placement.misplaced.lock().expect("txn misplaced"));
     if !misplaced.is_empty() {
         let committed = committed.lock().expect("txn committed");
-        let mut sample: Vec<i64> = misplaced.iter().copied().collect();
-        sample.sort_unstable();
+        let sample: BTreeSet<i64> = misplaced.iter().copied().collect();
         shared.violation(
             "lane_generation_order",
             format!(
