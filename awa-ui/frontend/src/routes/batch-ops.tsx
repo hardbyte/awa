@@ -233,9 +233,10 @@ export function BatchOpsPage() {
   const readOnly = useReadOnly();
   const search = useSearch({ strict: false }) as Record<string, unknown>;
   const [form, setForm] = useState<BatchForm>(() => initialForm(search));
-  // A preview holds the filter it was taken with: it stands for the form
-  // only while the form's filter is the same.
+  // A preview holds the operation kind and filter it was taken with: it
+  // stands for the form only while both are the same.
   const [preview, setPreview] = useState<{
+    opKind: BatchOperationKind;
     filter: BatchOperationFilter;
     result: BatchOperationPreview;
   } | null>(null);
@@ -246,12 +247,14 @@ export function BatchOpsPage() {
   const narrowing = isNarrowing(payload.filter);
   const isPayloadValid = isPayloadFormValid(form) && formFilterError === null && narrowing;
   const currentPreview =
-    preview && sameFilter(preview.filter, payload.filter) ? preview.result : null;
+    preview && preview.opKind === payload.op_kind && sameFilter(preview.filter, payload.filter)
+      ? preview.result
+      : null;
   const currentCount = currentPreview ? previewCount(currentPreview) : null;
   const submitHint = !isPayloadValid || currentPreview
     ? null
     : preview
-      ? "Filter changed; preview again"
+      ? "Operation or filter changed; preview again"
       : "Preview first";
 
   const operationsQuery = useManagedQuery({
@@ -265,7 +268,7 @@ export function BatchOpsPage() {
       return previewBatchOperation(previewed);
     },
     onSuccess: (result, previewed) => {
-      setPreview({ filter: previewed.filter, result });
+      setPreview({ opKind: previewed.op_kind, filter: previewed.filter, result });
       toast.success(`Preview matched ${formatCount(previewCount(result))} job(s)`);
     },
     onError: (error) => toast.error(error.message),

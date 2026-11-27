@@ -190,7 +190,7 @@ test.describe("Batch operations page", () => {
     await page.getByLabel("Kind filter").fill("e2e_job");
     await expect(submit).toBeDisabled();
     await expect(page.getByTestId("batch-submit-hint")).toHaveText(
-      "Filter changed; preview again"
+      "Operation or filter changed; preview again"
     );
     await expect(page.getByTestId("batch-preview-count")).toHaveCount(0);
 
@@ -200,6 +200,29 @@ test.describe("Batch operations page", () => {
 
     // Back to the previewed filter, the preview stands for it again.
     await page.getByLabel("State filter").selectOption({ label: "Available or scheduled" });
+    await expect(submit).toBeEnabled();
+  });
+
+  test("Submit waits for a preview of the form's current operation", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({ json: { total_matched: 3, sample: [] } })
+    );
+
+    await page.goto("/batch-ops?queue=e2e_test");
+    const submit = page.getByRole("button", { name: "Submit" });
+    await page.getByLabel("Operation").selectOption("retry");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await expect(submit).toBeEnabled();
+
+    await page.getByLabel("Operation").selectOption("purge_dlq");
+    await expect(submit).toBeDisabled();
+    await expect(page.getByTestId("batch-submit-hint")).toHaveText(
+      "Operation or filter changed; preview again"
+    );
+    await expect(page.getByTestId("batch-preview-count")).toHaveCount(0);
+
+    await page.getByLabel("Operation").selectOption("retry");
     await expect(submit).toBeEnabled();
   });
 
