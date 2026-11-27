@@ -294,31 +294,43 @@ pub async fn queue_storage_schema_ready<'e, E>(executor: E, schema: &str) -> Res
 where
     E: PgExecutor<'e>,
 {
+    // Catalog rows, not name lookups: a name lookup can lag a commit the snapshot already sees.
     sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
-            to_regclass(format('%I.%I', $1, 'job_id_seq')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_claim_receipt_id_seq')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_claim_batch_id_seq')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'queue_ring_rotations')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_ring_rotations')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'claim_ring_rotations')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'queue_terminal_rollup_deltas')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'ready_claim_attempt_batches')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'ready_tombstones')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'ready_segments')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'done_entries')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'receipt_completion_batches')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'receipt_completion_tombstones')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'queue_terminal_count_deltas')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'leases')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'deferred_jobs')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_claims')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_claim_batches')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_claim_closures')) IS NOT NULL
-            AND to_regclass(format('%I.%I', $1, 'lease_claim_closure_batches')) IS NOT NULL
+            (
+                SELECT count(c.oid) = cardinality(required.names)
+                FROM (SELECT ARRAY[
+                'job_id_seq',
+                'lease_claim_receipt_id_seq',
+                'lease_claim_batch_id_seq',
+                'queue_ring_state',
+                'queue_ring_rotations',
+                'lease_ring_rotations',
+                'claim_ring_rotations',
+                'queue_terminal_rollup_deltas',
+                'ready_entries',
+                'ready_claim_attempt_batches',
+                'ready_tombstones',
+                'ready_segments',
+                'done_entries',
+                'receipt_completion_batches',
+                'receipt_completion_tombstones',
+                'queue_terminal_count_deltas',
+                'leases',
+                'deferred_jobs',
+                'lease_claims',
+                'lease_claim_batches',
+                'lease_claim_closures',
+                'lease_claim_closure_batches'
+                ]::name[] AS names) AS required
+                LEFT JOIN pg_catalog.pg_namespace AS n
+                  ON n.nspname = $1
+                LEFT JOIN pg_catalog.pg_class AS c
+                  ON c.relnamespace = n.oid
+                 AND c.relname = ANY(required.names)
+                GROUP BY required.names
+            )
             AND EXISTS (
                 SELECT 1
                 FROM information_schema.columns
@@ -339,16 +351,17 @@ where
             )
             AND EXISTS (
                 SELECT 1
-                FROM pg_proc AS p
-                JOIN pg_namespace AS n
+                FROM pg_catalog.pg_proc AS p
+                JOIN pg_catalog.pg_namespace AS n
                   ON n.oid = p.pronamespace
                 WHERE n.nspname = $1
-                  AND p.oid = to_regprocedure(
-                      format('%I.%I(text,bigint,double precision,double precision)', $1, 'claim_ready_runtime')
-                  )::oid
-                  AND position('receipt_id' IN pg_get_function_result(p.oid)) > 0
-                  AND position('claim_batch_id' IN pg_get_function_result(p.oid)) > 0
-                  AND position('claim_batch_index' IN pg_get_function_result(p.oid)) > 0
+                  AND p.proname = 'claim_ready_runtime'
+                  AND p.pronargs = 4
+                  AND p.proargtypes[0] = 'text'::regtype
+                  AND p.proargtypes[1] = 'bigint'::regtype
+                  AND p.proargtypes[2] = 'double precision'::regtype
+                  AND p.proargtypes[3] = 'double precision'::regtype
+                  AND p.proargnames @> ARRAY['receipt_id', 'claim_batch_id', 'claim_batch_index']
             )
         "#,
     )
