@@ -387,8 +387,22 @@ pub const EXTENDED_FILTER_MIN_RUNTIME: &str = "0.7.0-alpha.2";
 pub(crate) async fn require_fleet_for_extended_filters(
     pool: &sqlx::PgPool,
 ) -> Result<(), AwaError> {
-    let minimum = semver::Version::parse(EXTENDED_FILTER_MIN_RUNTIME)
-        .expect("the extended-filter runtime floor is valid semver");
+    require_live_runtimes_at_least(
+        pool,
+        EXTENDED_FILTER_MIN_RUNTIME,
+        "this filter uses several tags or states, or dead_lettered",
+    )
+    .await
+}
+
+/// Refuse `what` while a live runtime reports a version older than
+/// `minimum`. Unknown and non-semver versions fail closed.
+pub(crate) async fn require_live_runtimes_at_least(
+    pool: &sqlx::PgPool,
+    minimum: &str,
+    what: &str,
+) -> Result<(), AwaError> {
+    let floor = semver::Version::parse(minimum).expect("the runtime floor is valid semver");
     let live: Vec<(String, String)> = sqlx::query_as(
         // The same liveness window cron reconciliation uses: three snapshot
         // intervals, and never under 30 seconds.
@@ -402,7 +416,7 @@ pub(crate) async fn require_fleet_for_extended_filters(
     let old: Vec<String> = live
         .into_iter()
         .filter(|(_, version)| {
-            semver::Version::parse(version).map_or(true, |reported| reported < minimum)
+            semver::Version::parse(version).map_or(true, |reported| reported < floor)
         })
         .map(|(id, version)| format!("{id} ({version})"))
         .collect();
@@ -410,8 +424,7 @@ pub(crate) async fn require_fleet_for_extended_filters(
         return Ok(());
     }
     Err(AwaError::Validation(format!(
-        "this filter uses several tags or states, or dead_lettered, which runtimes older \
-         than {EXTENDED_FILTER_MIN_RUNTIME} cannot run; {} live runtime(s) are older: {}",
+        "{what}, which runtimes older than {minimum} cannot run; {} live runtime(s) are older: {}",
         old.len(),
         old.join(", ")
     )))

@@ -452,6 +452,55 @@ async fn extended_filters_wait_for_the_fleet() {
 }
 
 #[tokio::test]
+async fn bulk_action_kinds_wait_for_the_fleet() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    sqlx::query(
+        "INSERT INTO awa.runtime_instances (instance_id, hostname, pid, version, started_at, \
+           last_seen_at, snapshot_interval_ms, healthy, postgres_connected, poll_loop_alive, \
+           heartbeat_alive, shutting_down, leader, queues, maintenance_alive, \
+           queue_descriptor_hashes, job_kind_descriptor_hashes, storage_capability, \
+           transition_role) \
+         VALUES (gen_random_uuid(), 'old-host', 1, '0.7.0-alpha.1', now(), now(), 10000, true, \
+           true, true, true, false, false, '[]', true, '{}', '{}', 'queue_storage', 'auto')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let submit = |spec: BatchOperationSpec| SubmitBatchOperation {
+        spec,
+        filter: JobFilter::new().queue("batch-fleet"),
+        submitted_by: Some("test".into()),
+        allow_all: false,
+    };
+    for spec in [
+        BatchOperationSpec::Retry,
+        BatchOperationSpec::Cancel,
+        BatchOperationSpec::Discard,
+        BatchOperationSpec::MoveToDlq { reason: None },
+        BatchOperationSpec::RetryFromDlq,
+        BatchOperationSpec::PurgeDlq,
+    ] {
+        let kind = spec.kind();
+        let err = batch_operations::submit_batch_operation(&pool, submit(spec))
+            .await
+            .expect_err("an old leader would fail the operation");
+        assert!(err.to_string().contains("0.7.0-alpha.1"), "{kind:?}: {err}");
+    }
+    batch_operations::submit_batch_operation(
+        &pool,
+        submit(BatchOperationSpec::SetPriority { priority: 1 }),
+    )
+    .await
+    .expect("an old leader runs set_priority");
+    let submitted: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.batch_operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(submitted, 1);
+}
+
+#[tokio::test]
 async fn dlq_paths_share_the_filter() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
