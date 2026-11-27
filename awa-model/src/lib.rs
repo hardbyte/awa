@@ -10,6 +10,7 @@ pub mod dlq;
 pub mod error;
 pub mod filter;
 pub mod insert;
+pub mod isolation;
 pub mod job;
 mod job_query;
 pub mod kind;
@@ -24,6 +25,9 @@ mod storage_footprint_sql;
 pub mod tag_index;
 pub mod trace;
 pub mod unique;
+mod wakeup;
+
+pub use wakeup::flush_wakeups;
 
 // Re-exports for ergonomics
 pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};

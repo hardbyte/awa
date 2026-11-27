@@ -15,6 +15,7 @@ use awa_model::admin::{
     RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
 use awa_model::audited_sql;
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::{
     storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
     RingRotationCadence,
@@ -34,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// How long [`Client::shutdown`] waits for pending queue wake-ups to be sent.
+const SHUTDOWN_WAKEUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Errors returned when building a worker client.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -186,6 +190,7 @@ pub struct ClientBuilder {
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
     max_concurrent_claims: Option<usize>,
+    max_concurrent_finalizes: Option<usize>,
     dlq_enabled_by_default: bool,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -252,6 +257,7 @@ impl ClientBuilder {
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
             max_concurrent_claims: None,
+            max_concurrent_finalizes: None,
             dlq_enabled_by_default: false,
             dlq_retention: None,
             dlq_cleanup_batch_size: None,
@@ -958,6 +964,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound the number of direct finalize transactions this runtime runs
+    /// concurrently on queue storage: retries, snoozes, cancels, callback
+    /// waits, failures, completions with follow-up enqueues, and completions
+    /// written directly after a completion batch fails. Completions written
+    /// by the completion batcher and canonical storage are not counted.
+    /// Defaults to a quarter of the pool, clamped to `4..=64`. Independent of
+    /// [`Self::max_concurrent_claims`]. The limit also caps direct finalize
+    /// throughput; raise it for workloads dominated by retries, snoozes or
+    /// callback waits when the pool has connections to spare.
+    pub fn max_concurrent_finalizes(mut self, limit: usize) -> Self {
+        self.max_concurrent_finalizes = Some(limit.max(1));
+        self
+    }
+
     /// Enable or disable DLQ routing by default.
     pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {
         self.dlq_enabled_by_default = enabled;
@@ -1271,7 +1291,12 @@ impl ClientBuilder {
                 .map(|(name, _)| (name.clone(), Arc::new(AtomicBool::new(false))))
                 .collect(),
         );
-        let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides);
+        let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides)
+            .with_queue_stripe_count(
+                self.storage
+                    .queue_storage()
+                    .map_or(1, |runtime| runtime.store.queue_stripe_count()),
+            );
 
         let health_addr = match self.health_addr {
             Some(addr) => Some(addr),
@@ -1339,6 +1364,7 @@ impl ClientBuilder {
             queue_retention_overrides: self.queue_retention_overrides,
             queue_stats_interval: self.queue_stats_interval,
             max_concurrent_claims: self.max_concurrent_claims,
+            max_concurrent_finalizes: self.max_concurrent_finalizes,
             dlq_policy,
             dlq_retention: self.dlq_retention,
             dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
@@ -1447,6 +1473,7 @@ pub struct Client {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Option<Duration>,
     max_concurrent_claims: Option<usize>,
+    max_concurrent_finalizes: Option<usize>,
     dlq_policy: DlqPolicy,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -1789,6 +1816,33 @@ impl Client {
         }
     }
 
+    /// awa's own transactions name READ COMMITTED, but single statements it
+    /// runs outside one, such as heartbeats, take the session's default
+    /// isolation.
+    /// Above READ COMMITTED those fail with serialization errors under
+    /// contention instead of waiting and seeing the rows they waited for.
+    async fn warn_on_default_isolation_above_read_committed(&self) {
+        let isolation: Result<String, sqlx::Error> =
+            sqlx::query_scalar("SELECT current_setting('default_transaction_isolation')")
+                .fetch_one(&self.pool)
+                .await;
+        match isolation {
+            Ok(isolation) if isolation != "read committed" && isolation != "read uncommitted" => {
+                warn!(
+                    default_transaction_isolation = %isolation,
+                    "The worker pool's default_transaction_isolation is above read committed; \
+                     single statements outside awa's transactions run at that level and can fail with \
+                     serialization errors. Give the pool's connections \
+                     default_transaction_isolation = 'read committed'"
+                )
+            }
+            Ok(_) => {}
+            Err(err) => {
+                debug!(error = %err, "Could not read default_transaction_isolation")
+            }
+        }
+    }
+
     async fn log_transition_startup_status(
         &self,
         effective_storage: &RuntimeStorage,
@@ -1863,6 +1917,7 @@ impl Client {
         self.log_transition_startup_status(&effective_storage)
             .await?;
         self.warn_on_unsafe_prune_lock_timeout().await;
+        self.warn_on_default_isolation_above_read_committed().await;
 
         admin::sync_queue_descriptors(
             &self.pool,
@@ -1941,6 +1996,9 @@ impl Client {
             self.finalizers.clone(),
             self.service_cancel.clone(),
             runtime_worker_capacity,
+            self.max_concurrent_finalizes.unwrap_or_else(|| {
+                (self.pool.options().get_max_connections() as usize / 4).clamp(4, 64)
+            }),
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
@@ -2204,6 +2262,8 @@ impl Client {
     /// 3. Wait for dispatchers to exit
     /// 4. Drain in-flight jobs (heartbeat + maintenance still alive!)
     /// 5. Stop heartbeat + maintenance
+    /// 6. Send pending queue wake-ups, for at most one second beyond
+    ///    `timeout`
     pub async fn shutdown(&self, timeout: Duration) {
         info!("Initiating graceful shutdown");
 
@@ -2283,6 +2343,11 @@ impl Client {
             self.metrics.record_queue_workers(queue, 0, 0);
         }
 
+        // Phase 6: Send the wake-ups that retries and enqueues during the
+        // drain left pending, so other runtimes claim those jobs now rather
+        // than at their next poll.
+        awa_model::flush_wakeups(&self.pool, SHUTDOWN_WAKEUP_FLUSH_TIMEOUT).await;
+
         info!("Awa worker runtime stopped");
     }
 
@@ -2315,7 +2380,7 @@ impl Client {
         default_action: awa_model::DefaultAction,
         run_lease: Option<i64>,
     ) -> Result<awa_model::ResolveOutcome, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let outcome =
             admin::resolve_callback_in_tx(&mut tx, callback_id, payload, default_action, run_lease)
                 .await?;
@@ -2375,7 +2440,7 @@ impl Client {
         payload: Option<serde_json::Value>,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let job = admin::complete_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
         self.dispatch_callback_followups_in_tx(
             &mut tx,
@@ -2403,7 +2468,7 @@ impl Client {
         callback_id: Uuid,
         opts: awa_model::ExternalCompletion,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let (job, dropped) =
             admin::complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
         self.dispatch_callback_followups_in_tx(
@@ -2437,7 +2502,7 @@ impl Client {
         error: &str,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let job = admin::fail_external_in_tx(&mut tx, callback_id, error, run_lease).await?;
         let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
             error: error.to_string(),
@@ -2479,7 +2544,7 @@ impl Client {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let parked_attempt: Option<i16> = sqlx::query_scalar(
             "SELECT attempt FROM awa.jobs \
              WHERE callback_id = $1 AND state = 'waiting_external' \
@@ -2665,7 +2730,7 @@ impl RuntimeReporterState {
 
     async fn publish_evidence_checked(&self, check: bool) -> Result<(), awa_model::AwaError> {
         let snapshot = self.snapshot_input().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         awa_model::cron_reconciliation::lock(&mut tx).await?;
         admin::upsert_runtime_snapshot(&mut *tx, &snapshot).await?;
         if let Some(config) = &self.periodic_reconciliation {

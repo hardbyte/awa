@@ -157,6 +157,14 @@ impl FinalizationBudget {
         state.paused_at.is_none().then_some(state.deadline)
     }
 
+    /// Stops the budget's clock until the returned guard is dropped, as a
+    /// wait for an acknowledgement does.
+    pub(crate) fn pause(&self) -> BudgetPause {
+        BudgetPause {
+            _wait: self.wait_for_acknowledgement(),
+        }
+    }
+
     fn wait_for_acknowledgement(&self) -> AcknowledgementWait {
         let mut state = self.inner.state.lock().unwrap();
         if state.acknowledgement_waits == 0 {
@@ -219,6 +227,11 @@ impl FinalizationBudget {
 
 struct AcknowledgementWait {
     budget: FinalizationBudget,
+}
+
+/// Keeps a [`FinalizationBudget`] paused while it lives.
+pub(crate) struct BudgetPause {
+    _wait: AcknowledgementWait,
 }
 
 impl Drop for AcknowledgementWait {

@@ -82,21 +82,22 @@ impl AwaError {
     /// `40P01`). Nothing the transaction did was applied, so a caller whose
     /// statements are idempotent may simply run it again.
     pub fn is_deadlock(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("40P01")
-        )
+        matches!(self, AwaError::Database(err) if pg_session_lock::is_deadlock(err))
+    }
+
+    /// Postgres aborted a `REPEATABLE READ` or `SERIALIZABLE` transaction
+    /// because it could not be serialized against a concurrent one (SQLSTATE
+    /// `40001`). Nothing the transaction did was applied; run the whole
+    /// transaction again. Under these isolation levels a race on a unique key
+    /// can also surface as `40001` rather than a unique violation.
+    pub fn is_serialization_failure(&self) -> bool {
+        matches!(self, AwaError::Database(err) if pg_session_lock::is_serialization_failure(err))
     }
 
     /// Postgres cancelled the statement at its `statement_timeout` (SQLSTATE
     /// `57014`).
     pub fn is_statement_timeout(&self) -> bool {
-        matches!(
-            self,
-            AwaError::Database(sqlx::Error::Database(database))
-                if database.code().as_deref() == Some("57014")
-        )
+        matches!(self, AwaError::Database(err) if pg_session_lock::is_query_canceled(err))
     }
 
     /// The statement named a column the table does not have (SQLSTATE 42703),
@@ -234,5 +235,14 @@ mod tests {
             assert!(!sqlstate(code).is_connection_lost(), "{code}");
         }
         assert!(sqlstate("40P01").is_deadlock());
+    }
+
+    #[test]
+    fn serialization_failure_is_sqlstate_40001_only() {
+        assert!(sqlstate("40001").is_serialization_failure());
+        for code in ["40P01", "23505", "55P03"] {
+            assert!(!sqlstate(code).is_serialization_failure(), "{code}");
+        }
+        assert!(!AwaError::Validation("40001".into()).is_serialization_failure());
     }
 }

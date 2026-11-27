@@ -1,6 +1,7 @@
 //! Owner-scoped periodic declarations and reconciliation. All decisions use
 //! database time. Writes share the runtime-evidence transaction serializer;
 //! previews read a consistent committed snapshot without taking the writer lock.
+use crate::isolation::BeginReadCommitted;
 use crate::{
     cron::{self, CronJobRow, PeriodicJob},
     AwaError,
@@ -466,7 +467,7 @@ async fn evaluate(
     apply: bool,
 ) -> Result<CronReconciliationPlan, AwaError> {
     let mut tx = if apply {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_read_committed().await?;
         lock(&mut tx).await?;
         tx
     } else {
@@ -525,7 +526,7 @@ pub async fn operate(
         ));
     }
     let mut tx = if apply {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_read_committed().await?;
         lock(&mut tx).await?;
         tx
     } else {

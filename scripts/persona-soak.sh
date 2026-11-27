@@ -33,15 +33,41 @@
 #   AWA_SOAK_HEARTBEAT_SECONDS, AWA_SOAK_STALENESS_SECONDS
 #                             heartbeat interval and heartbeat staleness of every runtime (default 2 s
 #                             and 12 s, so rescues happen often; the library's are 30 s and 90 s)
+#   AWA_SOAK_MEMORY_SLOPE_MIB_PER_100K, AWA_SOAK_MEMORY_WARMUP_SECONDS,
+#   AWA_SOAK_MEMORY_MIN_EXECUTIONS, AWA_SOAK_MEMORY_SAMPLE_SECONDS
+#                             memory growth gate: largest accepted growth of the soak process's
+#                             resident memory per 100k executions after the warm-up (default 64 MiB,
+#                             120 s warm-up, evaluated from 20000 executions, sampled every 5 s)
+#   AWA_SOAK_COMPLETION_STALL_SECONDS, AWA_SOAK_COMPLETION_STALL_MEMORY_MIB
+#                             halfway through the load, hold back queue-storage completions for this
+#                             many seconds while claims continue (default 0: off); resident memory
+#                             may rise by at most the given MiB over the stall (default 128)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
 #   SOAK_PG_CPUS              CPU limit for each database container (default: none)
+#   SOAK_PG_MEMORY            memory limit for each database container, as `docker run --memory`
+#                             takes it (default: none)
+#   SOAK_PG_ARGS              extra server arguments for pg17 and pg18, e.g.
+#                             "-c log_lock_waits=on -c deadlock_timeout=5ms"
+#   SOAK_KEEP_SERVER_LOG      set to 1 to write server.log for a run that passed too
+#   AWA_SOAK_QUEUE_ROTATE_MS, AWA_SOAK_CLAIM_ROTATE_MS, AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS
+#                             queue and claim ring rotation intervals and the prune lock timeout
+#                             of every in-process runtime (default: the pressure base interval for
+#                             the rings, 1000 ms or 4000 ms, and the library's 10 ms)
+#   AWA_PRESSURE_ROTATE_MULTIPLIER
+#                             1 (default) or 4: the base rotation interval of the queue, lease and
+#                             claim rings of every runtime, including the python and
+#                             claim-and-abandon processes, as 1000 ms or 4000 ms
 #   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0; the
 #                             -epqlog5 build, which logs every partition-pruning setup with its
 #                             query text, is opt-in for diagnosing pruning crashes)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
 #                             (neither is needed without the UI and python personas)
+#   AWA_SOAK_GATE_PROOF       1 adds the durable handler-return and completion witnesses; with the
+#                             python persona, preparation also installs asyncpg into
+#                             awa-python/.venv, and the run refuses to start when AWA_SOAK_PYTHON
+#                             cannot import it
 #   SOAK_TEST_BIN             a prebuilt harness binary to run instead of `cargo test`
 #   CARGO_TARGET_DIR          cargo target directory, as for any cargo build
 #
@@ -69,6 +95,17 @@ fi
 
 mkdir -p "$RESULTS_DIR"
 
+# The python persona writes its gate-proof witnesses with asyncpg, which is only a dev
+# dependency of awa-python.
+GATE_PROOF_PYTHON_DEPS="asyncpg>=0.31.0"
+python_gate_proof() {
+  [ "${AWA_SOAK_GATE_PROOF:-0}" = 1 ] || return 1
+  case ",${AWA_SOAK_PERSONAS:-python}," in
+    *,python,*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 prepare() {
   echo "== building the awa binary and the Python bindings"
   cargo build --release -p awa-cli || return 1
@@ -76,12 +113,20 @@ prepare() {
     uv venv --quiet awa-python/.venv || return 1
     uv pip install --quiet --python awa-python/.venv maturin || return 1
   fi
+  if python_gate_proof && [ -z "${AWA_SOAK_PYTHON:-}" ]; then
+    uv pip install --quiet --python awa-python/.venv "$GATE_PROOF_PYTHON_DEPS" || return 1
+  fi
   (cd awa-python && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" maturin develop --release) || return 1
 }
 if [ "${SOAK_SKIP_PREPARE:-0}" != 1 ]; then
   prepare >"$RESULTS_DIR/prepare.log" 2>&1 || { echo "prepare failed; see $RESULTS_DIR/prepare.log" >&2; exit 2; }
 fi
 export AWA_SOAK_PYTHON="${AWA_SOAK_PYTHON:-$PWD/awa-python/.venv/bin/python}"
+if python_gate_proof && ! "$AWA_SOAK_PYTHON" -c 'import asyncpg' >/dev/null 2>&1; then
+  echo "AWA_SOAK_GATE_PROOF=1 needs asyncpg in $AWA_SOAK_PYTHON for the python persona; install it with:" >&2
+  echo "  uv pip install --python '$AWA_SOAK_PYTHON' '$GATE_PROOF_PYTHON_DEPS'" >&2
+  exit 2
+fi
 export AWA_SOAK_AWA_BIN="${AWA_SOAK_AWA_BIN:-${CARGO_TARGET_DIR:-$PWD/target}/release/awa}"
 CONTAINERS=()
 STATS_PID=""
@@ -99,7 +144,11 @@ start_container() {
   local engine="$1" name="$2" port="$3"
   local cpu_args=()
   [ -n "${SOAK_PG_CPUS:-}" ] && cpu_args=(--cpus "$SOAK_PG_CPUS")
+  [ -n "${SOAK_PG_MEMORY:-}" ] && cpu_args+=(--memory "$SOAK_PG_MEMORY")
   local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a ")
+  local extra=()
+  read -r -a extra <<<"${SOAK_PG_ARGS:-}"
+  common+=("${extra[@]}")
   case "$engine" in
     pg17)
       docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
@@ -205,6 +254,10 @@ for index in "${!ENGINES[@]}"; do
     [ "$engine" = pg18-cassert ] && docker exec "$name" cat "$SOAK_PG_LOG_FILE" >"$out/server.log" 2>/dev/null
   else
     echo "   passed; report in $out/report.md"
+    if [ "${SOAK_KEEP_SERVER_LOG:-0}" = 1 ]; then
+      docker logs "$name" >"$out/server.log" 2>&1 || true
+      [ "$engine" = pg18-cassert ] && docker exec "$name" cat "$SOAK_PG_LOG_FILE" >"$out/server.log" 2>/dev/null
+    fi
   fi
   docker rm -f -v "$name" >/dev/null 2>&1
 done

@@ -31,8 +31,8 @@ exit code from a piped or backgrounded command.
 
 ### Version matrix
 
-CI runs the sharded Rust suite and the queue-storage leg against **Postgres 17
-and 18** — both majors run the whole suite, because the schema, its
+CI runs the sharded Rust suite and the queue-storage leg against **Postgres 17,
+18 and 19** — every major runs the whole suite, because the schema, its
 partitioning, and the planner behaviour the claim path depends on are all
 version-sensitive.
 
@@ -131,7 +131,9 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
 - [ ] Safe under live load: no long `ACCESS EXCLUSIVE` holds on hot tables; note the expected wall time on realistic data volumes.
 - [ ] The current binary remains operable before migration, or startup applies the migration before any changed path runs. Test binary-first as well as migrate-first ordering.
 - [ ] Document requirements for external runners, which do not execute Rust preflights.
-- [ ] If it adds or changes a trigger on `awa.jobs_hot` / `awa.scheduled_jobs`, or a table such a trigger writes, keep [ADR-045](docs/adr/045-hot-path-trigger-lock-contract.md): no `ON CONFLICT`, `TRUNCATE`, `LOCK`, row locks (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), or writes outside the allowlist; `hot_path_triggers_cannot_wait_on_other_transactions` enforces it.
+- [ ] A function that sets its own `search_path` lists `pg_temp` last and leaves `public` out; a `SECURITY DEFINER` function names every table with its schema. The search_path epilogue (`awa.pin_function_search_paths`, run after every step that includes v023 and at the end of the installer) rewrites older paths in place; `ring_cursor_temp_schema_test` checks every function's path, and calls every definer function a runtime role can execute with each table shadowed by a temporary view. A new definer function needs a call in its `definer_call`.
+- [ ] Take a session advisory lock (`pg_advisory_lock`, `pg_try_advisory_lock`) inside a block whose `EXCEPTION` handler names `query_canceled` as well as `OTHERS` and unlocks; `WHEN OTHERS` does not match a cancel or statement timeout, and a lock left held rides the pooled connection. Prefer `pg_advisory_xact_lock`. From Rust, use `pg_session_lock::SessionAdvisoryLock` (the `pg-session-lock` crate in this repo). `scripts/check-advisory-locks.py` enforces both.
+- [ ] If it adds or changes a trigger on `awa.jobs_hot` / `awa.scheduled_jobs`, or a table such a trigger writes, keep rule 1 of [ADR-053](docs/adr/053-coordination-off-the-commit-path.md): no `ON CONFLICT`, `TRUNCATE`, `LOCK`, row locks (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), or writes outside the allowlist; `hot_path_triggers_cannot_wait_on_other_transactions` enforces it.
 
 **If compatibility first ships in an earlier-release patch**
 

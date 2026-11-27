@@ -1,0 +1,20 @@
+[package]
+name = "pg-session-lock"
+# Versioned on its own, not with the workspace: released from a
+# `pg-session-lock-v*` tag by .github/workflows/pg-session-lock-release.yml.
+# Each sqlx 0.x release it moves to is a breaking release of this crate.
+version = "0.1.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "PostgreSQL session advisory locks for sqlx pools that never return a connection to the pool while it holds the lock"
+repository = "https://github.com/hardbyte/awa"
+readme = "README.md"
+keywords = ["postgres", "sqlx", "advisory-lock", "lock", "leader-election"]
+categories = ["database", "asynchronous", "concurrency"]
+
+[dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
+
+[dev-dependencies]
+sqlx = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["full"] }

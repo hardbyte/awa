@@ -3,6 +3,7 @@ use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState, PreparedJobInsert};
 use sqlx::PgPool;
@@ -12,7 +13,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, info_span, warn, Instrument};
@@ -153,6 +154,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 pub struct DlqPolicy {
     pub enabled_default: bool,
     pub overrides: Arc<HashMap<String, bool>>,
+    queue_stripe_count: usize,
 }
 
 impl DlqPolicy {
@@ -160,14 +162,39 @@ impl DlqPolicy {
         Self {
             enabled_default,
             overrides: Arc::new(overrides),
+            queue_stripe_count: 1,
         }
     }
 
+    /// The runtime's `QueueStorageConfig::queue_stripe_count`. With more
+    /// than one stripe, a queue named `q#N` is a stripe of `q`.
+    pub fn with_queue_stripe_count(mut self, queue_stripe_count: usize) -> Self {
+        self.queue_stripe_count = queue_stripe_count;
+        self
+    }
+
+    /// Whether `queue` routes exhausted jobs to the DLQ. While the runtime
+    /// stripes its queues, a stripe `q#N` takes the override of its logical
+    /// queue `q` unless it has one of its own.
     pub fn enabled_for(&self, queue: &str) -> bool {
         self.overrides
             .get(queue)
+            .or_else(|| {
+                self.stripe_logical_queue(queue)
+                    .and_then(|logical| self.overrides.get(logical))
+            })
             .copied()
             .unwrap_or(self.enabled_default)
+    }
+
+    /// The logical queue of `queue` when it is a stripe name `q#N` and the
+    /// runtime stripes its queues, as `QueueStorage` resolves it.
+    fn stripe_logical_queue<'a>(&self, queue: &'a str) -> Option<&'a str> {
+        if self.queue_stripe_count <= 1 {
+            return None;
+        }
+        let (logical, stripe) = queue.rsplit_once('#')?;
+        stripe.parse::<usize>().ok().map(|_| logical)
     }
 }
 
@@ -240,6 +267,9 @@ enum CompletionOutcome {
     },
     /// The job was already rescued/cancelled — stale completion, no event.
     IgnoredStale,
+    /// A snooze or retry was finalized as `cancelled` because a newer
+    /// duplicate holds the unique claim its successor needed.
+    CancelledDuplicate { event: Option<UntypedJobEvent> },
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +304,7 @@ pub struct JobExecutor {
     finalizers: TaskTracker,
     finalize_cancel: CancellationToken,
     finalize_capacity: Arc<Semaphore>,
+    finalize_gate: FinalizeGate,
 }
 
 impl JobExecutor {
@@ -298,10 +329,12 @@ impl JobExecutor {
         finalizers: TaskTracker,
         finalize_cancel: CancellationToken,
         runtime_worker_capacity: u32,
+        max_concurrent_finalizes: usize,
     ) -> Self {
         let finalize_capacity = Arc::new(Semaphore::new(
             completion_batcher.finalizer_capacity(runtime_worker_capacity),
         ));
+        let finalize_gate = FinalizeGate::new(max_concurrent_finalizes);
         Self {
             pool,
             workers,
@@ -317,6 +350,7 @@ impl JobExecutor {
             finalizers,
             finalize_cancel,
             finalize_capacity,
+            finalize_gate,
         }
     }
 
@@ -346,6 +380,7 @@ impl JobExecutor {
         let finalizers = self.finalizers.clone();
         let finalize_cancel = self.finalize_cancel.clone();
         let finalize_capacity = self.finalize_capacity.clone();
+        let finalize_gate = self.finalize_gate.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -411,7 +446,10 @@ impl JobExecutor {
                 }),
                 finalizing: false,
             };
-            in_flight.insert((job_id, job_run_lease), in_flight_state);
+            // An operator cancel can commit after the claim and before this
+            // registration; the registry kept it, and the cancel already
+            // closed the attempt, so there is nothing to run or finalize.
+            let cancelled_before_start = in_flight.insert((job_id, job_run_lease), in_flight_state);
             let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
                 in_flight: in_flight.clone(),
                 key: (job_id, job_run_lease),
@@ -436,6 +474,15 @@ impl JobExecutor {
 
             let mut started_event = None;
             let result = match workers.get(&job.kind) {
+                Some(_) if cancelled_before_start => {
+                    info!(
+                        kind = %job.kind,
+                        job_id,
+                        run_lease = job_run_lease,
+                        "Skipping a handler whose attempt was cancelled before it started"
+                    );
+                    None
+                }
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
@@ -588,6 +635,8 @@ impl JobExecutor {
                         let output_kept = AtomicBool::new(true);
                         let outcome = {
                             let budget = FinalizationBudget::from(COMPLETION_RECONNECT_WINDOW);
+                            let gate_scope = finalize_gate.scope(Some(budget.clone()));
+                            let gate_scope = &gate_scope;
                             let completion_batcher = if storage.queue_storage().is_some() {
                                 completion_batcher.with_acknowledgement_budget(budget.clone())
                             } else {
@@ -632,6 +681,7 @@ impl JobExecutor {
                                             storage,
                                             dlq_enabled,
                                             metrics,
+                                            gate_scope,
                                         )
                                         .await
                                         .inspect_err(|err| {
@@ -660,7 +710,14 @@ storage.queue_storage().is_some(),
                             .await
                         };
                         if !output_kept.into_inner() {
-                            if matches!(outcome, Ok(FinalizeAck { outcome: CompletionOutcome::Applied { .. }, .. })) {
+                            if matches!(
+                                outcome,
+                                Ok(FinalizeAck {
+                                    outcome: CompletionOutcome::Applied { .. }
+                                        | CompletionOutcome::CancelledDuplicate { .. },
+                                    ..
+                                })
+                            ) {
                                 record_output_dropped(&metrics, &job.kind, &job.queue, "schema_missing");
                             }
                             job.output = None;
@@ -744,6 +801,27 @@ storage.queue_storage().is_some(),
                                 }
                             }
                             Ok(FinalizeAck {
+                                outcome: CompletionOutcome::CancelledDuplicate { .. },
+                                ..
+                            }) => {
+                                // The cancelled row keeps the attempt's output
+                                // in its error history.
+                                record_output_published(&metrics, &job, &result, true);
+                                metrics.jobs_cancelled.add(
+                                    1,
+                                    &[
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.kind",
+                                            job_kind.clone(),
+                                        ),
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.queue",
+                                            job_queue.clone(),
+                                        ),
+                                    ],
+                                );
+                            }
+                            Ok(FinalizeAck {
                                 outcome: CompletionOutcome::IgnoredStale,
                                 reconnect_retries,
                                 ..
@@ -764,7 +842,12 @@ storage.queue_storage().is_some(),
                         }
 
                         if let Ok(FinalizeAck {
-                            outcome: CompletionOutcome::Applied { event: Some(event), .. }, ..
+                            outcome:
+                                CompletionOutcome::Applied {
+                                    event: Some(event), ..
+                                }
+                                | CompletionOutcome::CancelledDuplicate { event: Some(event) },
+                            ..
                         }) = outcome
                         {
                             Some(event)
@@ -848,6 +931,64 @@ enum FinalizeError {
     Operation(#[from] AwaError),
     #[error("durable finalization was not acknowledged before its retry deadline")]
     Deadline,
+}
+
+/// Bounds how many direct finalize transactions a queue-storage runtime runs
+/// at once. A finalize holds one permit for one attempt's statements, never
+/// across a retry back-off. Completions written by the completion batcher do
+/// not take a permit.
+#[derive(Clone)]
+pub(crate) struct FinalizeGate {
+    permits: Arc<Semaphore>,
+}
+
+impl FinalizeGate {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit.clamp(1, Semaphore::MAX_PERMITS))),
+        }
+    }
+
+    /// One finalize's view of the gate. While it waits for a permit, `budget`
+    /// is paused, so the wait does not count toward the finalize's retry
+    /// window.
+    fn scope(&self, budget: Option<FinalizationBudget>) -> FinalizeGateScope<'_> {
+        FinalizeGateScope { gate: self, budget }
+    }
+}
+
+struct FinalizeGateScope<'a> {
+    gate: &'a FinalizeGate,
+    budget: Option<FinalizationBudget>,
+}
+
+impl FinalizeGateScope<'_> {
+    async fn enter(&self) -> SemaphorePermit<'_> {
+        if let Ok(permit) = self.gate.permits.try_acquire() {
+            return permit;
+        }
+        let _paused = self.budget.as_ref().map(FinalizationBudget::pause);
+        self.gate
+            .permits
+            .acquire()
+            .await
+            .expect("finalize gate is never closed")
+    }
+}
+
+/// Whether a queue-storage finalize of `result` on `path` is written by the
+/// completion batcher: a `Completed` outcome with no follow-up enqueues.
+fn completes_through_batcher(
+    result: &Result<JobResult, JobError>,
+    path: CompletionPath,
+    staged_follow_ups: &[PreparedJobInsert],
+    enqueue_specs: &EnqueueSpecsByOutcome,
+    kind: &str,
+) -> bool {
+    matches!(result, Ok(JobResult::Completed))
+        && path == CompletionPath::Batched
+        && staged_follow_ups.is_empty()
+        && completed_specs(enqueue_specs, kind).is_empty()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1065,6 +1206,11 @@ fn log_applied_outcome(job: &JobRow, result: &Result<JobResult, JobError>, termi
 ///
 /// Returns a `CompletionOutcome` indicating whether the state transition was
 /// applied (with an optional lifecycle event) or ignored as stale.
+///
+/// On queue storage, every statement this attempt runs on `pool` runs under a
+/// `gate` permit, held until the attempt returns; a completion handed to the
+/// completion batcher takes a permit only if it falls back to a direct write.
+/// Canonical storage does not use the gate.
 #[allow(clippy::too_many_arguments)]
 async fn complete_job(
     pool: &PgPool,
@@ -1087,6 +1233,7 @@ async fn complete_job(
     storage: &RuntimeStorage,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
+    gate: &FinalizeGateScope<'_>,
 ) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match storage {
         RuntimeStorage::Canonical => complete_job_canonical(
@@ -1106,6 +1253,17 @@ async fn complete_job(
         .await
         .map_err(Into::into),
         RuntimeStorage::QueueStorage(runtime) => {
+            let _permit = if completes_through_batcher(
+                result,
+                completion_path,
+                staged_follow_ups,
+                enqueue_specs,
+                &job.kind,
+            ) {
+                None
+            } else {
+                Some(gate.enter().await)
+            };
             complete_job_queue_storage(
                 runtime,
                 pool,
@@ -1122,6 +1280,7 @@ async fn complete_job(
                 enqueue_specs,
                 dlq_enabled,
                 metrics,
+                gate,
             )
             .await
         }
@@ -1180,7 +1339,9 @@ async fn output_storable(
     match storage {
         RuntimeStorage::Canonical => Ok(false),
         RuntimeStorage::QueueStorage(_) if !matches!(result, Ok(JobResult::Completed)) => Ok(true),
-        RuntimeStorage::QueueStorage(runtime) => runtime.store.supports_job_output(pool).await,
+        RuntimeStorage::QueueStorage(runtime) => {
+            runtime.store.supports_job_output_from_pool(pool).await
+        }
     }
 }
 
@@ -1614,6 +1775,9 @@ async fn complete_job_canonical(
                 .await?;
                 return match result {
                     None => Ok(CompletionOutcome::IgnoredStale),
+                    Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                        Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
+                    }
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Retried {
@@ -1633,7 +1797,7 @@ async fn complete_job_canonical(
                 };
             }
 
-            let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+            let (outcome, successor) = reschedule_reading_successor(
                 pool,
                 job.id,
                 job.run_lease,
@@ -1642,8 +1806,22 @@ async fn complete_job_canonical(
                 },
                 None,
                 progress_snapshot.as_ref(),
+                job.unique_key.as_deref(),
             )
             .await?;
+            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                let cancelled = duplicate_cancelled_event_row(
+                    job,
+                    job_id,
+                    successor,
+                    Reschedule::RetryAfter {
+                        delay_secs: seconds,
+                    },
+                    None,
+                    progress_snapshot.clone(),
+                );
+                return Ok(cancelled_duplicate_outcome(job, cancelled, needs_event));
+            }
             let (RescheduleOutcome::Rescheduled {
                 job_id,
                 run_at,
@@ -1686,7 +1864,7 @@ async fn complete_job_canonical(
 
         Ok(JobResult::Snooze(snooze_duration)) => {
             let seconds = snooze_duration.as_secs() as f64;
-            let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+            let (outcome, successor) = reschedule_reading_successor(
                 pool,
                 job.id,
                 job.run_lease,
@@ -1695,12 +1873,23 @@ async fn complete_job_canonical(
                 },
                 None,
                 progress_snapshot.as_ref(),
+                job.unique_key.as_deref(),
             )
             .await?;
-            if matches!(
-                outcome,
-                RescheduleOutcome::Stale | RescheduleOutcome::CancelledDuplicate { .. }
-            ) {
+            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                let cancelled = duplicate_cancelled_event_row(
+                    job,
+                    job_id,
+                    successor,
+                    Reschedule::Snooze {
+                        delay_secs: seconds,
+                    },
+                    None,
+                    progress_snapshot.clone(),
+                );
+                return Ok(cancelled_duplicate_outcome(job, cancelled, needs_event));
+            }
+            if matches!(outcome, RescheduleOutcome::Stale) {
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             Ok(CompletionOutcome::Applied {
@@ -2012,6 +2201,9 @@ async fn complete_job_canonical(
                     .await?;
                     return match result {
                         None => Ok(CompletionOutcome::IgnoredStale),
+                        Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                            Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
+                        }
                         Some(updated_job) => {
                             let event = if needs_event {
                                 Some(UntypedJobEvent::Retried {
@@ -2036,15 +2228,27 @@ async fn complete_job_canonical(
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
                 });
-                let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+                let (outcome, successor) = reschedule_reading_successor(
                     pool,
                     job.id,
                     job.run_lease,
                     Reschedule::RetryBackoff,
                     Some(&error_entry),
                     progress_snapshot.as_ref(),
+                    job.unique_key.as_deref(),
                 )
                 .await?;
+                if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                    let cancelled = duplicate_cancelled_event_row(
+                        job,
+                        job_id,
+                        successor,
+                        Reschedule::RetryBackoff,
+                        Some(&error_entry),
+                        progress_snapshot.clone(),
+                    );
+                    return Ok(cancelled_duplicate_outcome(job, cancelled, needs_event));
+                }
                 let (RescheduleOutcome::Rescheduled {
                     job_id,
                     run_at,
@@ -2122,6 +2326,97 @@ fn rescheduled_event_row(
     row
 }
 
+/// Re-schedule a canonical attempt in its own transaction, returning the
+/// stored row when it is cancelled as a duplicate.
+#[allow(clippy::too_many_arguments)]
+async fn reschedule_reading_successor(
+    pool: &sqlx::PgPool,
+    job_id: i64,
+    run_lease: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<&serde_json::Value>,
+    unique_key: Option<&[u8]>,
+) -> Result<(RescheduleOutcome, Option<Box<JobRow>>), awa_model::AwaError> {
+    let mut tx = pool
+        .begin_read_committed()
+        .await
+        .map_err(awa_model::map_sqlx_error)?;
+    let (outcome, cancelled) =
+        awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
+            &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
+        )
+        .await?;
+    tx.commit().await.map_err(awa_model::map_sqlx_error)?;
+    Ok((outcome, cancelled.map(Box::new)))
+}
+
+/// The job as a read returns it after a canonical snooze or retry was
+/// cancelled because a newer duplicate holds its unique claim: the stored
+/// row when there is one, otherwise the canonical row as cancelled in place.
+fn duplicate_cancelled_event_row(
+    job: &JobRow,
+    job_id: i64,
+    persisted: Option<Box<JobRow>>,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<serde_json::Value>,
+) -> JobRow {
+    if let Some(persisted) = persisted {
+        return *persisted;
+    }
+    let now = chrono::Utc::now();
+    let mut row = job.clone();
+    row.id = job_id;
+    row.state = JobState::Cancelled;
+    row.finalized_at = Some(now);
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row.progress = progress;
+    row.unique_states = row
+        .unique_states
+        .map(|states| states & !(1 << JobState::Cancelled.bit_position()));
+    let errors = row.errors.get_or_insert_with(Vec::new);
+    if let Some(error) = error {
+        errors.push(error.clone());
+    }
+    errors.push(serde_json::json!({
+        "error": reschedule.duplicate_error(),
+        "attempt": job.attempt,
+        "at": now.to_rfc3339(),
+        "terminal": true,
+    }));
+    row
+}
+
+/// Records a snooze or retry that was cancelled as a duplicate, with the
+/// `Cancelled` event rescue dispatches for its duplicate cancellations.
+fn cancelled_duplicate_outcome(
+    job: &JobRow,
+    cancelled: JobRow,
+    needs_event: bool,
+) -> CompletionOutcome {
+    warn!(
+        job_id = job.id,
+        "Unique claim held by a newer job; attempt cancelled as duplicate"
+    );
+    let event = needs_event.then(|| {
+        let reason = cancelled
+            .errors
+            .as_ref()
+            .and_then(|errors| errors.last())
+            .and_then(|entry| entry.get("error"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        UntypedJobEvent::Cancelled {
+            job: cancelled,
+            reason,
+        }
+    });
+    CompletionOutcome::CancelledDuplicate { event }
+}
+
 /// The job as a read returns it after this attempt completes.
 fn completed_event_row(job: &JobRow) -> JobRow {
     let mut row = job.clone();
@@ -2155,6 +2450,7 @@ async fn complete_job_queue_storage(
     >,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
+    gate: &FinalizeGateScope<'_>,
 ) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match result {
         Ok(JobResult::Completed) => {
@@ -2230,6 +2526,7 @@ async fn complete_job_queue_storage(
                         return Err(FinalizeAttemptError::LockHeld)
                     }
                     Err(CompletionError::Storage(_)) => {
+                        let _permit = gate.enter().await;
                         direct_complete_job_queue_storage(
                             runtime,
                             pool,
@@ -2304,6 +2601,9 @@ async fn complete_job_queue_storage(
                 .await?;
                 return match result {
                     None => Ok(CompletionOutcome::IgnoredStale),
+                    Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                        Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
+                    }
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Retried {
@@ -2338,6 +2638,9 @@ async fn complete_job_queue_storage(
             else {
                 return Ok(CompletionOutcome::IgnoredStale);
             };
+            if updated_job.state == JobState::Cancelled {
+                return Ok(cancelled_duplicate_outcome(job, updated_job, needs_event));
+            }
             if needs_event {
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Retried {
@@ -2368,8 +2671,11 @@ async fn complete_job_queue_storage(
                     queue_storage_claim,
                 )
                 .await?;
-            if updated.is_none() {
+            let Some(updated) = updated else {
                 return Ok(CompletionOutcome::IgnoredStale);
+            };
+            if updated.state == JobState::Cancelled {
+                return Ok(cancelled_duplicate_outcome(job, updated, needs_event));
             }
             Ok(CompletionOutcome::Applied {
                 event: None,
@@ -2682,6 +2988,9 @@ async fn complete_job_queue_storage(
                     .await?;
                     return match result {
                         None => Ok(CompletionOutcome::IgnoredStale),
+                        Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                            Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
+                        }
                         Some(updated_job) => {
                             let event = if needs_event {
                                 Some(UntypedJobEvent::Retried {
@@ -2715,6 +3024,9 @@ async fn complete_job_queue_storage(
                 else {
                     return Ok(CompletionOutcome::IgnoredStale);
                 };
+                if updated_job.state == JobState::Cancelled {
+                    return Ok(cancelled_duplicate_outcome(job, updated_job, needs_event));
+                }
                 if needs_event {
                     Ok(CompletionOutcome::Applied {
                         event: Some(UntypedJobEvent::Retried {
@@ -2786,7 +3098,7 @@ async fn complete_queue_storage_with_followups(
         unique_states: queue_storage_unique_states.map(std::string::ToString::to_string),
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated = runtime
         .store
@@ -2826,7 +3138,7 @@ async fn cancel_queue_storage_with_followups(
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let Some(updated_job) = runtime
         .store
         .cancel_running_in_tx(
@@ -2860,7 +3172,7 @@ async fn retry_after_queue_storage_with_followups(
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let Some(updated_job) = runtime
         .store
         .retry_after_with_output_in_tx(
@@ -2877,6 +3189,10 @@ async fn retry_after_queue_storage_with_followups(
         tx.rollback().await?;
         return Ok(None);
     };
+    if updated_job.state == JobState::Cancelled {
+        tx.commit().await?;
+        return Ok(Some(updated_job));
+    }
     // Mirror the canonical `RetryAfter` event: empty error string.
     let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
         error: String::new(),
@@ -2900,7 +3216,7 @@ async fn retry_backoff_queue_storage_with_followups(
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let Some(updated_job) = runtime
         .store
         .fail_retryable_in_tx_with_claim(
@@ -2916,6 +3232,10 @@ async fn retry_backoff_queue_storage_with_followups(
         tx.rollback().await?;
         return Ok(None);
     };
+    if updated_job.state == JobState::Cancelled {
+        tx.commit().await?;
+        return Ok(Some(updated_job));
+    }
     let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
         error: error_msg.to_string(),
         attempt: job.attempt,
@@ -2942,7 +3262,7 @@ async fn fail_queue_storage_with_followups(
     metrics: &crate::metrics::AwaMetrics,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     // Track whether the row routed to DLQ so the metric records after a
     // successful commit only — a spec-INSERT failure rolls the whole tx
     // back, and a phantom DLQ count would lie about a transition that
@@ -3007,7 +3327,7 @@ async fn park_queue_storage_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let entered = runtime
         .store
         .enter_callback_wait_with_progress_in_tx(
@@ -3154,7 +3474,7 @@ async fn complete_canonical_with_followups(
     staged_follow_ups: &[PreparedJobInsert],
     metrics: &crate::metrics::AwaMetrics,
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     // `UPDATE ... RETURNING` against `awa.jobs_hot` directly (not the
     // `awa.jobs` compatibility view): in canonical-drain mode the view is
@@ -3210,7 +3530,7 @@ async fn cancel_canonical_with_followups(
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
     outcome_ctx: &crate::enqueue_specs::OutcomeContext,
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3257,7 +3577,7 @@ async fn park_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let parked_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3309,19 +3629,21 @@ async fn retry_after_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_tx(
-        &mut tx,
-        job.id,
-        job.run_lease,
-        Reschedule::RetryAfter {
-            delay_secs: seconds,
-        },
-        None,
-        progress_snapshot,
-    )
-    .await?;
+    let (outcome, cancelled) =
+        awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            Reschedule::RetryAfter {
+                delay_secs: seconds,
+            },
+            None,
+            progress_snapshot,
+            job.unique_key.as_deref(),
+        )
+        .await?;
     let (job_id, run_at, attempt) = match outcome {
         RescheduleOutcome::Rescheduled {
             job_id,
@@ -3333,9 +3655,19 @@ async fn retry_after_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate { .. } => {
+        RescheduleOutcome::CancelledDuplicate { job_id } => {
+            let persisted = cancelled.map(Box::new);
             tx.commit().await?;
-            return Ok(None);
+            return Ok(Some(duplicate_cancelled_event_row(
+                job,
+                job_id,
+                persisted,
+                Reschedule::RetryAfter {
+                    delay_secs: seconds,
+                },
+                None,
+                progress_snapshot.cloned(),
+            )));
         }
         RescheduleOutcome::Stale => {
             tx.rollback().await?;
@@ -3372,7 +3704,7 @@ async fn terminal_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3423,7 +3755,7 @@ async fn exhaust_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
@@ -3472,22 +3804,24 @@ async fn retry_backoff_canonical_with_followups(
     progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let error_entry = serde_json::json!({
         "error": error_msg,
         "attempt": job.attempt,
         "at": chrono::Utc::now().to_rfc3339()
     });
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_tx(
-        &mut tx,
-        job.id,
-        job.run_lease,
-        Reschedule::RetryBackoff,
-        Some(&error_entry),
-        progress_snapshot,
-    )
-    .await?;
+    let (outcome, cancelled) =
+        awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            Reschedule::RetryBackoff,
+            Some(&error_entry),
+            progress_snapshot,
+            job.unique_key.as_deref(),
+        )
+        .await?;
     let (job_id, run_at, attempt) = match outcome {
         RescheduleOutcome::Rescheduled {
             job_id,
@@ -3499,9 +3833,17 @@ async fn retry_backoff_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate { .. } => {
+        RescheduleOutcome::CancelledDuplicate { job_id } => {
+            let persisted = cancelled.map(Box::new);
             tx.commit().await?;
-            return Ok(None);
+            return Ok(Some(duplicate_cancelled_event_row(
+                job,
+                job_id,
+                persisted,
+                Reschedule::RetryBackoff,
+                Some(&error_entry),
+                progress_snapshot.cloned(),
+            )));
         }
         RescheduleOutcome::Stale => {
             tx.rollback().await?;
@@ -3843,6 +4185,7 @@ mod tests {
                 finalizers.clone(),
                 cancel.clone(),
                 1,
+                4,
             );
             executor
                 .execute_task(
@@ -3975,7 +4318,7 @@ mod tests {
             .unwrap();
         let pair = (claimed.job.id, claimed.job.run_lease);
         let schema = runtime.store.schema();
-        let mut historical = pool.begin().await.unwrap();
+        let mut historical = pool.begin_read_committed().await.unwrap();
         sqlx::query(awa_model::audited_sql(format!(
             "INSERT INTO {schema}.ready_tombstones
              (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
@@ -4008,7 +4351,7 @@ mod tests {
             .flush_progress(&pool, pair.0, pair.1, progress.clone())
             .await
             .unwrap();
-        let mut blocker = pool.begin().await.unwrap();
+        let mut blocker = pool.begin_read_committed().await.unwrap();
         sqlx::query(awa_model::audited_sql(format!(
             "SELECT 1 FROM {schema}.queue_claim_heads
              WHERE queue=$1 AND priority=3 AND enqueue_shard=0 FOR UPDATE"
@@ -4068,6 +4411,7 @@ mod tests {
                         storage,
                         false,
                         metrics,
+                        &FinalizeGate::new(4).scope(None),
                     )
                     .await;
                     if let Err(error) = &result {
@@ -4142,6 +4486,7 @@ mod tests {
             &storage,
             false,
             &metrics,
+            &FinalizeGate::new(4).scope(None),
         )
         .await
         .unwrap();
@@ -4371,6 +4716,7 @@ mod tests {
                     &storage,
                     false,
                     &metrics,
+                    &FinalizeGate::new(4).scope(None),
                 ),
             )
             .await
@@ -4779,6 +5125,7 @@ false,
             finalizers.clone(),
             cancel,
             1,
+            4,
         );
         executor.finalize_capacity = Arc::new(Semaphore::new(1));
         let dispatched = |job| DispatchedJob {
@@ -4870,6 +5217,7 @@ false,
             finalizers.clone(),
             cancel.clone(),
             1,
+            4,
         );
         executor.finalize_capacity = Arc::new(Semaphore::new(1));
         let dispatched = |job| DispatchedJob {
@@ -4921,7 +5269,7 @@ false,
             jobs.push(running_reconnect_job(&pool).await);
         }
         let job_ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
-        let mut blocking_tx = pool.begin().await.unwrap();
+        let mut blocking_tx = pool.begin_read_committed().await.unwrap();
         let blocking_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *blocking_tx)
             .await
@@ -4966,6 +5314,7 @@ false,
             finalizers.clone(),
             cancel.clone(),
             1,
+            4,
         );
         let dispatched = |job| DispatchedJob {
             job,
@@ -5080,5 +5429,422 @@ false,
                     && *delay <= Duration::from_millis(ceiling_ms)
             }));
         }
+    }
+
+    #[test]
+    fn dlq_policy_applies_a_logical_queue_override_to_its_stripes() {
+        let overrides = HashMap::from([
+            ("orders".to_string(), true),
+            ("orders#1".to_string(), false),
+        ]);
+        let unstriped = DlqPolicy::new(false, overrides.clone());
+        assert!(
+            !unstriped.enabled_for("orders#0"),
+            "without striping, orders#0 is a queue of its own"
+        );
+        let policy = DlqPolicy::new(false, overrides).with_queue_stripe_count(2);
+        assert!(policy.enabled_for("orders"));
+        assert!(policy.enabled_for("orders#0"));
+        assert!(policy.enabled_for("orders#12"));
+        assert!(
+            !policy.enabled_for("orders#1"),
+            "a stripe's own override wins"
+        );
+        assert!(!policy.enabled_for("orders#x"));
+        assert!(!policy.enabled_for("orders#"));
+        assert!(!policy.enabled_for("other#0"));
+    }
+
+    fn gate_test_job(id: i64) -> JobRow {
+        let now = chrono::Utc::now();
+        serde_json::from_value(serde_json::json!({
+            "id": id, "kind": "finalize_parent", "queue": "test", "args": {},
+            "state": "running", "priority": 2, "attempt": 1, "run_lease": 1,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "metadata": {}, "tags": [],
+        }))
+        .unwrap()
+    }
+
+    /// A pool whose connections are always refused, so a test can tell
+    /// whether a finalize reached the database without one.
+    fn unreachable_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgres://postgres:test@127.0.0.1:1/awa_test")
+            .unwrap()
+    }
+
+    fn test_queue_storage() -> RuntimeStorage {
+        RuntimeStorage::QueueStorage(
+            QueueStorageRuntime::new(
+                awa_model::QueueStorageConfig::default(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_gate_wait_does_not_consume_the_finalization_budget() {
+        let gate = FinalizeGate::new(1);
+        let held = gate.permits.clone().acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(held);
+        });
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let scope = gate.scope(Some(budget.clone()));
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let outcome = finalize_with_retry(
+            |_| async {
+                let _permit = scope.enter().await;
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(FinalizeAttemptError::from(finalize_sqlstate("55P03")))
+                } else {
+                    Ok(())
+                }
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            budget,
+            true,
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() > Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_gate_wait_extends_the_finalization_budget_by_the_wait_only() {
+        let gate = FinalizeGate::new(1);
+        let held = gate.permits.clone().acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(held);
+        });
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let scope = gate.scope(Some(budget.clone()));
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            |_| async {
+                let _permit = scope.enter().await;
+                Err::<(), _>(FinalizeAttemptError::from(finalize_sqlstate("55P03")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            budget,
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1) + Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_gate_permit_is_released_before_each_retry_backoff() {
+        let gate = FinalizeGate::new(1);
+        let budget = FinalizationBudget::from(Duration::from_secs(5));
+        let scope = gate.scope(Some(budget.clone()));
+        let pool = unreachable_pool();
+        let storage = test_queue_storage();
+        let metrics = test_metrics();
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let job = gate_test_job(1);
+        let result: Result<JobResult, JobError> = Err(JobError::retryable_msg("downstream"));
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let attempts = AtomicU32::new(0);
+        let backoff_acquisitions = AtomicU32::new(0);
+        let finalize = finalize_with_retry(
+            |path| {
+                let (pool, job, result, handle, specs, storage, metrics, scope) = (
+                    &pool, &job, &result, &handle, &specs, &storage, &metrics, &scope,
+                );
+                let attempts = &attempts;
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let outcome = complete_job(
+                        pool,
+                        job,
+                        None,
+                        None,
+                        result,
+                        &[],
+                        handle,
+                        path,
+                        None,
+                        Duration::ZERO,
+                        false,
+                        specs,
+                        storage,
+                        false,
+                        metrics,
+                        scope,
+                    )
+                    .await;
+                    assert!(
+                        matches!(outcome, Err(FinalizeAttemptError::Operation(_))),
+                        "the attempt must run its statements"
+                    );
+                    Err::<(), _>(FinalizeAttemptError::from(finalize_sqlstate("55P03")))
+                }
+            },
+            &metrics,
+            1,
+            "test",
+            "test",
+            budget,
+            true,
+        );
+        let observer = async {
+            loop {
+                if let Ok(permit) = gate.permits.try_acquire() {
+                    backoff_acquisitions.fetch_add(1, Ordering::SeqCst);
+                    drop(permit);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                result = finalize => result,
+                () = observer => unreachable!(),
+            }
+        })
+        .await
+        .expect("every attempt must get the permit back");
+        assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
+        assert!(attempts.load(Ordering::SeqCst) > 3);
+        assert!(
+            backoff_acquisitions.load(Ordering::SeqCst) > 0,
+            "the permit must be free while the finalize backs off"
+        );
+        assert_eq!(gate.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_finalize_does_not_take_a_gate_permit() {
+        let gate = FinalizeGate::new(1);
+        let _held = gate.permits.try_acquire().unwrap();
+        let pool = unreachable_pool();
+        let metrics = test_metrics();
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let job = gate_test_job(1);
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let scope = gate.scope(None);
+        for result in [
+            Err(JobError::retryable_msg("downstream")),
+            Ok(JobResult::Snooze(Duration::from_secs(1))),
+            Ok(JobResult::Cancel("stop".into())),
+        ] {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                complete_job(
+                    &pool,
+                    &job,
+                    None,
+                    None,
+                    &result,
+                    &[],
+                    &handle,
+                    CompletionPath::Direct,
+                    None,
+                    Duration::ZERO,
+                    false,
+                    &specs,
+                    &RuntimeStorage::Canonical,
+                    false,
+                    &metrics,
+                    &scope,
+                ),
+            )
+            .await
+            .expect("a canonical finalize must not wait for the gate");
+            assert!(
+                matches!(outcome, Err(FinalizeAttemptError::Operation(_))),
+                "the canonical finalize must go straight to the database"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn batched_completions_bypass_the_gate_and_their_fallback_takes_it(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig {
+                queue_stripe_count: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let queue = "finalize_gate_batched";
+        runtime.store.prepare_queue(&pool, queue, 1).await.unwrap();
+        let params = |n: i64| awa_model::job::InsertParams {
+            kind: "finalize_parent".into(),
+            args: serde_json::json!({ "n": n }),
+            opts: awa_model::InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        };
+        runtime
+            .store
+            .enqueue_params_batch(&pool, &[params(1), params(2)])
+            .await
+            .unwrap();
+        let mut claimed = runtime
+            .store
+            .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+        let fallback = claimed.pop().unwrap();
+        let batched = claimed.pop().unwrap();
+
+        let metrics = test_metrics();
+        let storage = RuntimeStorage::QueueStorage(runtime.clone());
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let completed: Result<JobResult, JobError> = Ok(JobResult::Completed);
+        let gate = FinalizeGate::new(1);
+        let scope = gate.scope(None);
+        let held = gate.permits.try_acquire().unwrap();
+
+        // A completion the batcher writes finishes while the gate is full.
+        let batcher_cancel = CancellationToken::new();
+        let (batcher, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            batcher_cancel.clone(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let batcher_tasks = batcher.spawn();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            complete_job(
+                &pool,
+                &batched.job,
+                Some(&batched.claim),
+                None,
+                &completed,
+                &[],
+                &handle,
+                CompletionPath::Batched,
+                None,
+                Duration::ZERO,
+                false,
+                &specs,
+                &storage,
+                false,
+                &metrics,
+                &scope,
+            ),
+        )
+        .await
+        .expect("a batched completion must not wait for the gate")
+        .unwrap();
+        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+        assert_eq!(
+            runtime
+                .store
+                .load_job(&pool, batched.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Completed
+        );
+        batcher_cancel.cancel();
+        for task in batcher_tasks {
+            task.await.unwrap();
+        }
+
+        // A stopped batcher sends the completion to the direct fallback,
+        // which waits for the gate.
+        let (stopped, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        drop(stopped);
+        let direct = complete_job(
+            &pool,
+            &fallback.job,
+            Some(&fallback.claim),
+            None,
+            &completed,
+            &[],
+            &handle,
+            CompletionPath::Batched,
+            None,
+            Duration::ZERO,
+            false,
+            &specs,
+            &storage,
+            false,
+            &metrics,
+            &scope,
+        );
+        tokio::pin!(direct);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut direct)
+                .await
+                .is_err(),
+            "the direct fallback must wait for the gate"
+        );
+        assert_eq!(
+            runtime
+                .store
+                .load_job(&pool, fallback.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), direct)
+            .await
+            .expect("the fallback must proceed once a permit is free")
+            .unwrap();
+        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+        assert_eq!(
+            runtime
+                .store
+                .load_job(&pool, fallback.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Completed
+        );
+        assert_eq!(gate.permits.available_permits(), 1);
     }
 }

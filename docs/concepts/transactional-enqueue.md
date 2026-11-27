@@ -43,3 +43,18 @@ The bridge supports asyncpg, psycopg 3, SQLAlchemy, and Django. It does not move
 
 !!! warning "Atomic enqueue does not make arbitrary side effects exactly once"
     AWA commits the job atomically with data in the same PostgreSQL transaction. A handler calling an external API still needs an idempotency key or another duplicate-safe design because delivery is at least once.
+
+## Isolation levels
+
+Enqueue works at every isolation level, and `READ COMMITTED`, PostgreSQL's default, is the simplest to run with.
+
+From migration v062 (0.7), an enqueue in a `REPEATABLE READ` or `SERIALIZABLE` transaction keeps its lane's jobs in order even when the transaction's snapshot predates a queue-ring rotation. Before v062, and on 0.6, such an enqueue could land in an older ring generation, where claims skipped it and prune deleted it ([#847](https://github.com/hardbyte/awa/issues/847)). While any producer from before v062 still enqueues, keep `REPEATABLE READ` and `SERIALIZABLE` producers on `READ COMMITTED`; the [upgrade guide](../upgrade-0.6-to-0.7.md) has the details.
+
+At `REPEATABLE READ` or `SERIALIZABLE`, expect PostgreSQL to abort some transactions with a serialization failure (SQLSTATE `40001`) and retry the whole transaction when it does:
+
+- An enqueue updates shared rows, such as its lane's head, that concurrent producers also update, so two enqueues to the same lane can conflict.
+- A race on a unique job key can fail with `40001` rather than a unique-key conflict, so handle both.
+
+In Rust, `AwaError::is_serialization_failure()` identifies the failure. The failure can also come from `tx.commit()`, which returns a `sqlx::Error`: convert it with `AwaError::from(err)` before checking, or check `err.as_database_error()` for code `40001`. In Python it comes from your driver: psycopg's `errors.SerializationFailure`, asyncpg's `SerializationError`, or a Django `OperationalError` whose cause has SQLSTATE `40001`. SQLAlchemy wraps the driver's exception in `sqlalchemy.exc.DBAPIError`, so catch that and check the driver exception in its `orig` attribute.
+
+Workers are not affected by the level your producers use. Every transaction awa opens to write runs at `READ COMMITTED`, whatever the session default. A few read-only reads, such as loading a page of jobs, name `REPEATABLE READ, READ ONLY` to see one consistent snapshot; a transaction it hands to your code, such as the Python client's `transaction()`, keeps the session default. Single statements it runs outside a transaction, such as heartbeats, take the session's `default_transaction_isolation`. If a role or database default is above `READ COMMITTED`, give the worker pool's connections `default_transaction_isolation = 'read committed'`, for example with `PgConnectOptions::options`. The worker logs a warning at start when the default is higher.

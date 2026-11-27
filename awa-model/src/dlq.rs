@@ -7,6 +7,7 @@
 use crate::audited_sql;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::filter::{DlqPage, JobFilter};
+use crate::isolation::BeginReadCommitted;
 use crate::job::JobRow;
 use crate::job_query::{dlq_predicate, set_statement_timeout, Bind, Predicate, ReadBudget};
 use crate::queue_storage::QueueStorage;
@@ -320,7 +321,7 @@ async fn list_dlq_where(
     let budget = ReadBudget::start();
     let rows: Vec<QueueStorageDlqRow> = budget
         .run(async {
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
             set_statement_timeout(&mut tx, budget.remaining()?).await?;
             predicate
                 .bind_query_as(sqlx::query_as(audited_sql(sql)))
@@ -563,28 +564,12 @@ pub async fn purge_dlq(
 
 async fn purge_where(pool: &PgPool, predicate: &Predicate) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let sql = format!(
-        "DELETE FROM {}.dlq_entries {}",
-        store.schema(),
-        predicate.where_clause()
-    );
-    let result = predicate
-        .bind_query(sqlx::query(audited_sql(sql)))
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    store.purge_dlq_where(pool, predicate).await
 }
 
 pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(audited_sql(format!(
-        "DELETE FROM {}.dlq_entries WHERE job_id = $1",
-        store.schema()
-    )))
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    store.purge_dlq_job(pool, job_id).await
 }
 
 /// Purge DLQ rows older than the configured retention horizon.
@@ -599,26 +584,17 @@ pub async fn cleanup_dlq(
     queue: Option<&str>,
 ) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let retention_secs = retention.as_secs().min(i64::MAX as u64) as i64;
-    let result = sqlx::query(audited_sql(format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE job_id IN (
-            SELECT job_id
-            FROM {}.dlq_entries
-            WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-              AND ($3::text IS NULL OR queue = $3)
-            ORDER BY dlq_at ASC, job_id ASC
-            LIMIT $2
+    store
+        .delete_expired_dlq_rows(
+            pool,
+            &crate::queue_storage::DlqExpiry {
+                retention,
+                limit: batch_size,
+                queue,
+                overridden_queues: &[],
+                stripe_families: false,
+                oldest_first: true,
+            },
         )
-        "#,
-        store.schema(),
-        store.schema()
-    )))
-    .bind(retention_secs)
-    .bind(batch_size)
-    .bind(queue)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+        .await
 }

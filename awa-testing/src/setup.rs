@@ -1,6 +1,7 @@
 //! Common test setup utilities for Awa integration tests.
 
 use awa_model::audited_sql;
+use awa_model::isolation::BeginReadCommitted;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool};
 use std::collections::HashMap;
@@ -65,7 +66,7 @@ pub async fn reset_runtime_backend(pool: &PgPool) {
 /// Force the canonical engine and clear any queue-storage runtime registration.
 pub async fn reset_to_canonical(pool: &PgPool) {
     let mut tx = pool
-        .begin()
+        .begin_read_committed()
         .await
         .expect("Failed to start runtime backend reset transaction");
 
@@ -102,7 +103,7 @@ pub async fn reset_to_canonical(pool: &PgPool) {
 /// `awa` schema (mirrors a fresh-install auto-finalize).
 pub async fn activate_queue_storage(pool: &PgPool) {
     let mut tx = pool
-        .begin()
+        .begin_read_committed()
         .await
         .expect("Failed to start queue-storage activation transaction");
 
@@ -414,6 +415,7 @@ async fn ensure_canonical_template() -> String {
 async fn ensure_template(name: String) -> String {
     let admin_url = admin_database_url();
     let mut admin = connect(&admin_url).await;
+    // advisory-lock: `admin` is a dedicated connection, closed when dropped.
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(TEMPLATE_BUILD_LOCK_KEY)
         .execute(&mut admin)

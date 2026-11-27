@@ -1,11 +1,11 @@
 use crate::error::AwaError;
 use semver::Version;
 use sqlx::postgres::PgConnection;
-use sqlx::{Connection, PgPool};
+use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 60;
+pub const CURRENT_VERSION: i32 = 62;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -332,6 +332,16 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Keep claim tombstone checks correlated",
         &[V23_UP, V60_UP],
     ),
+    (
+        61,
+        "Let a claim cross rolled-back reservations ahead of spent rows",
+        &[V23_UP, V61_UP],
+    ),
+    (
+        62,
+        "Keep a lane's ring generations in order under REPEATABLE READ producers",
+        &[V23_UP, V62_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -355,6 +365,7 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
+const SEARCH_PATH_EPILOGUE: &str = include_str!("../migrations/search_path_epilogue.sql");
 const SCHEMA_DISCOVERY_UP: &str = include_str!("../migrations/queue_storage_schema_discovery.sql");
 const V23_UP: &str = concat!(
     include_str!("../migrations/queue_storage_schema_discovery.sql"),
@@ -400,6 +411,8 @@ const V57_UP: &str = include_str!("../migrations/v057_insert_jobs_compat_batch_b
 const V58_UP: &str = include_str!("../migrations/v058_provision_lane_row_first.sql");
 const V59_UP: &str = include_str!("../migrations/v059_backoff_wider_jitter.sql");
 const V60_UP: &str = include_str!("../migrations/v060_correlated_claim_tombstones.sql");
+const V61_UP: &str = include_str!("../migrations/v061_claim_spent_prefix_gaps.sql");
+const V62_UP: &str = include_str!("../migrations/v062_queue_ring_generation_floor.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -525,7 +538,7 @@ async fn run_migration_transaction(
     // returned; the pool permit is held until the close completes.
     let mut conn = pool.acquire().await?;
     let result: Result<i32, AwaError> = async {
-        let mut tx = conn.begin().await?;
+        let mut tx = crate::isolation::begin_read_committed_on(&mut conn).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
             .execute(&mut *tx)
@@ -668,8 +681,8 @@ async fn apply_migrations(
             }
             info!(version, description, "Applying migration v{version}");
             let started = std::time::Instant::now();
-            for step in steps {
-                sqlx::raw_sql(*step).execute(&mut *conn).await?;
+            for step in migration_steps(steps) {
+                sqlx::raw_sql(step).execute(&mut *conn).await?;
             }
             let elapsed_ms = started.elapsed().as_millis();
             info!(
@@ -732,7 +745,7 @@ async fn warm_admin_metadata_cache(pool: &PgPool) {
         // that timeout fires the batch aborts and a raw trailing COMMIT would
         // never run, leaving the connection "idle in transaction (aborted)". A
         // managed transaction's guard rolls back on drop, keeping it clean.
-        if let Ok(mut tx) = conn.begin().await {
+        if let Ok(mut tx) = crate::isolation::begin_read_committed_on(&mut conn).await {
             let refreshed = sqlx::raw_sql(
                 "SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata();",
             )
@@ -1197,7 +1210,7 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 pub fn migration_sql() -> Vec<(i32, &'static str, String)> {
     MIGRATIONS
         .iter()
-        .map(|&(v, d, steps)| (v, d, steps.join("\n")))
+        .map(|&(v, d, steps)| (v, d, migration_steps(steps).collect::<Vec<_>>().join("\n")))
         .collect()
 }
 
@@ -1207,8 +1220,16 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
     MIGRATIONS
         .iter()
         .filter(|&&(v, _, _)| v > from && v <= to)
-        .map(|&(v, d, steps)| (v, d, steps.join("\n")))
+        .map(|&(v, d, steps)| (v, d, migration_steps(steps).collect::<Vec<_>>().join("\n")))
         .collect()
+}
+
+/// A migration's SQL as it runs: its listed steps, then, for a migration that
+/// refreshes the queue-storage helpers (it includes `V23_UP`), the epilogue
+/// that pins the search_path of every function it created or replaced.
+fn migration_steps(steps: &'static [&'static str]) -> impl Iterator<Item = &'static str> {
+    let epilogue = steps.contains(&V23_UP).then_some(SEARCH_PATH_EPILOGUE);
+    steps.iter().copied().chain(epilogue)
 }
 
 #[cfg(test)]
@@ -1578,7 +1599,7 @@ mod tests {
     #[test]
     fn every_migration_step_is_transaction_safe() {
         for &(version, _, steps) in MIGRATIONS {
-            for step in steps {
+            for step in migration_steps(steps) {
                 if let Some(violation) = transaction_safety_violation(step) {
                     panic!("migration v{version}: {violation}");
                 }
@@ -1736,7 +1757,7 @@ mod tests {
     #[test]
     fn every_migration_guards_its_ddl() {
         for &(version, _, steps) in MIGRATIONS {
-            for step in steps {
+            for step in migration_steps(steps) {
                 let top = strip_to_top_level(step);
 
                 for (keywords, label) in [

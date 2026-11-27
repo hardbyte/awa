@@ -28,10 +28,14 @@ pub struct WorkerErrors {
 #[derive(Default)]
 struct ErrorFields {
     invalid_ready_body: bool,
+    prune_ring: Option<&'static str>,
 }
 
 impl Visit for ErrorFields {
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.prune_ring = super::gate_metrics::prune_ring(value);
+        }
         if matches!(field.name(), "error" | "message") {
             self.invalid_ready_body |=
                 value.contains(MISSING_READY) || value.contains(AMBIGUOUS_READY);
@@ -40,10 +44,12 @@ impl Visit for ErrorFields {
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if matches!(field.name(), "error" | "message") {
-            self.invalid_ready_body |= {
-                let formatted = format!("{value:?}");
-                formatted.contains(MISSING_READY) || formatted.contains(AMBIGUOUS_READY)
-            };
+            let formatted = format!("{value:?}");
+            if field.name() == "message" {
+                self.prune_ring = super::gate_metrics::prune_ring(&formatted);
+            }
+            self.invalid_ready_body |=
+                formatted.contains(MISSING_READY) || formatted.contains(AMBIGUOUS_READY);
         }
     }
 }
@@ -61,6 +67,11 @@ impl<S: Subscriber> Layer<S> for ErrorLayer {
         }
         let mut fields = ErrorFields::default();
         event.record(&mut fields);
+        if *event.metadata().level() == tracing::Level::ERROR {
+            if let Some(ring) = fields.prune_ring {
+                super::gate_metrics::prune_error(ring);
+            }
+        }
         if fields.invalid_ready_body {
             self.evidence
                 .invalid_ready_body

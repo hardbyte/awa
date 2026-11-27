@@ -69,10 +69,18 @@ AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueueNumeric.cfg ;; 
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldStripedClaimDeadlock.cfg ;; NoDeadlock is violated ;; old striped-claim order witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg ;; NoDeadlock is violated ;; old QueueStorage lane-provisioning order witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg ;; NoDeadlock is violated ;; old lane-first re-enqueue against a fresh unique enqueue witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg ;; NoDeadlock is violated ;; old row-order claim pass against a fresh unique enqueue witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderCompletionFollowUpDeadlock.cfg ;; NoDeadlock is violated ;; completion follow-up claiming a key across two passes (known gap)
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrder.cfg            ;; pass ;; unique claim before enqueue lane
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrderBroken.cfg      ;; NoDeadlock is violated ;; old retry lane-before-claim witness
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKey.cfg             ;; pass ;; unique claims in key order
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKeyBroken.cfg       ;; NoDeadlock is violated ;; reversed batch key-order witness
+AwaSessionAdvisoryLock.tla     ;; -                                       ;; pass ;; session locks released on cancel, error, drop and failed unlock
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockOthersOnly.cfg    ;; NoPooledLock is violated ;; WHEN OTHERS handler misses a cancel after the grant
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockLockBeforeBlock.cfg ;; NoPooledLock is violated ;; lock taken before the block whose handler unlocks
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockCancelOnly.cfg    ;; NoPooledLock is violated ;; handler without OTHERS misses an ordinary error
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockUnguardedPool.cfg ;; NoPooledLock is violated ;; dropped Rust holder pools its locked connection
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + 0.7 migrate gate
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence
@@ -82,7 +90,8 @@ AwaStorageTransition.tla       ;; AwaStorageTransitionMigrate07Ungated.cfg ;; Mi
 AwaStorageTransition.tla       ;; AwaStorageTransitionRescheduleStaysCanonical.cfg ;; MixedTransitionCanReduceCanonicalBacklog is violated ;; pre-#456 canonical re-schedule wedge witness
 AwaMigratedRescheduleUnique.tla ;; -                                      ;; pass ;; migrated re-schedule duplicate cancellation
 AwaMigratedRescheduleUnique.tla ;; AwaMigratedRescheduleUniqueBroken.cfg  ;; NoUnclaimedExecutable is violated ;; old lost-claim successor witness
-AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
+AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; canonical per-row rescue fallback converges
+AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueQueueStorage.cfg ;; pass ;; queue-storage single settle pass converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
 AwaCanonicalDirtyMarks.tla     ;; -                                       ;; pass ;; wait-free dirty marks: no hot-path wait, no cycle
 AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksOnConflict.cfg     ;; NoDeadlock is violated ;; v006 ON CONFLICT dirty-row deadlock witness

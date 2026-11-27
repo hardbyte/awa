@@ -553,6 +553,29 @@ impl Dispatcher {
         permits
     }
 
+    /// Waits for a slot in this runtime's claim gate. Returns `None`, with the
+    /// batch's rate tokens refunded, when dispatch is cancelled or the gate is
+    /// closed first.
+    async fn acquire_claim_slot(
+        &self,
+        batch_size: usize,
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                self.refund_rate_limit(batch_size);
+                None
+            }
+            permit = self.claim_gate.acquire() => match permit {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.refund_rate_limit(batch_size);
+                    None
+                }
+            }
+        }
+    }
+
     /// In weighted mode, clear this queue's overflow demand.
     fn clear_overflow_demand(&self) {
         if let ConcurrencyMode::Weighted {
@@ -770,57 +793,66 @@ impl Dispatcher {
         let claim_start = Instant::now();
 
         let jobs: Vec<DispatchedJob> = match &self.storage {
-            RuntimeStorage::Canonical => match sqlx::query_as::<_, JobRow>(
-                r#"
-                WITH claimed AS (
-                    SELECT id
-                    FROM awa.jobs_hot
-                    WHERE state = 'available'
-                      AND queue = $1
-                      AND run_at <= now()
-                      AND NOT EXISTS (
-                          SELECT 1 FROM awa.queue_meta
-                          WHERE queue = $1 AND paused = TRUE
-                      )
-                    ORDER BY priority ASC, run_at ASC, id ASC
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE awa.jobs_hot
-                SET state = 'running',
-                    attempt = attempt + 1,
-                    run_lease = run_lease + 1,
-                    attempted_at = now(),
-                    heartbeat_at = now(),
-                    deadline_at = now() + make_interval(secs => $3)
-                FROM claimed
-                WHERE awa.jobs_hot.id = claimed.id
-                  AND awa.jobs_hot.state = 'available'
-                RETURNING awa.jobs_hot.*
-                "#,
-            )
-            .bind(&self.queue)
-            .bind(batch_size as i32)
-            .bind(deadline_secs)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(jobs) => jobs
-                    .into_iter()
-                    .map(|job| DispatchedJob {
-                        job,
-                        queue_storage_claim: None,
-                        queue_storage_unique_states: None,
-                        abandon_after,
-                    })
-                    .collect(),
-                Err(err) => {
-                    warn!(queue = %self.queue, messaging.destination.name = %self.queue, error = %err, "Failed to claim jobs");
-                    self.refund_rate_limit(batch_size);
+            RuntimeStorage::Canonical => {
+                let Some(claim_slot) = self.acquire_claim_slot(batch_size).await else {
                     return false;
+                };
+                let claimed = sqlx::query_as::<_, JobRow>(
+                    r#"
+                    WITH claimed AS (
+                        SELECT id
+                        FROM awa.jobs_hot
+                        WHERE state = 'available'
+                          AND queue = $1
+                          AND run_at <= now()
+                          AND NOT EXISTS (
+                              SELECT 1 FROM awa.queue_meta
+                              WHERE queue = $1 AND paused = TRUE
+                          )
+                        ORDER BY priority ASC, run_at ASC, id ASC
+                        LIMIT $2
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE awa.jobs_hot
+                    SET state = 'running',
+                        attempt = attempt + 1,
+                        run_lease = run_lease + 1,
+                        attempted_at = now(),
+                        heartbeat_at = now(),
+                        deadline_at = now() + make_interval(secs => $3)
+                    FROM claimed
+                    WHERE awa.jobs_hot.id = claimed.id
+                      AND awa.jobs_hot.state = 'available'
+                    RETURNING awa.jobs_hot.*
+                    "#,
+                )
+                .bind(&self.queue)
+                .bind(batch_size as i32)
+                .bind(deadline_secs)
+                .fetch_all(&self.pool)
+                .await;
+                drop(claim_slot);
+                match claimed {
+                    Ok(jobs) => jobs
+                        .into_iter()
+                        .map(|job| DispatchedJob {
+                            job,
+                            queue_storage_claim: None,
+                            queue_storage_unique_states: None,
+                            abandon_after,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        warn!(queue = %self.queue, messaging.destination.name = %self.queue, error = %err, "Failed to claim jobs");
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
                 }
-            },
+            }
             RuntimeStorage::QueueStorage(runtime) => {
+                let Some(claim_slot) = self.acquire_claim_slot(batch_size).await else {
+                    return false;
+                };
                 if check_ready_signal {
                     match runtime
                         .store
@@ -828,6 +860,7 @@ impl Dispatcher {
                         .await
                     {
                         Ok(false) => {
+                            drop(claim_slot);
                             self.refund_rate_limit(batch_size);
                             self.clear_overflow_demand();
                             return false;
@@ -842,21 +875,13 @@ impl Dispatcher {
                             );
                         }
                     }
-                }
-                let claim_slot = tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => {
+                    // Shutdown may have begun while the read waited.
+                    if self.cancel.is_cancelled() {
+                        drop(claim_slot);
                         self.refund_rate_limit(batch_size);
                         return false;
                     }
-                    permit = self.claim_gate.acquire() => match permit {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            self.refund_rate_limit(batch_size);
-                            return false;
-                        }
-                    }
-                };
+                }
                 let claimed = runtime
                     .store
                     .claim_runtime_batch_with_aging_for_instance(
@@ -1015,11 +1040,12 @@ mod tests {
     use super::*;
 
     fn blocked_dispatcher() -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:test@localhost/awa_test")
-            .unwrap();
-        let metrics =
-            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
+        blocked_dispatcher_on("postgres://postgres:test@localhost/awa_test")
+    }
+
+    fn blocked_dispatcher_on(
+        database_url: &str,
+    ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
         let storage = RuntimeStorage::QueueStorage(
             crate::storage::QueueStorageRuntime::new(
                 awa_model::QueueStorageConfig::default(),
@@ -1028,6 +1054,18 @@ mod tests {
             )
             .unwrap(),
         );
+        blocked_dispatcher_with(database_url, storage)
+    }
+
+    fn blocked_dispatcher_with(
+        database_url: &str,
+        storage: RuntimeStorage,
+    ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(database_url)
+            .unwrap();
+        let metrics =
+            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
         let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
         let (_, completion) = crate::completion::CompletionBatcher::new(
             pool.clone(),
@@ -1051,6 +1089,7 @@ mod tests {
             tokio_util::task::TaskTracker::new(),
             CancellationToken::new(),
             1,
+            4,
         ));
         let config = QueueConfig {
             max_workers: 1,
@@ -1127,6 +1166,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_signal_read_waits_for_the_claim_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut dispatcher, _capacity, cancel) = blocked_dispatcher_on(&format!(
+            "postgres://postgres:test@127.0.0.1:{port}/awa_test"
+        ));
+        dispatcher.check_ready_signal = true;
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block the ready signal read"),
+                accepted = listener.accept() => {
+                    panic!("ready signal read opened a connection past a saturated gate: {accepted:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(dispatcher.claim_gate.available_permits(), 0);
+    }
+
+    /// Cancelling the dispatcher while its ready-signal read waits must not
+    /// let a claim start once the read returns.
+    #[tokio::test]
+    async fn cancellation_during_the_ready_signal_read_starts_no_claim() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .unwrap();
+        awa_model::migrations::run(&pool).await.unwrap();
+        let config = awa_model::QueueStorageConfig {
+            schema: "awa_dispatch_cancel_signal".into(),
+            ..Default::default()
+        };
+        let store = awa_model::QueueStorage::new(config.clone()).unwrap();
+        store.install(&pool).await.unwrap();
+        store.reset(&pool).await.unwrap();
+        store
+            .enqueue_params_batch(
+                &pool,
+                &[awa_model::job::InsertParams {
+                    kind: "signal_job".into(),
+                    args: serde_json::json!({}),
+                    opts: awa_model::InsertOpts {
+                        queue: "blocked".into(),
+                        ..Default::default()
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let storage = RuntimeStorage::QueueStorage(
+            crate::storage::QueueStorageRuntime::new(
+                config,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher_with(&url, storage);
+        dispatcher.check_ready_signal = true;
+        dispatcher.claim_gate.add_permits(1);
+
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query(
+            "LOCK TABLE awa_dispatch_cancel_signal.queue_enqueue_heads IN ACCESS EXCLUSIVE MODE",
+        )
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("the ready signal read must wait for the lock"),
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            lock.commit().await.unwrap();
+            assert!(!tokio::time::timeout(Duration::from_secs(10), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        let claimed = store
+            .claim_runtime_batch(&pool, "blocked", 10, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "a claim started after cancellation");
+    }
+
+    #[tokio::test]
+    async fn canonical_claim_waits_for_the_claim_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher_with(
+            &format!("postgres://postgres:test@127.0.0.1:{port}/awa_test"),
+            RuntimeStorage::Canonical,
+        );
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block the canonical claim"),
+                accepted = listener.accept() => {
+                    panic!("canonical claim opened a connection past a saturated gate: {accepted:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        assert_eq!(dispatcher.claim_gate.available_permits(), 0);
+    }
+
+    #[tokio::test]
     async fn claim_finishing_during_shutdown_starts_with_cancelled_context() {
         let flag = Arc::new(AtomicBool::new(false));
         let observed = flag.clone();
@@ -1184,5 +1372,334 @@ mod tests {
         assert_eq!(idle_poll_sleep(poll, cap, 4), cap);
         assert_eq!(idle_poll_sleep(poll, cap, 40), cap);
         assert_eq!(idle_poll_sleep(poll, Duration::from_millis(50), 5), poll);
+    }
+
+    const PROBE_KIND: &str = "dispatch_probe";
+
+    #[derive(Default)]
+    struct Recorder {
+        performed: std::sync::atomic::AtomicU32,
+        started_uncancelled: std::sync::atomic::AtomicU32,
+    }
+
+    struct RecordingWorker(Arc<Recorder>);
+
+    #[async_trait::async_trait]
+    impl crate::executor::Worker for RecordingWorker {
+        fn kind(&self) -> &'static str {
+            PROBE_KIND
+        }
+
+        async fn perform(
+            &self,
+            ctx: &crate::context::JobContext,
+        ) -> Result<crate::executor::JobResult, crate::executor::JobError> {
+            self.0.performed.fetch_add(1, Ordering::SeqCst);
+            if ctx.is_cancelled() {
+                return Ok(crate::executor::JobResult::Cancel("cancelled".into()));
+            }
+            self.0.started_uncancelled.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::executor::JobResult::Completed)
+        }
+    }
+
+    struct ProbeRuntime {
+        dispatcher: Dispatcher,
+        in_flight: InFlightMap,
+        job_set: Arc<Mutex<JoinSet<()>>>,
+        recorder: Arc<Recorder>,
+        store: Arc<awa_model::QueueStorage>,
+        job_ids: Vec<i64>,
+        _completions: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    /// A dispatcher on a migrated queue-storage schema with `jobs` jobs
+    /// waiting on `queue`. Its claimer already owns a lease whose last claim
+    /// is old, so the first claim refreshes the lease after it commits: a
+    /// lock on that lease row holds the dispatcher between claim commit and
+    /// dispatch.
+    async fn probe_runtime(pool: &PgPool, queue: &str, jobs: usize) -> ProbeRuntime {
+        awa_model::migrations::run(pool).await.unwrap();
+        let config = awa_model::QueueStorageConfig {
+            queue_stripe_count: 1,
+            ..Default::default()
+        };
+        let runtime = crate::storage::QueueStorageRuntime::new(
+            config,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let store = runtime.store.clone();
+        store.prepare_queue(pool, queue, 1).await.unwrap();
+        // Route admin operations to this schema, as a finalized storage
+        // transition would.
+        sqlx::query(
+            "INSERT INTO awa.runtime_storage_backends (backend, schema_name)
+             VALUES ('queue_storage', $1)
+             ON CONFLICT (backend) DO UPDATE SET schema_name = EXCLUDED.schema_name",
+        )
+        .bind(store.schema())
+        .execute(pool)
+        .await
+        .unwrap();
+        let params: Vec<_> = (0..jobs)
+            .map(|n| awa_model::job::InsertParams {
+                kind: PROBE_KIND.into(),
+                args: serde_json::json!({ "n": n }),
+                opts: awa_model::InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        store.enqueue_params_batch(pool, &params).await.unwrap();
+        let schema = store.schema().to_string();
+        let job_ids: Vec<i64> = sqlx::query_scalar(awa_model::audited_sql(format!(
+            "SELECT job_id FROM {schema}.ready_entries WHERE queue = $1 ORDER BY job_id"
+        )))
+        .bind(queue)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(job_ids.len(), jobs);
+
+        let claimer_owner_id = Uuid::new_v4();
+        sqlx::query(awa_model::audited_sql(format!(
+            "INSERT INTO {schema}.queue_claimer_leases
+               (queue, claimer_slot, owner_instance_id, lease_epoch, leased_at, last_claimed_at, expires_at)
+             VALUES ($1, 0, $2, 0, now() - interval '1 hour', now() - interval '1 hour', now() + interval '1 hour')"
+        )))
+        .bind(queue)
+        .bind(claimer_owner_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let storage = RuntimeStorage::QueueStorage(runtime);
+        let metrics =
+            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let (completion, completion_handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            jobs as u32,
+        );
+        let completions = completion.spawn();
+        let recorder = Arc::new(Recorder::default());
+        let executor = Arc::new(JobExecutor::new(
+            pool.clone(),
+            Arc::new(HashMap::from([(
+                PROBE_KIND.to_string(),
+                Box::new(RecordingWorker(recorder.clone())) as crate::executor::BoxedWorker,
+            )])),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics.clone(),
+            completion_handle,
+            storage.clone(),
+            crate::executor::DlqPolicy::default(),
+            tokio_util::task::TaskTracker::new(),
+            CancellationToken::new(),
+            jobs as u32,
+            4,
+        ));
+        let config = QueueConfig {
+            max_workers: jobs as u32,
+            deadline_duration: Duration::ZERO,
+            ..Default::default()
+        };
+        let job_set = Arc::new(Mutex::new(JoinSet::new()));
+        let dispatcher = Dispatcher::with_concurrency(
+            queue.into(),
+            Uuid::new_v4(),
+            config,
+            pool.clone(),
+            executor,
+            metrics,
+            in_flight.clone(),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            job_set.clone(),
+            ConcurrencyMode::HardReserved {
+                semaphore: Arc::new(Semaphore::new(jobs)),
+            },
+            None,
+            Arc::new(Notify::new()),
+            None,
+            Arc::new(Semaphore::new(1)),
+            claimer_owner_id,
+            storage,
+        );
+        ProbeRuntime {
+            dispatcher,
+            in_flight,
+            job_set,
+            recorder,
+            store,
+            job_ids,
+            _completions: completions,
+        }
+    }
+
+    /// Locks the claimer lease row of `queue` in an open transaction.
+    async fn hold_claimer_lease(
+        pool: &PgPool,
+        store: &awa_model::QueueStorage,
+        queue: &str,
+    ) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "SELECT 1 FROM {}.queue_claimer_leases WHERE queue = $1 FOR UPDATE",
+            store.schema()
+        )))
+        .bind(queue)
+        .fetch_one(tx.as_mut())
+        .await
+        .unwrap();
+        tx
+    }
+
+    /// The backend blocked on the held claimer lease row: the claim it
+    /// follows has committed.
+    async fn claimer_refresh_waiter(pool: &PgPool) -> i32 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiter: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND pid <> pg_backend_pid()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE '%UPDATE%queue_claimer_leases%'
+                     LIMIT 1",
+                )
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+                if let Some(pid) = waiter {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the claim must commit and reach the claimer lease refresh")
+    }
+
+    async fn drain(job_set: &Mutex<JoinSet<()>>) {
+        let mut set = job_set.lock().await;
+        while let Some(joined) = set.join_next().await {
+            joined.unwrap();
+        }
+    }
+
+    async fn wait_for_state(pool: &PgPool, job_id: i64, state: awa_model::JobState) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let job = awa_model::admin::get_job(pool, job_id).await.unwrap();
+            if job.state == state {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job {job_id} is {:?}, expected {state:?}",
+                job.state
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The claimer lease refresh runs after the claim has committed. When it
+    /// fails, the claimed jobs are already the runtime's: they must still be
+    /// dispatched, not left open until rescue.
+    #[sqlx::test(migrations = false)]
+    async fn claimed_jobs_are_dispatched_when_the_claimer_refresh_fails(pool: PgPool) {
+        let queue = "claimer_refresh_fault";
+        let mut probe = probe_runtime(&pool, queue, 2).await;
+        let lease = hold_claimer_lease(&pool, &probe.store, queue).await;
+        let poll = tokio::spawn(async move {
+            let dispatched = probe.dispatcher.poll_once(None).await;
+            (probe.dispatcher, dispatched)
+        });
+        let waiter = claimer_refresh_waiter(&pool).await;
+        let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
+            .bind(waiter)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(cancelled);
+        let (_dispatcher, dispatched) = poll.await.unwrap();
+        lease.rollback().await.unwrap();
+        assert!(
+            dispatched,
+            "a failed claimer refresh must not drop the committed claim"
+        );
+        drain(&probe.job_set).await;
+        assert_eq!(probe.recorder.performed.load(Ordering::SeqCst), 2);
+        for job_id in &probe.job_ids {
+            wait_for_state(&pool, *job_id, awa_model::JobState::Completed).await;
+        }
+    }
+
+    /// An operator cancel that commits after the claim but before the
+    /// attempt registers in flight must still reach it: the handler does not
+    /// run.
+    #[sqlx::test(migrations = false)]
+    async fn operator_cancel_between_claim_and_dispatch_reaches_the_attempt(pool: PgPool) {
+        let queue = "cancel_before_dispatch";
+        let mut probe = probe_runtime(&pool, queue, 1).await;
+        let job_id = probe.job_ids[0];
+        let mut notifications = sqlx::postgres::PgListener::connect_with(&pool)
+            .await
+            .unwrap();
+        notifications.listen("awa:cancel").await.unwrap();
+        let listener = crate::cancel_listener::CancelListener::new(
+            pool.clone(),
+            probe.in_flight.clone(),
+            CancellationToken::new(),
+        );
+
+        let lease = hold_claimer_lease(&pool, &probe.store, queue).await;
+        let poll = tokio::spawn(async move {
+            let dispatched = probe.dispatcher.poll_once(None).await;
+            (probe.dispatcher, dispatched)
+        });
+        claimer_refresh_waiter(&pool).await;
+
+        let cancelled = awa_model::admin::cancel(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the claimed job is cancellable");
+        assert_eq!(cancelled.state, awa_model::JobState::Cancelled);
+        let notification = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+            .await
+            .expect("the cancel notifies on commit")
+            .unwrap();
+        listener.handle_notification(notification.payload());
+
+        lease.commit().await.unwrap();
+        let (_dispatcher, dispatched) = poll.await.unwrap();
+        assert!(dispatched);
+        drain(&probe.job_set).await;
+        assert_eq!(
+            probe.recorder.started_uncancelled.load(Ordering::SeqCst),
+            0,
+            "the handler ran without seeing the committed cancel"
+        );
+        assert_eq!(
+            probe.recorder.performed.load(Ordering::SeqCst),
+            0,
+            "the handler ran although its attempt was cancelled before it started"
+        );
+        assert!(probe
+            .in_flight
+            .get_cancel((job_id, cancelled.run_lease))
+            .is_none());
+        wait_for_state(&pool, job_id, awa_model::JobState::Cancelled).await;
     }
 }

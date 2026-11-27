@@ -1,6 +1,7 @@
 use crate::audited_sql;
 use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
+use crate::isolation::BeginReadCommitted;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Duration, Utc};
@@ -867,7 +868,26 @@ pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErro
             finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
             callback_id = NULL, callback_timeout_at = NULL,
             callback_filter = NULL, callback_on_complete = NULL,
-            callback_on_fail = NULL, callback_transform = NULL
+            callback_on_fail = NULL, callback_transform = NULL,
+            unique_states = CASE
+                WHEN state = 'cancelled' THEN COALESCE(
+                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
+                     FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
+                     WHERE entry->>'error' IN (
+                           'snoozed as duplicate: unique claim held by a newer job',
+                           'retried as duplicate: unique claim held by a newer job',
+                           'promoted as duplicate: unique claim held by another job',
+                           'rescued as duplicate: heartbeat stale and unique claim held by a newer job',
+                           'rescued as duplicate: deadline expired and unique claim held by a newer job',
+                           'rescued as duplicate: callback timed out and unique claim held by a newer job'
+                       )
+                       AND entry->>'duplicate_unique_states' IS NOT NULL
+                     ORDER BY n DESC
+                     LIMIT 1),
+                    unique_states
+                )
+                ELSE unique_states
+            END
         WHERE id = $1 AND state IN ('failed', 'cancelled', 'waiting_external')
         RETURNING *
         "#,
@@ -893,7 +913,7 @@ pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErr
     // of `running` / `waiting_external`, NOTIFY listening workers so
     // the handler currently executing it can learn about the
     // cancellation and stop cleanly.
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
 
     let prior_state: Option<JobState> =
         sqlx::query_scalar::<_, JobState>("SELECT state FROM awa.jobs WHERE id = $1 FOR UPDATE")
@@ -3958,7 +3978,26 @@ pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaEr
             finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
             callback_id = NULL, callback_timeout_at = NULL,
             callback_filter = NULL, callback_on_complete = NULL,
-            callback_on_fail = NULL, callback_transform = NULL
+            callback_on_fail = NULL, callback_transform = NULL,
+            unique_states = CASE
+                WHEN state = 'cancelled' THEN COALESCE(
+                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
+                     FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
+                     WHERE entry->>'error' IN (
+                           'snoozed as duplicate: unique claim held by a newer job',
+                           'retried as duplicate: unique claim held by a newer job',
+                           'promoted as duplicate: unique claim held by another job',
+                           'rescued as duplicate: heartbeat stale and unique claim held by a newer job',
+                           'rescued as duplicate: deadline expired and unique claim held by a newer job',
+                           'rescued as duplicate: callback timed out and unique claim held by a newer job'
+                       )
+                       AND entry->>'duplicate_unique_states' IS NOT NULL
+                     ORDER BY n DESC
+                     LIMIT 1),
+                    unique_states
+                )
+                ELSE unique_states
+            END
         WHERE id = ANY($1) AND state IN ('failed', 'cancelled', 'waiting_external')
         RETURNING *
         "#,
@@ -4091,7 +4130,7 @@ pub async fn register_callback(
     run_lease: i64,
     timeout: std::time::Duration,
 ) -> Result<Uuid, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store
@@ -4140,7 +4179,7 @@ pub async fn complete_external(
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = complete_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4221,7 +4260,7 @@ pub async fn complete_external_with(
     callback_id: Uuid,
     opts: ExternalCompletion,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = complete_external_with_in_tx(&mut tx, callback_id, opts).await?;
     tx.commit().await?;
     Ok(row)
@@ -4248,7 +4287,7 @@ pub async fn complete_external_reporting_output(
     callback_id: Uuid,
     opts: ExternalCompletion,
 ) -> Result<(JobRow, Option<&'static str>), AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let reported = complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
     tx.commit().await?;
     Ok(reported)
@@ -4346,7 +4385,7 @@ pub async fn resume_external(
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = resume_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4448,7 +4487,7 @@ pub async fn fail_external(
     error: &str,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = fail_external_in_tx(&mut tx, callback_id, error, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4520,7 +4559,7 @@ pub async fn retry_external(
     callback_id: Uuid,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let row = retry_external_in_tx(&mut tx, callback_id, run_lease).await?;
     tx.commit().await?;
     Ok(row)
@@ -4586,7 +4625,7 @@ pub async fn heartbeat_callback(
     callback_id: Uuid,
     timeout: std::time::Duration,
 ) -> Result<JobRow, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_queue_storage_in_tx(&mut tx, callback_id).await? {
         tx.commit().await?;
         return store.heartbeat_callback(pool, callback_id, timeout).await;
@@ -4618,7 +4657,7 @@ pub async fn heartbeat_callback(
 /// `Ok(false)` if no match (already resolved, rescued, or wrong lease).
 /// Callers should not treat `false` as an error.
 pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Result<bool, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store.cancel_callback(pool, job_id, run_lease).await;
@@ -4651,6 +4690,22 @@ pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Resu
 // so that both the Rust `JobContext` and the Python bridge call the same
 // code paths.
 
+/// Shortest wait between two `wait_for_callback` polls of a pending callback.
+pub const CALLBACK_POLL_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Longest wait between two `wait_for_callback` polls of a pending callback.
+pub const CALLBACK_POLL_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `wait_for_callback` waits after its `pending_polls`-th poll that
+/// found the callback still pending (counting from 1): the minimum delay,
+/// doubled per poll up to the maximum.
+pub fn callback_poll_delay(pending_polls: u32) -> std::time::Duration {
+    let doublings = pending_polls.saturating_sub(1).min(16);
+    CALLBACK_POLL_MIN_DELAY
+        .saturating_mul(1u32 << doublings)
+        .min(CALLBACK_POLL_MAX_DELAY)
+}
+
 /// Result of a single poll iteration inside `wait_for_callback`.
 #[derive(Debug)]
 pub enum CallbackPollResult {
@@ -4680,7 +4735,7 @@ pub async fn enter_callback_wait(
     run_lease: i64,
     callback_id: Uuid,
 ) -> Result<bool, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store
@@ -4717,7 +4772,7 @@ pub async fn check_callback_state(
     job_id: i64,
     callback_id: Uuid,
 ) -> Result<CallbackPollResult, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store.check_callback_state(pool, job_id, callback_id).await;
@@ -4909,7 +4964,7 @@ pub async fn register_callback_with_config(
         }
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
         tx.commit().await?;
         return store
@@ -4970,7 +5025,7 @@ pub async fn resolve_callback(
     default_action: DefaultAction,
     run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read_committed().await?;
     let outcome =
         resolve_callback_in_tx(&mut tx, callback_id, payload, default_action, run_lease).await?;
     tx.commit().await?;
@@ -5344,5 +5399,23 @@ fn apply_transform(job: &JobRow, payload_value: &serde_json::Value) -> serde_jso
             );
             payload_value.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_poll_delay_tests {
+    use super::{callback_poll_delay, CALLBACK_POLL_MAX_DELAY, CALLBACK_POLL_MIN_DELAY};
+    use std::time::Duration;
+
+    #[test]
+    fn doubles_from_the_minimum_to_the_maximum() {
+        assert_eq!(callback_poll_delay(0), CALLBACK_POLL_MIN_DELAY);
+        assert_eq!(callback_poll_delay(1), Duration::from_millis(200));
+        assert_eq!(callback_poll_delay(2), Duration::from_millis(400));
+        assert_eq!(callback_poll_delay(3), Duration::from_millis(800));
+        assert_eq!(callback_poll_delay(4), Duration::from_millis(1600));
+        assert_eq!(callback_poll_delay(5), Duration::from_millis(3200));
+        assert_eq!(callback_poll_delay(6), CALLBACK_POLL_MAX_DELAY);
+        assert_eq!(callback_poll_delay(u32::MAX), CALLBACK_POLL_MAX_DELAY);
     }
 }

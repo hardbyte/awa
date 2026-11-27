@@ -3,15 +3,16 @@ use crate::audited_sql;
 use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
+use crate::isolation::BeginReadCommitted;
 use crate::output::AttemptError;
 use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use sqlx::Acquire;
 use sqlx::{FromRow, PgPool, Postgres, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -34,23 +35,47 @@ pub(crate) const COPY_MIN_ROWS: usize = 2048;
 /// Claim and claim-cursor transactions commit without waiting for the WAL
 /// flush. A claim lost to a server crash leaves its job claimable again, and
 /// any later synchronous commit flushes every earlier claim first.
-const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off";
+const CLAIM_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL synchronous_commit = off");
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
+pub(crate) const SNOOZED_DUPLICATE_ERROR: &str =
+    "snoozed as duplicate: unique claim held by a newer job";
+pub(crate) const RETRIED_DUPLICATE_ERROR: &str =
+    "retried as duplicate: unique claim held by a newer job";
+pub(crate) const RESCHEDULED_DUPLICATE_ERROR: &str =
+    "rescheduled as duplicate: unique claim held by a newer job";
+/// The error a promotion writes when it cancels a due job as a duplicate.
+#[doc(hidden)]
+pub const PROMOTED_DUPLICATE_ERROR: &str =
+    "promoted as duplicate: unique claim held by another job";
+/// The errors canonical rescue writes when it cancels a stale, expired or
+/// timed-out attempt as a duplicate.
+#[doc(hidden)]
+pub const RESCUED_STALE_DUPLICATE_ERROR: &str =
+    "rescued as duplicate: heartbeat stale and unique claim held by a newer job";
+#[doc(hidden)]
+pub const RESCUED_EXPIRED_DUPLICATE_ERROR: &str =
+    "rescued as duplicate: deadline expired and unique claim held by a newer job";
+#[doc(hidden)]
+pub const RESCUED_TIMED_OUT_DUPLICATE_ERROR: &str =
+    "rescued as duplicate: callback timed out and unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
-const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const DRAIN_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
 // Rescue cursor scans are estimated far above their real cost, enough to
 // JIT-compile them, which takes seconds against about 100 ms of execution.
-const RESCUE_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const RESCUE_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
-// Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
+// Physical bytes above empty-index overhead on PostgreSQL 17 to 19. Installed
 // btree/GiST main forks retain one page; GIN (tag and claim-batch job indexes) retains its
 // metapage and root; BRIN retains three main
 // and three FSM pages (four below 4 KiB block size) when empty. Unknown
@@ -117,6 +142,10 @@ SELECT EXISTS (
 /// always treated as pinning regardless of age (they hold their snapshot
 /// indefinitely with no query in flight to bound it).
 const MVCC_HORIZON_PIN_MIN_AGE: Duration = Duration::from_secs(5);
+
+/// How long the job output column probe's catalog query may run once it has
+/// a connection.
+const JOB_OUTPUT_PROBE_QUERY_BUDGET: Duration = Duration::from_secs(10);
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -918,10 +947,7 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
 }
 
 fn is_lock_contention_error(err: &sqlx::Error) -> bool {
-    matches!(
-        err,
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("55P03")
-    )
+    pg_session_lock::is_lock_not_available(err)
 }
 
 async fn set_lock_timeout_tx(
@@ -1797,11 +1823,15 @@ fn busy_indicator(has_rows: bool) -> i64 {
     }
 }
 
+/// Whether a lease still points at a ready row in the slot. Leases of any
+/// generation count, for the same reason as the pending-ready gate: a job
+/// written into an older generation before v062 (#847) can be claimed after
+/// the slot was reused, and truncating the slot would delete its ready row
+/// under the running attempt.
 async fn queue_prune_has_active_leases_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
     slot: i32,
-    generation: i64,
 ) -> Result<bool, AwaError> {
     sqlx::query_scalar(audited_sql(format!(
         r#"
@@ -1809,13 +1839,11 @@ async fn queue_prune_has_active_leases_tx(
             SELECT 1
             FROM {schema}.leases
             WHERE ready_slot = $1
-              AND ready_generation = $2
             LIMIT 1
         )
         "#
     )))
     .bind(slot)
-    .bind(generation)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)
@@ -1825,11 +1853,15 @@ async fn queue_prune_has_active_leases_tx(
 /// cursor. The `ready_slot` predicate lets each per-lane probe use the
 /// partition primary key `(ready_slot, queue, priority, enqueue_shard,
 /// lane_seq)`.
+///
+/// Rows of any generation count. Before v062 a REPEATABLE READ or
+/// SERIALIZABLE producer could write a ready row into an older generation
+/// than the slot's (#847); truncating the slot would delete that unclaimed
+/// job, so it holds the slot instead.
 async fn queue_prune_has_pending_ready_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
     slot: i32,
-    generation: i64,
 ) -> Result<bool, AwaError> {
     let ready_child = ready_child_name(schema, slot as usize);
     sqlx::query_scalar(audited_sql(format!(
@@ -1848,8 +1880,7 @@ async fn queue_prune_has_pending_ready_tx(
             CROSS JOIN LATERAL (
                 SELECT 1
                 FROM {ready_child} AS ready
-                WHERE ready.ready_slot = $2
-                  AND ready.ready_generation = $1
+                WHERE ready.ready_slot = $1
                   AND ready.queue = claims.queue
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
@@ -1860,18 +1891,18 @@ async fn queue_prune_has_pending_ready_tx(
         )
         "#
     )))
-    .bind(generation)
     .bind(slot)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)
 }
 
+/// Whether a claim on a ready row in the slot is not yet proven closed. Claims
+/// of any generation count, as in [`queue_prune_has_active_leases_tx`].
 async fn queue_prune_has_unclosed_claim_refs_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
     slot: i32,
-    generation: i64,
 ) -> Result<bool, AwaError> {
     let count_proves_claim_refs_closed: bool = sqlx::query_scalar(audited_sql(format!(
         r#"
@@ -1879,13 +1910,11 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
             SELECT count(*)::bigint AS total
             FROM {schema}.lease_claims AS claims
             WHERE claims.ready_slot = $1
-              AND claims.ready_generation = $2
         ),
         compact_claim_count AS (
             SELECT COALESCE(sum(claimed_count), 0)::bigint AS total
             FROM {schema}.lease_claim_batches AS batches
             WHERE batches.ready_slot = $1
-              AND batches.ready_generation = $2
         ),
         explicit_count AS (
             SELECT count(*)::bigint AS total
@@ -1895,13 +1924,11 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
              AND closures.job_id = claims.job_id
              AND closures.run_lease = claims.run_lease
             WHERE claims.ready_slot = $1
-              AND claims.ready_generation = $2
         ),
         compact_count AS (
             SELECT COALESCE(sum(closed_count), 0)::bigint AS total
             FROM {schema}.lease_claim_closure_batches AS batches
             WHERE batches.ready_slot = $1
-              AND batches.ready_generation = $2
         )
         SELECT claim_count.total + compact_claim_count.total =
                explicit_count.total + compact_count.total
@@ -1909,7 +1936,6 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
         "#
     )))
     .bind(slot)
-    .bind(generation)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)?;
@@ -2599,6 +2625,250 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+/// The key of a duplicate-cancellation error entry that holds the job's
+/// unique mask from before `cancelled` was cleared from it.
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "duplicate_unique_states";
+
+/// The messages of the error entries awa writes when it cancels a job as a
+/// duplicate. A recorded mask is trusted only on an entry with one of them.
+pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 8] = [
+    SNOOZED_DUPLICATE_ERROR,
+    RETRIED_DUPLICATE_ERROR,
+    RESCUED_DUPLICATE_ERROR,
+    RESCHEDULED_DUPLICATE_ERROR,
+    PROMOTED_DUPLICATE_ERROR,
+    RESCUED_STALE_DUPLICATE_ERROR,
+    RESCUED_EXPIRED_DUPLICATE_ERROR,
+    RESCUED_TIMED_OUT_DUPLICATE_ERROR,
+];
+
+/// The messages releases before 0.6.19 wrote when they cancelled a duplicate
+/// and stored it without its unique key.
+const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] =
+    [RESCUED_DUPLICATE_ERROR, RESCHEDULED_DUPLICATE_ERROR];
+
+/// The unique mask a revived job takes. A row cancelled as a duplicate
+/// carries its original mask under [`DUPLICATE_CANCEL_MASK_KEY`] in the
+/// duplicate error entry, and gets it back. A cancelled duplicate that a
+/// release before 0.6.19 stored without its unique key cannot be revived:
+/// nothing would keep it from running beside the job that holds its key.
+/// Neither can a recorded duplicate whose key is gone.
+fn revived_unique_states(
+    state: JobState,
+    unique_key: Option<&[u8]>,
+    unique_states: Option<String>,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, AwaError> {
+    if state != JobState::Cancelled {
+        return Ok(unique_states);
+    }
+    let errors = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(original) = errors.iter().rev().find_map(|error| {
+        let message = error.get("error").and_then(serde_json::Value::as_str)?;
+        if !DUPLICATE_CANCEL_ERRORS.contains(&message) {
+            return None;
+        }
+        error
+            .get(DUPLICATE_CANCEL_MASK_KEY)
+            .and_then(serde_json::Value::as_str)
+    }) {
+        if unique_key.is_none() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        return Ok(Some(original.to_string()));
+    }
+    let legacy_keyless_duplicate = unique_key.is_none()
+        && unique_states.is_none()
+        && errors.last().is_some_and(|error| {
+            error.get("terminal") == Some(&serde_json::Value::Bool(true))
+                && error
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| LEGACY_KEYLESS_DUPLICATE_ERRORS.contains(&message))
+        });
+    if legacy_keyless_duplicate {
+        return Err(AwaError::UniqueConflict {
+            constraint: Some("idx_awa_jobs_unique".to_string()),
+        });
+    }
+    Ok(unique_states)
+}
+
+/// `entry` without the duplicate cancellation mask key, which only awa
+/// records.
+pub(crate) fn without_duplicate_mask(entry: &serde_json::Value) -> serde_json::Value {
+    let mut entry = entry.clone();
+    if let Some(object) = entry.as_object_mut() {
+        object.remove(DUPLICATE_CANCEL_MASK_KEY);
+    }
+    entry
+}
+
+/// A caller-supplied error entry as stored on a failed job, with the
+/// attempt, time and terminal flag filled in when absent. The duplicate
+/// cancellation mask key is dropped: only awa records it.
+fn caller_error_entry(error_entry: serde_json::Value, attempt: i16) -> serde_json::Value {
+    let mut error_obj = match error_entry {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("error".to_string(), other);
+            map
+        }
+    };
+    error_obj.remove(DUPLICATE_CANCEL_MASK_KEY);
+    error_obj
+        .entry("attempt".to_string())
+        .or_insert_with(|| serde_json::Value::from(i64::from(attempt)));
+    error_obj
+        .entry("at".to_string())
+        .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
+    error_obj
+        .entry("terminal".to_string())
+        .or_insert(serde_json::Value::Bool(true));
+    serde_json::Value::Object(error_obj)
+}
+
+/// Clear `cancelled` from `done`'s mask and record the original mask in its
+/// last error entry, the duplicate cancellation.
+fn clear_cancelled_claim(done: &mut DoneJobRow) -> Result<(), AwaError> {
+    let Some(original) = done.unique_states.clone() else {
+        return Ok(());
+    };
+    let mut payload = RuntimePayload::from_json(done.payload.clone())?;
+    if let Some(entry) = payload.errors.last_mut() {
+        entry[DUPLICATE_CANCEL_MASK_KEY] = serde_json::Value::String(original.clone());
+    }
+    done.payload = payload.into_json();
+    done.unique_states = unique_states_without(Some(original), JobState::Cancelled);
+    Ok(())
+}
+
+/// The cancelled done row for an attempt whose outcome's unique claim
+/// another job holds, with `duplicate_error` as its last error entry, and
+/// whether `cancelled` was cleared from its mask. The attempt held no claim,
+/// since its outcome's claim conflicted. A mask that claims `cancelled`
+/// would conflict again, so the row is written with `cancelled` cleared from
+/// its mask and the original mask recorded in its error entry. It keeps its
+/// unique key, so a later retry restores the mask and re-checks ownership.
+fn duplicate_cancelled_row(
+    row: LeaseTransitionRow,
+    payload: serde_json::Value,
+    duplicate_error: &str,
+    finalized_at: DateTime<Utc>,
+) -> Result<(DoneJobRow, bool), AwaError> {
+    let attempt = row.attempt;
+    let mut payload = RuntimePayload::from_json(payload)?;
+    payload.push_error(lifecycle_error(duplicate_error, attempt, true));
+    let mut done = row.into_done_row(JobState::Cancelled, finalized_at, payload.into_json());
+    let cleared = unique_state_claims(done.unique_states.as_deref(), JobState::Cancelled);
+    if cleared {
+        clear_cancelled_claim(&mut done)?;
+    }
+    Ok((done, cleared))
+}
+
+/// `unique_states` with `state`'s bit cleared.
+fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
+    let mut bitmask = unique_states?.into_bytes();
+    if let Some(bit) = bitmask.get_mut(state.bit_position() as usize) {
+        *bit = b'0';
+    }
+    String::from_utf8(bitmask).ok()
+}
+
+/// A change to one job's row in `awa.job_unique_claims`: `(key, claim,
+/// job_id)`, where `claim` takes the key for the job and otherwise releases
+/// it. The tuple order is the order every transaction applies changes in:
+/// unique key bytewise, a key's releases before its claims, then job ID.
+type UniqueClaimChange<'k> = (&'k [u8], bool, i64);
+
+/// The claim change a job moving from `old_state` to `new_state` makes, if
+/// any. `None` is a state outside job storage.
+fn unique_claim_change<'k>(
+    job_id: i64,
+    unique_key: Option<&'k [u8]>,
+    unique_states: Option<&str>,
+    old_state: Option<JobState>,
+    new_state: Option<JobState>,
+) -> Option<UniqueClaimChange<'k>> {
+    let key = unique_key?;
+    let old_claim = old_state.is_some_and(|state| unique_state_claims(unique_states, state));
+    let new_claim = new_state.is_some_and(|state| unique_state_claims(unique_states, state));
+    // A terminal row's mask can name its state while another job holds the
+    // key, as for a cancelled duplicate, so reviving it re-checks ownership
+    // through the claim upsert.
+    let recheck = new_claim
+        && old_state.is_some_and(|state| state.is_terminal())
+        && !new_state.is_some_and(|state| state.is_terminal());
+    (old_claim != new_claim || recheck).then_some((key, new_claim, job_id))
+}
+
+/// The claim changes writing `rows` as done rows makes.
+fn done_claim_changes(
+    rows: &[DoneJobRow],
+    old_state: Option<JobState>,
+) -> impl Iterator<Item = UniqueClaimChange<'_>> {
+    rows.iter().filter_map(move |row| {
+        unique_claim_change(
+            row.job_id,
+            row.unique_key.as_deref(),
+            row.unique_states.as_deref(),
+            old_state,
+            Some(row.state),
+        )
+    })
+}
+
+/// The claim change writing `row` as a done row makes, owning its key.
+fn owned_done_claim_change(
+    row: &DoneJobRow,
+    old_state: Option<JobState>,
+) -> Option<(Vec<u8>, bool, i64)> {
+    done_claim_changes(std::slice::from_ref(row), old_state)
+        .next()
+        .map(|(key, claim, job_id)| (key.to_vec(), claim, job_id))
+}
+
+/// The claim changes writing `rows` as DLQ rows makes. A DLQ row holds its
+/// claim as `failed`.
+fn dlq_claim_changes(
+    rows: &[DlqJobRow],
+    old_state: Option<JobState>,
+) -> impl Iterator<Item = UniqueClaimChange<'_>> {
+    rows.iter().filter_map(move |row| {
+        unique_claim_change(
+            row.job_id,
+            row.unique_key.as_deref(),
+            row.unique_states.as_deref(),
+            old_state,
+            Some(JobState::Failed),
+        )
+    })
+}
+
+/// The claim changes writing `rows` as deferred rows makes.
+fn deferred_claim_changes(
+    rows: &[DeferredJobRow],
+    old_state: Option<JobState>,
+) -> impl Iterator<Item = UniqueClaimChange<'_>> {
+    rows.iter().filter_map(move |row| {
+        unique_claim_change(
+            row.job_id,
+            row.unique_key.as_deref(),
+            row.unique_states.as_deref(),
+            old_state,
+            Some(row.state),
+        )
+    })
+}
+
 fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
     if value.contains(',')
         || value.contains('"')
@@ -3088,7 +3358,13 @@ enum CancelStep {
 
 struct CancelJobTxResult {
     row: JobRow,
+    /// The cancellation's claim change, for the caller to apply with the
+    /// rest of its transaction's.
+    claim_change: Option<(Vec<u8>, bool, i64)>,
     claim_cursor_advance: Option<ClaimCursorAdvance>,
+    /// Shard-0 lane of a cancelled deferred job, to be ensured after the
+    /// transaction's unique claims change.
+    lane: Option<(String, i16)>,
 }
 
 struct ReadyBatchMoveResult {
@@ -3348,6 +3624,189 @@ mod ready_segment_tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn concurrent_job_output_probes_share_one_catalog_read(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let probes = (0..16).map(|_| {
+            let (store, pool) = (store.clone(), pool.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&pool).await })
+        });
+        for probe in probes.collect::<Vec<_>>() {
+            assert!(probe.await.unwrap().unwrap());
+        }
+        assert_eq!(store.job_output_probe_count(), 1);
+    }
+
+    /// Callers waiting on a probe that fails do not each probe again, so an
+    /// unreachable database costs about one acquire timeout, not one per
+    /// waiting caller.
+    #[tokio::test]
+    async fn callers_waiting_on_a_failed_probe_fail_without_probing_again() {
+        use super::QueueStorageConfig;
+        use std::time::{Duration, Instant};
+
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(300))
+            .connect_lazy("postgres://awa@127.0.0.1:1/awa")
+            .unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let started = Instant::now();
+        let probes: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, pool) = (store.clone(), unreachable.clone());
+                tokio::spawn(async move { store.supports_job_output_from_pool(&pool).await })
+            })
+            .collect();
+        for probe in probes {
+            assert!(probe.await.unwrap().is_err());
+        }
+        assert!(
+            store.job_output_probe_count() < 8,
+            "waiting callers probed again: {} probes",
+            store.job_output_probe_count()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "eight callers took {:?}, about one acquire timeout each",
+            started.elapsed()
+        );
+    }
+
+    /// A probe whose catalog query stalls on an open connection gives up
+    /// after its budget instead of holding the single-flight lock while every
+    /// other pool caller waits behind it.
+    #[sqlx::test(migrations = false)]
+    async fn a_stalled_probe_query_releases_the_single_flight_lock(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::migrations::run(&pool).await.unwrap();
+        let options = (*pool.connect_options()).clone();
+        let (db_host, db_port) = (options.get_host().to_string(), options.get_port());
+
+        // A relay to the database that stops forwarding once `stall` is set,
+        // leaving the pool's connection open but unanswered.
+        let stall = std::sync::Arc::new(AtomicBool::new(false));
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        {
+            let stall = stall.clone();
+            tokio::spawn(async move {
+                while let Ok((client, _)) = relay.accept().await {
+                    let server = tokio::net::TcpStream::connect((db_host.as_str(), db_port))
+                        .await
+                        .unwrap();
+                    let (client_rx, client_tx) = client.into_split();
+                    let (server_rx, server_tx) = server.into_split();
+                    for (mut from, mut to) in [
+                        (
+                            Box::new(client_rx) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                            Box::new(server_tx) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                        ),
+                        (Box::new(server_rx) as _, Box::new(client_tx) as _),
+                    ] {
+                        let stall = stall.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                let read = match from.read(&mut buf).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(read) => read,
+                                };
+                                while stall.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                if to.write_all(&buf[..read]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        let relayed = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(300))
+            .test_before_acquire(false)
+            .connect_with(options.host("127.0.0.1").port(relay_port))
+            .await
+            .unwrap();
+        sqlx::query("SELECT 1").execute(&relayed).await.unwrap();
+        // Let the connection finish returning to the pool before stalling.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(relayed.num_idle(), 1);
+        stall.store(true, Ordering::SeqCst);
+
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let started = Instant::now();
+        let first = {
+            let (store, relayed) = (store.clone(), relayed.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&relayed).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waiter = {
+            let (store, relayed) = (store.clone(), relayed.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&relayed).await })
+        };
+        let limit = Duration::from_millis(300) + super::JOB_OUTPUT_PROBE_QUERY_BUDGET;
+        let first = tokio::time::timeout(limit + Duration::from_secs(5), first)
+            .await
+            .expect("a stalled probe must give up within its budget")
+            .unwrap();
+        assert!(first.is_err(), "{first:?}");
+        let waiter = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a caller waiting on the stalled probe must not wait again")
+            .unwrap();
+        assert!(waiter.is_err(), "{waiter:?}");
+        assert!(
+            started.elapsed() < limit + Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(store.job_output_probe_count(), 1);
+    }
+
+    /// A pool probe holding the single-flight lock while it waits for the
+    /// only connection must not block a transaction holding that connection
+    /// from probing on it.
+    #[sqlx::test(migrations = false)]
+    async fn a_transaction_probe_does_not_wait_for_a_pool_probe(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+        use std::time::Duration;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let mut tx = single.begin().await.unwrap();
+        let pool_probe = {
+            let (store, single) = (store.clone(), single.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&single).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let in_tx = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.supports_job_output(tx.as_mut()),
+        )
+        .await
+        .expect("the transaction's probe waited for the pool probe");
+        assert!(in_tx.unwrap());
+        tx.commit().await.unwrap();
+        assert!(pool_probe.await.unwrap().unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
         use super::{QueueStorageConfig, RuntimeReadyRow};
         use crate::audited_sql;
@@ -3536,6 +3995,54 @@ impl DoneJobRow {
     }
 }
 
+/// One pass of DLQ retention for [`QueueStorage::delete_expired_dlq_rows`].
+#[derive(Debug, Clone, Copy)]
+pub struct DlqExpiry<'a> {
+    /// Rows older than this are deleted.
+    pub retention: std::time::Duration,
+    /// At most this many rows are deleted.
+    pub limit: i64,
+    /// With a queue, the pass covers that queue; without one, every queue
+    /// except `overridden_queues`.
+    pub queue: Option<&'a str>,
+    /// Queues with a retention of their own. A pass without a queue leaves
+    /// them alone; a pass for a queue leaves its stripes that are listed here
+    /// alone.
+    pub overridden_queues: &'a [&'a str],
+    /// Treat a queue's stripes `q#N` as part of `q`, by the rule the store
+    /// routes with, while the store stripes its queues.
+    pub stripe_families: bool,
+    /// Delete in `(dlq_at, job_id)` order.
+    pub oldest_first: bool,
+}
+
+/// SQL that is true when `queue` is a stripe name of `logical`, by the rule
+/// `QueueStorage` routes with: `logical`, the stripe delimiter `#`, then a
+/// suffix that parses as `usize` (ASCII digits, an optional leading `+`, a
+/// value no greater than `usize_max`). The stripe count does not bound the
+/// suffix, so stripes left over from a larger former stripe count stay
+/// stripes, and a suffix too large for `usize` names an independent queue.
+fn stripe_of_sql(queue: &str, logical: &str, usize_max: &str) -> String {
+    let suffix = format!("substr({queue}, char_length({logical}) + 2)");
+    format!(
+        "(left({queue}, char_length({logical}) + 1) = {logical} || '#' \
+         AND CASE WHEN {suffix} ~ '^\\+?[0-9]+$' \
+                  THEN ltrim({suffix}, '+')::numeric <= {usize_max}::numeric \
+                  ELSE false END)"
+    )
+}
+
+/// The unique-claim fields of a deleted DLQ row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DeletedDlqRow {
+    job_id: i64,
+    state: JobState,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+}
+
+const DELETED_DLQ_COLUMNS: &str = "job_id, state, unique_key, unique_states";
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DlqJobRow {
     job_id: i64,
@@ -3663,6 +4170,13 @@ struct ExistingReadyRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+/// What one lane's promotion transaction did.
+#[derive(Debug, Default)]
+struct LanePromotion {
+    promoted: usize,
+    cancelled: Vec<JobRow>,
 }
 
 /// Which of a lane's due rows one promotion transaction takes.
@@ -4067,26 +4581,30 @@ pub struct QueueStorage {
     /// This instance's claimer lease per queue, as last read or written, so a
     /// claim does not re-read the lease and claimer target on every call.
     claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
-    /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
-    /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
-    /// queue_claim_heads) we have previously inserted. Skips the three
-    /// `INSERT … ON CONFLICT DO NOTHING` round-trips on subsequent enqueue
-    /// batches to a known lane/shard. Cleared on `reset()` because reset
-    /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
-    /// (head row gone after a rolled-back ensure_lane).
-    ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     /// Whether `{schema}.provision_lane` (migration v053) was callable the
     /// last time a lane was created. Only a positive answer is kept: lane
     /// creation is rare, and the probe rides on the lane-lock round trip.
     lane_provisioner_present: AtomicBool,
     /// Set once a provisioner failure has been logged.
     lane_provisioner_warned: AtomicBool,
+    /// Set once `{schema}.enqueue_ring_cursor()` (migration v062) was found
+    /// callable. A negative answer is not kept: until the function appears,
+    /// each enqueue checks again, so producers start using the floor with the
+    /// first enqueue after v062 commits rather than some time later.
+    enqueue_ring_cursor_present: AtomicBool,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
     cancel_phase_hook: CancelPhaseHookSlot,
     /// Whether this schema has migration v052's output columns (ADR-048),
     /// and when that was last checked.
     job_output_columns: Mutex<Option<(bool, std::time::Instant)>>,
+    /// Held while one caller probes for the output columns, so concurrent
+    /// cache misses wait for its answer instead of probing on their own.
+    job_output_probe: tokio::sync::Mutex<()>,
+    /// When a pool probe last failed, so callers that waited on it fail at
+    /// once instead of each probing again during an outage.
+    job_output_probe_failed_at: Mutex<Option<std::time::Instant>>,
+    job_output_probes: AtomicU64,
 }
 
 /// How long a negative answer about the output columns is trusted before
@@ -4136,13 +4654,16 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             claimer_gates: Mutex::new(HashMap::new()),
-            ensured_lanes: Mutex::new(HashSet::new()),
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
+            enqueue_ring_cursor_present: AtomicBool::new(false),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
             cancel_phase_hook: CancelPhaseHookSlot(None),
             job_output_columns: Mutex::new(None),
+            job_output_probe: tokio::sync::Mutex::new(()),
+            job_output_probe_failed_at: Mutex::new(None),
+            job_output_probes: AtomicU64::new(0),
         })
     }
 
@@ -4163,19 +4684,90 @@ impl QueueStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// How many catalog probes [`Self::supports_job_output`] has run.
+    #[doc(hidden)]
+    pub fn job_output_probe_count(&self) -> u64 {
+        self.job_output_probes.load(Ordering::Relaxed)
+    }
+
+    fn cached_job_output_columns(&self) -> Option<bool> {
+        let cached = *self
+            .job_output_columns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached.and_then(|(supported, checked_at)| {
+            (supported || checked_at.elapsed() < JOB_OUTPUT_PROBE_INTERVAL).then_some(supported)
+        })
+    }
+
+    /// Whether this schema has migration v052's job output columns.
+    ///
+    /// This probes on `executor` whenever the cache misses, without waiting
+    /// for a concurrent probe: a caller inside a transaction must not wait on
+    /// a pool probe that may need its connection. Pool callers should use
+    /// [`Self::supports_job_output_from_pool`].
     pub async fn supports_job_output<'e, E>(&self, executor: E) -> Result<bool, AwaError>
     where
         E: sqlx::PgExecutor<'e>,
     {
-        if let Some((supported, checked_at)) = *self
-            .job_output_columns
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        self.probe_job_output_columns(executor).await
+    }
+
+    /// [`Self::supports_job_output`] for a pool caller: concurrent cache
+    /// misses wait for one probe instead of each taking a connection for
+    /// their own. The probe holds the single-flight lock while it waits for a
+    /// connection; transaction callers never wait on that lock, so the
+    /// connection they hold is always released. A caller that waited while
+    /// the probe failed gets a retryable error at once rather than probing
+    /// again, so an outage costs one probe's wait rather than one per caller.
+    /// The probe gets the pool's acquire timeout plus
+    /// `JOB_OUTPUT_PROBE_QUERY_BUDGET`; a probe whose query stalls on an open
+    /// connection fails then, so it cannot hold the lock indefinitely.
+    pub async fn supports_job_output_from_pool(&self, pool: &PgPool) -> Result<bool, AwaError> {
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        let waiting_since = std::time::Instant::now();
+        let _probe = self.job_output_probe.lock().await;
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        let failed_while_waiting = self
+            .job_output_probe_failed_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            if supported || checked_at.elapsed() < JOB_OUTPUT_PROBE_INTERVAL {
-                return Ok(supported);
-            }
+            .is_some_and(|failed_at| failed_at >= waiting_since);
+        if failed_while_waiting {
+            return Err(AwaError::Database(sqlx::Error::Protocol(
+                "the job output column probe failed while this call waited for it".into(),
+            )));
         }
+        let deadline = pool.options().get_acquire_timeout() + JOB_OUTPUT_PROBE_QUERY_BUDGET;
+        let probed = match tokio::time::timeout(deadline, self.probe_job_output_columns(pool)).await
+        {
+            Ok(probed) => probed,
+            Err(_) => Err(AwaError::Database(sqlx::Error::Protocol(format!(
+                "the job output column probe did not finish within {deadline:?}"
+            )))),
+        };
+        if probed.is_err() {
+            *self
+                .job_output_probe_failed_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::time::Instant::now());
+        }
+        probed
+    }
+
+    async fn probe_job_output_columns<'e, E>(&self, executor: E) -> Result<bool, AwaError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        self.job_output_probes.fetch_add(1, Ordering::Relaxed);
         let supported: bool = sqlx::query_scalar(
             r#"
             SELECT count(*) = 2
@@ -4499,20 +5091,94 @@ impl QueueStorage {
         .into_json())
     }
 
-    async fn sync_unique_claim<'a>(
+    /// Apply `changes` to `awa.job_unique_claims` in one pass, in
+    /// [`UniqueClaimChange`] order. A run of consecutive releases goes in one
+    /// statement, and so does a run of consecutive claims. Each transaction
+    /// changes its claims in a single such pass, before it reserves any lane.
+    /// Returns the job IDs whose key another job holds; without
+    /// `skip_conflicts` any such job is an error.
+    async fn apply_unique_claim_changes_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        job_id: i64,
-        unique_key: &Option<Vec<u8>>,
-        unique_states: Option<&str>,
-        old_state: Option<JobState>,
-        new_state: Option<JobState>,
-    ) -> Result<(), AwaError> {
-        let old_claim = old_state.is_some_and(|state| unique_state_claims(unique_states, state));
-        let new_claim = new_state.is_some_and(|state| unique_state_claims(unique_states, state));
+        mut changes: Vec<UniqueClaimChange<'_>>,
+        skip_conflicts: bool,
+    ) -> Result<HashSet<i64>, AwaError> {
+        let mut conflicts = HashSet::new();
+        if changes.is_empty() {
+            return Ok(conflicts);
+        }
+        changes.sort_unstable();
+        changes.dedup();
 
-        if old_claim && !new_claim {
-            if let Some(key) = unique_key {
+        let contested: Vec<&[u8]> = changes
+            .windows(2)
+            .filter(|pair| pair[0].1 && pair[1].1 && pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+            .collect();
+        let owners: HashMap<Vec<u8>, i64> = if contested.is_empty() {
+            HashMap::new()
+        } else {
+            sqlx::query_as::<_, (Vec<u8>, i64)>(
+                "SELECT unique_key, job_id FROM awa.job_unique_claims WHERE unique_key = ANY($1)",
+            )
+            .bind(&contested)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .collect()
+        };
+        // Among jobs claiming the same key, the one that owns it wins;
+        // otherwise the lowest job ID does.
+        let mut winners: HashMap<&[u8], i64> = HashMap::new();
+        for (key, claim, job_id) in &changes {
+            if !*claim {
+                continue;
+            }
+            let winner = winners.entry(*key).or_insert(*job_id);
+            if owners.get(*key) == Some(job_id) {
+                *winner = *job_id;
+            }
+        }
+
+        let mut claiming: Vec<(&[u8], i64)> = Vec::new();
+        let mut releasing: Vec<(&[u8], i64)> = Vec::new();
+        for (key, claim, job_id) in changes {
+            if claim {
+                if winners.get(key) == Some(&job_id) {
+                    self.release_unique_keys_tx(tx, &mut releasing).await?;
+                    claiming.push((key, job_id));
+                } else {
+                    conflicts.insert(job_id);
+                }
+            } else {
+                self.claim_unique_keys_tx(tx, &mut claiming, &mut conflicts)
+                    .await?;
+                releasing.push((key, job_id));
+            }
+        }
+        self.claim_unique_keys_tx(tx, &mut claiming, &mut conflicts)
+            .await?;
+        self.release_unique_keys_tx(tx, &mut releasing).await?;
+
+        if !skip_conflicts && !conflicts.is_empty() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        Ok(conflicts)
+    }
+
+    /// Release the `pending` claims each job holds, locking them in the given
+    /// order, and clear `pending`.
+    async fn release_unique_keys_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        pending: &mut Vec<(&[u8], i64)>,
+    ) -> Result<(), AwaError> {
+        match pending.as_slice() {
+            [] => return Ok(()),
+            [(key, job_id)] => {
                 sqlx::query(
                     "DELETE FROM awa.job_unique_claims WHERE unique_key = $1 AND job_id = $2",
                 )
@@ -4522,33 +5188,35 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             }
-        }
-
-        if new_claim && !old_claim {
-            if let Some(key) = unique_key {
-                let result = sqlx::query(
+            _ => {
+                let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = pending.iter().copied().unzip();
+                // The locking clause applies after ORDER BY, so the CTE locks
+                // the rows in key order; the DELETE only reaches rows the CTE
+                // has already locked.
+                sqlx::query(
                     r#"
-                    INSERT INTO awa.job_unique_claims (unique_key, job_id)
-                    VALUES ($1, $2)
-                    ON CONFLICT (unique_key)
-                    DO UPDATE SET job_id = EXCLUDED.job_id
-                    WHERE awa.job_unique_claims.job_id = EXCLUDED.job_id
+                    WITH released AS MATERIALIZED (
+                        SELECT claims.unique_key
+                        FROM unnest($1::bytea[], $2::bigint[]) AS input(unique_key, job_id)
+                        JOIN awa.job_unique_claims AS claims
+                          ON claims.unique_key = input.unique_key
+                         AND claims.job_id = input.job_id
+                        ORDER BY claims.unique_key
+                        FOR UPDATE OF claims
+                    )
+                    DELETE FROM awa.job_unique_claims AS claims
+                    USING released
+                    WHERE claims.unique_key = released.unique_key
                     "#,
                 )
-                .bind(key)
-                .bind(job_id)
+                .bind(&keys)
+                .bind(&job_ids)
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-
-                if result.rows_affected() == 0 {
-                    return Err(AwaError::UniqueConflict {
-                        constraint: Some("idx_awa_jobs_unique".to_string()),
-                    });
-                }
             }
         }
-
+        pending.clear();
         Ok(())
     }
 
@@ -4606,7 +5274,8 @@ impl QueueStorage {
 
     // Enqueue inserts have no prior storage state, so uniqueness only needs to
     // add claims for states included in the row's unique-state bitmask. State
-    // transitions still use `sync_unique_claim`, which can release old claims.
+    // transitions use `apply_unique_claim_changes_tx`, which can release old
+    // claims.
     async fn sync_ready_enqueue_unique_claims<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4680,7 +5349,9 @@ impl QueueStorage {
         // and the tag-index pass instead of returned; the pool permit is held
         // until the close completes.
         let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?;
-        let mut install_tx = install_conn.begin().await.map_err(map_sqlx_error)?;
+        let mut install_tx = crate::isolation::begin_read_committed_on(&mut install_conn)
+            .await
+            .map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
@@ -5003,7 +5674,7 @@ impl QueueStorage {
         let schema = self.schema();
         let details = serde_json::json!({ "schema": schema });
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Mark queue storage active only after the full schema, partitions,
         // indexes, and helper functions are in place. The explicit install
@@ -5084,7 +5755,7 @@ impl QueueStorage {
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
@@ -5173,6 +5844,22 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // The ring restarts at generation 0, and so does its generation
+        // floor (#847). The next enqueue or rotation raises it again.
+        let has_generation_floor: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("{schema}.queue_ring_generation_floor"))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        if has_generation_floor {
+            sqlx::query(audited_sql(format!(
+                "ALTER SEQUENCE {schema}.queue_ring_generation_floor RESTART WITH 0"
+            )))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
         for (family, slot_count) in [
             (RingFamily::Queue, self.queue_slot_count()),
             (RingFamily::Lease, self.lease_slot_count()),
@@ -5236,9 +5923,8 @@ impl QueueStorage {
 
         // queue_lanes and queue_claimer_leases were TRUNCATEd above and
         // queue_meta may have a new shard configuration for the next round.
-        // Clear the caches so the next ensure_lane / shard_for_enqueue /
-        // claim calls re-observe DB state.
-        self.clear_lane_cache();
+        // Clear the caches so the next shard_for_enqueue / claim calls
+        // re-observe DB state.
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
@@ -5258,36 +5944,35 @@ impl QueueStorage {
         priority: i16,
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
-        // Fast path: this store has previously written the three lane
-        // rows for this `(queue, priority, shard)` triple. The cache is
-        // optimistic: another transaction may have marked the lane before
-        // commit, or the marking transaction may later roll back. Verify the
-        // head row is visible in this transaction before trusting the cache.
-        if self.lane_is_cached(queue, priority, enqueue_shard) {
-            let schema = self.schema();
-            let visible: bool = sqlx::query_scalar(audited_sql(format!(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {schema}.queue_enqueue_heads
-                    WHERE queue = $1
-                      AND priority = $2
-                      AND enqueue_shard = $3
-                )
-                "#
-            )))
-            .bind(queue)
-            .bind(priority)
-            .bind(enqueue_shard)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        // A lane whose head row and lane row this transaction can see needs
+        // no provisioning. `reset` truncates `queue_lanes` and keeps the heads.
+        let schema = self.schema();
+        let visible: bool = sqlx::query_scalar(audited_sql(format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM {schema}.queue_enqueue_heads
+                WHERE queue = $1
+                  AND priority = $2
+                  AND enqueue_shard = $3
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM {schema}.queue_lanes
+                WHERE queue = $1
+                  AND priority = $2
+            )
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
-            if visible {
-                return Ok(());
-            }
-
-            self.invalidate_cached_lane(queue, priority, enqueue_shard);
+        if visible {
+            return Ok(());
         }
 
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
@@ -5309,7 +5994,7 @@ impl QueueStorage {
                 "prepare_queue requires a nonempty queue and 1..=64 enqueue shards".into(),
             ));
         }
-        let mut transaction = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut transaction = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut physical_queues = self.physical_queues_for_logical(queue);
         physical_queues.sort_unstable();
         for physical_queue in physical_queues {
@@ -5324,11 +6009,8 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// Run the three lane-row inserts unconditionally and mark the
-    /// `(queue, priority)` pair as cached on success. Skips the cache
-    /// fast path so callers in the rollback-recovery path can force a
-    /// re-insert without racing another transaction that has marked
-    /// the lane but not yet committed its inserts.
+    /// Run the three lane-row inserts unconditionally under the lane's
+    /// provisioning lock.
     async fn ensure_lane_inserts<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5380,7 +6062,6 @@ impl QueueStorage {
                 .provision_lane(tx, queue, priority, enqueue_shard)
                 .await?
         {
-            self.mark_lane_ensured(queue, priority, enqueue_shard);
             return Ok(());
         }
 
@@ -5436,7 +6117,6 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        self.mark_lane_ensured(queue, priority, enqueue_shard);
         Ok(())
     }
 
@@ -5569,40 +6249,11 @@ impl QueueStorage {
         }
     }
 
-    fn lane_is_cached(&self, queue: &str, priority: i16, enqueue_shard: i16) -> bool {
-        let cache = self.ensured_lanes.lock().expect("ensured_lanes mutex");
-        cache.contains(&(queue.to_string(), priority, enqueue_shard))
-    }
-
-    fn mark_lane_ensured(&self, queue: &str, priority: i16, enqueue_shard: i16) {
-        self.ensured_lanes
-            .lock()
-            .expect("ensured_lanes mutex")
-            .insert((queue.to_string(), priority, enqueue_shard));
-    }
-
-    fn invalidate_cached_lane(&self, queue: &str, priority: i16, enqueue_shard: i16) {
-        self.ensured_lanes
-            .lock()
-            .expect("ensured_lanes mutex")
-            .remove(&(queue.to_string(), priority, enqueue_shard));
-    }
-
-    fn clear_lane_cache(&self) {
-        self.ensured_lanes
-            .lock()
-            .expect("ensured_lanes mutex")
-            .clear();
-    }
-
     // Reserve lane sequence numbers for a specific
     // `(queue, priority, shard)` triple and return the lane sequence at
-    // which the caller's range starts. If the head row is missing —
-    // typically because a previous ensure_lane ran inside a transaction
-    // that ultimately rolled back, leaving a stale cache entry behind —
-    // the cache entry is invalidated, ensure_lane is re-run, and the reserve
-    // is retried exactly once. A second miss surfaces as
-    // RowNotFound.
+    // which the caller's range starts. If the head row is missing, the lane
+    // rows are inserted again and the reserve is retried exactly once. A
+    // second miss surfaces as RowNotFound.
     async fn advance_enqueue_head<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5633,14 +6284,7 @@ impl QueueStorage {
             return Ok(start);
         }
 
-        // Recovery path: a prior ensure_lane marked the cache and
-        // then rolled back, leaving the head row missing. Bypass the
-        // cache fast path here and run the inserts unconditionally —
-        // calling `ensure_lane` would re-take the fast path if
-        // another concurrent transaction has re-marked the cache but
-        // not yet committed its inserts, leaving us in the same
-        // failure state.
-        self.invalidate_cached_lane(queue, priority, enqueue_shard);
+        // Recovery path: the head row was removed after ensure_lane saw it.
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
             .await?;
         let start: i64 = sqlx::query_scalar(audited_sql(sql))
@@ -5894,16 +6538,63 @@ impl QueueStorage {
         }
     }
 
-    /// Current queue-ring cursor for the Rust-side enqueue paths, honouring
-    /// the schema's authority (#371 staged upgrade). Reads the authority row
-    /// (single cached page) then the O(1) cursor; callers that already hold
-    /// an authority for the transaction should use `ring_cursor_tx` directly.
+    /// The queue-ring cursor that ready and terminal rows are written into.
+    ///
+    /// `{schema}.enqueue_ring_cursor()` (#847) returns the newer of the
+    /// cursor this transaction can see and the schema's generation floor, and
+    /// raises the floor to the former. Enqueues call this after reserving
+    /// their lane positions, while they hold the lane locks, so a REPEATABLE
+    /// READ or SERIALIZABLE producer whose snapshot predates a rotation still
+    /// writes into a generation no older than any earlier enqueue in its lane.
+    ///
+    /// A schema before v062, or a role that may not execute the function,
+    /// reads the cursor through the schema's authority (#371) as before.
     async fn current_queue_ring<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<(i32, i64), AwaError> {
+        if self.enqueue_ring_cursor_callable(tx.as_mut()).await? {
+            let schema = self.schema();
+            return sqlx::query_as(audited_sql(format!(
+                "SELECT slot, generation FROM {schema}.enqueue_ring_cursor()"
+            )))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(|err| {
+                // Gone or no longer executable since it was probed: probe
+                // again next time rather than fail every enqueue.
+                if let sqlx::Error::Database(db) = &err {
+                    if matches!(db.code().as_deref(), Some("42883" | "42501")) {
+                        self.enqueue_ring_cursor_present
+                            .store(false, Ordering::Relaxed);
+                    }
+                }
+                map_sqlx_error(err)
+            });
+        }
         let authority = self.ring_authority_tx(tx).await?;
         self.ring_cursor_tx(tx, RingFamily::Queue, authority).await
+    }
+
+    async fn enqueue_ring_cursor_callable<'e, E>(&self, executor: E) -> Result<bool, AwaError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        if self.enqueue_ring_cursor_present.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let callable: bool = sqlx::query_scalar(
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), false)",
+        )
+        .bind(format!("{}.enqueue_ring_cursor()", self.schema()))
+        .fetch_one(executor)
+        .await
+        .map_err(map_sqlx_error)?;
+        if callable {
+            self.enqueue_ring_cursor_present
+                .store(true, Ordering::Relaxed);
+        }
+        Ok(callable)
     }
 
     async fn next_job_ids<'a>(
@@ -6629,28 +7320,51 @@ impl QueueStorage {
         rows: Vec<ExistingReadyRow>,
         old_state: Option<JobState>,
     ) -> Result<usize, AwaError> {
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        let mut unique_rows: Vec<&ExistingReadyRow> = rows.iter().collect();
-        unique_rows.sort_unstable_by(|left, right| {
-            left.unique_key
-                .cmp(&right.unique_key)
-                .then(left.job_id.cmp(&right.job_id))
-        });
-        for row in unique_rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                old_state,
-                Some(JobState::Available),
-            )
+        let rows = rows.into_iter().map(|row| (row, old_state)).collect();
+        let (inserted, _) = self
+            .insert_existing_ready_rows_inner_tx(tx, rows, false)
             .await?;
+        Ok(inserted)
+    }
+
+    /// Re-enqueue `rows`, each paired with the state it leaves. Every row's
+    /// unique claim is synced before any lane is reserved, the order every
+    /// enqueue path takes them in. With `skip_conflicts`, a row whose unique
+    /// key a live job holds gets no lane position and its job ID is returned.
+    async fn insert_existing_ready_rows_inner_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<(ExistingReadyRow, Option<JobState>)>,
+        skip_conflicts: bool,
+    ) -> Result<(usize, Vec<i64>), AwaError> {
+        if rows.is_empty() {
+            return Ok((0, Vec::new()));
         }
 
+        let conflicts = self
+            .sync_reenqueue_unique_claims(tx, &rows, skip_conflicts)
+            .await?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        let mut skipped = Vec::with_capacity(conflicts.len());
+        for (row, _) in rows {
+            if conflicts.contains(&row.job_id) {
+                skipped.push(row.job_id);
+            } else {
+                claimed.push(row);
+            }
+        }
+        let inserted = self.insert_claimed_ready_rows_tx(tx, claimed).await?;
+        Ok((inserted, skipped))
+    }
+
+    /// Reserve lane positions for `rows` and write them to the ready ring.
+    /// Their unique claims must already be synced.
+    async fn insert_claimed_ready_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<ExistingReadyRow>,
+    ) -> Result<usize, AwaError> {
         let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
         for row in rows {
             grouped
@@ -6702,10 +7416,76 @@ impl QueueStorage {
             }
         }
 
+        if ready_rows.is_empty() {
+            return Ok(0);
+        }
         let ring = self.current_queue_ring(tx).await?;
         self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
         self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
-        Ok(total_rows)
+        Ok(ready_rows.len())
+    }
+
+    /// Sync the unique claims of rows moving to `available` through
+    /// [`Self::apply_unique_claim_changes_tx`].
+    async fn sync_reenqueue_unique_claims<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[(ExistingReadyRow, Option<JobState>)],
+        skip_conflicts: bool,
+    ) -> Result<HashSet<i64>, AwaError> {
+        let changes = rows
+            .iter()
+            .filter_map(|(row, old_state)| {
+                unique_claim_change(
+                    row.job_id,
+                    row.unique_key.as_deref(),
+                    row.unique_states.as_deref(),
+                    *old_state,
+                    Some(JobState::Available),
+                )
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, skip_conflicts)
+            .await
+    }
+
+    /// Claim distinct `pending` keys in the given order, adding the job IDs
+    /// whose key another job holds to `conflicts`, and clear `pending`.
+    async fn claim_unique_keys_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        pending: &mut Vec<(&[u8], i64)>,
+        conflicts: &mut HashSet<i64>,
+    ) -> Result<(), AwaError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = pending.drain(..).unzip();
+        let claimed: HashSet<i64> = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO awa.job_unique_claims (unique_key, job_id)
+            SELECT input.unique_key, input.job_id
+            FROM unnest($1::bytea[], $2::bigint[]) WITH ORDINALITY AS input(unique_key, job_id, ord)
+            ORDER BY input.ord
+            ON CONFLICT (unique_key)
+            DO UPDATE SET job_id = EXCLUDED.job_id
+            WHERE awa.job_unique_claims.job_id = EXCLUDED.job_id
+            RETURNING job_id
+            "#,
+        )
+        .bind(&keys)
+        .bind(&job_ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?
+        .into_iter()
+        .collect();
+        conflicts.extend(
+            job_ids
+                .into_iter()
+                .filter(|job_id| !claimed.contains(job_id)),
+        );
+        Ok(())
     }
 
     async fn insert_deferred_rows_tx<'a>(
@@ -6721,23 +7501,9 @@ impl QueueStorage {
         if old_state.is_none() {
             self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
         } else {
-            let mut unique_rows: Vec<&DeferredJobRow> = rows.iter().collect();
-            unique_rows.sort_unstable_by(|left, right| {
-                left.unique_key
-                    .cmp(&right.unique_key)
-                    .then(left.job_id.cmp(&right.job_id))
-            });
-            for row in unique_rows {
-                self.sync_unique_claim(
-                    tx,
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    old_state,
-                    Some(row.state),
-                )
+            let changes = deferred_claim_changes(&rows, old_state).collect();
+            self.apply_unique_claim_changes_tx(tx, changes, false)
                 .await?;
-            }
         }
 
         self.execute_deferred_inserts_tx(tx, &rows).await
@@ -6846,23 +7612,21 @@ impl QueueStorage {
         if rows.is_empty() {
             return Ok(0);
         }
-
-        let mut unique_rows: Vec<&DoneJobRow> = rows.iter().collect();
-        unique_rows.sort_unstable_by(|left, right| {
-            left.unique_key
-                .cmp(&right.unique_key)
-                .then(left.job_id.cmp(&right.job_id))
-        });
-        for row in unique_rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                old_state,
-                Some(row.state),
-            )
+        let changes = done_claim_changes(rows, old_state).collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
             .await?;
+        self.write_done_rows_tx(tx, rows, old_state).await
+    }
+
+    /// Write `rows` into `done_entries` without touching unique claims.
+    async fn write_done_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DoneJobRow],
+        old_state: Option<JobState>,
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
         }
 
         let schema = self.schema();
@@ -7349,23 +8113,20 @@ impl QueueStorage {
         if rows.is_empty() {
             return Ok(0);
         }
-
-        let mut unique_rows: Vec<&DlqJobRow> = rows.iter().collect();
-        unique_rows.sort_unstable_by(|left, right| {
-            left.unique_key
-                .cmp(&right.unique_key)
-                .then(left.job_id.cmp(&right.job_id))
-        });
-        for row in unique_rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                old_state,
-                Some(JobState::Failed),
-            )
+        let changes = dlq_claim_changes(rows, old_state).collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
             .await?;
+        self.write_dlq_rows_tx(tx, rows).await
+    }
+
+    /// Write `rows` into `dlq_entries` without touching unique claims.
+    async fn write_dlq_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DlqJobRow],
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
         }
 
         let schema = self.schema();
@@ -7570,15 +8331,13 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let total_rows = self
             .insert_ready_rows_tx(&mut tx, rows.clone(), false)
             .await?;
 
-        let queues_to_notify: Vec<String> = rows.iter().map(|row| row.queue.clone()).collect();
-        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, rows.into_iter().map(|row| row.queue));
         Ok(total_rows)
     }
 
@@ -7696,7 +8455,7 @@ impl QueueStorage {
         let queues_to_notify: Vec<String> =
             ready_rows.iter().map(|row| row.queue.clone()).collect();
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let job_ids = self
             .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
             .await?;
@@ -7725,9 +8484,8 @@ impl QueueStorage {
                 .await?;
         }
 
-        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues_to_notify);
         Ok(total)
     }
 
@@ -7810,7 +8568,7 @@ impl QueueStorage {
         let queues_to_notify: Vec<String> =
             ready_rows.iter().map(|row| row.queue.clone()).collect();
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
         let job_ids = self
             .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
@@ -7839,9 +8597,8 @@ impl QueueStorage {
                 .await?;
         }
 
-        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues_to_notify);
         Ok(total)
     }
 
@@ -7993,23 +8750,20 @@ impl QueueStorage {
                 .await?,
         );
 
-        let mut unique_claimed: Vec<&ReadyJobLeaseRow> = claimed.iter().collect();
-        unique_claimed.sort_unstable_by(|left, right| {
-            left.unique_key
-                .cmp(&right.unique_key)
-                .then(left.job_id.cmp(&right.job_id))
-        });
-        for row in unique_claimed {
-            self.sync_unique_claim(
-                &mut tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                Some(JobState::Available),
-                Some(JobState::Running),
-            )
+        let changes = claimed
+            .iter()
+            .filter_map(|row| {
+                unique_claim_change(
+                    row.job_id,
+                    row.unique_key.as_deref(),
+                    row.unique_states.as_deref(),
+                    Some(JobState::Available),
+                    Some(JobState::Running),
+                )
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(&mut tx, changes, false)
             .await?;
-        }
 
         let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
         if !use_lease_claim_receipts && deadline_duration.is_zero() {
@@ -8294,6 +9048,17 @@ impl QueueStorage {
         }
     }
 
+    /// The queue's shared claimer target, recomputed from the claimer signal
+    /// once the stored value is older than `control_interval`.
+    ///
+    /// A recomputed target is written only when it differs from the stored
+    /// one, and with a plain `UPDATE` whose `WHERE` excludes the stored value.
+    /// Such an `UPDATE` takes no row lock on a row it skips, so steady-state
+    /// refreshes from every instance neither write nor wait on each other.
+    /// (`INSERT ... ON CONFLICT DO UPDATE ... WHERE` would lock the existing
+    /// row even when its `WHERE` is false.) `updated_at` therefore records
+    /// the last change, and a change stands for `control_interval` before
+    /// anyone recomputes it.
     async fn queue_claimer_target(
         &self,
         pool: &PgPool,
@@ -8307,64 +9072,69 @@ impl QueueStorage {
             - TimeDelta::from_std(control_interval).map_err(|err| {
                 AwaError::Validation(format!("invalid claimer control interval: {err}"))
             })?;
+        let clamp = |target: i16| target.clamp(1, max_claimers.max(1));
 
-        if let Some(target) = sqlx::query_scalar::<_, i16>(audited_sql(format!(
+        let stored: Option<(i16, bool)> = sqlx::query_as(audited_sql(format!(
             r#"
-            SELECT target_claimers
+            SELECT target_claimers, updated_at > $2
             FROM {schema}.queue_claimer_state
             WHERE queue = $1
-              AND updated_at > $2
             "#
         )))
         .bind(queue)
         .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(target.clamp(1, max_claimers.max(1)));
-        }
-
-        let current_target = sqlx::query_scalar::<_, i16>(audited_sql(format!(
-            r#"
-            SELECT target_claimers
-            FROM {schema}.queue_claimer_state
-            WHERE queue = $1
-            "#
-        )))
-        .bind(queue)
         .fetch_optional(pool)
         .await
         .map_err(map_sqlx_error)?;
+        if let Some((target, true)) = stored {
+            return Ok(clamp(target));
+        }
+        let current_target = stored.map(|(target, _)| target);
 
         let signal = self.queue_claimer_signal(pool, queue).await?;
         let desired = self.desired_queue_claimer_target(current_target, &signal, max_claimers);
-
-        if let Some(updated) = sqlx::query_scalar::<_, i16>(audited_sql(format!(
-            r#"
-            INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (queue) DO UPDATE
-            SET target_claimers = EXCLUDED.target_claimers,
-                updated_at = EXCLUDED.updated_at
-            WHERE {schema}.queue_claimer_state.updated_at <= $4
-            RETURNING target_claimers
-            "#
-        )))
-        .bind(queue)
-        .bind(desired)
-        .bind(now)
-        .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(updated.clamp(1, max_claimers.max(1)));
+        if current_target == Some(desired) {
+            return Ok(clamp(desired));
         }
 
-        Ok(current_target
-            .unwrap_or(desired)
-            .clamp(1, max_claimers.max(1)))
+        let written = match current_target {
+            None => sqlx::query_scalar::<_, i16>(audited_sql(format!(
+                r#"
+                INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (queue) DO NOTHING
+                RETURNING target_claimers
+                "#
+            )))
+            .bind(queue)
+            .bind(desired)
+            .bind(now)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?,
+            Some(_) => sqlx::query_scalar::<_, i16>(audited_sql(format!(
+                r#"
+                UPDATE {schema}.queue_claimer_state
+                SET target_claimers = $2,
+                    updated_at = $3
+                WHERE queue = $1
+                  AND target_claimers IS DISTINCT FROM $2
+                  AND updated_at <= $4
+                RETURNING target_claimers
+                "#
+            )))
+            .bind(queue)
+            .bind(desired)
+            .bind(now)
+            .bind(stale_cutoff)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?,
+        };
+
+        // Another instance changed or created the row first; its target
+        // stands until the next recompute.
+        Ok(clamp(written.or(current_target).unwrap_or(desired)))
     }
 
     /// Whether a claim of `queue` could find a ready row, from the same
@@ -8470,24 +9240,39 @@ impl QueueStorage {
 
         let now = Utc::now();
         if !claimed.is_empty() && lease.needs_refresh(now, lease_ttl, idle_threshold) {
-            let still_owned = self
+            // The claim has committed, so a failed refresh leaves the claimed
+            // jobs with this runtime; the cached lease is dropped instead.
+            let refreshed = match self
                 .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
-                .await?;
-            if still_owned {
-                let refreshed = QueueClaimerLeaseRow {
-                    last_claimed_at: now,
-                    expires_at: now
-                        + TimeDelta::from_std(lease_ttl).map_err(|err| {
-                            AwaError::Validation(format!("invalid claimer lease ttl: {err}"))
-                        })?,
-                    ..lease
-                };
-                self.cache_claimer_gate(gate_key, refreshed);
-            } else {
-                self.claimer_gates
-                    .lock()
-                    .expect("claimer gate cache poisoned")
-                    .remove(&gate_key);
+                .await
+            {
+                Ok(true) => TimeDelta::from_std(lease_ttl)
+                    .ok()
+                    .map(|ttl| QueueClaimerLeaseRow {
+                        last_claimed_at: now,
+                        expires_at: now + ttl,
+                        ..lease
+                    }),
+                Ok(false) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        queue,
+                        claimed = claimed.len(),
+                        "failed to refresh the queue claimer lease after a committed claim; \
+                         dispatching the claimed jobs"
+                    );
+                    None
+                }
+            };
+            match refreshed {
+                Some(refreshed) => self.cache_claimer_gate(gate_key, refreshed),
+                None => {
+                    self.claimer_gates
+                        .lock()
+                        .expect("claimer gate cache poisoned")
+                        .remove(&gate_key);
+                }
             }
         }
 
@@ -8532,7 +9317,7 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let lease_slots: Vec<i32> = claimed.iter().map(|entry| entry.lease_slot).collect();
         let queues: Vec<String> = claimed.iter().map(|entry| entry.queue.clone()).collect();
@@ -8639,7 +9424,7 @@ impl QueueStorage {
             return Ok(RuntimeBatchCompletion::default());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         // Without the per-job closure-row insert,
         // lease_claim_closure_batches become the idempotence evidence.
         // Serialize duplicate completion attempts before the main statement
@@ -9089,7 +9874,7 @@ impl QueueStorage {
         claimed: &[ClaimedRuntimeJob],
         locks: AttemptLocks,
     ) -> Result<RuntimeBatchCompletion, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         // With `Try`, the attempts this transaction could lock stay locked to
         // commit; the slow path's own `lock_receipt_attempts_tx` then takes
         // them again, which does not wait on this transaction's own locks.
@@ -9180,6 +9965,9 @@ impl QueueStorage {
                 .cloned()
                 .partition(|entry| entry.claim.lease_claim_receipt);
             let mut updated_all = Vec::new();
+            // Both groups' done rows are written together, so their unique
+            // claims change in one key-ordered pass.
+            let mut done_rows = Vec::new();
 
             if !receipt_claimed.is_empty() {
                 let receipt_pairs: Vec<(i64, i64)> = receipt_claimed
@@ -9404,16 +10192,12 @@ impl QueueStorage {
 
                 if !updated.is_empty() {
                     let finalized_at = Utc::now();
-                    let mut done_rows = Vec::with_capacity(updated.len());
                     for (job_id, run_lease) in &updated {
                         if let Some(runtime_job) = claimed_map.get(&(*job_id, *run_lease)).cloned()
                         {
                             done_rows.push(runtime_job.into_done_row(finalized_at)?);
                         }
                     }
-
-                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
-                        .await?;
                     updated_all.extend(updated);
                 }
 
@@ -9548,7 +10332,6 @@ impl QueueStorage {
                         .await?;
 
                     let finalized_at = Utc::now();
-                    let mut done_rows = Vec::with_capacity(deleted.len());
                     for deleted_row in deleted {
                         if let Some(runtime_job) = claimed_map
                             .get(&(deleted_row.job_id, deleted_row.run_lease))
@@ -9558,12 +10341,11 @@ impl QueueStorage {
                             updated_all.push((deleted_row.job_id, deleted_row.run_lease));
                         }
                     }
-
-                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
-                        .await?;
                 }
             }
 
+            self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
+                .await?;
             return Ok(updated_all);
         }
 
@@ -9696,7 +10478,7 @@ impl QueueStorage {
         if completions.is_empty() {
             return Ok(Vec::new());
         }
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .complete_job_batch_by_id_in_tx(&mut tx, completions)
             .await?;
@@ -10159,6 +10941,41 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
     ) -> Result<Option<JobRow>, AwaError> {
+        let Some((ready_row, old_state)) = self.take_retry_row_tx(tx, job_id).await? else {
+            return Ok(None);
+        };
+        let row = Self::retried_job_row(ready_row.clone())?;
+        self.insert_existing_ready_rows_tx(tx, vec![ready_row], Some(old_state))
+            .await?;
+        Ok(Some(row))
+    }
+
+    fn retried_job_row(ready_row: ExistingReadyRow) -> Result<JobRow, AwaError> {
+        ReadyJobRow {
+            job_id: ready_row.job_id,
+            kind: ready_row.kind,
+            queue: ready_row.queue,
+            args: ready_row.args,
+            priority: ready_row.priority,
+            attempt: ready_row.attempt,
+            run_lease: ready_row.run_lease,
+            max_attempts: ready_row.max_attempts,
+            run_at: ready_row.run_at,
+            attempted_at: ready_row.attempted_at,
+            created_at: ready_row.created_at,
+            unique_key: ready_row.unique_key,
+            payload: ready_row.payload,
+        }
+        .into_job_row()
+    }
+
+    /// Remove a waiting, failed or cancelled job from where it sits and
+    /// return its ready row and the state it leaves, without enqueueing it.
+    async fn take_retry_row_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<(ExistingReadyRow, JobState)>, AwaError> {
         let schema = self.schema();
         let deleted_waiting: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -10206,28 +11023,7 @@ impl QueueStorage {
                 attempted_at: None,
                 ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
             };
-            self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(waiting.state))
-                .await?;
-            self.notify_queues_tx(tx, std::iter::once(waiting.queue.clone()))
-                .await?;
-            return Ok(Some(
-                ReadyJobRow {
-                    job_id: ready_row.job_id,
-                    kind: ready_row.kind,
-                    queue: ready_row.queue,
-                    args: ready_row.args,
-                    priority: ready_row.priority,
-                    attempt: ready_row.attempt,
-                    run_lease: ready_row.run_lease,
-                    max_attempts: ready_row.max_attempts,
-                    run_at: ready_row.run_at,
-                    attempted_at: ready_row.attempted_at,
-                    created_at: ready_row.created_at,
-                    unique_key: ready_row.unique_key,
-                    payload: ready_row.payload,
-                }
-                .into_job_row()?,
-            ));
+            return Ok(Some((ready_row, waiting.state)));
         }
 
         let done_projection = done_row_projection("done", "ready");
@@ -10281,41 +11077,28 @@ impl QueueStorage {
                 run_at: Utc::now(),
                 attempted_at: None,
                 created_at: terminal.created_at,
+                unique_states: revived_unique_states(
+                    terminal.state,
+                    terminal.unique_key.as_deref(),
+                    terminal.unique_states,
+                    &terminal.payload,
+                )?,
                 unique_key: terminal.unique_key,
-                unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
-            self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(terminal.state))
-                .await?;
-            self.notify_queues_tx(tx, std::iter::once(terminal.queue.clone()))
-                .await?;
-            return Ok(Some(
-                ReadyJobRow {
-                    job_id: ready_row.job_id,
-                    kind: ready_row.kind,
-                    queue: ready_row.queue,
-                    args: ready_row.args,
-                    priority: ready_row.priority,
-                    attempt: ready_row.attempt,
-                    run_lease: ready_row.run_lease,
-                    max_attempts: ready_row.max_attempts,
-                    run_at: ready_row.run_at,
-                    attempted_at: ready_row.attempted_at,
-                    created_at: ready_row.created_at,
-                    unique_key: ready_row.unique_key,
-                    payload: ready_row.payload,
-                }
-                .into_job_row()?,
-            ));
+            return Ok(Some((ready_row, terminal.state)));
         }
 
         Ok(None)
     }
 
     pub async fn retry_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let row = self.retry_job_tx(&mut tx, job_id).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        if let Some(row) = &row {
+            self.wake_queues_after_commit(pool, [row.queue.clone()]);
+        }
         Ok(row)
     }
 
@@ -10336,14 +11119,21 @@ impl QueueStorage {
             return Ok((Vec::new(), 0));
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut rows = Vec::with_capacity(unique_ids.len());
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        let mut taken = Vec::with_capacity(unique_ids.len());
         for job_id in &unique_ids {
-            if let Some(row) = self.retry_job_tx(&mut tx, *job_id).await? {
-                rows.push(row);
+            if let Some((ready_row, old_state)) = self.take_retry_row_tx(&mut tx, *job_id).await? {
+                taken.push((ready_row, Some(old_state)));
             }
         }
+        let rows = taken
+            .iter()
+            .map(|(ready_row, _)| Self::retried_job_row(ready_row.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.insert_existing_ready_rows_inner_tx(&mut tx, taken, false)
+            .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, rows.iter().map(|row| row.queue.clone()));
         Ok((rows, unique_ids.len() as u64))
     }
 
@@ -10619,7 +11409,8 @@ impl QueueStorage {
         let done = lease
             .clone()
             .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
-        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
+        let claim_change = owned_done_claim_change(&done, Some(lease.state));
+        self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
             .await?;
         // Receipt-plane consistency: close any matching open
         // receipt so the ADR-023 anti-join no longer considers this
@@ -10631,7 +11422,9 @@ impl QueueStorage {
             .await?;
         Ok(Some(CancelJobTxResult {
             row: done.into_job_row()?,
+            claim_change,
             claim_cursor_advance: None,
+            lane: None,
         }))
     }
 
@@ -10980,13 +11773,16 @@ impl QueueStorage {
         let done_payload =
             Self::payload_with_attempt_state(lease.payload.clone(), lease.progress.clone())?;
         let done = lease.into_done_row(JobState::Cancelled, Utc::now(), done_payload);
-        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Running))
+        let claim_change = owned_done_claim_change(&done, Some(JobState::Running));
+        self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Running))
             .await?;
         self.notify_cancellation_tx(tx, job_id, run_lease).await?;
         Ok(CancelStep::Done(RunningAttemptCancel::Cancelled(Box::new(
             CancelJobTxResult {
                 row: done.into_job_row()?,
+                claim_change,
                 claim_cursor_advance: None,
+                lane: None,
             },
         ))))
     }
@@ -11142,7 +11938,8 @@ impl QueueStorage {
                 ready
                     .clone()
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
-            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
+            let claim_change = owned_done_claim_change(&done, Some(JobState::Available));
+            self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
             // If the cancelled lane was *exactly* at the claim head,
             // advance the head past it so the derived cursor-difference count
@@ -11162,7 +11959,9 @@ impl QueueStorage {
             };
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
+                claim_change,
                 claim_cursor_advance: Some(claim_cursor_advance),
+                lane: None,
             }));
         }
 
@@ -11202,10 +12001,10 @@ impl QueueStorage {
             // is parked on shard 0 with a synthetic negative `lane_seq`
             // that keeps the `done_entries` PK
             // `(ready_slot, queue, priority, enqueue_shard, lane_seq)`
-            // unique. `ensure_lane` registers shard 0 for the queue so
-            // the lane row exists regardless of producer activity.
-            self.ensure_lane(tx, &deferred.queue, deferred.priority, 0)
-                .await?;
+            // unique. The caller ensures shard 0 of the lane so the lane
+            // row exists regardless of producer activity, after the
+            // transaction's unique claims change.
+            let lane = (deferred.queue.clone(), deferred.priority);
             let done = DoneJobRow {
                 ready_slot,
                 ready_generation,
@@ -11229,11 +12028,14 @@ impl QueueStorage {
                 payload: deferred.payload,
                 output: None,
             };
-            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
+            let claim_change = owned_done_claim_change(&done, Some(deferred.state));
+            self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
                 .await?;
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
+                claim_change,
                 claim_cursor_advance: None,
+                lane: Some(lane),
             }));
         }
 
@@ -11241,8 +12043,13 @@ impl QueueStorage {
     }
 
     pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self.cancel_job_tx(&mut tx, job_id).await?;
+        self.apply_cancel_claim_changes_tx(&mut tx, result.as_slice())
+            .await?;
+        if let Some((queue, priority)) = result.as_ref().and_then(|result| result.lane.as_ref()) {
+            self.ensure_lane(&mut tx, queue, *priority, 0).await?;
+        }
         tx.commit().await.map_err(map_sqlx_error)?;
         if let Some(result) = result {
             if let Some(advance) = result.claim_cursor_advance.as_ref() {
@@ -11265,10 +12072,31 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
     ) -> Result<Option<JobRow>, AwaError> {
-        Ok(self
-            .cancel_job_tx(tx, job_id)
-            .await?
-            .map(|result| result.row))
+        let Some(result) = self.cancel_job_tx(tx, job_id).await? else {
+            return Ok(None);
+        };
+        self.apply_cancel_claim_changes_tx(tx, std::slice::from_ref(&result))
+            .await?;
+        if let Some((queue, priority)) = &result.lane {
+            self.ensure_lane(tx, queue, *priority, 0).await?;
+        }
+        Ok(Some(result.row))
+    }
+
+    /// Apply the claim changes of `results` in one key-ordered pass.
+    async fn apply_cancel_claim_changes_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        results: &[CancelJobTxResult],
+    ) -> Result<(), AwaError> {
+        let changes = results
+            .iter()
+            .filter_map(|result| result.claim_change.as_ref())
+            .map(|(key, claim, job_id)| (key.as_slice(), *claim, *job_id))
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        Ok(())
     }
 
     pub async fn cancel_jobs_by_ids(
@@ -11280,17 +12108,26 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         self.lock_claim_heads_of_jobs_tx(&mut tx, ids).await?;
-        let mut rows = Vec::with_capacity(ids.len());
-        let mut claim_cursor_advances = Vec::new();
+        let mut results = Vec::with_capacity(ids.len());
         for job_id in ids {
-            if let Some(result) = self.cancel_job_tx(&mut tx, *job_id).await? {
-                if let Some(advance) = result.claim_cursor_advance {
-                    claim_cursor_advances.push(advance);
-                }
-                rows.push(result.row);
+            results.extend(self.cancel_job_tx(&mut tx, *job_id).await?);
+        }
+        self.apply_cancel_claim_changes_tx(&mut tx, &results)
+            .await?;
+        let mut rows = Vec::with_capacity(results.len());
+        let mut claim_cursor_advances = Vec::new();
+        let mut lanes = BTreeSet::new();
+        for result in results {
+            if let Some(advance) = result.claim_cursor_advance {
+                claim_cursor_advances.push(advance);
             }
+            lanes.extend(result.lane);
+            rows.push(result.row);
+        }
+        for (queue, priority) in &lanes {
+            self.ensure_lane(&mut tx, queue, *priority, 0).await?;
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         self.advance_claim_cursors(pool, &claim_cursor_advances)
@@ -11461,9 +12298,6 @@ impl QueueStorage {
             .iter()
             .map(|row| (row.queue.clone(), row.priority))
             .collect();
-        for (queue, priority) in &lanes {
-            self.ensure_lane(tx, queue, *priority, 0).await?;
-        }
 
         let finalized_at = Utc::now();
         let mut by_state: HashMap<JobState, Vec<DoneJobRow>> = HashMap::new();
@@ -11495,8 +12329,17 @@ impl QueueStorage {
             };
             by_state.entry(deferred.state).or_default().push(done);
         }
-        for (old_state, rows) in by_state {
-            self.insert_done_rows_tx(tx, &rows, Some(old_state)).await?;
+        let changes = by_state
+            .iter()
+            .flat_map(|(old_state, rows)| done_claim_changes(rows, Some(*old_state)))
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        for (old_state, rows) in &by_state {
+            self.write_done_rows_tx(tx, rows, Some(*old_state)).await?;
+        }
+        for (queue, priority) in &lanes {
+            self.ensure_lane(tx, queue, *priority, 0).await?;
         }
 
         Ok((cancelled, last_job_id))
@@ -11769,17 +12612,18 @@ impl QueueStorage {
             // column behind OFFSET 0, so it is not pushed down as a NOT EXISTS,
             // for the reason given in `cancel_available_chunk_tx`. A gap before a visible row
             // is an enqueue that rolled back: enqueues on a lane commit in
-            // position order.
+            // position order. So each window starts at the lane's first
+            // visible row at or after the cursor, however many rolled-back
+            // positions lie before it.
             let unfinished: Vec<(String, i16, i16)> = sqlx::query_as(audited_sql(format!(
                 r#"
-                WITH windows AS (
+                WITH cursors AS (
                     SELECT
                         lanes.queue,
                         lanes.priority,
                         lanes.enqueue_shard,
                         claims.seq_name,
                         {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                        LEAST({schema}.sequence_next_value(claims.seq_name) + $5, lanes.to_seq) AS window_end,
                         lanes.to_seq
                     FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[])
                         AS lanes(queue, priority, enqueue_shard, to_seq)
@@ -11787,6 +12631,39 @@ impl QueueStorage {
                       ON claims.queue = lanes.queue
                      AND claims.priority = lanes.priority
                      AND claims.enqueue_shard = lanes.enqueue_shard
+                ),
+                windows AS (
+                    SELECT
+                        cursors.*,
+                        LEAST(first_visible.lane_seq + $5, cursors.to_seq) AS window_end
+                    FROM cursors
+                    -- A lane's segments cover disjoint position ranges, so
+                    -- the first segment in position order with a visible row
+                    -- at or after the cursor holds the lane's first one.
+                    JOIN LATERAL (
+                        SELECT head.lane_seq
+                        FROM {schema}.ready_segments AS segment
+                        CROSS JOIN LATERAL (
+                            SELECT ready.lane_seq
+                            FROM {schema}.ready_entries AS ready
+                            WHERE ready.ready_slot = segment.ready_slot
+                              AND ready.ready_generation = segment.ready_generation
+                              AND ready.queue = cursors.queue
+                              AND ready.priority = cursors.priority
+                              AND ready.enqueue_shard = cursors.enqueue_shard
+                              AND ready.lane_seq >= GREATEST(segment.first_lane_seq, cursors.claim_seq)
+                              AND ready.lane_seq < LEAST(segment.next_lane_seq, cursors.to_seq)
+                            ORDER BY ready.lane_seq
+                            LIMIT 1
+                        ) AS head
+                        WHERE segment.queue = cursors.queue
+                          AND segment.priority = cursors.priority
+                          AND segment.enqueue_shard = cursors.enqueue_shard
+                          AND segment.next_lane_seq > cursors.claim_seq
+                          AND segment.first_lane_seq < cursors.to_seq
+                        ORDER BY segment.next_lane_seq
+                        LIMIT 1
+                    ) AS first_visible ON TRUE
                 ),
                 scanned AS (
                     SELECT
@@ -11910,7 +12787,7 @@ impl QueueStorage {
             ));
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self.set_priority_tx(&mut tx, job_id, priority).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
@@ -11961,7 +12838,7 @@ impl QueueStorage {
             }
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self.move_queue_tx(&mut tx, job_id, queue, priority).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
@@ -12245,7 +13122,7 @@ impl QueueStorage {
             - TimeDelta::from_std(aging_interval)
                 .map_err(|err| AwaError::Validation(format!("invalid aging interval: {err}")))?;
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let claimed = self.ready_row_claimed_sql("ready");
 
         // Claims commit before their cursor advance. Select only a bounded
@@ -12420,8 +13297,8 @@ impl QueueStorage {
         // The drift is bounded by aging rate × poll interval.
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues);
         Ok(ids)
     }
 
@@ -12440,7 +13317,7 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
     ) -> Result<serde_json::Value, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut row: Option<AttemptStateRow> = sqlx::query_as(audited_sql(format!(
             r#"
             SELECT
@@ -12518,6 +13395,19 @@ impl QueueStorage {
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)
+    }
+
+    /// Wake the claimers of `queues` once the caller's transaction has
+    /// committed, coalesced per pool (see [`crate::wakeup`]). Paths that
+    /// commit their own transaction use this; the public `*_tx` methods,
+    /// whose caller commits, notify inside the transaction instead.
+    fn wake_queues_after_commit(&self, pool: &PgPool, queues: impl IntoIterator<Item = String>) {
+        crate::wakeup::wake_after_commit(
+            pool,
+            queues
+                .into_iter()
+                .map(|queue| format!("awa:{}", self.logical_queue_name(&queue))),
+        );
     }
 
     async fn notify_queues_tx<'a>(
@@ -16040,7 +16930,7 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
         let schema = self.schema();
-        let output_column = if include_output && self.supports_job_output(pool).await? {
+        let output_column = if include_output && self.supports_job_output_from_pool(pool).await? {
             ",\n                output"
         } else {
             ""
@@ -16555,7 +17445,7 @@ impl QueueStorage {
         timeout: Duration,
     ) -> Result<Uuid, AwaError> {
         let callback_id = Uuid::new_v4();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
             .await?;
         let updated = sqlx::query(audited_sql(format!(
@@ -16678,7 +17568,7 @@ impl QueueStorage {
         }
 
         let callback_id = Uuid::new_v4();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
             .await?;
         let updated = sqlx::query(audited_sql(format!(
@@ -16747,7 +17637,7 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
     ) -> Result<bool, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = sqlx::query(audited_sql(format!(
             r#"
             UPDATE {}
@@ -16921,7 +17811,7 @@ impl QueueStorage {
         callback_id: Uuid,
         progress: Option<&serde_json::Value>,
     ) -> Result<bool, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let entered = self
             .enter_callback_wait_with_progress_in_tx(
                 &mut tx,
@@ -17096,7 +17986,7 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .callback_job_in_tx(&mut tx, callback_id, run_lease, false)
             .await?;
@@ -17211,7 +18101,7 @@ impl QueueStorage {
         run_lease: Option<i64>,
         resume: bool,
     ) -> Result<JobRow, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .complete_external_in_tx(&mut tx, callback_id, payload, run_lease, resume)
             .await?;
@@ -17436,7 +18326,7 @@ impl QueueStorage {
         error_entry: serde_json::Value,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_external_with_error_entry_in_tx(&mut tx, callback_id, error_entry, run_lease)
             .await?;
@@ -17507,23 +18397,7 @@ impl QueueStorage {
             moved.payload.clone(),
             moved.progress.clone(),
         )?)?;
-        let mut error_entry = match error_entry {
-            serde_json::Value::Object(map) => serde_json::Value::Object(map),
-            other => serde_json::json!({ "error": other }),
-        };
-        let error_obj = error_entry
-            .as_object_mut()
-            .ok_or_else(|| AwaError::Validation("callback error entry must be an object".into()))?;
-        error_obj
-            .entry("attempt".to_string())
-            .or_insert_with(|| serde_json::Value::from(i64::from(moved.attempt)));
-        error_obj
-            .entry("at".to_string())
-            .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
-        error_obj
-            .entry("terminal".to_string())
-            .or_insert(serde_json::Value::Bool(true));
-        payload.push_error(error_entry);
+        payload.push_error(caller_error_entry(error_entry, moved.attempt));
         let done_row =
             moved
                 .clone()
@@ -17539,7 +18413,7 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .retry_external_in_tx(&mut tx, callback_id, run_lease)
             .await?;
@@ -17676,7 +18550,7 @@ impl QueueStorage {
         run_lease: i64,
         progress: serde_json::Value,
     ) -> Result<(), AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         if self.lease_claim_receipts() {
             self.upsert_attempt_state_progress_from_receipts_tx(
                 &mut tx,
@@ -17705,7 +18579,7 @@ impl QueueStorage {
             return Ok(0);
         }
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let pairs: Vec<(i64, i64)> = claims
             .iter()
             .map(|claim| (claim.job_id, claim.run_lease))
@@ -17835,7 +18709,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let mut updated = 0_usize;
         if self.lease_claim_receipts() {
             // #169 B1: in receipts mode, attempt_state is the
@@ -17894,7 +18768,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let updated = if self.lease_claim_receipts() {
             // #169 B1: receipts mode is the only supported shape for
             // the default `awa` schema. attempt_state already carries
@@ -17986,7 +18860,7 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .retry_after_in_tx_with_claim(&mut tx, job_id, run_lease, retry_after, progress, claim)
             .await?;
@@ -18044,7 +18918,7 @@ impl QueueStorage {
         claim: Option<&ClaimedEntry>,
         output: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .retry_after_with_output_in_tx(
                 &mut tx,
@@ -18106,9 +18980,10 @@ impl QueueStorage {
             Some(now),
             payload,
         );
-        self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(moved.state))
+        let row = self
+            .insert_deferred_or_cancel_duplicate_tx(tx, moved, deferred, RETRIED_DUPLICATE_ERROR)
             .await?;
-        Ok(Some(deferred.into_job_row()?))
+        Ok(Some(row))
     }
 
     pub async fn snooze(
@@ -18132,7 +19007,7 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let Some(moved) = self
             .take_running_attempt_tx(&mut tx, job_id, run_lease, "scheduled", claim)
             .await?
@@ -18152,10 +19027,16 @@ impl QueueStorage {
             payload,
         );
         deferred.attempt = deferred.attempt.saturating_sub(1);
-        self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
+        let row = self
+            .insert_deferred_or_cancel_duplicate_tx(
+                &mut tx,
+                moved,
+                deferred,
+                SNOOZED_DUPLICATE_ERROR,
+            )
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(Some(deferred.into_job_row()?))
+        Ok(Some(row))
     }
 
     /// Insert a canonical attempt's transition-time deferred successor,
@@ -18169,6 +19050,7 @@ impl QueueStorage {
         row: JobRow,
         unique_states: Option<String>,
         duplicate_error: &str,
+        ran_attempt: i16,
     ) -> Result<JobRow, AwaError> {
         let payload = Self::payload_from_parts(row.metadata, row.tags, row.errors, row.progress)?;
         let deferred = DeferredJobRow {
@@ -18208,10 +19090,8 @@ impl QueueStorage {
         }
 
         let mut cancelled_payload = RuntimePayload::from_json(deferred.payload.clone())?;
-        cancelled_payload.push_error(lifecycle_error(duplicate_error, deferred.attempt, true));
+        cancelled_payload.push_error(lifecycle_error(duplicate_error, ran_attempt, true));
         let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
-        self.ensure_lane(tx, &deferred.queue, deferred.priority, 0)
-            .await?;
         let mut done = DoneJobRow {
             ready_slot,
             ready_generation,
@@ -18221,7 +19101,9 @@ impl QueueStorage {
             args: deferred.args,
             state: JobState::Cancelled,
             priority: deferred.priority,
-            attempt: deferred.attempt,
+            // The cancelled row records the attempt that ran, not a snooze
+            // successor's decremented one.
+            attempt: ran_attempt,
             run_lease: deferred.run_lease,
             max_attempts: deferred.max_attempts,
             // The successor never entered a ready lane. Mirror deferred-job
@@ -18238,7 +19120,7 @@ impl QueueStorage {
             output: None,
         };
 
-        {
+        let claimed = {
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
                 .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), None)
@@ -18246,98 +19128,113 @@ impl QueueStorage {
             {
                 Ok(_) => {
                     savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return done.into_job_row();
+                    true
                 }
                 Err(AwaError::UniqueConflict { .. }) => {
                     savepoint.rollback().await.map_err(map_sqlx_error)?;
+                    false
                 }
                 Err(err) => return Err(err),
             }
-        }
+        };
 
-        // If `cancelled` itself claims uniqueness, the newer holder still
-        // wins. The cancelled evidence carries no claim to release, so strip
-        // the uniqueness fields exactly like rescue duplicate cancellation.
-        done.unique_key = None;
-        done.unique_states = None;
-        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
-            .await?;
+        if !claimed {
+            // If `cancelled` itself claims uniqueness, the newer holder still
+            // wins. The row keeps its key, so a retry re-checks ownership.
+            clear_cancelled_claim(&mut done)?;
+            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
+                .await?;
+        }
+        self.ensure_lane(tx, &done.queue, done.priority, 0).await?;
         done.into_job_row()
     }
 
-    /// Rescue-path fallback for unique-claim conflicts: insert the rescued
-    /// attempt's deferred successor, degrading to a cancelled terminal row
-    /// when the job's unique claim is held by a newer duplicate — the claim
-    /// holder wins, and one poisoned row must not abort the whole batched
-    /// rescue transaction. The insert attempt runs inside a savepoint so the
-    /// conflict leaves the outer transaction usable.
-    async fn insert_rescued_deferred_or_cancel_tx(
+    /// Write `deferred` as the successor of the attempt `row`, or, when
+    /// another job holds its unique key, finish the attempt as a cancelled
+    /// duplicate with `duplicate_error` instead: the claim holder wins. The
+    /// claim change is applied in one pass before any row is written, as
+    /// every queue-storage path does.
+    async fn insert_deferred_or_cancel_duplicate_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         row: LeaseTransitionRow,
         deferred: DeferredJobRow,
         duplicate_error: &str,
     ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_deferred_rows_tx(&mut savepoint, vec![deferred.clone()], Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return deferred.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
+        let changes =
+            deferred_claim_changes(std::slice::from_ref(&deferred), Some(row.state)).collect();
+        let conflicts = self
+            .apply_unique_claim_changes_tx(tx, changes, true)
+            .await?;
+        if !conflicts.contains(&row.job_id) {
+            self.execute_deferred_inserts_tx(tx, std::slice::from_ref(&deferred))
+                .await?;
+            return deferred.into_job_row();
         }
-        self.cancel_rescued_duplicate_tx(tx, row, deferred.payload, duplicate_error)
-            .await
+        let old_state = row.state;
+        // The cancelled row takes the time the caller stamped the successor
+        // with, truncated to what PostgreSQL stores so the returned row
+        // matches the committed one.
+        let finalized_at = deferred
+            .finalized_at
+            .unwrap_or_else(Utc::now)
+            .trunc_subsecs(6);
+        let (done, cleared) =
+            duplicate_cancelled_row(row, deferred.payload, duplicate_error, finalized_at)?;
+        // As in rescue: a row whose mask was cleared is written
+        // self-contained, so it stores the mask it reports.
+        let old_state = (!cleared).then_some(old_state);
+        self.write_done_rows_tx(tx, std::slice::from_ref(&done), old_state)
+            .await?;
+        done.into_job_row()
     }
 
     /// Settle attempts that maintenance rescued (stale heartbeat, expired
     /// deadline or callback timeout): back to `retryable` with backoff while
     /// attempts remain, `failed` once the rescued attempt was the last. A job
     /// that kills or hangs its worker every time therefore stops after
-    /// `max_attempts`, like one whose handler returns an error.
+    /// `max_attempts`, like one whose handler returns an error. Each batch
+    /// pairs rescued attempts with the error recorded on them.
     ///
     /// An exhausted attempt on a queue whose DLQ is enabled goes straight to
     /// `dlq_entries` in this transaction, as `fail_to_dlq` does for a handler
     /// error, so there is no window in which it sits `failed` outside the DLQ.
     ///
-    /// Each outcome is written in one statement per previous state. If that
-    /// statement hits a unique-claim conflict, the group is retried row by
-    /// row so only the conflicting attempts become cancellations.
+    /// Every batch's unique claims change in one key-ordered pass. An attempt
+    /// whose outcome claims a key a newer duplicate holds is cancelled
+    /// instead: the claim holder wins, and one poisoned row must not abort
+    /// the whole rescue transaction.
     async fn settle_rescued_attempts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        rows: Vec<LeaseTransitionRow>,
-        error: &str,
+        batches: Vec<(Vec<LeaseTransitionRow>, &str)>,
         dlq: RescueDlq<'_>,
     ) -> Result<Vec<JobRow>, AwaError> {
+        let rows: Vec<(LeaseTransitionRow, &str)> = batches
+            .into_iter()
+            .flat_map(|(rows, error)| rows.into_iter().map(move |row| (row, error)))
+            .collect();
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
         let (retry_attempts, retry_max_attempts): (Vec<i16>, Vec<i16>) = rows
             .iter()
-            .filter(|row| row.attempt < row.max_attempts)
-            .map(|row| (row.attempt, row.max_attempts))
+            .filter(|(row, _)| row.attempt < row.max_attempts)
+            .map(|(row, _)| (row.attempt, row.max_attempts))
             .unzip();
         let mut retry_run_ats = self
             .backoffs_at_tx(tx, &retry_attempts, &retry_max_attempts)
             .await?
             .into_iter();
 
-        let finalized_at = Utc::now();
+        // PostgreSQL keeps microseconds, so the rows returned match the rows
+        // committed.
+        let finalized_at = Utc::now().trunc_subsecs(6);
         let mut retries: Vec<(LeaseTransitionRow, DeferredJobRow)> = Vec::new();
         let mut failures: Vec<(LeaseTransitionRow, DoneJobRow)> = Vec::new();
         let mut dead_letters: Vec<(LeaseTransitionRow, DlqJobRow)> = Vec::new();
-        for row in rows {
+        for (row, error) in rows {
             let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
                 row.payload.clone(),
                 row.progress.clone(),
@@ -18371,95 +19268,104 @@ impl QueueStorage {
             }
         }
 
+        let mut changes = Vec::new();
+        for (row, deferred) in &retries {
+            changes.extend(deferred_claim_changes(
+                std::slice::from_ref(deferred),
+                Some(row.state),
+            ));
+        }
+        for (row, done) in &failures {
+            changes.extend(done_claim_changes(
+                std::slice::from_ref(done),
+                Some(row.state),
+            ));
+        }
+        for (row, dead_letter) in &dead_letters {
+            changes.extend(dlq_claim_changes(
+                std::slice::from_ref(dead_letter),
+                Some(row.state),
+            ));
+        }
+        let conflicts = self
+            .apply_unique_claim_changes_tx(tx, changes, true)
+            .await?;
+
         let mut settled = Vec::with_capacity(retries.len() + failures.len() + dead_letters.len());
-        for (old_state, group) in group_by_previous_state(retries) {
-            let deferred: Vec<DeferredJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_deferred_rows_tx(&mut savepoint, deferred, Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    for (_, deferred) in group {
-                        settled.push(deferred.into_job_row()?);
-                    }
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                    for (row, deferred) in group {
-                        settled.push(
-                            self.insert_rescued_deferred_or_cancel_tx(
-                                tx,
-                                row,
-                                deferred,
-                                RESCUED_DUPLICATE_ERROR,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-                Err(err) => return Err(err),
+        let mut duplicates: Vec<(LeaseTransitionRow, (DoneJobRow, bool))> = Vec::new();
+        let mut duplicate = |row: LeaseTransitionRow, payload: serde_json::Value| {
+            let done = duplicate_cancelled_row(
+                row.clone(),
+                payload,
+                RESCUED_DUPLICATE_ERROR,
+                finalized_at,
+            )?;
+            duplicates.push((row, done));
+            Ok::<_, AwaError>(())
+        };
+        let mut kept_retries = Vec::with_capacity(retries.len());
+        for (row, deferred) in retries {
+            if conflicts.contains(&row.job_id) {
+                duplicate(row, deferred.payload)?;
+            } else {
+                kept_retries.push((row, deferred));
             }
         }
-        for (old_state, group) in group_by_previous_state(failures) {
-            let done: Vec<DoneJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_done_rows_tx(&mut savepoint, &done, Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    for done in done {
-                        settled.push(done.into_job_row()?);
-                    }
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                    for (row, done) in group {
-                        settled.push(
-                            self.insert_rescued_done_or_cancel_tx(
-                                tx,
-                                row,
-                                done,
-                                RESCUED_DUPLICATE_ERROR,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-                Err(err) => return Err(err),
+        let mut kept_failures = Vec::with_capacity(failures.len());
+        for (row, done) in failures {
+            if conflicts.contains(&row.job_id) {
+                duplicate(row, done.payload)?;
+            } else {
+                kept_failures.push((row, done));
             }
         }
-        for (old_state, group) in group_by_previous_state(dead_letters) {
-            let dead_letters: Vec<DlqJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_dlq_rows_tx(&mut savepoint, &dead_letters, Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    for dead_letter in dead_letters {
-                        settled.push(dead_letter.into_job_row()?);
-                    }
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                    for (row, dead_letter) in group {
-                        settled.push(
-                            self.insert_rescued_dlq_or_cancel_tx(
-                                tx,
-                                row,
-                                dead_letter,
-                                RESCUED_DUPLICATE_ERROR,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-                Err(err) => return Err(err),
+        let mut kept_dead_letters = Vec::with_capacity(dead_letters.len());
+        for (row, dead_letter) in dead_letters {
+            if conflicts.contains(&row.job_id) {
+                duplicate(row, dead_letter.payload)?;
+            } else {
+                kept_dead_letters.push((row, dead_letter));
+            }
+        }
+
+        let deferred: Vec<DeferredJobRow> = kept_retries
+            .into_iter()
+            .map(|(_, deferred)| deferred)
+            .collect();
+        self.execute_deferred_inserts_tx(tx, &deferred).await?;
+        for deferred in deferred {
+            settled.push(deferred.into_job_row()?);
+        }
+        for (old_state, group) in group_by_previous_state(kept_failures) {
+            let done: Vec<DoneJobRow> = group.into_iter().map(|(_, done)| done).collect();
+            self.write_done_rows_tx(tx, &done, Some(old_state)).await?;
+            for done in done {
+                settled.push(done.into_job_row()?);
+            }
+        }
+        let dead_letters: Vec<DlqJobRow> = kept_dead_letters
+            .into_iter()
+            .map(|(_, dead_letter)| dead_letter)
+            .collect();
+        self.write_dlq_rows_tx(tx, &dead_letters).await?;
+        for dead_letter in dead_letters {
+            settled.push(dead_letter.into_job_row()?);
+        }
+        // A ready-backed done row takes its unique key and mask from the
+        // retained ready row, so a duplicate whose mask was cleared is
+        // written self-contained, as a rescheduled duplicate is, and stores
+        // the mask it reports.
+        for (old_state, group) in group_by_previous_state(duplicates) {
+            let (cleared, kept): (Vec<_>, Vec<_>) = group
+                .into_iter()
+                .map(|(_, done)| done)
+                .partition(|(_, cleared)| *cleared);
+            let kept: Vec<DoneJobRow> = kept.into_iter().map(|(done, _)| done).collect();
+            let cleared: Vec<DoneJobRow> = cleared.into_iter().map(|(done, _)| done).collect();
+            self.write_done_rows_tx(tx, &kept, Some(old_state)).await?;
+            self.write_done_rows_tx(tx, &cleared, None).await?;
+            for done in kept.into_iter().chain(cleared) {
+                settled.push(done.into_job_row()?);
             }
         }
         Ok(settled)
@@ -18491,112 +19397,6 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
-    /// Same fallback for rescue arms that write a terminal row directly
-    /// (an exhausted rescued attempt): a `failed` insert that conflicts
-    /// with a newer duplicate's claim becomes a cancellation instead.
-    async fn insert_rescued_done_or_cancel_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        done: DoneJobRow,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return done.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        self.cancel_rescued_duplicate_tx(tx, row, done.payload, duplicate_error)
-            .await
-    }
-
-    /// The DLQ counterpart of [`Self::insert_rescued_done_or_cancel_tx`]: a
-    /// DLQ row holds its unique claim as `failed`, so it conflicts with a
-    /// newer duplicate exactly when the `failed` terminal row would.
-    async fn insert_rescued_dlq_or_cancel_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        dlq: DlqJobRow,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_dlq_rows_tx(&mut savepoint, std::slice::from_ref(&dlq), Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return dlq.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        self.cancel_rescued_duplicate_tx(tx, row, dlq.payload, duplicate_error)
-            .await
-    }
-
-    /// Write the cancelled terminal row for a rescue that lost its unique
-    /// claim to a newer duplicate. `cancelled` normally sits outside the
-    /// claiming mask so the insert is conflict-free; a mask that claims
-    /// `cancelled` as well conflicts again, and then the row is written with
-    /// its unique key stripped — the attempt held no claim (that is what
-    /// made it conflict), so there is nothing to release, and losing the key
-    /// on this terminal row beats aborting rescue for the whole cluster.
-    async fn cancel_rescued_duplicate_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        base_payload: serde_json::Value,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        let mut payload = RuntimePayload::from_json(base_payload)?;
-        payload.push_error(lifecycle_error(duplicate_error, row.attempt, true));
-        let done = row.into_done_row(JobState::Cancelled, Utc::now(), payload.into_json());
-
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return done.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let mut stripped = done;
-        stripped.unique_key = None;
-        stripped.unique_states = None;
-        self.insert_done_rows_tx(tx, std::slice::from_ref(&stripped), Some(old_state))
-            .await?;
-        stripped.into_job_row()
-    }
-
     pub async fn cancel_running(
         &self,
         pool: &PgPool,
@@ -18605,7 +19405,7 @@ impl QueueStorage {
         reason: impl Into<AttemptError>,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .cancel_running_in_tx(&mut tx, job_id, run_lease, reason, progress)
             .await?;
@@ -18682,7 +19482,7 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_terminal_in_tx_with_claim(&mut tx, job_id, run_lease, error, progress, claim)
             .await?;
@@ -18756,7 +19556,7 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_to_dlq_in_tx_with_claim(
                 &mut tx, job_id, run_lease, dlq_reason, error, progress, claim,
@@ -18823,7 +19623,7 @@ impl QueueStorage {
         dlq_reason: &str,
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
         let moved: Option<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
@@ -18889,7 +19689,7 @@ impl QueueStorage {
         dlq_reason: &str,
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
         let moved: Vec<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
@@ -18942,6 +19742,155 @@ impl QueueStorage {
         Ok(rows.len() as u64)
     }
 
+    /// Release the unique claims of the DLQ rows `deleted` removed. A DLQ
+    /// row is a failed job, and a unique key whose states include `failed`
+    /// stays claimed while the row exists; deleting the row without this
+    /// leaves a claim that refuses the key to new jobs. The claims are
+    /// locked in key order, the order every other claim change takes.
+    async fn release_deleted_dlq_claims_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: &[DeletedDlqRow],
+    ) -> Result<(), AwaError> {
+        let mut released: Vec<(&[u8], i64)> = deleted
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
+            .filter_map(|row| Some((row.unique_key.as_deref()?, row.job_id)))
+            .collect();
+        if released.is_empty() {
+            return Ok(());
+        }
+        released.sort_unstable();
+        let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = released.into_iter().unzip();
+        // The locking clause applies after ORDER BY, so the CTE locks the
+        // claims in key order; the DELETE only reaches rows it has locked.
+        sqlx::query(
+            r#"
+            WITH released AS MATERIALIZED (
+                SELECT claims.unique_key
+                FROM unnest($1::bytea[], $2::bigint[]) AS input(unique_key, job_id)
+                JOIN awa.job_unique_claims AS claims
+                  ON claims.unique_key = input.unique_key
+                 AND claims.job_id = input.job_id
+                ORDER BY claims.unique_key
+                FOR UPDATE OF claims
+            )
+            DELETE FROM awa.job_unique_claims AS claims
+            USING released
+            WHERE claims.unique_key = released.unique_key
+            "#,
+        )
+        .bind(&keys)
+        .bind(&job_ids)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Delete the DLQ rows `predicate` selects in one transaction, releasing
+    /// their unique claims, and return how many were deleted.
+    pub(crate) async fn purge_dlq_where(
+        &self,
+        pool: &PgPool,
+        predicate: &crate::job_query::Predicate,
+    ) -> Result<u64, AwaError> {
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        let sql = format!(
+            "DELETE FROM {}.dlq_entries {} RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema(),
+            predicate.where_clause()
+        );
+        let deleted: Vec<DeletedDlqRow> = predicate
+            .bind_query_as(sqlx::query_as(audited_sql(sql)))
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
+    }
+
+    /// Delete one DLQ row, releasing its unique claim.
+    pub async fn purge_dlq_job(&self, pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            "DELETE FROM {}.dlq_entries WHERE job_id = $1 RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema()
+        )))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(!deleted.is_empty())
+    }
+
+    /// Delete up to `expiry.limit` DLQ rows older than `expiry.retention`,
+    /// releasing their unique claims, and return how many were deleted. See
+    /// [`DlqExpiry`] for which rows a pass covers.
+    pub async fn delete_expired_dlq_rows(
+        &self,
+        pool: &PgPool,
+        expiry: &DlqExpiry<'_>,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let retention_secs = i64::try_from(expiry.retention.as_secs()).unwrap_or(i64::MAX);
+        let order = if expiry.oldest_first {
+            "ORDER BY dlq_at ASC, job_id ASC"
+        } else {
+            ""
+        };
+        // A stripe `q#N` belongs to `q`'s family only while this store
+        // stripes its queues; otherwise `q#N` is a queue of its own.
+        let stripes = expiry.stripe_families && self.queue_stripe_count() > 1;
+        let stripe_of_queue = stripe_of_sql("queue", "$3", "$6");
+        let stripe_of_overridden = stripe_of_sql("dlq_entries.queue", "overridden.queue", "$6");
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE job_id IN (
+                SELECT job_id FROM {schema}.dlq_entries
+                WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+                  AND (
+                      $3::text IS NULL
+                      OR queue = $3
+                      -- A stripe with an override of its own keeps it.
+                      OR ($5::boolean AND {stripe_of_queue} AND queue <> ALL($4::text[]))
+                  )
+                  AND (
+                      $3::text IS NOT NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM unnest($4::text[]) AS overridden(queue)
+                          WHERE dlq_entries.queue = overridden.queue
+                             OR ($5::boolean AND {stripe_of_overridden})
+                      )
+                  )
+                {order}
+                LIMIT $2
+            )
+            RETURNING {DELETED_DLQ_COLUMNS}
+            "#
+        )))
+        .bind(retention_secs)
+        .bind(expiry.limit)
+        .bind(expiry.queue)
+        .bind(expiry.overridden_queues)
+        .bind(stripes)
+        .bind(usize::MAX.to_string())
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
+    }
+
     pub async fn retry_from_dlq(
         &self,
         pool: &PgPool,
@@ -18949,7 +19898,7 @@ impl QueueStorage {
         opts: &RetryFromDlqOpts,
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let moved: Option<DlqJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -19003,9 +19952,8 @@ impl QueueStorage {
         let ready = moved.into_retry_ready_row(queue.clone(), priority, Utc::now(), payload);
         self.insert_existing_ready_rows_tx(&mut tx, vec![ready.clone()], Some(JobState::Failed))
             .await?;
-        self.notify_queues_tx(&mut tx, std::iter::once(queue))
-            .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, [queue]);
         Ok(Some(
             ReadyJobRow {
                 job_id: ready.job_id,
@@ -19057,7 +20005,7 @@ impl QueueStorage {
         predicate: &crate::job_query::Predicate,
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let sql = format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -19116,14 +20064,14 @@ impl QueueStorage {
         let revived = ready_rows.len() as u64;
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Failed))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues);
         Ok(revived)
     }
 
     pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
@@ -19188,38 +20136,20 @@ impl QueueStorage {
         )
         .await?;
 
-        let mut unique_releases: Vec<_> = deleted_done
+        let changes = deleted_done
             .iter()
-            .map(|row| {
-                (
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    row.state,
-                )
-            })
-            .chain(deleted_dlq.iter().map(|row| {
-                (
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    row.state,
-                )
-            }))
-            .collect();
-        unique_releases
-            .sort_unstable_by(|left, right| left.1.cmp(right.1).then(left.0.cmp(&right.0)));
-        for (job_id, unique_key, unique_states, state) in unique_releases {
-            self.sync_unique_claim(
-                &mut tx,
-                job_id,
-                unique_key,
-                unique_states,
-                Some(state),
-                None,
+            .map(|row| (row.job_id, &row.unique_key, &row.unique_states, row.state))
+            .chain(
+                deleted_dlq
+                    .iter()
+                    .map(|row| (row.job_id, &row.unique_key, &row.unique_states, row.state)),
             )
+            .filter_map(|(job_id, key, states, state)| {
+                unique_claim_change(job_id, key.as_deref(), states.as_deref(), Some(state), None)
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(&mut tx, changes, false)
             .await?;
-        }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok((deleted_done.len() + deleted_dlq.len()) as u64)
@@ -19246,7 +20176,7 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_retryable_in_tx_with_claim(&mut tx, job_id, run_lease, error, progress, claim)
             .await?;
@@ -19295,7 +20225,7 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         let result = self
             .fail_retryable_at_tx(
                 &mut tx,
@@ -19364,9 +20294,10 @@ impl QueueStorage {
             Some(Utc::now()),
             payload.into_json(),
         );
-        self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(moved.state))
+        let row = self
+            .insert_deferred_or_cancel_duplicate_tx(tx, moved, deferred, RETRIED_DUPLICATE_ERROR)
             .await?;
-        Ok(Some(deferred.into_job_row()?))
+        Ok(Some(row))
     }
 
     /// Rescue attempts whose heartbeat went stale. Exhausted attempts fail
@@ -19597,29 +20528,19 @@ impl QueueStorage {
                 }
             };
 
-            let mut rescued = self
+            let rescued = self
                 .settle_rescued_attempts_tx(
                     &mut attempt,
-                    moved_leases,
-                    "heartbeat stale: worker presumed dead",
+                    vec![
+                        (moved_leases, "heartbeat stale: worker presumed dead"),
+                        (moved_receipts, "receipt claim stale: worker presumed dead"),
+                    ],
                     RescueDlq {
                         reason: "heartbeat_stale",
                         enabled: dlq_enabled,
                     },
                 )
                 .await?;
-            rescued.extend(
-                self.settle_rescued_attempts_tx(
-                    &mut attempt,
-                    moved_receipts,
-                    "receipt claim stale: worker presumed dead",
-                    RescueDlq {
-                        reason: "heartbeat_stale",
-                        enabled: dlq_enabled,
-                    },
-                )
-                .await?,
-            );
             attempt.commit().await.map_err(map_sqlx_error)?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RescueBatch {
@@ -19822,8 +20743,7 @@ impl QueueStorage {
             let rescued = self
                 .settle_rescued_attempts_tx(
                     &mut attempt,
-                    moved,
-                    "hard deadline exceeded",
+                    vec![(moved, "hard deadline exceeded")],
                     RescueDlq {
                         reason: "deadline_exceeded",
                         enabled: dlq_enabled,
@@ -19975,8 +20895,7 @@ impl QueueStorage {
             let rescued = self
                 .settle_rescued_attempts_tx(
                     &mut attempt,
-                    moved,
-                    "callback timed out",
+                    vec![(moved, "callback timed out")],
                     RescueDlq {
                         reason: "callback_timeout",
                         enabled: dlq_enabled,
@@ -20026,6 +20945,9 @@ impl QueueStorage {
     /// transaction runs under that `lock_timeout`; a lane that hits it rolls
     /// back, keeps its rows deferred and is reported in
     /// [`PromoteOutcome::contended`], and the remaining lanes go ahead.
+    ///
+    /// A due row whose unique key another live job holds is cancelled as a
+    /// duplicate in its lane's transaction instead of being promoted.
     pub async fn promote_due_lanes(
         &self,
         pool: &PgPool,
@@ -20034,8 +20956,33 @@ impl QueueStorage {
         lane_lock_timeout: Option<Duration>,
         skip: &[PromotionLane],
     ) -> Result<PromoteOutcome, AwaError> {
+        self.promote_due_lanes_with_cancelled(
+            pool,
+            state,
+            batch_size,
+            lane_lock_timeout,
+            skip,
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::promote_due_lanes`], also appending to `cancelled` the rows it
+    /// cancelled as duplicates. Each lane commits on its own, so the rows of
+    /// lanes that committed are appended even when a later lane returns an
+    /// error.
+    #[doc(hidden)]
+    pub async fn promote_due_lanes_with_cancelled(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        skip: &[PromotionLane],
+        cancelled: &mut Vec<JobRow>,
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(PromoteOutcome::default());
+            return Ok(Default::default());
         }
 
         let schema = self.schema();
@@ -20095,19 +21042,20 @@ impl QueueStorage {
                 .await;
             match promoted {
                 Ok(Some(promoted)) => {
-                    outcome.promoted += promoted;
-                    if promoted > 0 {
+                    outcome.promoted += promoted.promoted;
+                    cancelled.extend(promoted.cancelled);
+                    if promoted.promoted > 0 {
                         promoted_queues.insert(lane.queue);
                     }
                 }
                 Ok(None) => outcome.contended.push(lane),
                 Err(err) => {
-                    self.notify_promoted_queues(pool, promoted_queues).await;
+                    self.notify_promoted_queues(pool, promoted_queues);
                     return Err(err);
                 }
             }
         }
-        self.notify_promoted_queues(pool, promoted_queues).await;
+        self.notify_promoted_queues(pool, promoted_queues);
         Ok(outcome)
     }
 
@@ -20123,8 +21071,31 @@ impl QueueStorage {
         batch_size: i64,
         lane_lock_timeout: Option<Duration>,
     ) -> Result<PromoteOutcome, AwaError> {
+        self.promote_due_lane_with_cancelled(
+            pool,
+            state,
+            lane,
+            batch_size,
+            lane_lock_timeout,
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::promote_due_lane`], also appending to `cancelled` the rows it
+    /// cancelled as duplicates.
+    #[doc(hidden)]
+    pub async fn promote_due_lane_with_cancelled(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        cancelled: &mut Vec<JobRow>,
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(PromoteOutcome::default());
+            return Ok(Default::default());
         }
         let promoted = self
             .promote_lane(
@@ -20135,16 +21106,22 @@ impl QueueStorage {
                 lane_lock_timeout,
             )
             .await?;
-        if promoted.is_some_and(|promoted| promoted > 0) {
-            self.notify_promoted_queues(pool, [lane.queue.clone()])
-                .await;
+        if promoted
+            .as_ref()
+            .is_some_and(|promoted| promoted.promoted > 0)
+        {
+            self.notify_promoted_queues(pool, [lane.queue.clone()]);
         }
         Ok(match promoted {
-            Some(promoted) => PromoteOutcome {
-                promoted,
-                selected: promoted,
-                contended: Vec::new(),
-            },
+            Some(promoted) => {
+                let selected = promoted.promoted + promoted.cancelled.len();
+                cancelled.extend(promoted.cancelled);
+                PromoteOutcome {
+                    promoted: promoted.promoted,
+                    selected,
+                    contended: Vec::new(),
+                }
+            }
             None => PromoteOutcome {
                 contended: vec![lane.clone()],
                 ..PromoteOutcome::default()
@@ -20161,8 +21138,8 @@ impl QueueStorage {
         lane: &PromotionLane,
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
-    ) -> Result<Option<usize>, AwaError> {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    ) -> Result<Option<LanePromotion>, AwaError> {
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
         match self
             .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
             .await
@@ -20186,7 +21163,7 @@ impl QueueStorage {
         lane: &PromotionLane,
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
-    ) -> Result<usize, AwaError> {
+    ) -> Result<LanePromotion, AwaError> {
         if let Some(timeout) = lock_timeout {
             set_lock_timeout_tx(tx, timeout).await?;
         }
@@ -20243,34 +21220,121 @@ impl QueueStorage {
         let mut moved: Vec<DeferredJobRow> =
             query.fetch_all(tx.as_mut()).await.map_err(map_sqlx_error)?;
         if moved.is_empty() {
-            return Ok(0);
+            return Ok(LanePromotion::default());
         }
         // DELETE ... RETURNING has no order; lane sequence follows due order.
         moved.sort_unstable_by_key(|row| (row.run_at, row.job_id));
 
-        let promoted = moved.len();
-        let ready_rows: Vec<ExistingReadyRow> = moved
+        let mut due_run_ats = Vec::with_capacity(moved.len());
+        let rows: Vec<(ExistingReadyRow, Option<JobState>)> = moved
             .into_iter()
-            .map(|row| ExistingReadyRow {
-                job_id: row.job_id,
-                kind: row.kind,
-                queue: row.queue,
-                args: row.args,
-                priority: row.priority,
-                attempt: row.attempt,
-                run_lease: row.run_lease,
-                max_attempts: row.max_attempts,
-                run_at: Utc::now(),
-                attempted_at: row.attempted_at,
-                created_at: row.created_at,
-                unique_key: row.unique_key,
-                unique_states: row.unique_states,
-                payload: row.payload,
+            .map(|row| {
+                due_run_ats.push(row.run_at);
+                let ready = ExistingReadyRow {
+                    job_id: row.job_id,
+                    kind: row.kind,
+                    queue: row.queue,
+                    args: row.args,
+                    priority: row.priority,
+                    attempt: row.attempt,
+                    run_lease: row.run_lease,
+                    max_attempts: row.max_attempts,
+                    run_at: Utc::now(),
+                    attempted_at: row.attempted_at,
+                    created_at: row.created_at,
+                    unique_key: row.unique_key,
+                    unique_states: row.unique_states,
+                    payload: row.payload,
+                };
+                (ready, Some(state))
             })
             .collect();
-        self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
+        let conflicts = self.sync_reenqueue_unique_claims(tx, &rows, true).await?;
+        if conflicts.is_empty() {
+            let ready_rows = rows.into_iter().map(|(row, _)| row).collect();
+            let promoted = self.insert_claimed_ready_rows_tx(tx, ready_rows).await?;
+            return Ok(LanePromotion {
+                promoted,
+                cancelled: Vec::new(),
+            });
+        }
+
+        let mut ready_rows = Vec::with_capacity(rows.len());
+        let mut duplicates = Vec::with_capacity(conflicts.len());
+        for ((row, _), due_run_at) in rows.into_iter().zip(due_run_ats) {
+            if conflicts.contains(&row.job_id) {
+                duplicates.push((row, due_run_at));
+            } else {
+                ready_rows.push(row);
+            }
+        }
+        let cancelled = self
+            .cancel_promoted_duplicates_tx(tx, state, lane, duplicates)
             .await?;
-        Ok(promoted)
+        let promoted = self.insert_claimed_ready_rows_tx(tx, ready_rows).await?;
+        Ok(LanePromotion {
+            promoted,
+            cancelled,
+        })
+    }
+
+    /// Cancel due rows whose promotion lost their unique key to another job.
+    /// The cancelled row keeps its unique key with `cancelled` cleared from
+    /// its mask and the original mask recorded in its error entry, so it
+    /// never holds the key and a later retry restores the mask and re-checks
+    /// ownership.
+    async fn cancel_promoted_duplicates_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        state: JobState,
+        lane: &PromotionLane,
+        duplicates: Vec<(ExistingReadyRow, DateTime<Utc>)>,
+    ) -> Result<Vec<JobRow>, AwaError> {
+        let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
+        let finalized_at = Utc::now().trunc_subsecs(6);
+        let done: Vec<DoneJobRow> = duplicates
+            .into_iter()
+            .map(|(row, due_run_at)| {
+                let mut payload = RuntimePayload::from_json(row.payload)?;
+                payload.push_error(lifecycle_error(PROMOTED_DUPLICATE_ERROR, row.attempt, true));
+                let mut done = DoneJobRow {
+                    ready_slot,
+                    ready_generation,
+                    job_id: row.job_id,
+                    kind: row.kind,
+                    queue: row.queue,
+                    args: row.args,
+                    state: JobState::Cancelled,
+                    priority: row.priority,
+                    attempt: row.attempt,
+                    run_lease: row.run_lease,
+                    max_attempts: row.max_attempts,
+                    lane_seq: -row.job_id,
+                    enqueue_shard: 0,
+                    run_at: due_run_at,
+                    attempted_at: row.attempted_at,
+                    finalized_at,
+                    created_at: row.created_at,
+                    unique_key: row.unique_key,
+                    unique_states: row.unique_states,
+                    payload: payload.into_json(),
+                    output: None,
+                };
+                // The row keeps its key, so a retry restores the mask and
+                // re-checks ownership; without `cancelled` in its mask the
+                // cancelled row never holds the key.
+                if unique_state_claims(done.unique_states.as_deref(), JobState::Cancelled) {
+                    clear_cancelled_claim(&mut done)?;
+                }
+                Ok(done)
+            })
+            .collect::<Result<_, AwaError>>()?;
+        self.ensure_lane(tx, &lane.queue, lane.priority, 0).await?;
+        // No claim changes: the due row held no claim, since its promotion's
+        // claim conflicted, and its cancelled state claims nothing. Writing
+        // the rows directly keeps every claim change ahead of the lane locks.
+        self.write_done_rows_tx(tx, &done, Some(state)).await?;
+        done.into_iter().map(DoneJobRow::into_job_row).collect()
     }
 
     /// Wake claimers of queues whose promotion has committed.
@@ -20279,34 +21343,9 @@ impl QueueStorage {
     /// A notifying transaction takes PostgreSQL's notify-queue lock at
     /// `COMMIT`, which every notifying transaction in the cluster waits its
     /// turn for, and a lane transaction would hold its lane's locks, and run
-    /// under its lock timeout, while it waited. The wakeup is a hint that
-    /// claimers also poll for, so a failure is logged and not returned.
-    async fn notify_promoted_queues(
-        &self,
-        pool: &PgPool,
-        queues: impl IntoIterator<Item = String>,
-    ) {
-        let channels: Vec<String> = queues
-            .into_iter()
-            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect();
-        if channels.is_empty() {
-            return;
-        }
-        if let Err(err) =
-            sqlx::query("SELECT pg_notify(channel, '') FROM unnest($1::text[]) AS channel")
-                .bind(&channels)
-                .execute(pool)
-                .await
-        {
-            tracing::warn!(
-                error = %err,
-                channels = channels.len(),
-                "Failed to wake claimers after promotion; they pick the rows up on their next poll"
-            );
-        }
+    /// under its lock timeout, while it waited.
+    fn notify_promoted_queues(&self, pool: &PgPool, queues: impl IntoIterator<Item = String>) {
+        self.wake_queues_after_commit(pool, queues);
     }
 
     // Statements whose text names one ring child (probes, prune locks and
@@ -20525,7 +21564,7 @@ impl QueueStorage {
         idle_probe: RingIdleProbe,
     ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // #371 staged upgrade: pick the cursor authority once, then thread
         // it through the lock/cursor/append seams so this whole rotation
@@ -20709,6 +21748,35 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
+        // Raise the generation floor to the generation just committed, so a
+        // producer whose snapshot predates this rotation (or many) writes
+        // into it rather than into a slot the ring may since have reused
+        // (#847). Producers raise the floor themselves, so a failure here
+        // only leaves that case open until the next producer or rotation.
+        match self.enqueue_ring_cursor_callable(pool).await {
+            Ok(true) => {
+                if let Err(err) = sqlx::query(audited_sql(format!(
+                    "SELECT FROM {schema}.enqueue_ring_cursor()"
+                )))
+                .execute(pool)
+                .await
+                {
+                    tracing::warn!(
+                        schema,
+                        generation = next_generation,
+                        error = %err,
+                        "Failed to raise the queue-ring generation floor after rotation"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                schema,
+                generation = next_generation,
+                error = %err,
+                "Failed to check for the queue-ring generation floor after rotation"
+            ),
+        }
         Ok(RotateOutcome::Rotated {
             slot: next_slot,
             generation: next_generation,
@@ -20754,7 +21822,7 @@ impl QueueStorage {
         idle_probe: RingIdleProbe,
     ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // The per-ring serialization lock guards against prune_oldest_leases
         // and parallel rotators (#371). In ledger mode it is the per-ring
@@ -20904,7 +21972,7 @@ impl QueueStorage {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
         let rebuild_lock_name = format!("awa.queue_storage.rebuild_terminal_counters:{schema}");
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
@@ -21174,13 +22242,11 @@ impl QueueStorage {
                 SELECT EXISTS (
                     SELECT 1
                     FROM {delta_child}
-                    WHERE ready_generation = $1
                     LIMIT 1
                 )
                 "#
             )))
             .persistent(false)
-            .bind(generation)
             .fetch_one(pool)
             .await
             .map_err(map_sqlx_error)?;
@@ -21200,7 +22266,7 @@ impl QueueStorage {
     ) -> Result<TerminalDeltaSlotRollup, AwaError> {
         let schema = self.schema();
         let delta_child = terminal_delta_child_name(schema, slot as usize);
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Ring rotation serialization first (stabilises the cursor against
         // rotate and prune — advisory lock in ledger mode, singleton FOR
@@ -21260,8 +22326,7 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
-        let pending_ready =
-            queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
+        let pending_ready = queue_prune_has_pending_ready_tx(&mut tx, schema, slot).await?;
 
         if pending_ready {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21280,14 +22345,14 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             let active_leases =
-                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot).await?;
 
             if active_leases {
                 return Ok(TerminalDeltaSlotRollup::SkippedActive);
             }
 
             let unclosed_claim_refs =
-                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot).await?;
 
             if unclosed_claim_refs {
                 return Ok(TerminalDeltaSlotRollup::SkippedActive);
@@ -21297,10 +22362,8 @@ impl QueueStorage {
                 r#"
                 SELECT count(*)::bigint
                 FROM {delta_child}
-                WHERE ready_generation = $1
                 "#
             )))
-            .bind(generation)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -21326,7 +22389,6 @@ impl QueueStorage {
                         enqueue_shard,
                         SUM(terminal_delta)::bigint AS delta
                     FROM {delta_child}
-                    WHERE ready_generation = $1
                     GROUP BY ready_slot, queue, priority, enqueue_shard
                     HAVING SUM(terminal_delta) <> 0
                 ),
@@ -21389,7 +22451,6 @@ impl QueueStorage {
                 SELECT count(*)::bigint FROM grouped
                 "#
                 )))
-                .bind(generation)
                 .fetch_one(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?,
@@ -21404,7 +22465,6 @@ impl QueueStorage {
                         counter_bucket,
                         SUM(terminal_delta)::bigint AS delta
                     FROM {delta_child}
-                    WHERE ready_generation = $1
                     GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
                     HAVING SUM(terminal_delta) <> 0
                 ),
@@ -21460,7 +22520,6 @@ impl QueueStorage {
                 SELECT count(*)::bigint FROM grouped
                 "#
                 )))
-                .bind(generation)
                 .fetch_one(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?,
@@ -21504,7 +22563,7 @@ impl QueueStorage {
         pool: &PgPool,
     ) -> Result<TerminalRollupFoldOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         if Self::terminal_delta_rollup_mvcc_horizon_pinned_tx(&mut tx).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21562,7 +22621,7 @@ impl QueueStorage {
         pool: &PgPool,
     ) -> Result<RingLedgerFoldOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         if Self::terminal_delta_rollup_mvcc_horizon_pinned_tx(&mut tx).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21619,7 +22678,7 @@ impl QueueStorage {
         failed_retention: Duration,
     ) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Ring rotation serialization keeps the cursor stable for the whole
         // prune so rotate cannot hand the slot being truncated out to fresh
@@ -21693,8 +22752,7 @@ impl QueueStorage {
         // a known-busy slot does not block hot claim reads behind a
         // doomed truncate attempt. These are only MVCC snapshots; the
         // same gates are checked again after the exclusive locks.
-        let active_leases =
-            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+        let active_leases = queue_prune_has_active_leases_tx(&mut tx, schema, slot).await?;
 
         if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21705,7 +22763,7 @@ impl QueueStorage {
             });
         }
 
-        let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
+        let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot).await?;
 
         if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21717,7 +22775,7 @@ impl QueueStorage {
         }
 
         let unclosed_claim_refs =
-            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot).await?;
 
         if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21757,7 +22815,7 @@ impl QueueStorage {
             // producer or claimer committed while the exclusive partition
             // lock waited, these post-lock gates see it before TRUNCATE.
             let active_leases =
-                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot).await?;
             if active_leases {
                 return Ok(PruneOutcome::SkippedActive {
                     slot,
@@ -21766,7 +22824,7 @@ impl QueueStorage {
                 });
             }
 
-            let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
+            let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot).await?;
             if pending {
                 return Ok(PruneOutcome::SkippedActive {
                     slot,
@@ -21776,7 +22834,7 @@ impl QueueStorage {
             }
 
             let unclosed_claim_refs =
-                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot).await?;
             if unclosed_claim_refs {
                 return Ok(PruneOutcome::SkippedActive {
                     slot,
@@ -22068,7 +23126,15 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.queue_ring_pin")]
     pub async fn queue_ring_pin(&self, pool: &PgPool) -> Result<Option<QueueRingPin>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        // One snapshot for the oldest sealed slot and the rows in it: the
+        // row probe counts every generation in the slot, so a rotation that
+        // reopened the slot between two statements would otherwise report
+        // the new current generation's rows as pinning the old one.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let authority = self.ring_authority_tx(&mut tx).await?;
@@ -22106,8 +23172,7 @@ impl QueueStorage {
             CROSS JOIN LATERAL (
                 SELECT ready.lane_seq, ready.run_at
                 FROM {ready_child} AS ready
-                WHERE ready.ready_slot = $2
-                  AND ready.ready_generation = $1
+                WHERE ready.ready_slot = $1
                   AND ready.queue = claims.queue
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
@@ -22118,7 +23183,6 @@ impl QueueStorage {
             ORDER BY head.run_at ASC, claims.queue, claims.priority, claims.enqueue_shard
             "#
             )))
-            .bind(generation)
             .bind(slot)
             .fetch_all(tx.as_mut())
             .await
@@ -22157,7 +23221,7 @@ impl QueueStorage {
     )]
     pub async fn prune_oldest_leases(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // `PruneLeasesPlan` in
         // `correctness/storage/AwaStorageLockOrder.tla` requires the
@@ -22347,7 +23411,7 @@ impl QueueStorage {
         idle_probe: RingIdleProbe,
     ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Per-ring serialization lock: guards prune_oldest_claims and
         // parallel rotators (#371). Ledger mode -> advisory lock; compat
@@ -22524,7 +23588,7 @@ impl QueueStorage {
     )]
     pub async fn prune_oldest_claims(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
 
         // Claim-ring rotation serialization: first resource in
         // `PruneClaimsPlan` (`correctness/storage/AwaStorageLockOrder.tla`);
@@ -22823,6 +23887,128 @@ mod writer_bind_tests {
             offenders.is_empty(),
             "queue_storage.rs builds a per-row VALUES insert at lines {offenders:?}; \
              use INSERT ... SELECT FROM unnest(...) with one array bind per column"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revived_unique_states_tests {
+    use super::*;
+
+    fn payload(error: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "errors": [error] })
+    }
+
+    #[test]
+    fn a_handler_cancel_reason_mentioning_duplicates_does_not_block_retry() {
+        let reason = payload(serde_json::json!({
+            "error": "remote job rejected as duplicate: unique claim held by another job",
+            "attempt": 1,
+            "terminal": true,
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &reason).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyless_legacy_duplicate_cancellation_is_refused() {
+        for message in LEGACY_KEYLESS_DUPLICATE_ERRORS {
+            let legacy = payload(serde_json::json!({
+                "error": message,
+                "attempt": 1,
+                "terminal": true,
+            }));
+            assert!(matches!(
+                revived_unique_states(JobState::Cancelled, None, None, &legacy),
+                Err(AwaError::UniqueConflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_mask_field_on_a_caller_error_entry_is_ignored() {
+        let forged = payload(serde_json::json!({
+            "error": "upstream failed",
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &forged).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_caller_error_entry_cannot_record_a_duplicate_mask() {
+        let entry = caller_error_entry(
+            serde_json::json!({
+                "error": SNOOZED_DUPLICATE_ERROR,
+                DUPLICATE_CANCEL_MASK_KEY: "11111111",
+            }),
+            2,
+        );
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], SNOOZED_DUPLICATE_ERROR);
+        assert_eq!(entry["attempt"], 2);
+        assert_eq!(entry["terminal"], true);
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &payload(entry)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reschedule_error_cannot_record_a_duplicate_mask() {
+        let entry = without_duplicate_mask(&serde_json::json!({
+            "error": RETRIED_DUPLICATE_ERROR,
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], RETRIED_DUPLICATE_ERROR);
+        assert_eq!(
+            without_duplicate_mask(&serde_json::json!("plain")),
+            serde_json::json!("plain")
+        );
+    }
+
+    #[test]
+    fn canonical_revive_sql_names_every_canonical_duplicate_message() {
+        let admin = include_str!("admin.rs");
+        for message in [
+            SNOOZED_DUPLICATE_ERROR,
+            RETRIED_DUPLICATE_ERROR,
+            PROMOTED_DUPLICATE_ERROR,
+            RESCUED_STALE_DUPLICATE_ERROR,
+            RESCUED_EXPIRED_DUPLICATE_ERROR,
+            RESCUED_TIMED_OUT_DUPLICATE_ERROR,
+        ] {
+            assert_eq!(
+                admin.matches(&format!("'{message}'")).count(),
+                2,
+                "{message} in both canonical revive statements"
+            );
+        }
+        assert!(admin.contains(&format!("entry->>'{DUPLICATE_CANCEL_MASK_KEY}'")));
+    }
+
+    #[test]
+    fn a_recorded_mask_is_restored() {
+        let recorded = payload(serde_json::json!({
+            "error": SNOOZED_DUPLICATE_ERROR,
+            "attempt": 1,
+            "terminal": true,
+            DUPLICATE_CANCEL_MASK_KEY: "11000010",
+        }));
+        assert_eq!(
+            revived_unique_states(
+                JobState::Cancelled,
+                Some(b"key"),
+                Some("11000000".to_string()),
+                &recorded
+            )
+            .unwrap(),
+            Some("11000010".to_string())
         );
     }
 }

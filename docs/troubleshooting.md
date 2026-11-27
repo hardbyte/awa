@@ -120,19 +120,19 @@ Then investigate why the worker stopped.
 
 ### Admin Cancel Doesn't Wake A Running Worker
 
-`awa job cancel <id>` writes the cancellation to the database and emits `pg_notify('awa:cancel', {job_id, run_lease})`. Each worker runtime runs a `CancelListener` (PgListener-based) that picks up the notification and fires the matching `Arc<AtomicBool>` cancel flag the handler's `JobContext` holds — so the handler sees `ctx.is_cancelled() == true` on its next check and can stop cleanly.
+`awa job cancel <id>` writes the cancellation to the database and emits `pg_notify('awa:cancel', {job_id, run_lease})`. Each worker runtime runs a `CancelListener` (PgListener-based) that picks up the notification and fires the matching `Arc<AtomicBool>` cancel flag the handler's `JobContext` holds — so the handler sees `ctx.is_cancelled() == true` on its next check and can stop cleanly. If the notification arrives after the claim but before the attempt registers to run, the runtime keeps it for that attempt, for up to five minutes and at most 256 per registry shard, and does not run the handler; the worker logs `Skipping a handler whose attempt was cancelled before it started`. This depends on the notification arriving before the handler starts, not on the cancel's commit: a notification that arrives later, or never, leaves the handler running until it checks `is_cancelled()` or finishes, and the `run_lease` check then rejects its completion.
 
-If the listener fails to start or its connection drops, the listener logs a `warn!` and exits; admin cancels then silently fall back to heartbeat / deadline rescue for detection (i.e. the cancel does take effect on the next completion-time `run_lease` check, but the handler doesn't get the early wake-up). Symptoms: `awa job cancel` returns success and the database shows the job as `cancelled`, but a worker reports completing the cancelled `run_lease` long after the cancel was issued; the completion is rejected by `StaleCompleteRejected` so no harm done, just wasted work.
+If the listener fails to start, it logs `Failed to start the admin cancel listener; retrying in the background` and retries with backoff from 250 ms up to 30 s until it connects, then logs `Admin cancel listener started after retrying`; if its connection drops, it logs `PG cancel listener connection lost; reconnecting` and listens again, and cancels committed while it was down do not wake their handlers. In both cases admin cancels fall back to heartbeat / deadline rescue for detection (i.e. the cancel does take effect on the next completion-time `run_lease` check, but the handler doesn't get the early wake-up). Symptoms: `awa job cancel` returns success and the database shows the job as `cancelled`, but a worker reports completing the cancelled `run_lease` long after the cancel was issued; the completion is rejected by `StaleCompleteRejected` so no harm done, just wasted work.
 
 To diagnose:
 
-- Search the worker logs for `Failed to create PG listener for admin cancel` or `Failed to LISTEN on cancel channel`. Either message means the listener started, hit the failure, and the runtime is now in fallback mode.
+- Search the worker logs for `Failed to start the admin cancel listener`. The runtime is in fallback mode until `Admin cancel listener started after retrying` follows it.
 - Search for `PG cancel listener error; will retry` — the listener saw a transient error and is sleeping 1s before reconnecting; not a steady-state failure unless it spams the log.
 - Confirm `pg_listener` works from outside the runtime: `psql -c "LISTEN \"awa:cancel\";"` and watch a separate session fire `SELECT pg_notify('awa:cancel', '{}');`.
 
 To recover:
 
-- Restart the worker process — the listener spawns at runtime startup, so restart re-creates the listener with a fresh connection.
+- The listener retries on its own; a restart is not needed once the database accepts its connection.
 - If the failure is steady (e.g. a Postgres pool sized so all connections are saturated by claim/complete traffic and `LISTEN` can't acquire one), increase the pool max or dedicate a connection to listening.
 
 In all cases the cancel itself is durable — only the early wake-up is lost. Long-running handlers that don't poll `ctx.is_cancelled()` between heartbeats won't notice the cancel until they finish or heartbeat-rescue fires.
@@ -178,7 +178,7 @@ Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates u
 Failed to rescue deadline-expired jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
 ```
 
-Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. In both fixed paths the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue degrades row-at-a-time; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
+Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. A worker finalizing its own snooze, `RetryAfter` or retryable failure reports it as `snoozed as duplicate` or `retried as duplicate` ([#807](https://github.com/hardbyte/awa/issues/807)); before that fix the worker logged `Failed to complete job` with `unique conflict` and the attempt stayed running until rescue. In every fixed path the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue no longer aborts on the conflict: the canonical engine retries row at a time, and queue storage cancels the conflicted attempt in the same pass that rescues the others; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
 
 ```sql
 SELECT j.id AS stuck_job, j.kind, j.queue, j.unique_key,
@@ -190,6 +190,21 @@ WHERE j.state = 'running';
 ```
 
 Cancel the `stuck_job` (cancelled is outside the default mask, so the transition succeeds). Delete a claim row only after proving its recorded holder no longer exists; deleting a live holder's claim admits a duplicate.
+
+Promotion meets the same race when a scheduled or retryable job's mask leaves out the state it waits in: it holds no claim, a newer job takes the key, and the job then falls due. Up to 0.6.18 promotion failed on it every tick (`Failed to promote scheduled jobs` or `Failed to promote retryable jobs`, with `idx_awa_jobs_unique` or `unique conflict`), and the other due jobs in its batch (canonical storage) or in its lane and the lanes after it (queue storage) stayed scheduled. From 0.6.19 and 0.7.0 promotion cancels the job with `promoted as duplicate` and promotes the rest in the same pass. On an older build, find the due jobs whose mask claims `available` but not the state they wait in, while another job holds their key:
+
+```sql
+SELECT j.id AS stuck_job, j.kind, j.queue, j.state, j.unique_states,
+       c.job_id AS claim_holder
+FROM awa.jobs j
+JOIN awa.job_unique_claims c ON c.unique_key = j.unique_key AND c.job_id <> j.id
+WHERE j.state IN ('scheduled', 'retryable')
+  AND j.run_at <= now()
+  AND awa.job_state_in_bitmask(j.unique_states, 'available')
+  AND NOT awa.job_state_in_bitmask(j.unique_states, j.state);
+```
+
+Cancel a `stuck_job` whose mask leaves out `cancelled`. When the mask claims `cancelled`, the cancellation conflicts the same way; upgrade instead and let promotion cancel it.
 
 Prevention: choose `unique_states` masks that are *closed under runtime transitions* — retry/rescue move `running -> retryable`, snooze moves `running -> scheduled`, and promotion moves `retryable -> available` or `scheduled -> available`. A mask a transition can enter from outside (for example `{scheduled, available, retryable}` without `running`) intentionally permits a newer enqueue during execution, so the superseded old attempt can end in a fallback cancellation. `{}` (no dedup) and the full non-terminal set `{scheduled, available, running, retryable}` avoid that race; pair the full mask with a short `by_period` bucket if you need "a change during a run still gets a fresh run" semantics.
 
@@ -406,6 +421,112 @@ Moving the stuck jobs to another queue or changing their priority does not relea
 
 Pick the threshold above the longest time a healthy lane's oldest row waits to be claimed. To list the lanes from Rust, `QueueStorage::queue_ring_pin` returns the oldest sealed slot and each pinning lane with its first pending row's `lane_seq`, `run_at` and age.
 
+The ring is shared by every queue in the database. To keep queues that are expected to sit paused, unserved or starved from holding back reclamation for the rest, serve them from a separate database; see [storage isolation](deployment.md#storage-isolation). A separate queue-storage schema in the same database is not a boundary, since a database has one active queue-storage schema.
+
+## Ring Prune Stays Blocked Under Claim Load
+
+Symptoms on queue storage under sustained claim traffic from several runtimes ([#721](https://github.com/hardbyte/awa/issues/721)):
+
+- `awa.maintenance.prune.attempts` for the queue ring, the claim ring or both keeps rising with outcome `blocked` (reason `none`), and `pruned` stops advancing; prune retries every tick, since a `blocked` outcome does not back it off
+- `awa.maintenance.rotate.attempts` for the same ring reports `skipped_busy`, usually with several blockers at once (`queue.ready_rows`, `queue.ready_segments`, `queue.done_rows` and the other slot tables, or `claim.rows`, `claim.closure_rows` and `claim.closure_batch_rows`)
+- `awa.ring.generation` for that ring stops advancing
+- the current slot's `ready_entries_*` and `ready_segments_*` partitions keep growing, and `awa.dispatch.claim_duration` rises as they grow
+
+No jobs are lost: a blocked prune rolls back and changes nothing. The cost is storage that is not reclaimed and claim latency that grows with the current slot.
+
+Claims hold `AccessShareLock` on the ring partitions they read, which can include the slot prune wants to truncate. When claims from several runtimes overlap continuously, prune's lock request never finds the slot free within its wait, the ring cannot rotate into the unpruned slot, the current slot grows, and slower claims overlap more. The loop sustains itself without any other blocker.
+
+A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue ring on one slot for about two days this way, with that slot's ready partition at about 55M rows (64 GB). Sampling `pg_locks` on the next slot's partitions every 25 ms never found them free: each sample showed four to six `AccessShareLock` holders, all short transactions running the claim function, including claims for a queue with no backlog.
+
+0.7 does not fix it yet. Queue prune already runs its skip checks before it requests `ACCESS EXCLUSIVE` (and checks them again once it holds it), but it makes one request per attempt: it does not have 0.6.17's retry of the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms.
+
+### Confirm It
+
+Tell it apart from the other ring stalls by the prune outcome:
+
+| Fault | `awa.maintenance.prune.attempts` |
+| --- | --- |
+| Claims starve prune (this section) | `blocked`, reason `none` |
+| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` |
+| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` |
+
+Do not use `awa.maintenance.prune.pinned_ready_age` to rule this fault in or out. The leader updates the gauge only after a `skipped_active` prune and leaves it unchanged when prune is `blocked`, so during this fault it can keep showing a lane's age from an earlier pin, or `0`.
+
+```promql
+sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
+```
+
+To see what holds the slots prune wants, list the locks on the oldest sealed slot of the queue ring and of the claim ring; the query picks each slot the way prune does, from the ring cursor that `ring_cursor` resolves for either cursor authority. Replace `<schema>` with the active `schema_name` from [Find the active queue-storage schema](#find-the-active-queue-storage-schema), and run it as a role that may execute `<schema>.ring_cursor`, such as the migration role, and that can see other roles' sessions (a superuser, or a member of `pg_read_all_stats`): without that, `pg_stat_activity` hides the query, `xact_start` and age of the runtime role's sessions, and the second query below leaves them out. The query reads catalog and lock views, the ring state rows and the rotation ledger only, and takes no lock on the partitions; run it several times, since one sample can miss a short claim. Look at the rows for the ring whose prune reports `blocked`.
+
+```sql
+WITH cursors AS (
+    SELECT 'queue' AS ring, c.slot, c.generation, s.slot_count
+    FROM <schema>.ring_cursor('queue') AS c, <schema>.queue_ring_state AS s
+    WHERE s.singleton
+    UNION ALL
+    SELECT 'claim', c.slot, c.generation, s.slot_count
+    FROM <schema>.ring_cursor('claim') AS c, <schema>.claim_ring_state AS s
+    WHERE s.singleton
+), oldest AS (
+    SELECT ring,
+           ((slot - (LEAST(generation + 1, slot_count) - 1)) % slot_count + slot_count) % slot_count AS slot
+    FROM cursors
+    WHERE LEAST(generation + 1, slot_count) > 1
+), targets AS (
+    SELECT o.ring, p.prefix || o.slot AS relname
+    FROM oldest o
+    CROSS JOIN (VALUES
+        ('queue', 'ready_entries_'), ('queue', 'ready_segments_'), ('queue', 'done_entries_'),
+        ('queue', 'ready_claim_attempt_batches_'), ('queue', 'ready_tombstones_'),
+        ('queue', 'receipt_completion_batches_'), ('queue', 'receipt_completion_tombstones_'),
+        ('queue', 'queue_terminal_count_deltas_'),
+        ('claim', 'lease_claims_'), ('claim', 'lease_claim_batches_'),
+        ('claim', 'lease_claim_closures_'), ('claim', 'lease_claim_closure_batches_')
+    ) AS p(ring, prefix)
+    WHERE p.ring = o.ring
+)
+SELECT t.ring, c.relname, l.mode, l.granted, a.pid, a.application_name,
+       now() - a.xact_start AS xact_age, left(a.query, 80) AS query
+FROM targets t
+JOIN pg_class c ON c.relname = t.relname
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
+JOIN pg_locks l ON l.relation = c.oid
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+JOIN pg_stat_activity a ON a.pid = l.pid
+ORDER BY t.ring, c.relname, l.granted, a.xact_start;
+```
+
+This fault shows as a few holders in every sample, each a different short transaction: on the queue ring, `AccessShareLock` from `claim_ready_runtime` or a `claim_ready_slot_<N>` function; on the claim ring, claims and completions that read or write the claim tables. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
+
+Long readers of the queue-storage tables stall prune the same way, without any claim load. A query that scans `leases`, `lease_claims`, `lease_claim_closures`, `done_entries`, `ready_entries` or another ring table through its parent holds `ACCESS SHARE` on every partition of that table, sealed slots included, until its transaction ends, and prune cannot truncate the oldest slot until it finishes. Monitoring and dashboard queries are the usual source: a count over these tables can run for minutes with millions of jobs in the ring, and polls issued back to back keep prune `blocked` and the ring from rotating for as long as they run. The query above covers only the queue and claim rings' prune targets; this one lists every transaction older than five seconds that holds a lock on any table in the queue-storage schema, for every ring:
+
+```sql
+SELECT a.pid, a.application_name, now() - a.xact_start AS xact_age,
+       count(DISTINCT l.relation) AS relations, left(a.query, 80) AS query
+FROM pg_locks l
+JOIN pg_class c ON c.oid = l.relation
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE a.xact_start < now() - interval '5 seconds'
+GROUP BY a.pid, a.application_name, a.xact_start, a.query
+ORDER BY xact_age DESC;
+```
+
+Run such readers against a replica or with a short `statement_timeout`, poll them less often, or use Awa's metrics instead. A reader that finished its query but left its transaction open (`state = 'idle in transaction'`) keeps its locks until the transaction ends, which `statement_timeout` does not do: end it, or set `idle_in_transaction_session_timeout` for the reporting role.
+
+### Mitigations
+
+None of these has been measured against this fault. Change one at a time and watch `pruned`, `awa.ring.generation` and `awa.dispatch.claim_duration`.
+
+- **Reduce overlapping claims.** Serve each queue from fewer runtimes, especially queues that are usually idle, since every runtime that serves a queue claims on it. A dispatcher whose fallback poll finds no ready jobs does not claim, so idle queues add fewer claims than busy ones.
+- **Raise `prune_lock_timeout` modestly**, for example to `50ms` or `100ms`. Only the `ready_segments` partition waits for this timeout; the other queue partitions are locked `NOWAIT`. While prune's `ACCESS EXCLUSIVE` request waits, every new claim on that partition queues behind it, so a longer wait trades claim latency for reclamation. Keep it well below `deadlock_timeout` and `statement_timeout`; startup warns when it reaches either.
+- **Stop long readers of the ring tables.** If either lock query shows a monitoring, dashboard or reporting query rather than claims, bound or move that query instead; see above.
+- **Do not lengthen the rotation interval for this fault.** It does not help prune get its lock, and it makes each slot larger.
+- **Split workloads across databases.** Claims lock only their own database's ring partitions, so moving some queues and their runtimes to a [separate database](deployment.md#storage-isolation) leaves fewer overlapping claims on each ring, at the cost of a second installation to migrate and operate.
+
+Once prune gets its lock, for example when claim traffic drops, the ring rotates again and the oversized slot is reclaimed when the ring reaches it.
+
 ## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means
@@ -563,6 +684,7 @@ Cause:
 - `insert_many`, `insert_many_copy`, `insert_many_skip_unique_conflicts` and the `QueueStorage` batch enqueues register and lock their lanes one at a time in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so two batch calls cannot hold each other's lanes in opposite orders
 - a `QueueStorage` process (batch enqueue, or a worker promoting scheduled or retried jobs) from 0.6.15 or earlier, or from a 0.7 build before this fix, creates a new `(queue, priority)` lane by taking its provisioning lock before writing its `queue_lanes` row; every other producer, and current `QueueStorage`, writes the row first, so one of each that are both the first to use the lane can deadlock (#692). Upgrade those processes, or create a queue's lanes before traffic reaches it with `awa storage prepare-queue`
 - from migration v055, `insert_many_copy` and `insert_many_skip_unique_conflicts` take all of a batch's unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, and binaries that predate the batch function) take each job's claim and lane together. From migration v057, for 2 s the function waits at most 500 ms (or half of its session's `deadlock_timeout`, if lower) while it holds claims or lanes, then releases them and retries, so it gives way to a per-row transaction that holds a lane the batch needs and waits for one of its keys, provided that transaction's `deadlock_timeout` is above 500 ms (the default is 1 s) and the batch inserts its unique claims within 500 ms (10,000 to 20,000 keys on a fast server, fewer under load; split larger batches). Its last attempt waits as any statement does, so a per-row transaction that holds the lane for longer than the retries (about 2.5 s) before it inserts the key still deadlocks with it, and a cycle that retrying cannot break, for example through a lock the batch's own transaction took in an earlier statement, still ends in `40P01`, after 3 to 4 s and usually by aborting the batch's transaction. The v055 body of the function waited instead, and the two deadlocked; `awa migrate` replaces it
+- a `QueueStorage` process from 0.6.18 or earlier, or from a 0.7 build before this change, re-enqueues a job by reserving its lane before claiming its unique key, while every insert claims the key first, so retrying a failed, cancelled or dead-lettered job, or promoting or resuming one whose `unique_states` leave out the state it is in, can deadlock with a producer inserting a job with the same unique key into the same lane. Current `QueueStorage` claims every re-enqueue's keys first, in key order; upgrade the workers, admin tools and services that retry jobs
 - unique keys and the application's own locks can form other cycles
 - a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a generic `insert_many`, a `QueueStorage` batch enqueue or another such transaction that touches the same lanes in a different order; a batch through `awa.insert_jobs_compat_batch` normally gives way to it instead
 

@@ -36,8 +36,8 @@ impl Worker for PriyaWorker {
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let _guard = self.shared.begin_execution(Persona::Priya, &ctx.job, true);
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Priya, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }

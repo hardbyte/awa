@@ -13678,6 +13678,208 @@ async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_or
     assert_eq!(claimed, expected);
 }
 
+async fn unique_claim_holders(pool: &sqlx::PgPool, job_id: i64, store: &QueueStorage) -> Vec<i64> {
+    sqlx::query_scalar(audited_sql(format!(
+        r#"
+        SELECT claims.job_id
+        FROM awa.job_unique_claims AS claims
+        WHERE claims.unique_key = (
+            SELECT unique_key FROM {schema}.ready_entries WHERE job_id = $1
+        )
+        ORDER BY claims.job_id
+        "#,
+        schema = store.schema()
+    )))
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .expect("read unique claim holders")
+}
+
+async fn promote_unique_conflict_case(unique_states: u8, schema: &str) {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_promote_unique_conflict";
+    let store = create_store(&pool, schema).await;
+    let due = Utc::now() - chrono::Duration::seconds(60);
+    let unique_opts = |run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        run_at,
+        unique: Some(UniqueOpts {
+            states: unique_states,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let duplicate_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        unique_opts(Some(due - chrono::Duration::seconds(1))),
+    )
+    .await;
+    let holder_id = enqueue_job(&pool, &store, &CompleteJob { id: 1 }, unique_opts(None)).await;
+    let other_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            run_at: Some(due),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let outcome = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
+        .await
+        .expect("a unique conflict must not fail promotion");
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert_eq!(outcome.selected, 2, "{outcome:?}");
+    assert!(outcome.contended.is_empty(), "{outcome:?}");
+
+    let duplicate = store
+        .load_job(&pool, duplicate_id)
+        .await
+        .expect("load duplicate")
+        .expect("duplicate exists");
+    assert_eq!(duplicate.state, JobState::Cancelled);
+    let errors = serde_json::to_string(&duplicate.errors).expect("render errors");
+    assert!(
+        errors.contains("promoted as duplicate: unique claim held by another job"),
+        "{errors}"
+    );
+    let other = store
+        .load_job(&pool, other_id)
+        .await
+        .expect("load other")
+        .expect("other exists");
+    assert_eq!(other.state, JobState::Available);
+    let holder = store
+        .load_job(&pool, holder_id)
+        .await
+        .expect("load holder")
+        .expect("holder exists");
+    assert_eq!(holder.state, JobState::Available);
+    assert_eq!(
+        unique_claim_holders(&pool, holder_id, &store).await,
+        vec![holder_id]
+    );
+
+    // The cancelled row keeps its key, with `cancelled` cleared from its
+    // mask, so it holds no claim and a retry still checks the key.
+    let (duplicate_key, duplicate_states): (Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as(audited_sql(format!(
+            "SELECT unique_key, unique_states::text FROM {}.done_entries WHERE job_id = $1",
+            store.schema()
+        )))
+        .bind(duplicate_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read cancelled row");
+    assert!(duplicate_key.is_some());
+    let expected_states = unique_states & !(1 << JobState::Cancelled.bit_position());
+    let expected_states: String = (0..8)
+        .map(|bit| {
+            if expected_states & (1 << bit) != 0 {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .collect();
+    assert_eq!(duplicate_states.as_deref(), Some(expected_states.as_str()));
+
+    let again = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
+        .await
+        .expect("promote again");
+    assert_eq!(again, Default::default());
+
+    // Retrying the duplicate while the holder owns the key conflicts.
+    let err = admin::retry(&pool, duplicate_id)
+        .await
+        .expect_err("retry while the holder owns the key must conflict");
+    assert!(matches!(err, AwaError::UniqueConflict { .. }), "{err:?}");
+    assert_eq!(
+        unique_claim_holders(&pool, holder_id, &store).await,
+        vec![holder_id]
+    );
+
+    // Once the holder completes and releases the key, the retry succeeds
+    // and takes the claim.
+    let completed: Vec<i64> = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+        .await
+        .iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert!(completed.contains(&holder_id), "{completed:?}");
+    let retried = admin::retry(&pool, duplicate_id)
+        .await
+        .expect("retry after the holder leaves")
+        .expect("retried row");
+    assert_eq!(retried.state, JobState::Available);
+    assert_eq!(
+        unique_claim_holders(&pool, duplicate_id, &store).await,
+        vec![duplicate_id]
+    );
+
+    // The retry restored the original mask: cancelling the job again keeps
+    // its key exactly when that mask claims `cancelled`.
+    let key = sqlx::query_scalar::<_, Vec<u8>>(audited_sql(format!(
+        "SELECT unique_key FROM {}.ready_entries WHERE job_id = $1",
+        store.schema()
+    )))
+    .bind(duplicate_id)
+    .fetch_one(&pool)
+    .await
+    .expect("retried key");
+    admin::cancel(&pool, duplicate_id)
+        .await
+        .expect("cancel the retried job")
+        .expect("cancelled row");
+    let holders: Vec<i64> =
+        sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+            .bind(&key)
+            .fetch_all(&pool)
+            .await
+            .expect("claim holders");
+    let claims_cancelled = unique_states & (1 << JobState::Cancelled.bit_position()) != 0;
+    assert_eq!(
+        holders,
+        if claims_cancelled {
+            vec![duplicate_id]
+        } else {
+            Vec::new()
+        }
+    );
+}
+
+/// A due row whose unique key another live job holds is cancelled as a
+/// duplicate in the same pass that promotes the other due rows of its lane.
+/// The job holding the key keeps it.
+#[tokio::test]
+async fn test_queue_storage_promotion_cancels_a_unique_duplicate_and_promotes_its_lane() {
+    promote_unique_conflict_case(
+        1 << JobState::Available.bit_position(),
+        "awa_qs_promote_unique_conflict",
+    )
+    .await;
+}
+
+/// A duplicate whose mask also claims `cancelled` is cancelled with its key
+/// and `cancelled` cleared from its mask, so the cancelled row holds no claim
+/// and a retry of it still conflicts while the holder owns the key.
+#[tokio::test]
+async fn test_queue_storage_promotion_cancels_a_duplicate_whose_mask_claims_cancelled() {
+    promote_unique_conflict_case(
+        (1 << JobState::Available.bit_position()) | (1 << JobState::Cancelled.bit_position()),
+        "awa_qs_promote_unique_conflict_cancelled",
+    )
+    .await;
+}
+
 /// Holds PostgreSQL's cluster-wide notify-queue lock for about `commits` ×
 /// 100 ms. A transaction that issued NOTIFY takes that lock at COMMIT and
 /// keeps it until its commit record is flushed, which `commit_delay` stretches.
@@ -18436,6 +18638,104 @@ async fn test_queue_storage_claimer_cache_rechecks_reduced_target_after_lease_lo
     );
 }
 
+/// Claim once on a fresh gate, so the claimer target is recomputed.
+async fn claim_once_for_target(store: &QueueStorage, pool: &sqlx::PgPool, queue: &str) {
+    let ttl = Duration::from_secs(300);
+    store
+        .claim_runtime_batch_with_aging_for_instance(
+            pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            ttl,
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("claim should succeed");
+}
+
+async fn claimer_state_row(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+) -> (i16, String, DateTime<Utc>) {
+    sqlx::query_as(audited_sql(format!(
+        "SELECT target_claimers, xmin::text, updated_at
+         FROM {schema}.queue_claimer_state WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("claimer state row")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_target_refresh_writes_only_a_change() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_target_writes";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_target_writes";
+    // A stale row whose target an empty queue keeps at 1.
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 1, now() - interval '1 hour')"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = claimer_state_row(&pool, schema, queue).await;
+    claim_once_for_target(&store, &pool, queue).await;
+    assert_eq!(
+        claimer_state_row(&pool, schema, queue).await,
+        before,
+        "an unchanged target leaves the row as it was"
+    );
+
+    // A backlog raises the target, and that change is written.
+    store.enqueue_batch(&pool, queue, 1, 100).await.unwrap();
+    claim_once_for_target(&store, &pool, queue).await;
+    let (target, xmin, updated_at) = claimer_state_row(&pool, schema, queue).await;
+    assert_eq!(target, 4);
+    assert_ne!(xmin, before.1);
+    assert!(updated_at > before.2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_target_refresh_does_not_wait_on_a_locked_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_target_lock";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_target_lock";
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 1, now() - interval '1 hour')"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Another instance holds the row, as one mid-refresh would.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_claimer_state WHERE queue = $1 FOR UPDATE"
+    )))
+    .bind(queue)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        claim_once_for_target(&store, &pool, queue),
+    )
+    .await
+    .expect("a refresh that leaves the target unchanged must not wait on the row lock");
+    holder.rollback().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
     let (_db_guard, pool) = setup_pool(10).await;
@@ -20903,6 +21203,121 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
         .await
         .expect("discard_failed should release dlq unique claims");
     assert_eq!(reinserted.state, JobState::Available);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dlq_deletes_release_unique_claims() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_dlq_delete_claims";
+    let schema = "awa_qs_dlq_delete_claims";
+    let store = create_store(&pool, schema).await;
+    // The default unique states plus `failed`, so a dead-lettered job keeps
+    // its key against new jobs.
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts {
+            states: UniqueOpts::default().states | 1 << JobState::Failed.bit_position(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut job_ids = Vec::new();
+    for id in 0..5 {
+        job_ids.push(enqueue_job(&pool, &store, &DlqJob { id }, opts.clone()).await);
+    }
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(TerminalFailureWorker)
+        .dlq_enabled_by_default(true)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("Failed to build dlq delete client");
+    client
+        .start()
+        .await
+        .expect("Failed to start dlq delete client");
+    wait_for_dlq_count(&pool, &store, queue, 5, Duration::from_secs(10)).await;
+    client.shutdown(Duration::from_secs(5)).await;
+
+    // While its row is in the DLQ, each failed job holds its key.
+    let claims_held = |pool: sqlx::PgPool, job_ids: Vec<i64>| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM awa.job_unique_claims WHERE job_id = ANY($1)",
+        )
+        .bind(&job_ids)
+        .fetch_one(&pool)
+        .await
+        .expect("count claims")
+    };
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 5);
+    let err = insert::insert_with(&pool, &DlqJob { id: 0 }, opts.clone())
+        .await
+        .expect_err("a dead-lettered job keeps its key");
+    assert!(matches!(err, AwaError::UniqueConflict { .. }), "{err:?}");
+
+    assert!(awa::model::dlq::purge_dlq_job(&pool, job_ids[0])
+        .await
+        .expect("purge_dlq_job"));
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 4);
+
+    let cleaned = awa::model::dlq::cleanup_dlq(&pool, Duration::ZERO, 1, Some(queue))
+        .await
+        .expect("cleanup_dlq");
+    assert_eq!(cleaned, 1);
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 3);
+
+    // The maintenance leader's retention pass.
+    let expired = store
+        .delete_expired_dlq_rows(
+            &pool,
+            &awa::model::queue_storage::DlqExpiry {
+                retention: Duration::ZERO,
+                limit: 1,
+                queue: None,
+                overridden_queues: &[],
+                stripe_families: true,
+                oldest_first: false,
+            },
+        )
+        .await
+        .expect("delete_expired_dlq_rows");
+    assert_eq!(expired, 1);
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 2);
+
+    let purged =
+        awa::model::dlq::purge_dlq_matching(&pool, &awa::JobFilter::new().queue(queue), false)
+            .await
+            .expect("purge_dlq_matching");
+    assert_eq!(purged, 2);
+    assert_eq!(claims_held(pool.clone(), job_ids.clone()).await, 0);
+
+    for id in 0..5 {
+        let reinserted = insert::insert_with(&pool, &DlqJob { id }, opts.clone())
+            .await
+            .expect("a purged DLQ row no longer holds its key");
+        assert_eq!(reinserted.state, JobState::Available);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -30270,4 +30685,186 @@ async fn test_idle_check_session_follows_leadership() {
     client_a.shutdown(Duration::from_secs(5)).await;
     pool_a.close().await;
     pool_b.close().await;
+}
+
+/// Leave `count` rolled-back reservations on the lane: positions an enqueue
+/// reserved and never committed.
+async fn reserve_and_roll_back(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    count: i64,
+) {
+    let schema = store.schema();
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, 0::smallint, $3)"
+    )))
+    .bind(queue)
+    .bind(priority)
+    .bind(count)
+    .execute(&mut *tx)
+    .await
+    .expect("reserve lane positions");
+    tx.rollback().await.expect("roll back the reservation");
+}
+
+/// #779: a drain moves its lane's claim cursor across a run of rolled-back
+/// reservations longer than one window, so the drained lane stops pinning
+/// the queue ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_drain_moves_the_claim_cursor_across_rolled_back_reservations() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_drain_gap").await;
+    let queue = "qs_drain_gap";
+
+    let first = enqueue_lane(&pool, &store, queue, 2, 1).await;
+    let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+    assert_eq!(claimed[0].job.id, first[0]);
+    reserve_and_roll_back(&pool, &store, queue, 2, 2_500).await;
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 3).await;
+    let schema = store.schema();
+    let mut seqs = Vec::with_capacity(jobs.len());
+    for job_id in &jobs {
+        seqs.push(
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT lane_seq FROM {schema}.ready_entries
+                 WHERE job_id = $1 ORDER BY run_lease LIMIT 1"
+            )))
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read lane position"),
+        );
+    }
+    let start = claim_cursor_for(&pool, &store, queue, 2, 0).await;
+    assert!(seqs[0] - start >= 2_500, "the gap is wider than one window");
+
+    assert_eq!(
+        admin::drain_queue(&pool, queue).await.expect("drain queue"),
+        3
+    );
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, 2, 0).await,
+        seqs[2] + 1,
+        "a drain moves its lane's cursor across the gap and its cancelled rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_coalesced_wakeups";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_coalesced_wakeups";
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // Each enqueue commits its own transaction. Notifying inside each one
+    // would deliver one notification per enqueue; coalesced wake-ups send
+    // at most one per channel per window, the last after the final commit.
+    const ENQUEUES: usize = 20;
+    let started = Instant::now();
+    for _ in 0..ENQUEUES {
+        store.enqueue_batch(&pool, queue, 1, 1).await.unwrap();
+    }
+    let burst = started.elapsed();
+
+    let mut received = 0;
+    while let Ok(notification) =
+        tokio::time::timeout(Duration::from_millis(300), listener.recv()).await
+    {
+        notification.expect("listener stays connected");
+        received += 1;
+    }
+    assert!(received >= 1, "a burst of enqueues wakes its claimers");
+    // One at the start of each 50 ms window, plus the trailing one.
+    let bound = burst.as_millis() as usize / 50 + 2;
+    assert!(
+        received <= bound,
+        "{ENQUEUES} enqueues in {burst:?} sent {received} notifications, more than one per window"
+    );
+}
+
+#[tokio::test]
+async fn test_queue_storage_flush_wakeups_sends_before_the_pool_closes() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_flush_wakeups";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_flush_wakeups";
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // A short-lived producer enqueues on its own pool and closes it at once.
+    // Closing the pool fails a wake-up still waiting to be sent, so the
+    // producer flushes first.
+    let producer = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("connect producer pool");
+    store.enqueue_batch(&producer, queue, 1, 1).await.unwrap();
+    assert!(
+        awa::flush_wakeups(&producer, Duration::from_secs(5)).await,
+        "the flush finished before its timeout"
+    );
+    producer.close().await;
+
+    let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("the flushed wake-up was delivered")
+        .expect("listener stays connected");
+    assert_eq!(notification.channel(), format!("awa:{queue}"));
+}
+
+/// `reset` truncates `queue_lanes` and keeps the enqueue heads, so the next
+/// enqueue to a lane registers it again.
+#[tokio::test]
+async fn test_enqueue_after_reset_registers_the_lane_again() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_reset_lane_registration";
+    let queue = "qs_reset_lane_registration";
+    let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    let opts = || InsertOpts {
+        queue: queue.to_string(),
+        ..Default::default()
+    };
+    enqueue_job(&pool, &store, &CompleteJob { id: 1 }, opts()).await;
+    store.reset(&pool).await.expect("reset");
+
+    let count = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT count(*) FROM {schema}.{table} WHERE queue = $1"
+            )))
+            .bind(queue)
+            .fetch_one(&pool)
+            .await
+            .expect("count lane rows")
+        }
+    };
+    assert!(
+        count("queue_enqueue_heads").await > 0,
+        "reset keeps the heads"
+    );
+    assert_eq!(count("queue_lanes").await, 0, "reset clears the lanes");
+
+    enqueue_job(&pool, &store, &CompleteJob { id: 2 }, opts()).await;
+    assert_eq!(
+        count("queue_lanes").await,
+        1,
+        "the enqueue after reset registers its lane"
+    );
 }
