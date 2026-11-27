@@ -1780,9 +1780,17 @@ BEGIN
         INSERT INTO %1$I.queue_ring_rotations (generation, slot)
         SELECT s.generation, s.current_slot
         FROM %1$I.queue_ring_state AS s
-        WHERE s.singleton AND s.generation IS NOT NULL
+        WHERE s.singleton AND s.generation >= 0
         ON CONFLICT (generation) DO NOTHING
         $ddl$,
+        p_schema
+    );
+
+    -- Under ledger authority the columns hold the (-1, -1) fence, which is
+    -- not a cursor: the copy above skips it, and any negative-generation
+    -- row already in the ledger is removed.
+    EXECUTE format(
+        'DELETE FROM %I.queue_ring_rotations WHERE generation < 0',
         p_schema
     );
 
@@ -1893,9 +1901,17 @@ BEGIN
         $ddl$
         INSERT INTO %1$I.lease_ring_rotations (generation, slot)
         SELECT s.generation, s.current_slot FROM %1$I.lease_ring_state AS s
-        WHERE s.singleton AND s.generation IS NOT NULL
+        WHERE s.singleton AND s.generation >= 0
         ON CONFLICT (generation) DO NOTHING
         $ddl$,
+        p_schema
+    );
+
+    -- Under ledger authority the columns hold the (-1, -1) fence, which is
+    -- not a cursor: the copy above skips it, and any negative-generation
+    -- row already in the ledger is removed.
+    EXECUTE format(
+        'DELETE FROM %I.lease_ring_rotations WHERE generation < 0',
         p_schema
     );
 
@@ -2000,9 +2016,17 @@ BEGIN
         $ddl$
         INSERT INTO %1$I.claim_ring_rotations (generation, slot)
         SELECT s.generation, s.current_slot FROM %1$I.claim_ring_state AS s
-        WHERE s.singleton AND s.generation IS NOT NULL
+        WHERE s.singleton AND s.generation >= 0
         ON CONFLICT (generation) DO NOTHING
         $ddl$,
+        p_schema
+    );
+
+    -- Under ledger authority the columns hold the (-1, -1) fence, which is
+    -- not a cursor: the copy above skips it, and any negative-generation
+    -- row already in the ledger is removed.
+    EXECUTE format(
+        'DELETE FROM %I.claim_ring_rotations WHERE generation < 0',
         p_schema
     );
 

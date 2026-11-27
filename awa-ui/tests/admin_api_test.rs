@@ -1045,6 +1045,16 @@ async fn test_mutation_endpoint_returns_read_only_error() {
         payload.get("error").and_then(Value::as_str),
         Some("awa serve is connected to a read-only database; admin actions are disabled")
     );
+
+    for path in ["/api/dlq/retry-matching", "/api/dlq/purge-matching"] {
+        let (status, _) = post_json(
+            &app,
+            path,
+            serde_json::json!({ "filter": { "queue": queue } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -1203,6 +1213,32 @@ async fn test_batch_ops_api_accepts_bulk_action_kinds() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// Apply chunks of any open operation, as the maintenance leader would,
+/// until `id` is finalized.
+async fn run_batch_operation_to_completion(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+) -> awa_model::batch_operations::BatchOperation {
+    let runner = Uuid::new_v4();
+    for _ in 0..100 {
+        let outcome = awa_model::batch_operations::run_one_batch_operation_chunk(pool, runner, 100)
+            .await
+            .unwrap();
+        let operation = awa_model::batch_operations::get_batch_operation(pool, id)
+            .await
+            .unwrap();
+        if operation.finalized_at.is_some() {
+            assert_eq!(
+                operation.state,
+                awa_model::batch_operations::BatchOperationState::Completed
+            );
+            return operation;
+        }
+        assert!(outcome.claimed, "an open operation is claimed");
+    }
+    panic!("batch operation {id} did not finalize");
+}
+
 async fn post_status(app: &axum::Router, path: &str, payload: Value) -> StatusCode {
     app.clone()
         .oneshot(
@@ -1303,14 +1339,17 @@ async fn test_dlq_bulk_bodies_never_mean_more_on_an_older_server() {
         "a refused body changes nothing"
     );
 
-    let (status, purged) = post_json(
+    let (status, purge) = post_json(
         &app,
         "/api/dlq/purge-matching",
         serde_json::json!({ "filter": { "queue": queue, "tag": "purge" } }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(purged["count"], serde_json::json!(1));
+    assert_eq!(status, StatusCode::ACCEPTED, "{purge}");
+    let id: Uuid = purge["id"].as_str().unwrap().parse().unwrap();
+    let purge = run_batch_operation_to_completion(&pool, id).await;
+    assert_eq!(purge.processed, 1);
+    assert_eq!(depth(pool.clone()).await, 1);
     let (status, retried) = post_json(
         &app,
         "/api/dlq/bulk-retry",
@@ -1320,4 +1359,163 @@ async fn test_dlq_bulk_bodies_never_mean_more_on_an_older_server() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(retried["count"], serde_json::json!(1));
     assert_eq!(depth(pool.clone()).await, 0);
+}
+
+/// `retry-matching` and `purge-matching` submit a batch operation for the
+/// filter and answer 202 with it; the DLQ changes only as the operation runs.
+#[tokio::test]
+async fn test_dlq_matching_endpoints_submit_batch_operations() {
+    use awa_model::queue_storage::QueueStorage;
+
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool)
+        .await
+        .unwrap()
+        .expect("queue storage should be active");
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    let queue = "api_dlq_matching";
+    for tag in ["retry", "purge", "other"] {
+        awa_model::insert_many(
+            &pool,
+            &[awa_model::InsertParams {
+                kind: "api_dlq_matching_job".to_string(),
+                args: serde_json::json!({}),
+                opts: awa_model::InsertOpts {
+                    queue: queue.to_string(),
+                    tags: vec![tag.to_string()],
+                    ..Default::default()
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 3);
+    let mut ids_by_tag = std::collections::HashMap::new();
+    for claim in &claimed {
+        ids_by_tag.insert(claim.job.tags[0].clone(), claim.job.id);
+        store
+            .fail_to_dlq(
+                &pool,
+                claim.job.id,
+                claim.job.run_lease,
+                "poison",
+                "bad",
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let depth = |pool: sqlx::PgPool| async move {
+        awa_model::dlq::dlq_depth(&pool, Some(queue)).await.unwrap()
+    };
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    // Refused bodies submit nothing.
+    for (path, body) in [
+        (
+            "/api/dlq/retry-matching",
+            serde_json::json!({ "filter": {} }),
+        ),
+        (
+            "/api/dlq/purge-matching",
+            serde_json::json!({ "filter": { "dead_lettered": true } }),
+        ),
+        (
+            "/api/dlq/retry-matching",
+            serde_json::json!({ "filter": { "queue": queue }, "all": true }),
+        ),
+        (
+            "/api/dlq/purge-matching",
+            serde_json::json!({ "filter": { "queue": queue }, "submitted_by": "x" }),
+        ),
+        (
+            "/api/dlq/retry-matching",
+            serde_json::json!({ "filter": { "ids": [] } }),
+        ),
+        (
+            "/api/dlq/purge-matching",
+            serde_json::json!({ "filter": { "queue": queue, "state": ["failed", "available"] } }),
+        ),
+    ] {
+        let status = post_status(&app, path, body.clone()).await;
+        assert!(status.is_client_error(), "{path} {body} -> {status}");
+    }
+    let operations = get_json(&app, "/api/batch-ops").await;
+    assert_eq!(operations, serde_json::json!([]));
+
+    for (path, op_kind, tag) in [
+        ("/api/dlq/retry-matching", "retry_from_dlq", "retry"),
+        ("/api/dlq/purge-matching", "purge_dlq", "purge"),
+    ] {
+        let filter = serde_json::json!({ "queue": queue, "tag": tag });
+        let (status, operation) =
+            post_json(&app, path, serde_json::json!({ "filter": filter })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {operation}");
+        assert_eq!(operation["op_kind"], serde_json::json!(op_kind));
+        assert_eq!(operation["state"], serde_json::json!("pending"));
+        assert_eq!(operation["filter"], filter);
+        assert_eq!(operation["spec"], serde_json::json!({ "op_kind": op_kind }));
+        assert_eq!(operation["submitted_by"], serde_json::json!("http"));
+        assert_eq!(operation["processed"], serde_json::json!(0));
+        let id = operation["id"].as_str().expect("id should be a string");
+        assert_eq!(
+            get_json(&app, &format!("/api/batch-ops/{id}")).await,
+            operation,
+            "the response is the operation as /api/batch-ops/{{id}} returns it"
+        );
+        assert_eq!(depth(pool.clone()).await, 3, "submitting changes no row");
+    }
+
+    let operations = get_json(&app, "/api/batch-ops").await;
+    let ids: Vec<Uuid> = operations
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| operation["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        let operation = run_batch_operation_to_completion(&pool, id).await;
+        assert_eq!(
+            (operation.processed, operation.skipped, operation.errored),
+            (1, 0, 0)
+        );
+    }
+
+    assert_eq!(depth(pool.clone()).await, 1);
+    let remaining = awa_model::dlq::find_dlq(
+        &pool,
+        &awa_model::JobFilter::new().queue(queue),
+        awa_model::DlqPage {
+            before_dlq_at: None,
+            before_id: None,
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining.iter().map(|row| row.job.id).collect::<Vec<_>>(),
+        vec![ids_by_tag["other"]]
+    );
+    let retried = awa_model::admin::get_job(&pool, ids_by_tag["retry"])
+        .await
+        .unwrap();
+    assert_eq!(retried.state, awa_model::JobState::Available);
+    assert!(
+        awa_model::dlq::get_dlq_job(&pool, ids_by_tag["purge"])
+            .await
+            .unwrap()
+            .is_none(),
+        "the purged row is gone"
+    );
 }

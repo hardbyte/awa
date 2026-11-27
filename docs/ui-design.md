@@ -98,8 +98,8 @@ GET  /api/dlq/:id
 GET  /api/dlq/depth
 POST   /api/dlq/:id/retry
 DELETE /api/dlq/:id
-POST   /api/dlq/retry-matching          { filter, all? }   all only with an empty filter
-POST   /api/dlq/purge-matching          { filter, all? }   all only with an empty filter
+POST   /api/dlq/retry-matching          { filter, all? }   all only with an empty filter; 202 with a retry_from_dlq batch operation
+POST   /api/dlq/purge-matching          { filter, all? }   all only with an empty filter; 202 with a purge_dlq batch operation
 POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }   the 0.6 form
 POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }   the 0.6 form
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
@@ -169,7 +169,7 @@ The first UI form intentionally covers the common operator paths. The API and Py
 Operator surface for queue-storage `dlq_entries`.
 
 - **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, age, and attempts.
-- **Bulk actions** — filter-scoped bulk retry and purge. Empty-filter actions require explicit `all=true` confirmation through the API.
+- **Bulk actions** — filter-scoped bulk retry and purge, each confirmed and then submitted as a `retry_from_dlq` or `purge_dlq` batch operation; the page names the submitted operation and links to the batch operations page, where its progress shows. Empty-filter actions require explicit `all=true` confirmation through the API.
 - **Detail (`/dlq/:id`)** — single-row inspection with retry and purge actions.
 - **Queue badge** — `/queues` shows a `+N DLQ` link next to queues with non-zero DLQ depth.
 
