@@ -20,7 +20,7 @@
 #
 # Env:
 #   DATABASE_URL          default postgres://postgres:test@localhost:15432/awa_test
-#   AWA_N_MINUS_ONE_VER   released N-1 awa-pg version to rehearse against, default 0.6.3
+#   AWA_N_MINUS_ONE_VER   released N-1 awa-pg version to rehearse against, default 0.6.19
 #   AWA_N_MINUS_ONE_PYTHON  path to an existing interpreter; skips venv setup if set
 #
 # On a failure, the full test output is kept under
@@ -32,7 +32,7 @@ set -euo pipefail
 ITERATIONS=${1:-20}
 TEST_FILTER=${2:-}
 DATABASE_URL=${DATABASE_URL:-postgres://postgres:test@localhost:15432/awa_test}
-AWA_N_MINUS_ONE_VER=${AWA_N_MINUS_ONE_VER:-0.6.3}
+AWA_N_MINUS_ONE_VER=${AWA_N_MINUS_ONE_VER:-0.6.19}
 LOG_DIR=rehearsal-repro-logs
 
 if ! psql "$DATABASE_URL" -c "SELECT 1" >/dev/null 2>&1; then

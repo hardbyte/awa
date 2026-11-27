@@ -893,7 +893,7 @@ async fn wait_for_drain(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a released awa-pg 0.6.3 environment"]
+#[ignore = "requires a released awa-pg 0.6.19 environment"]
 async fn test_migrate_first_mixed_fleet_flip_and_fence() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("migrate_first_mixed_fleet_flip_and_fence");
@@ -920,7 +920,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
     // Apply all current migrations while the released runtime and producer remain live.
     migrations::run(&pool)
         .await
-        .expect("current migrations must accept a live 0.6.3 runtime");
+        .expect("current migrations must accept a live 0.6.19 runtime");
     assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
     let authority: String =
         sqlx::query_scalar("SELECT authority FROM awa.ring_cursor_authority WHERE singleton")
@@ -1053,7 +1053,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a released awa-pg 0.6.3 environment"]
+#[ignore = "requires a released awa-pg 0.6.19 environment"]
 async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("migrate_first_deadline_rescue_handoff");
@@ -1229,7 +1229,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
 /// migration lands; the released worker is then hard-killed (SIGKILL)
 /// mid-traffic, and the current fleet must rescue its in-flight work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a released awa-pg 0.6.3 environment"]
+#[ignore = "requires a released awa-pg 0.6.19 environment"]
 async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("binary_first_refusal_then_roll");
@@ -1390,7 +1390,7 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
 /// designed terminal state and attempt, and the DLQ to hold exactly the
 /// designed failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a released awa-pg 0.6.3 environment"]
+#[ignore = "requires a released awa-pg 0.6.19 environment"]
 async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("migrate_first_full_workload");
@@ -1627,7 +1627,7 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
 /// must come up unaided the moment the current migrations commit. Both versions must then
 /// claim and complete work concurrently before any flip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a released awa-pg 0.6.3 environment"]
+#[ignore = "requires a released awa-pg 0.6.19 environment"]
 async fn test_overlap_current_roll_races_live_migration() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("overlap_roll_races_migration");
@@ -1828,7 +1828,7 @@ fn error_outputs(row: &awa::model::JobRow) -> Vec<Option<serde_json::Value>> {
 /// artifact without loss; compact receipt batches with and without
 /// outputs coexist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a released awa-pg 0.6.3 environment"]
+#[ignore = "requires a released awa-pg 0.6.19 environment"]
 async fn test_migrate_first_mixed_fleet_job_output() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let mut report = RehearsalReport::new("migrate_first_mixed_fleet_job_output");

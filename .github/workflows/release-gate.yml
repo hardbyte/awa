@@ -21,7 +21,7 @@ on:
       n_minus_one:
         description: "Released N-1 awa-pg version to rehearse against"
         required: false
-        default: "0.6.3"
+        default: "0.6.19"
       compat_repetitions:
         description: "Diagnostic lifecycle repetitions per pinned wheel (fails on first error)"
         required: false
@@ -31,7 +31,7 @@ on:
       n_minus_one:
         description: "Released N-1 awa-pg version to rehearse against"
         required: false
-        default: "0.6.3"
+        default: "0.6.19"
         type: string
 
 env:
@@ -81,7 +81,7 @@ jobs:
         run: |
           uv venv --quiet --clear .compat-venv-gate
           uv pip install --quiet --python .compat-venv-gate \
-            "awa-pg==${{ inputs.n_minus_one || github.event.inputs.n_minus_one || '0.6.3' }}"
+            "awa-pg==${{ inputs.n_minus_one || github.event.inputs.n_minus_one || '0.6.19' }}"
       - name: Run mixed-version upgrade rehearsal
         run: |
           set -o pipefail
