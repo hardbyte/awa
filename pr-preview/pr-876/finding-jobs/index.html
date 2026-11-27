@@ -2603,12 +2603,7 @@ same holds for the query parameters of <code>GET /api/jobs</code>, <code>/api/jo
 pass over candidates and every load of their rows. A filter that needs longer
 fails with an error asking to narrow it. Batch operations scan without that
 budget, since a failed scan fails the operation.</p>
-<p>A DLQ purge or bulk retry, and a batch operation, needs a field that picks
-out particular jobs (kind, queue, tag, ids or a created bound), or
-<code>allow_all</code>. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes
-to <code>POST /api/dlq/retry-matching</code> or <code>/api/dlq/purge-matching</code>:
-<code>{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}</code>, or
-<code>{"filter": {}, "all": true}</code> for the whole DLQ.</p>
+<p>A DLQ purge or bulk retry, and a batch operation, needs a field that picks out particular jobs (kind, queue, tag, ids or a created bound), or <code>allow_all</code>. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes to <code>POST /api/dlq/retry-matching</code> or <code>/api/dlq/purge-matching</code>: <code>{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}</code>, or <code>{"filter": {}, "all": true}</code> for the whole DLQ. Each submits a <code>retry_from_dlq</code> or <code>purge_dlq</code> batch operation with that filter and answers <code>202 Accepted</code> with it, as <code>GET /api/batch-ops/{id}</code> returns it.</p>
 <p>Each job appears once, in its current state. Listing is newest first; page by
 passing the last id you saw as <code>before_id</code>. A job whose claim is in flight
 can be missed or shown in its previous state, and a job can change state
