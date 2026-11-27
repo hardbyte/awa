@@ -13,6 +13,9 @@ anyhow = ["dep:anyhow"]
 http-worker = ["dep:reqwest"]
 __python-bridge = []
 
+[lints]
+workspace = true
+
 [dependencies]
 pg-session-lock.workspace = true
 awa-model.workspace = true

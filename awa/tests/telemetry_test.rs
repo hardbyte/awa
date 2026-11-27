@@ -9,6 +9,7 @@
 //!   cargo test -p awa --test telemetry_test -- --ignored --nocapture
 //!
 //! See docs/test-plan.md for local setup instructions.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::audited_sql;

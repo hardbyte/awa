@@ -1,4 +1,5 @@
 //! Mount behavior must also work without a frontend build (the placeholder).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::time::Duration;
 
 use awa_ui::state::ReadOnlyMode;

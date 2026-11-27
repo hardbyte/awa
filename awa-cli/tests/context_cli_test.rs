@@ -8,6 +8,7 @@
 //!
 //! Database-backed cases use isolated migrated databases. Set
 //! DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use assert_cmd::Command;
 use awa_testing::setup::TestDatabase;

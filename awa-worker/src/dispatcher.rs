@@ -1,6 +1,7 @@
 use crate::executor::{DispatchedJob, JobExecutor};
 use crate::runtime::InFlightMap;
 use crate::storage::RuntimeStorage;
+use crate::sync::MutexExt;
 use awa_model::JobRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -259,7 +260,7 @@ impl OverflowPool {
     ///
     /// Calling with wanted=0 is valid — it clears this queue's demand signal.
     pub fn try_acquire(&self, queue: &str, wanted: u32) -> u32 {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_unpoisoned();
 
         // Always update demand — this is the key signal for fairness
         state.demand.insert(queue.to_string(), wanted);
@@ -306,7 +307,7 @@ impl OverflowPool {
 
     /// Release `n` overflow permits back to the pool.
     pub fn release(&self, queue: &str, n: u32) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_unpoisoned();
         if let Some(held) = state.held.get_mut(queue) {
             *held = held.saturating_sub(n);
         }
@@ -319,7 +320,7 @@ impl OverflowPool {
 
     /// Get the number of overflow permits currently held by a queue.
     pub fn held(&self, queue: &str) -> u32 {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock_unpoisoned();
         state.held.get(queue).copied().unwrap_or(0)
     }
 }
@@ -593,7 +594,7 @@ impl Dispatcher {
             return;
         }
         if let Some(rate_limiter) = &self.rate_limiter {
-            let mut rate_limiter = rate_limiter.lock().expect("rate limiter lock poisoned");
+            let mut rate_limiter = rate_limiter.lock_unpoisoned();
             rate_limiter.refund(n as u32);
         }
     }
@@ -671,10 +672,7 @@ impl Dispatcher {
                         base.burst
                     },
                 };
-                limiter
-                    .lock()
-                    .expect("rate limiter mutex poisoned")
-                    .reconfigure(&effective);
+                limiter.lock_unpoisoned().reconfigure(&effective);
             }
             _ if overrides.rate_limit.is_some() => {
                 warn!(
@@ -751,7 +749,7 @@ impl Dispatcher {
 
         // Phase 2: Apply rate limit
         let batch_size = if let Some(rate_limiter) = &self.rate_limiter {
-            let mut rate_limiter = rate_limiter.lock().expect("rate limiter lock poisoned");
+            let mut rate_limiter = rate_limiter.lock_unpoisoned();
             let rate_available = rate_limiter.available() as usize;
             let batch_size = permits
                 .len()

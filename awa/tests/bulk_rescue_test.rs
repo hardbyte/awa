@@ -3,6 +3,7 @@
 //! time, the claim ring must resume rotating, a runtime that stays alive
 //! must never have a claim rescued, and every rescued attempt must count
 //! (#627).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[path = "ci_timing.rs"]
 mod ci_timing;

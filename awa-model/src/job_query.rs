@@ -251,6 +251,10 @@ impl Branch {
             }
         }
         if !tags.is_empty() {
+            #[expect(
+                clippy::expect_used,
+                reason = "branches without a tag payload are filtered out when tags are present"
+            )]
             let payload = self
                 .payload
                 .expect("branches without a tag payload are skipped for tag filters");

@@ -2,6 +2,7 @@
 //!
 //! This is intentionally ignored in the normal test suite because it requires
 //! Docker Compose and boots a primary/replica stack on demand.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::audited_sql;

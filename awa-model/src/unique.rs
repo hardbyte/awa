@@ -22,6 +22,10 @@ pub fn compute_unique_key(
         // so keys iterate in sorted order. This is an implementation detail
         // of serde_json, not a guarantee. Python uses json.dumps(sort_keys=True)
         // explicitly. Cross-language golden tests verify consistency.
+        #[expect(
+            clippy::expect_used,
+            reason = "a serde_json::Value always serializes to JSON"
+        )]
         let canonical = serde_json::to_vec(args).expect("JSON serialization should not fail");
         hasher.update(&canonical);
     }

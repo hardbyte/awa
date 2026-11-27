@@ -28,6 +28,7 @@
 //! Run with:
 //!   cargo test --release --package awa --test enqueue_lane_maintenance_coupling_test \
 //!       -- --ignored --nocapture --test-threads=1
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::{insert_many, QueueStorage};
 use awa::worker::maintenance::QueueStoragePromoter;

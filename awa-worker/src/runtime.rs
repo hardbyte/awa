@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::sync::{MutexExt, RwLockExt};
+
 use awa_model::queue_storage::ClaimHeartbeatRef;
 
 const IN_FLIGHT_SHARDS: usize = 64;
@@ -99,12 +101,13 @@ impl ProgressState {
     }
 
     /// Shallow-merge keys into the `metadata` sub-object.
-    /// Returns false if the existing metadata sub-object is a non-object type (no-op).
+    /// Returns false if progress or its metadata sub-object is a non-object type (no-op).
     pub fn merge_metadata(&mut self, updates: &serde_json::Map<String, serde_json::Value>) -> bool {
         let progress = self.latest.get_or_insert_with(|| serde_json::json!({}));
+        let Some(progress) = progress.as_object_mut() else {
+            return false;
+        };
         let metadata = progress
-            .as_object_mut()
-            .expect("progress is always an object")
             .entry("metadata")
             .or_insert_with(|| serde_json::json!({}));
 
@@ -164,9 +167,7 @@ impl InFlightRegistry {
     /// arrived before it registered; its cancel flag is then already set.
     pub fn insert(&self, key: InFlightKey, state: InFlightState) -> bool {
         let index = self.shard_index(&key);
-        let mut guard = self.shards[index]
-            .write()
-            .expect("in_flight shard poisoned");
+        let mut guard = self.shards[index].write_unpoisoned();
         let cancelled = self.cancelled[index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -187,9 +188,7 @@ impl InFlightRegistry {
     pub fn signal_cancel(&self, key: InFlightKey) -> bool {
         let index = self.shard_index(&key);
         // The write lock orders this against `insert`.
-        let guard = self.shards[index]
-            .write()
-            .expect("in_flight shard poisoned");
+        let guard = self.shards[index].write_unpoisoned();
         if let Some(state) = guard.get(&key) {
             state
                 .cancel
@@ -215,18 +214,12 @@ impl InFlightRegistry {
     }
 
     pub fn remove(&self, key: InFlightKey) -> Option<InFlightState> {
-        let mut guard = self
-            .shard_for(&key)
-            .write()
-            .expect("in_flight shard poisoned");
+        let mut guard = self.shard_for(&key).write_unpoisoned();
         guard.remove(&key)
     }
 
     pub fn get_cancel(&self, key: InFlightKey) -> Option<CancelFlag> {
-        let guard = self
-            .shard_for(&key)
-            .read()
-            .expect("in_flight shard poisoned");
+        let guard = self.shard_for(&key).read_unpoisoned();
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
@@ -234,7 +227,7 @@ impl InFlightRegistry {
     pub fn claim_refs(&self) -> Vec<(InFlightKey, Option<ClaimHeartbeatRef>)> {
         let mut refs = Vec::new();
         for shard in &*self.shards {
-            let guard = shard.read().expect("in_flight shard poisoned");
+            let guard = shard.read_unpoisoned();
             refs.extend(guard.iter().map(|(key, state)| (*key, state.claim)));
         }
         refs
@@ -243,10 +236,7 @@ impl InFlightRegistry {
     /// The handler has returned: keep heartbeating the attempt until its
     /// finalize is done, and stop flushing its progress.
     pub fn mark_finalizing(&self, key: InFlightKey) {
-        let mut guard = self
-            .shard_for(&key)
-            .write()
-            .expect("in_flight shard poisoned");
+        let mut guard = self.shard_for(&key).write_unpoisoned();
         if let Some(state) = guard.get_mut(&key) {
             state.finalizing = true;
         }
@@ -255,7 +245,7 @@ impl InFlightRegistry {
     pub fn flags(&self) -> Vec<CancelFlag> {
         let mut flags = Vec::new();
         for shard in &*self.shards {
-            let guard = shard.read().expect("in_flight shard poisoned");
+            let guard = shard.read_unpoisoned();
             flags.extend(guard.values().map(|s| s.cancel.clone()));
         }
         flags
@@ -269,12 +259,12 @@ impl InFlightRegistry {
     pub fn snapshot_pending_progress(&self) -> Vec<(i64, i64, u64, serde_json::Value)> {
         let mut result = Vec::new();
         for shard in &*self.shards {
-            let guard = shard.read().expect("in_flight shard poisoned");
+            let guard = shard.read_unpoisoned();
             for (&(job_id, run_lease), state) in guard.iter() {
                 if state.finalizing {
                     continue;
                 }
-                let mut progress = state.progress.lock().expect("progress lock poisoned");
+                let mut progress = state.progress.lock_unpoisoned();
                 if progress.has_pending() && progress.in_flight.is_none() {
                     if let Some(ref value) = progress.latest {
                         let gen = progress.generation;
@@ -292,12 +282,9 @@ impl InFlightRegistry {
     pub fn ack_progress(&self, acked: &[(i64, i64, u64)]) {
         for &(job_id, run_lease, generation) in acked {
             let key = (job_id, run_lease);
-            let guard = self
-                .shard_for(&key)
-                .read()
-                .expect("in_flight shard poisoned");
+            let guard = self.shard_for(&key).read_unpoisoned();
             if let Some(state) = guard.get(&key) {
-                let mut progress = state.progress.lock().expect("progress lock poisoned");
+                let mut progress = state.progress.lock_unpoisoned();
                 if progress
                     .in_flight
                     .as_ref()
@@ -314,12 +301,9 @@ impl InFlightRegistry {
     pub fn clear_in_flight_progress(&self, failed: &[(i64, i64, u64)]) {
         for &(job_id, run_lease, generation) in failed {
             let key = (job_id, run_lease);
-            let guard = self
-                .shard_for(&key)
-                .read()
-                .expect("in_flight shard poisoned");
+            let guard = self.shard_for(&key).read_unpoisoned();
             if let Some(state) = guard.get(&key) {
-                let mut progress = state.progress.lock().expect("progress lock poisoned");
+                let mut progress = state.progress.lock_unpoisoned();
                 if progress
                     .in_flight
                     .as_ref()
@@ -345,6 +329,15 @@ impl InFlightRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_metadata_refuses_progress_that_is_not_an_object() {
+        let mut progress = ProgressState::new(Some(serde_json::json!(5)));
+        let updates = serde_json::Map::from_iter([("step".to_string(), serde_json::json!(1))]);
+
+        assert!(!progress.merge_metadata(&updates));
+        assert!(progress.pending_snapshot().is_none());
+    }
 
     #[test]
     fn ack_progress_does_not_roll_back_newer_explicit_flush() {

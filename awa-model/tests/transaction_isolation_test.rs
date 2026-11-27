@@ -1,5 +1,6 @@
 //! awa's own transactions run at READ COMMITTED whatever the session's
 //! default isolation level (#847).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::isolation::BeginReadCommitted;
 use sqlx::postgres::PgPoolOptions;

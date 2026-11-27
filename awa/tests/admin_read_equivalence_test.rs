@@ -7,6 +7,7 @@
 //! The reference reads `current_jobs`, the expanded view of every job
 //! (`admin::queue_storage_current_jobs_cte`), so it follows that definition
 //! rather than a copy of it.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::admin::{self, JobKindOverview, ListJobsFilter};
 use awa::model::{insert_many, migrations, InsertOpts, InsertParams, QueueStorage};

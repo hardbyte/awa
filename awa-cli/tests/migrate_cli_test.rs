@@ -8,6 +8,7 @@
 //! advisory lock keeps the tests in this file from racing each other.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::str::FromStr;
 use std::sync::OnceLock;

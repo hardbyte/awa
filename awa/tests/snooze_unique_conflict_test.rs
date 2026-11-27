@@ -11,6 +11,7 @@
 //! cancelled-job count.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, JobArgs, JobError, JobEvent, JobResult, QueueConfig, UniqueOpts};
 use awa_model::{admin, insert_with, migrations, AwaError, InsertOpts};

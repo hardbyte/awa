@@ -2,6 +2,7 @@
 //! custom-schema discovery trusts. A look-alike schema owned by another role
 //! keeps its index even when a superuser applies the migration, and a custom
 //! schema prepared by the awa owner loses it.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::{audited_sql, migrations, QueueStorage, QueueStorageConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

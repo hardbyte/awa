@@ -3,6 +3,7 @@
 //! Implements the test plan from docs/test-plan.md. Each test is self-contained
 //! and uses unique queue names to avoid interference when running in parallel.
 //! All tests target real Postgres.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa_macros::JobArgs;

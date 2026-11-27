@@ -19,8 +19,7 @@
 //! code, so individual files do not need to be enumerated here.
 
 fn main() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR is always set during build scripts");
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     println!("cargo:rerun-if-changed={manifest_dir}/static");
     println!("cargo:rerun-if-changed={manifest_dir}/static/assets");
 }

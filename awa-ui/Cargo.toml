@@ -19,6 +19,9 @@ include = [
     "/README.md",
 ]
 
+[lints]
+workspace = true
+
 [dependencies]
 awa-model.workspace = true
 awa-metrics.workspace = true

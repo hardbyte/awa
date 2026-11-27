@@ -26,6 +26,7 @@
 //! cargo test -p awa --test pg_restart_chaos_test \
 //!   -- --ignored --test-threads=1 --nocapture
 //! ```
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::model::{insert::insert_with, migrations, QueueStorage, QueueStorageConfig};

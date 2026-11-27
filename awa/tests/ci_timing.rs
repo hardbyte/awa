@@ -27,6 +27,7 @@
 //! the strict values, so a real regression still fails fast on a
 //! developer machine. Override with `AWA_CHAOS_TIMEOUT_MULTIPLIER`.
 #![allow(dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::time::Duration;
 

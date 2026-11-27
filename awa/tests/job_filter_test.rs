@@ -1,5 +1,6 @@
 //! ADR-049: one filter for listing, counting, batch operations and the DLQ,
 //! and tags indexed on queue storage.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::admin;
 use awa::model::batch_operations::{self, BatchOperationSpec, SubmitBatchOperation};

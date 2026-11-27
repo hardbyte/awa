@@ -3,6 +3,7 @@
 //! These cells exercise migration and rolling operation from the latest
 //! released 0.6 patch to the current schema while traffic remains live. The old
 //! worker is a PyPI wheel installed by the workflow, not a source checkout.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 

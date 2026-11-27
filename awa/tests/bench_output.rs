@@ -4,6 +4,7 @@
 //! this schema (schema_version=2). Human-readable summaries go to stdout
 //! as before; these JSONL records are printed on a separate line prefixed
 //! with `@@BENCH_JSON@@` for easy extraction.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use serde::Serialize;
 use std::collections::HashMap;

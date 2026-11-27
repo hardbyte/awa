@@ -6,6 +6,7 @@
 //! The old per-descriptor loop is gone from the repo but the baseline number
 //! it produced (≈N × per-upsert RTT) is what makes the batched number
 //! meaningful.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::admin::{
     sync_job_kind_descriptors, sync_queue_descriptors, JobKindDescriptor, NamedJobKindDescriptor,

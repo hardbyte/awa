@@ -24,6 +24,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+
+use crate::sync::{MutexExt, RwLockExt};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -461,11 +463,11 @@ enum RuntimeLifecycle {
 }
 
 fn set_runtime_lifecycle(lifecycle: &Mutex<RuntimeLifecycle>, state: RuntimeLifecycle) {
-    *lifecycle.lock().expect("runtime lifecycle mutex poisoned") = state;
+    *lifecycle.lock_unpoisoned() = state;
 }
 
 fn begin_queue_storage_install(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
-    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    let mut guard = lifecycle.lock_unpoisoned();
     match *guard {
         RuntimeLifecycle::Idle => {
             *guard = RuntimeLifecycle::InstallingQueueStorage;
@@ -481,7 +483,7 @@ fn begin_queue_storage_install(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<
 }
 
 fn begin_runtime_start(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
-    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    let mut guard = lifecycle.lock_unpoisoned();
     match *guard {
         RuntimeLifecycle::Idle => {
             *guard = RuntimeLifecycle::Running;
@@ -810,10 +812,7 @@ impl PyClient {
 
                 let workers = workers.clone();
                 let kind = kind_str.clone();
-                workers
-                    .write()
-                    .expect("workers lock poisoned")
-                    .insert(kind, entry);
+                workers.write_unpoisoned().insert(kind, entry);
 
                 Ok(handler_py)
             },
@@ -834,10 +833,7 @@ impl PyClient {
             .map_err(|_| validation_error("cron grace_seconds must be finite and nonnegative"))?;
         let config = awa_model::PeriodicReconciliation::authoritative(owner, revision, grace)
             .map_err(map_awa_error)?;
-        *self
-            .periodic_reconciliation
-            .lock()
-            .expect("periodic reconciliation mutex poisoned") = Some(config);
+        *self.periodic_reconciliation.lock_unpoisoned() = Some(config);
         Ok(())
     }
 
@@ -953,10 +949,7 @@ impl PyClient {
             .build_raw(kind, args_json)
             .map_err(map_awa_error)?;
 
-        self.periodic_jobs
-            .lock()
-            .expect("periodic_jobs mutex poisoned")
-            .push(periodic_job);
+        self.periodic_jobs.lock_unpoisoned().push(periodic_job);
 
         Ok(())
     }
@@ -989,13 +982,7 @@ impl PyClient {
         // Mutation after start() is a footgun: the runtime only reads
         // queue_descriptors during startup, so the late call would
         // silently have no effect. Fail loudly instead.
-        if !matches!(
-            *self
-                .lifecycle
-                .lock()
-                .expect("runtime lifecycle mutex poisoned"),
-            RuntimeLifecycle::Idle
-        ) {
+        if !matches!(*self.lifecycle.lock_unpoisoned(), RuntimeLifecycle::Idle) {
             return Err(state_error(
                 "queue_descriptor() must be called before start()",
             ));
@@ -1003,8 +990,7 @@ impl PyClient {
         let descriptor =
             build_queue_descriptor(py, display_name, description, owner, docs_url, tags, extra)?;
         self.queue_descriptors
-            .lock()
-            .expect("queue_descriptors mutex poisoned")
+            .lock_unpoisoned()
             .insert(queue, descriptor);
         Ok(())
     }
@@ -1033,13 +1019,7 @@ impl PyClient {
         tags: Option<Vec<String>>,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        if !matches!(
-            *self
-                .lifecycle
-                .lock()
-                .expect("runtime lifecycle mutex poisoned"),
-            RuntimeLifecycle::Idle
-        ) {
+        if !matches!(*self.lifecycle.lock_unpoisoned(), RuntimeLifecycle::Idle) {
             return Err(state_error(
                 "job_kind_descriptor() must be called before start()",
             ));
@@ -1047,8 +1027,7 @@ impl PyClient {
         let descriptor =
             build_job_kind_descriptor(py, display_name, description, owner, docs_url, tags, extra)?;
         self.job_kind_descriptors
-            .lock()
-            .expect("job_kind_descriptors mutex poisoned")
+            .lock_unpoisoned()
             .insert(kind, descriptor);
         Ok(())
     }
@@ -1887,7 +1866,7 @@ impl PyClient {
 
     fn health_check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
+        let runtime = self.runtime.lock_unpoisoned().clone();
         crate::async_bridge::future_into_py(py, async move {
             if let Some(runtime) = runtime {
                 let health = runtime.health_check().await;
@@ -1944,13 +1923,7 @@ impl PyClient {
         queue_storage_rotate_max_slot_age_ms: Option<u64>,
         storage_transition_role: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let entries: Vec<_> = self
-            .workers
-            .read()
-            .expect("workers lock poisoned")
-            .values()
-            .cloned()
-            .collect();
+        let entries: Vec<_> = self.workers.read_unpoisoned().values().cloned().collect();
         if entries.is_empty() {
             return Err(state_error(
                 "register at least one worker before starting the runtime",
@@ -2170,20 +2143,11 @@ impl PyClient {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
         }
 
-        if let Some(config) = self
-            .periodic_reconciliation
-            .lock()
-            .expect("periodic reconciliation mutex poisoned")
-            .clone()
-        {
+        if let Some(config) = self.periodic_reconciliation.lock_unpoisoned().clone() {
             builder = builder.periodic_reconciliation(config);
         }
         // Register periodic jobs
-        let periodic_jobs = self
-            .periodic_jobs
-            .lock()
-            .expect("periodic_jobs mutex poisoned")
-            .clone();
+        let periodic_jobs = self.periodic_jobs.lock_unpoisoned().clone();
         for job in periodic_jobs {
             builder = builder.periodic(job);
         }
@@ -2191,19 +2155,11 @@ impl PyClient {
         // Attach descriptors. Using `job_kind_descriptor_kind` (by name) keeps
         // the Python surface symmetric with `queue_descriptor` and sidesteps
         // the typed T::kind() path, which requires Rust-side generics.
-        let queue_descriptors = self
-            .queue_descriptors
-            .lock()
-            .expect("queue_descriptors mutex poisoned")
-            .clone();
+        let queue_descriptors = self.queue_descriptors.lock_unpoisoned().clone();
         for (queue, descriptor) in queue_descriptors {
             builder = builder.queue_descriptor(queue, descriptor);
         }
-        let mut job_kind_descriptors = self
-            .job_kind_descriptors
-            .lock()
-            .expect("job_kind_descriptors mutex poisoned")
-            .clone();
+        let mut job_kind_descriptors = self.job_kind_descriptors.lock_unpoisoned().clone();
         for entry in &entries {
             if let Some(output) = &entry.output_descriptor {
                 let descriptor = job_kind_descriptors.entry(entry.kind.clone()).or_default();
@@ -2229,9 +2185,9 @@ impl PyClient {
             };
             // Publish only after bridge acceptance, before starting so an
             // accepted concurrent shutdown can find the runtime.
-            *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime.clone());
+            *runtime_store.lock_unpoisoned() = Some(runtime.clone());
             if let Err(e) = runtime.start().await {
-                runtime_store.lock().expect("runtime mutex poisoned").take();
+                runtime_store.lock_unpoisoned().take();
                 set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
                 return Err(map_awa_error(e));
             }
@@ -2244,7 +2200,7 @@ impl PyClient {
         let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let runtime = runtime_store.lock().expect("runtime mutex poisoned").take();
+            let runtime = runtime_store.lock_unpoisoned().take();
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
@@ -3555,7 +3511,7 @@ impl PyClient {
 
     fn health_check_sync(&self, py: Python<'_>) -> PyResult<PyHealthCheck> {
         let pool = self.pool.clone();
-        let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
+        let runtime = self.runtime.lock_unpoisoned().clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 if let Some(runtime) = runtime {
@@ -3857,7 +3813,14 @@ fn parse_queue_configs(
         }
 
         let max_workers = if has_max {
-            dict.get_item("max_workers")?.unwrap().extract()?
+            #[expect(
+                clippy::expect_used,
+                reason = "has_max was computed from the same key under the GIL"
+            )]
+            let max_item = dict
+                .get_item("max_workers")?
+                .expect("max_workers key is present when has_max is set");
+            max_item.extract()?
         } else if global_max_workers.is_none() && !has_min {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "max_workers required in hard-reserved mode (no global_max_workers set)",

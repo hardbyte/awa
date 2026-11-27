@@ -17,6 +17,7 @@
 //!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test unique_claim_lane_lock_order_test -- --nocapture`
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 

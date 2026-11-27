@@ -1223,6 +1223,10 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
     write_csv_field(buf, &row.queue);
     buf.push(b',');
     // args (JSONB as text)
+    #[expect(
+        clippy::expect_used,
+        reason = "a serde_json::Value always serializes to JSON"
+    )]
     let args_str = serde_json::to_string(&row.args).expect("JSON serialization should not fail");
     write_csv_field(buf, &args_str);
     buf.push(b',');
@@ -1242,6 +1246,10 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
     }
     buf.push(b',');
     // metadata (JSONB as text)
+    #[expect(
+        clippy::expect_used,
+        reason = "a serde_json::Value always serializes to JSON"
+    )]
     let metadata_str =
         serde_json::to_string(&row.metadata).expect("JSON serialization should not fail");
     write_csv_field(buf, &metadata_str);

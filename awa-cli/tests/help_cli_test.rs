@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use assert_cmd::Command;
 
 fn rendered_help(args: &[&str], env_name: &str, secret: &str) -> String {

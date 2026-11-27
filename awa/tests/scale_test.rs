@@ -4,6 +4,7 @@
 //! bulk insert at scale, and queue isolation under load.
 //!
 //! Each test uses a unique queue name to avoid interference when running in parallel.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa_macros::JobArgs;

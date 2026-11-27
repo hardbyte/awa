@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use assert_cmd::Command;
 use awa_model::{insert_with, InsertOpts, JobArgs};
 use serde::{Deserialize, Serialize};

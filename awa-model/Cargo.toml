@@ -11,6 +11,9 @@ readme = "README.md"
 cel = ["dep:cel"]
 tokio-postgres = ["dep:tokio-postgres"]
 
+[lints]
+workspace = true
+
 [dependencies]
 awa-macros.workspace = true
 pg-session-lock.workspace = true

@@ -3,6 +3,7 @@
 //! Verifies the deployable-role split: the router exposes only the three
 //! callback ingress endpoints, refuses requests without a valid signature
 //! when configured to do so, and does NOT serve admin REST or static UI.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::callback_contract;
 use awa_ui::callback_router::{CallbackAuth, CallbackReceiverConfig};

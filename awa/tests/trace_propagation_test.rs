@@ -4,6 +4,7 @@
 //! trace across processes, asserted with an in-memory span exporter.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
 use std::sync::OnceLock;

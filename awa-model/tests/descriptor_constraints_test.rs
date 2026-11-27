@@ -5,6 +5,7 @@
 //! These are in the integration tests dir (not unit tests) because they
 //! need a live Postgres. Requires DATABASE_URL to point at a reachable
 //! database with the current schema applied.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::admin::{
     cleanup_stale_descriptors, sync_job_kind_descriptors, sync_queue_descriptors,

@@ -19,6 +19,7 @@
 //! measurement. A handler keeps its worker slot until a finalizer slot is
 //! free, so slow completions still throttle the count. One query at the end
 //! confirms every trigger committed.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, EnqueueRequest, JobArgs, JobResult, QueueConfig, UniqueOpts};
 use awa_testing::setup::TestDatabase;

@@ -921,6 +921,10 @@ async fn check_runtime_version_floor(
         .execute(&mut *conn)
         .await?;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "floors are compile-time constants valid semver"
+    )]
     let minimum = Version::parse(minimum_version)
         .expect("migration runtime version floors must be valid semver");
     let live: Vec<(String, Option<String>, i32, String, i64)> = sqlx::query_as(

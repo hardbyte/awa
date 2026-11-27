@@ -6,6 +6,7 @@
 //! refusing to truncate while live traffic flows, the lock-table
 //! barrier between TRUNCATE and concurrent inserts, and the orphan-
 //! lease race between admin cancel and materialize.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa::model::{

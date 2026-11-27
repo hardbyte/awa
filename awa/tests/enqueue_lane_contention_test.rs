@@ -43,6 +43,7 @@
 //! Run with:
 //!   cargo test --release --package awa --test enqueue_lane_contention_test \
 //!       -- --ignored --nocapture --test-threads=1
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod bench_output;
 mod ci_timing;

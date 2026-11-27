@@ -11,6 +11,14 @@ crate-type = ["cdylib"]
 default = ["cel"]
 cel = ["awa-model/cel"]
 
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
 [dependencies]
 awa-model = { path = "../awa-model", version = "0.7.0-alpha.2" }
 awa-worker = { path = "../awa-worker", version = "0.7.0-alpha.2", features = ["__python-bridge"] }

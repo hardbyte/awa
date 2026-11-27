@@ -27,6 +27,7 @@
 //!     deadline-exceeded reason recorded in `errors`.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::{insert_with, migrations, InsertOpts};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, JobState, QueueConfig, Worker};

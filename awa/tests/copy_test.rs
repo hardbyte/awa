@@ -2,6 +2,7 @@
 //!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test copy_test -- --nocapture`
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::{admin, insert_many_copy, insert_many_copy_from_pool, migrations};
 use awa::{InsertOpts, InsertParams, JobState, UniqueOpts};

@@ -18,6 +18,7 @@ mod notify_hub;
 mod output;
 mod runtime;
 mod storage;
+mod sync;
 
 // Re-exports
 pub use awa_model::{

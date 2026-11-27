@@ -1,5 +1,6 @@
 use crate::runtime::RunLease;
 use crate::storage::RuntimeStorage;
+use crate::sync::MutexExt;
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob};
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -153,7 +154,7 @@ impl FinalizationBudget {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.state.lock_unpoisoned();
         state.paused_at.is_none().then_some(state.deadline)
     }
 
@@ -166,7 +167,7 @@ impl FinalizationBudget {
     }
 
     fn wait_for_acknowledgement(&self) -> AcknowledgementWait {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.acknowledgement_waits == 0 {
             state.paused_at = Some(Instant::now());
         }
@@ -218,6 +219,10 @@ impl FinalizationBudget {
     where
         F: std::future::Future,
     {
+        #[expect(
+            clippy::expect_used,
+            reason = "callers use it only where the budget is never paused"
+        )]
         let deadline = self.deadline().expect("unpaused finalization budget");
         tokio::time::timeout_at(deadline, future)
             .await
@@ -236,10 +241,17 @@ pub(crate) struct BudgetPause {
 
 impl Drop for AcknowledgementWait {
     fn drop(&mut self) {
-        let mut state = self.budget.inner.state.lock().unwrap();
+        let mut state = self.budget.inner.state.lock_unpoisoned();
         state.acknowledgement_waits -= 1;
         if state.acknowledgement_waits == 0 {
-            let paused_at = state.paused_at.take().unwrap();
+            #[expect(
+                clippy::expect_used,
+                reason = "a pause start is recorded whenever a wait is outstanding"
+            )]
+            let paused_at = state
+                .paused_at
+                .take()
+                .expect("a pause start is recorded while an acknowledgement wait is outstanding");
             state.deadline += Instant::now() - paused_at;
         }
         drop(state);

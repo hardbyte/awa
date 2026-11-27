@@ -6,6 +6,7 @@
 //! PRD targets:
 //!   - >5,000 jobs/sec sustained (Rust workers, single queue, no uniqueness)
 //!   - <50ms median pickup latency (LISTEN/NOTIFY enabled)
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod bench_output;
 

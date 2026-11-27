@@ -1,5 +1,6 @@
 //! The admin UI pool's session limits bound queries that a dropped request
 //! leaves running on Postgres.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::time::{Duration, Instant};
 

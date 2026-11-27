@@ -1,6 +1,7 @@
 //! Weighted/opportunistic queue concurrency integration tests.
 //!
 //! Tests the OverflowPool, ConcurrencyMode, and global_max_workers behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{BuildError, Client, JobArgs, JobContext, JobError, JobResult, QueueConfig};
 use awa_model::{insert_with, migrations, InsertOpts};

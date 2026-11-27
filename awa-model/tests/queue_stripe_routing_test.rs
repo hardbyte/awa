@@ -10,6 +10,7 @@
 //!   in insertion order;
 //! - single-job inserts without a key spread across stripes;
 //! - keys routed to one stripe still use every enqueue shard.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::{
     audited_sql, cron, insert, migrations, storage, InsertOpts, InsertParams, JobArgs, PeriodicJob,

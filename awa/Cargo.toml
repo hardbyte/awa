@@ -14,6 +14,9 @@ http-worker = ["awa-worker/http-worker"]
 tokio-postgres = ["awa-model/tokio-postgres"]
 __python-bridge = ["awa-worker/__python-bridge"]
 
+[lints]
+workspace = true
+
 [dependencies]
 awa-model.workspace = true
 awa-macros.workspace = true

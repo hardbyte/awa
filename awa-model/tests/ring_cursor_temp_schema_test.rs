@@ -2,6 +2,7 @@
 //! that runs with its owner's privileges: `<schema>.enqueue_ring_cursor()`
 //! (v062) and every other `SECURITY DEFINER` function, with everything they
 //! call.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::{audited_sql, migrations, QueueStorage, QueueStorageConfig};
 use sqlx::{Connection, PgConnection, PgPool};

@@ -1,6 +1,7 @@
 //! Rate limiting integration tests.
 //!
 //! Tests that the token bucket rate limiter correctly throttles job dispatch.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{BuildError, Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, RateLimit};
 use awa_model::{insert_with, migrations, InsertOpts};

@@ -5,6 +5,7 @@
 //! different retention policies would interfere with each other's test data.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa::model::{insert_with, InsertOpts};

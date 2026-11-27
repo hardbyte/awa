@@ -9,6 +9,7 @@
 // The metadata `json!` literal is large enough to exceed the default
 // macro recursion limit of 128.
 #![recursion_limit = "256"]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod bench_output;
 mod ci_timing;

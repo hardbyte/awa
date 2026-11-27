@@ -1,6 +1,7 @@
 //! Batch operations for operator bulk actions (ADR-030): retry, cancel,
 //! discard, move to the DLQ, retry from the DLQ and purge the DLQ, each
 //! applied a chunk per transaction.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa::model::admin;

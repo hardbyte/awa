@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use awa::audited_sql;
 use awa::{AwaError, InsertOpts, JobArgs, JobResult, QueueConfig, UniqueOpts};
 use awa_seaorm::{client_builder, insert, insert_raw, insert_with, migrate, SeaOrmAwaExt};

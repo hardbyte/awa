@@ -16,6 +16,7 @@
 //! `TAG_BENCH_JOBS` overrides the batch size (default 50000).
 //! `TAG_BENCH_KEEP=1` stops after loading and keeps the database, printing
 //! its name, for running `EXPLAIN` by hand.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::admin;
 use awa::{Client, JobArgs, JobFilter, JobPage, JobResult, QueueConfig};

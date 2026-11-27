@@ -9,6 +9,7 @@
 //! `awa.install_queue_storage_substrate('awa')`), and the staged
 //! transition is driven by the SQL functions defined in v010/v013/v014.
 //! Tests below call those functions directly via raw SQL.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::audited_sql;
 use sqlx::postgres::PgPoolOptions;

@@ -4,6 +4,7 @@
 //!
 //! A hung handler that never heartbeats stands in for a worker that dies on
 //! every attempt: from the database's side the two are indistinguishable.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::{admin, dlq};
 use awa::{Client, JobArgs, JobRow, JobState, QueueConfig};

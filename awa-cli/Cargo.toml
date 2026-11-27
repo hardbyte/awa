@@ -11,6 +11,9 @@ readme = "README.md"
 name = "awa"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 awa-model.workspace = true
 awa-worker.workspace = true

@@ -2082,6 +2082,10 @@ impl QueueDescriptor {
             "tags": self.tags,
             "extra": canonicalize_json(&self.extra),
         });
+        #[expect(
+            clippy::expect_used,
+            reason = "a serde_json::Value always serializes to JSON"
+        )]
         let encoded = serde_json::to_vec(&payload)
             .expect("queue descriptor JSON serialization should not fail");
         hex::encode(blake3::hash(&encoded).as_bytes())
@@ -2150,10 +2154,17 @@ impl JobKindDescriptor {
         // Only a declared output joins the hash, so descriptors without one
         // keep the hash earlier binaries computed.
         if let Some(output) = &self.output {
-            payload["output"] = canonicalize_json(
-                &serde_json::to_value(output).expect("output descriptor serializes"),
-            );
+            #[expect(
+                clippy::expect_used,
+                reason = "a derived Serialize descriptor always converts to a JSON value"
+            )]
+            let output_value = serde_json::to_value(output).expect("output descriptor serializes");
+            payload["output"] = canonicalize_json(&output_value);
         }
+        #[expect(
+            clippy::expect_used,
+            reason = "a serde_json::Value always serializes to JSON"
+        )]
         let encoded = serde_json::to_vec(&payload)
             .expect("job kind descriptor JSON serialization should not fail");
         hex::encode(blake3::hash(&encoded).as_bytes())

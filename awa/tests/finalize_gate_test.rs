@@ -5,6 +5,7 @@
 //! transactions block at their insert, which makes each open finalize
 //! transaction visible in `pg_locks` and keeps the rest waiting for a gate
 //! permit for longer than the heartbeat staleness window.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 

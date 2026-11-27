@@ -1,5 +1,6 @@
 //! `SessionAdvisoryLock` never returns a connection to the pool while it still
 //! holds the lock.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use pg_session_lock::pg_locks_key;
 use pg_session_lock::{

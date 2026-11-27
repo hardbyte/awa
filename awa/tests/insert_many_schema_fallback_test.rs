@@ -11,6 +11,7 @@
 //! Requires a running Postgres instance and a role that may create databases
 //! and roles.
 //! Run with: `cargo test --package awa --test insert_many_schema_fallback_test`
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa::model::{

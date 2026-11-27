@@ -3,6 +3,7 @@ use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use crate::sync::MutexExt;
 use awa_model::isolation::BeginReadCommitted;
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState, PreparedJobInsert};
@@ -538,7 +539,7 @@ impl JobExecutor {
 
             // Snapshot progress for state transition
             let progress_snapshot = {
-                let guard = progress_state.lock().expect("progress lock poisoned");
+                let guard = progress_state.lock_unpoisoned();
                 guard.clone_latest()
             };
 
@@ -571,6 +572,7 @@ impl JobExecutor {
             // so heartbeats stop flushing progress for this attempt.
             in_flight.mark_finalizing((job_id, job_run_lease));
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
+            #[expect(clippy::expect_used, reason = "the finalizer capacity semaphore is never closed")]
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
                     biased;
@@ -968,11 +970,17 @@ impl FinalizeGateScope<'_> {
             return permit;
         }
         let _paused = self.budget.as_ref().map(FinalizationBudget::pause);
-        self.gate
+        #[expect(
+            clippy::expect_used,
+            reason = "the finalize gate semaphore is never closed"
+        )]
+        let permit = self
+            .gate
             .permits
             .acquire()
             .await
-            .expect("finalize gate is never closed")
+            .expect("finalize gate is never closed");
+        permit
     }
 }
 

@@ -7,6 +7,7 @@
 //! process-local mutex plus an advisory lock keeps the tests in this
 //! file from racing against each other when cargo runs them
 //! concurrently.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::str::FromStr;
 use std::sync::OnceLock;

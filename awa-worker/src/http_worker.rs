@@ -112,6 +112,10 @@ impl HttpWorker {
             builder = builder.timeout(*response_timeout);
         }
 
+        #[expect(
+            clippy::expect_used,
+            reason = "client construction fails only when the TLS backend cannot initialise"
+        )]
         let client = builder.build().expect("failed to build HTTP client");
 
         Self {

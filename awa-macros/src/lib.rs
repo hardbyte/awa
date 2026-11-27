@@ -164,7 +164,9 @@ fn camel_to_snake(name: &str) -> String {
             if needs_separator {
                 result.push('_');
             }
-            result.push(current.to_lowercase().next().unwrap());
+            if let Some(lower) = current.to_lowercase().next() {
+                result.push(lower);
+            }
         } else {
             result.push(current);
         }

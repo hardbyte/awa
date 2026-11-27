@@ -3,6 +3,7 @@
 //! These focus on longer mixed workloads and large terminal-failure bursts,
 //! with periodic dead-tuple sampling so we can watch whether churn stays
 //! confined to the small hot tables.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::audited_sql;

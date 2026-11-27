@@ -3,6 +3,7 @@
 //! group role. Only the owner and the migration role have default privileges,
 //! so a lane sequence is usable by every runtime role only if it is created as
 //! the owner or granted explicitly, whichever role touches the lane first.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::storage::LaneSequenceOutcome;
 use awa::model::{migrations, storage, AwaError, InsertOpts, InsertParams, QueueStorage};
