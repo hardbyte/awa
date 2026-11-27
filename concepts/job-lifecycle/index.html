@@ -2667,7 +2667,7 @@
 <li><strong>Recognise it.</strong> The job's error history repeats one message across attempts. <code>awa job dump &lt;id&gt;</code> shows each attempt; a run of <code>presumed dead</code> or <code>hard deadline exceeded</code> errors points at the process, not the handler's own error path.</li>
 <li><strong>Stop one job.</strong> <code>awa job cancel &lt;id&gt;</code>. A running handler is signalled to stop. One stuck in blocking or CPU-bound code keeps its worker slot until it returns, but the job stays cancelled: a late finish is ignored.</li>
 <li><strong>Stop a kind.</strong> <code>awa queue pause &lt;queue&gt;</code> holds everything on the queue while you deploy a fix. Until a fix ships, the bound above ends each poison job after <code>max_attempts</code>.</li>
-<li><strong>Redrive after the fix.</strong> <code>awa dlq retry-bulk --queue &lt;queue&gt; --kind &lt;kind&gt;</code> re-runs the dead-lettered jobs with a fresh attempt budget.</li>
+<li><strong>Redrive after the fix.</strong> <code>awa dlq retry-bulk --queue &lt;queue&gt; --kind &lt;kind&gt;</code> submits a batch operation that re-runs the dead-lettered jobs with a fresh attempt budget; add <code>--wait</code> to wait for the maintenance leader to finish it.</li>
 </ol>
 <h2 id="where-to-go-next">Where to go next<a class="headerlink" href="#where-to-go-next" title="Permanent link">&para;</a></h2>
 <ul>

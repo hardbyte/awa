@@ -53,7 +53,12 @@ awa dlq retry-bulk --kind charge_card --tag manual_review
 
 # Retry the entire DLQ (safety guard requires --all)
 awa dlq retry-bulk --all
+
+# Wait for the retry to finish and print its counters
+awa dlq retry-bulk --queue billing --wait
 ```
+
+`awa dlq retry-bulk` submits a `retry_from_dlq` [batch operation](#large-sets-batch-operations) and prints its id and state; the maintenance leader retries the rows a chunk at a time while a worker runs. Follow it with `awa batch-ops get <id>`, or pass `--wait` to poll it until it finishes and print how many rows it processed, skipped and errored (the command exits non-zero if the operation fails).
 
 Retry moves the row out of `dlq_entries` and back into the runnable path with `attempt = 0` and `run_lease = 0`, ready for fresh processing. The retry is recorded in the job's error history; the original failure trail is preserved.
 
@@ -83,11 +88,13 @@ awa dlq purge --queue billing --kind charge_card
 awa dlq purge --all
 ```
 
+`awa dlq purge` submits a `purge_dlq` batch operation the same way and takes `--wait`.
+
 Purging is destructive: the rows are deleted from `dlq_entries` and not recoverable through the DLQ tools. Use with care; prefer `retry-bulk` if you might want the data back.
 
 ## Large sets: batch operations
 
-`awa dlq retry-bulk`, `move` and `purge` act on every matching row in one transaction, and a unique conflict on any retried row aborts the whole retry. For a large set, submit the same action as a durable batch operation: the maintenance leader applies it a chunk at a time, records each row as processed, skipped or errored, and can be previewed, watched and cancelled. A retried row whose unique key a newer job holds is recorded as errored and the rest are retried. Purging releases the purged rows' unique claims.
+A durable batch operation is applied by the maintenance leader a chunk at a time; it records each row as processed, skipped or errored, and can be previewed, watched and cancelled. A retried row whose unique key a newer job holds is recorded as errored and the rest are retried. Purging releases the purged rows' unique claims. `awa dlq retry-bulk` and `awa dlq purge` submit one; `awa dlq move` acts on every matching row in one transaction, so for a large set submit a `move_to_dlq` operation instead.
 
 ```bash
 # Retry dead-lettered rows on a queue
@@ -102,7 +109,7 @@ awa batch-ops submit --op-kind move_to_dlq --filter '{"queue":"billing"}' --spec
 
 The same kinds are in the admin UI's batch operations page, `POST /api/batch-ops` and the Python client's `submit_batch_operation`. See [ADR-030](../adr/030-batch-operations/index.md#bulk-action-operations) for each kind's eligible jobs.
 
-The admin UI's DLQ page submits its **Retry matching** and **Purge matching** actions as `retry_from_dlq` and `purge_dlq` batch operations, and links to the batch operations page to follow them. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` do the same: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge`, `awa dlq retry-bulk` and `awa dlq purge` still act in one transaction and report a count.
+The admin UI's DLQ page submits its **Retry matching** and **Purge matching** actions as `retry_from_dlq` and `purge_dlq` batch operations, and links to the batch operations page to follow them. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` do the same: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge` and the Python client's `purge_dlq_before` still act in one transaction and report a count.
 
 ## Retention
 
@@ -112,7 +119,7 @@ The maintenance leader periodically prunes DLQ rows older than the configured re
 
 Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the facade crate, for DLQ list, retry, move, and purge helpers. Admin helpers such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and `bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
 
-Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and `purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)` purges one DLQ row by job ID. These wrap the same SQL helpers the CLI uses.
+Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, `purge_dlq_before`, and `purge_dlq_job`. `bulk_retry_from_dlq(...)` and `purge_dlq(...)` submit a `retry_from_dlq` or `purge_dlq` batch operation (`submitted_by: "python"`) and return it as `submit_batch_operation` does; follow it with `get_batch_operation`. `purge_dlq_before(...)` deletes, in one transaction, the matching rows that sort before a `(before_dlq_at, before_id)` cursor from `list_dlq` and returns the count; it needs at least one of `before_id` and `before_dlq_at`. `purge_dlq_job(...)` purges one DLQ row by job ID.
 
 ## See also
 
