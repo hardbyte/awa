@@ -64,8 +64,13 @@
 #                             of every in-process runtime (default: the library's 1000, 1000 and 10)
 #   AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS, AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS
 #                             statement and lock timeouts of the oracle's periodic samples (default
-#                             10000 and 1000); a sample cut short is counted, not treated as missing
-#                             evidence
+#                             10000 and 1000); a sample cut short is skipped and counted per check
+#   AWA_SOAK_SAMPLER_MAX_SKIP_PERCENT
+#                             share of one check's periodic samples that may be skipped before the
+#                             run is inconclusive (default 20)
+#   AWA_SOAK_DIAG_STATEMENT_TIMEOUT_MS, AWA_SOAK_DIAG_LOCK_TIMEOUT_MS
+#                             statement and lock timeouts of the txn persona's reads and the
+#                             open-claims capture at claim-ring stalls (default 2000 and 100)
 #   AWA_SOAK_FINAL_STATEMENT_TIMEOUT_MS
 #                             statement and lock timeout of the final reconciliation (default 300000)
 #   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0, built by
@@ -142,15 +147,15 @@ start_container() {
   local cpu_args=()
   [ -n "${SOAK_PG_CPUS:-}" ] && cpu_args=(--cpus "$SOAK_PG_CPUS")
   [ -n "${SOAK_PG_MEMORY:-}" ] && cpu_args+=(--memory "$SOAK_PG_MEMORY")
-  local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a " "${STATEMENT_ARGS[@]}")
+  local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a " ${STATEMENT_ARGS[@]+"${STATEMENT_ARGS[@]}"})
   local extra=()
   read -r -a extra <<<"${SOAK_PG_ARGS:-}"
-  common+=("${extra[@]}")
+  common+=(${extra[@]+"${extra[@]}"})
   case "$engine" in
     pg17)
-      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
+      docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -e POSTGRES_PASSWORD=test -p "127.0.0.1:$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
     pg18)
-      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
+      docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -e POSTGRES_PASSWORD=test -p "127.0.0.1:$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
     pg18-cassert)
       # The image ships an initialised, trust-authenticated cluster in /data. Parallel query is
       # off: at -O0 a handful of admin reads would otherwise take every core.
@@ -162,7 +167,7 @@ start_container() {
           # collector writes into a FIFO whose reader drops those messages and keeps the rest
           # (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
           SOAK_PG_LOG_FILE=/data/log/pg-filtered.log
-          docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" sh -c '
+          docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -p "127.0.0.1:$port:5432" "$CASSERT_IMAGE" sh -c '
             mkdir -p /data/log
             rm -f /data/log/pg.log /data/log/pg-filtered.log
             mkfifo /data/log/pg.log
@@ -178,7 +183,7 @@ start_container() {
             exec postgres -D /data '"$pgargs"'' >/dev/null ;;
         *)
           SOAK_PG_LOG_FILE=/data/log/pg.log
-          docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" \
+          docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -p "127.0.0.1:$port:5432" "$CASSERT_IMAGE" \
             sh -c 'mkdir -p /data/log && exec postgres -D /data '"$pgargs" >/dev/null ;;
       esac ;;
     *)

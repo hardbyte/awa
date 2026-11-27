@@ -1,6 +1,7 @@
 # Assert-enabled, -O0 PostgreSQL 18 for the persona soak's pg18-cassert engine
-# (scripts/persona-soak.sh). The image ships an initialised, trust-authenticated
-# cluster in /data and runs as the postgres user.
+# (scripts/persona-soak.sh). The image ships an initialised cluster in /data and runs
+# as the postgres user. It authenticates every client with `trust`, so the container's
+# port must only be published on loopback (-p 127.0.0.1:<port>:5432), as the script does.
 #
 #   docker build -t awa-pg18-cassert:18.6-O0 docker/pg18-cassert
 #   docker build --build-arg PG_VERSION=18.7 -t awa-pg18-cassert:18.7-O0 docker/pg18-cassert
@@ -13,7 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libreadline-dev zlib1g-dev libicu-dev libssl-dev liblz4-dev libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-RUN curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" | tar -xj --strip-components=1
+RUN curl -fsSLO "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" \
+    && curl -fsSLO "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2.sha256" \
+    && sha256sum -c "postgresql-${PG_VERSION}.tar.bz2.sha256" \
+    && tar -xjf "postgresql-${PG_VERSION}.tar.bz2" --strip-components=1 \
+    && rm "postgresql-${PG_VERSION}.tar.bz2" "postgresql-${PG_VERSION}.tar.bz2.sha256"
 RUN ./configure --prefix=/usr/local/pgsql --enable-cassert --enable-debug \
       --with-icu --with-openssl --with-lz4 --with-zstd CFLAGS="-O0 -g" \
     && make -j"$(nproc)" world-bin && make install-world-bin
