@@ -2225,6 +2225,41 @@ fn initialized_sealed_ring_slots(
         .collect()
 }
 
+/// One statement returning `(slot, generation, slot_count)` for `family`'s
+/// current cursor as the schema's `ring_cursor_authority` names it: the
+/// ledger's max-generation row under `ledger`, the `{ring}_ring_state`
+/// singleton columns under `columns`. Reading the authority and the cursor
+/// in one statement keeps them from one snapshot. Takes no locks; for
+/// callers that need a cursor without holding the ring serializer.
+fn ring_cursor_with_slot_count_sql(schema: &str, family: RingFamily) -> String {
+    let ledger = family.ledger_relname();
+    let state = family.state_relname();
+    format!(
+        r#"
+        SELECT cursor.slot, cursor.generation, cursor.slot_count
+        FROM {schema}.ring_cursor_authority AS authority
+        CROSS JOIN LATERAL (
+            SELECT ledger.slot, ledger.generation, state.slot_count
+            FROM {schema}.{state} AS state
+            CROSS JOIN LATERAL (
+                SELECT slot, generation
+                FROM {schema}.{ledger}
+                ORDER BY generation DESC
+                LIMIT 1
+            ) AS ledger
+            WHERE state.singleton = TRUE
+              AND authority.authority = 'ledger'
+            UNION ALL
+            SELECT state.current_slot, state.generation, state.slot_count
+            FROM {schema}.{state} AS state
+            WHERE state.singleton = TRUE
+              AND authority.authority <> 'ledger'
+        ) AS cursor
+        WHERE authority.singleton = TRUE
+        "#
+    )
+}
+
 #[cfg(test)]
 mod identifier_tests {
     use super::{validate_ident, QueueStorage, QueueStorageConfig};
@@ -5677,14 +5712,13 @@ impl QueueStorage {
 
             let legacy_claim_slot: Option<i32> =
                 if lease_claims_legacy_exists || closures_legacy_exists {
-                    Some(
-                        sqlx::query_scalar(audited_sql(format!(
-                            "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-                        )))
-                        .fetch_one(install_tx.as_mut())
-                        .await
-                        .map_err(map_sqlx_error)?,
+                    let (slot, _generation, _slot_count): (i32, i64, i32) = sqlx::query_as(
+                        audited_sql(ring_cursor_with_slot_count_sql(schema, RingFamily::Claim)),
                     )
+                    .fetch_one(install_tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    Some(slot)
                 } else {
                     None
                 };
@@ -13788,24 +13822,23 @@ impl QueueStorage {
             receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        // The lease cursor the schema's authority names: the ledger's
+        // max-generation row, or under compat authority the singleton
+        // columns a 0.6 rotator advances without touching the ledger. Both
+        // reads are plain SELECTs that take no row or advisory lock, so this
+        // path never waits on a rotator or prune holding the lease-ring
+        // serializer.
+        let authority = self.ring_authority_tx(tx).await?;
+        let (lease_slot, lease_generation) = self
+            .ring_cursor_tx(tx, RingFamily::Lease, authority)
+            .await?;
         let inserted: i64 = sqlx::query_scalar(audited_sql(format!(
             r#"
             WITH inflight(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
             ),
-            -- #371: MATERIALIZED pins the max-generation ledger read to a
-            -- single evaluation. Without it PG18 inlines this one-reference
-            -- CTE into the `CROSS JOIN lease_ring` below, and the planner
-            -- re-runs the `ORDER BY generation DESC LIMIT 1` index descent
-            -- once per materialized claim row (loops=N). The pre-ledger
-            -- `lease_ring_state` singleton was a single cached heap read; the
-            -- ledger descent cost scales with unfolded ledger depth, so the
-            -- per-row re-execution regressed the completion hot path.
-            lease_ring AS MATERIALIZED (
-                SELECT slot AS lease_slot, generation AS lease_generation
-                FROM {schema}.lease_ring_rotations
-                ORDER BY generation DESC
-                LIMIT 1
+            lease_ring AS (
+                SELECT $3::int AS lease_slot, $4::bigint AS lease_generation
             ),
             row_claim_refs AS (
                 -- Source claim metadata directly from the partitioned
@@ -13981,6 +14014,8 @@ impl QueueStorage {
         )))
         .bind(&job_ids)
         .bind(&run_leases)
+        .bind(lease_slot)
+        .bind(lease_generation)
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -16350,20 +16385,9 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<(Option<i32>, Vec<i32>), AwaError> {
-        let schema = self.schema();
-        let ring_cursor = sqlx::query_as::<_, (i32, i64, i32)>(audited_sql(format!(
-            r#"
-            SELECT ledger.slot, ledger.generation, state.slot_count
-            FROM {schema}.claim_ring_state AS state
-            CROSS JOIN LATERAL (
-                SELECT slot, generation
-                FROM {schema}.claim_ring_rotations
-                ORDER BY generation DESC
-                LIMIT 1
-            ) AS ledger
-            WHERE state.singleton = TRUE
-            "#
-        )))
+        let ring_cursor = sqlx::query_as::<_, (i32, i64, i32)>(audited_sql(
+            ring_cursor_with_slot_count_sql(self.schema(), RingFamily::Claim),
+        ))
         .fetch_optional(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -22864,26 +22888,15 @@ impl QueueStorage {
         pool: &PgPool,
     ) -> Result<Vec<(i32, i64)>, AwaError> {
         let schema = self.schema();
-        // Sealed slots and their last-open generations are derived from
-        // the rotation-ledger cursor (#371); no per-slot generation rows
-        // exist anymore.
-        let (current_slot, generation, slot_count): (i32, i64, i32) =
-            sqlx::query_as(audited_sql(format!(
-                r#"
-                SELECT ledger.slot, ledger.generation, state.slot_count
-                FROM {schema}.queue_ring_state AS state
-                CROSS JOIN LATERAL (
-                    SELECT slot, generation
-                    FROM {schema}.queue_ring_rotations
-                    ORDER BY generation DESC
-                    LIMIT 1
-                ) AS ledger
-                WHERE state.singleton = TRUE
-                "#
-            )))
-            .fetch_one(pool)
-            .await
-            .map_err(map_sqlx_error)?;
+        // Sealed slots and their last-open generations are derived from the
+        // cursor the schema's authority names (`slot = generation mod
+        // slot_count`, which 0.6 rotators also keep).
+        let (current_slot, generation, slot_count): (i32, i64, i32) = sqlx::query_as(audited_sql(
+            ring_cursor_with_slot_count_sql(schema, RingFamily::Queue),
+        ))
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
         let sealed_slots = initialized_sealed_ring_slots(current_slot, generation, slot_count);
 
         let mut pending_slots = Vec::new();

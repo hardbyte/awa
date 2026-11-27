@@ -6996,6 +6996,12 @@ async fn test_ring_rotation_ledger_append_is_a_generation_cas() {
 ///
 /// Force a schema into compat ('columns') authority, simulating a rolling
 /// upgrade where the ledgers were seeded but the fleet has not yet flipped.
+///
+/// Under `columns` the schema also takes the shape a 0.6 schema has after the
+/// upgrade: the singleton cursor columns hold the cursor and are NOT NULL,
+/// each `{ring}_ring_slots.generation` holds the generation at which the ring
+/// last opened that slot (-1 for a slot it has not opened yet), and that
+/// column has no DEFAULT.
 async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) {
     sqlx::query(audited_sql(format!(
         "UPDATE {schema}.ring_cursor_authority SET authority = $1, \
@@ -7025,8 +7031,58 @@ async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) 
             .execute(pool)
             .await
             .expect("restore compat cursor from ledger");
+            sqlx::raw_sql(audited_sql(format!(
+                "ALTER TABLE {schema}.{ring}_ring_state \
+                     ALTER COLUMN current_slot SET NOT NULL, \
+                     ALTER COLUMN generation SET NOT NULL; \
+                 ALTER TABLE {schema}.{ring}_ring_slots ALTER COLUMN generation DROP DEFAULT"
+            )))
+            .execute(pool)
+            .await
+            .expect("give the ring the 0.6 column shape");
+            stamp_ring_slot_generations(pool, schema, ring).await;
         }
     }
+}
+
+/// Stamp every `{ring}_ring_slots.generation` with the generation at which
+/// the ring last opened that slot, given the singleton columns' cursor
+/// (`slot = generation mod slot_count`), or -1 for a slot not yet opened.
+/// This is the per-slot state a 0.6 rotator leaves.
+async fn stamp_ring_slot_generations(pool: &sqlx::PgPool, schema: &str, ring: &str) {
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.{ring}_ring_slots AS slots \
+         SET generation = CASE \
+             WHEN opened.generation >= 0 THEN opened.generation ELSE -1 END \
+         FROM ( \
+             SELECT slots.slot, state.generation \
+                 - (((state.current_slot - slots.slot) % state.slot_count) \
+                    + state.slot_count) % state.slot_count AS generation \
+             FROM {schema}.{ring}_ring_state AS state \
+             CROSS JOIN {schema}.{ring}_ring_slots AS slots \
+             WHERE state.singleton \
+         ) AS opened \
+         WHERE opened.slot = slots.slot"
+    )))
+    .execute(pool)
+    .await
+    .expect("stamp per-slot ring generations");
+}
+
+/// Advance a ring the way a 0.6 rotator does under compat authority: move the
+/// singleton columns and stamp the newly opened slot's generation, leaving the
+/// rotation ledger untouched.
+async fn advance_ring_as_0_6(pool: &sqlx::PgPool, schema: &str, ring: &str, generation: i64) {
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.{ring}_ring_state \
+         SET current_slot = ($1 % slot_count)::int, generation = $1 \
+         WHERE singleton"
+    )))
+    .bind(generation)
+    .execute(pool)
+    .await
+    .expect("advance the ring columns as a 0.6 rotator does");
+    stamp_ring_slot_generations(pool, schema, ring).await;
 }
 
 async fn ring_authority(pool: &sqlx::PgPool, schema: &str) -> String {
@@ -7299,6 +7355,220 @@ async fn test_compat_mode_reconciles_externally_casd_columns() {
         4,
         "reconcile backfilled the ledger: genesis + gens 1, 2, 3"
     );
+}
+
+/// Under compat authority a 0.6 maintenance leader advances the lease ring's
+/// singleton columns and not the ledger. A callback registered on a receipt
+/// claim materializes its lease into the lease slot the columns name, not the
+/// one the lagging ledger names.
+#[tokio::test]
+async fn test_compat_mode_callback_lease_follows_the_column_cursor() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_compat_callback_lease";
+    let schema = "awa_qs_compat_callback_lease";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 4,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    set_ring_authority(&pool, schema, "columns").await;
+    advance_ring_as_0_6(&pool, schema, "lease", 2).await;
+    assert_eq!(ring_cursor(&pool, schema, "lease").await, (0, 0));
+
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim on the receipt plane");
+    assert_eq!(claimed.len(), 1);
+    store
+        .register_callback(
+            &pool,
+            claimed[0].job.id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+
+    let lease: (i32, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT lease_slot, lease_generation FROM {schema}.leases WHERE job_id = $1"
+    )))
+    .bind(claimed[0].job.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the materialized lease");
+    assert_eq!(
+        lease,
+        ring_columns_cursor(&pool, schema, "lease").await,
+        "the lease lands in the lease slot the column cursor names"
+    );
+}
+
+/// Under compat authority with the claim-ring ledger lagging a 0.6 rotator,
+/// rescue visits the claim slots oldest first by the column cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_compat_mode_rescue_orders_claim_slots_by_the_column_cursor() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_compat_rescue_order";
+    let schema = "awa_qs_compat_rescue_order";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 4,
+        },
+    )
+    .await;
+    set_ring_authority(&pool, schema, "columns").await;
+    for id in 0..4 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    // One open claim in each slot, taken at claim generations 2..=5, so the
+    // column cursor ends at (slot 1, generation 5) and slot 2 is the oldest.
+    for generation in 2..=5 {
+        advance_ring_as_0_6(&pool, schema, "claim", generation).await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+            .await
+            .expect("claim into the current claim slot");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(i64::from(claimed[0].claim.claim_slot), generation % 4);
+    }
+    assert_eq!(ring_cursor(&pool, schema, "claim").await, (0, 0));
+
+    let batch = store
+        .rescue_stale_heartbeats_batch(
+            &pool,
+            Duration::from_secs(90),
+            &|_| false,
+            &awa::model::RescueBatchOptions::default(),
+        )
+        .await
+        .expect("rescue batch");
+    assert!(batch.rescued.is_empty(), "every claim is fresh");
+    assert_eq!(
+        batch
+            .scan_progress
+            .iter()
+            .map(|progress| progress.slot)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 0, 1],
+        "slots are visited oldest first by the column cursor"
+    );
+}
+
+/// Under compat authority with the queue-ring ledger lagging a 0.6 rotator,
+/// the terminal-delta rollup still folds the slot the column cursor sealed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_compat_mode_terminal_delta_rollup_folds_the_slot_a_0_6_rotator_sealed() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_compat_delta_rollup";
+    let schema = "awa_qs_compat_delta_rollup";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 6)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 6).await.expect("claim");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
+
+    advance_ring_as_0_6(&pool, schema, "queue", 1).await;
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup terminal deltas");
+    assert_eq!(outcome.rolled_slots, 1, "{outcome:?}");
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
+}
+
+/// Re-running the installer on a ledger-authority schema leaves no
+/// negative-generation row in any rotation ledger: the poisoned (-1, -1)
+/// singleton columns are not copied in, and such a row already there is
+/// removed.
+#[tokio::test]
+async fn test_installer_rerun_keeps_negative_generations_out_of_the_ledgers() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_installer_rerun_ledger";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(ring_authority(&pool, schema).await, "ledger");
+    let negative_rows = || async {
+        let mut rows = 0_i64;
+        for ring in ["queue", "lease", "claim"] {
+            rows += sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT count(*) FROM {schema}.{ring}_ring_rotations WHERE generation < 0"
+            )))
+            .fetch_one(&pool)
+            .await
+            .expect("count negative ledger rows");
+        }
+        rows
+    };
+
+    store.prepare_schema(&pool).await.expect("re-run installer");
+    assert_eq!(negative_rows().await, 0, "re-run copies no fence row");
+
+    for ring in ["queue", "lease", "claim"] {
+        sqlx::query(audited_sql(format!(
+            "INSERT INTO {schema}.{ring}_ring_rotations (generation, slot) VALUES (-1, -1)"
+        )))
+        .execute(&pool)
+        .await
+        .expect("plant a fence row");
+    }
+    store.prepare_schema(&pool).await.expect("re-run installer");
+    assert_eq!(negative_rows().await, 0, "re-run removes a fence row");
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
 }
 
 /// #371 staged upgrade: the one-way flip reconciles every shadow ledger,
