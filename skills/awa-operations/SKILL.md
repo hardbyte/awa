@@ -289,9 +289,10 @@ awa batch-ops cancel <id>
 - An older maintenance leader marks an operation of a kind it doesn't know as
   failed, so submitting `retry`, `cancel`, `discard`, `move_to_dlq`,
   `retry_from_dlq` or `purge_dlq` is refused, naming the runtimes, while a live
-  runtime reports a version older than 0.7.0-alpha.2. Finish the rollout (or
-  wait for stopped runtimes to drop out of `awa.runtime_instances`) and submit
-  again.
+  runtime reports a version older than 0.7.0-alpha.2. Finish the rollout and
+  submit again once stopped runtimes are no longer live: their `last_seen_at`
+  is older than three snapshot intervals (at least 30 seconds). Their rows stay
+  in `awa.runtime_instances` for a day, so don't wait for them to disappear.
 
 ## Cron
 
