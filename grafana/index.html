@@ -1954,6 +1954,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#queue-health" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue health
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#heartbeat" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2859,6 +2870,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#queue-health" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue health
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#heartbeat" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3186,10 +3208,10 @@
 <p>A weighted queue reaches its ceiling only while no other queue wants overflow, so it can be saturated below 1 when other queues hold part of the pool; for weighted runtimes also watch <code>sum(awa_queue_worker_in_use)</code> against <code>global_max_workers</code>. See <a href="../configuration/#sizing-workers-from-utilization">sizing workers from utilization</a> for how to read the number.</p>
 <h3 id="what-the-dashboards-cannot-show">What the dashboards cannot show<a class="headerlink" href="#what-the-dashboards-cannot-show" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>Due-but-unpromoted work.</strong> <code>awa_queue_depth{awa_job_state="scheduled"}</code> counts every deferred job, due or not, and queue lag only sees jobs already in the ready lanes. A stall in promotion shows up as the deferred backlog growing while the promotion rate is flat, not as a direct number.</li>
-<li><strong>Maintenance leader identity.</strong> No metric names the leader. The <em>Maintenance leader</em> row infers it from which series is running maintenance branches, so it needs a per-runtime label (<code>instance</code>, pod or similar) from your pipeline.</li>
+<li><strong>Due-but-unpromoted work.</strong> No panel charts it yet. <code>awa.queue.due.depth</code> and <code>awa.queue.due.lag</code> report it, and the <code>awa_promotion_due_lag_high</code> example alert fires on it.</li>
+<li><strong>Maintenance leader identity.</strong> The <em>Maintenance leader</em> row infers the leader from which series is running maintenance branches, so it needs a per-runtime label (<code>instance</code>, pod or similar) from your pipeline. <code>awa.maintenance.leader</code> reports it by <code>awa.runtime.instance_id</code>, but no panel reads it yet.</li>
 <li><strong>Runtime versions.</strong> No metric reports the awa version a runtime runs.</li>
-<li><strong>Maintenance task failures.</strong> Failed promotion, rescue or prune queries are logged, not counted.</li>
+<li><strong>Maintenance task failures.</strong> No panel charts them yet. A branch run that hit an error carries <code>error.type</code> on <code>awa.maintenance.branch.duration</code>, and the <code>awa_maintenance_branch_failing</code> example alert fires on it.</li>
 </ul>
 <h2 id="setup">Setup<a class="headerlink" href="#setup" title="Permanent link">&para;</a></h2>
 <h3 id="1-configure-otlp-export-in-your-worker">1. Configure OTLP export in your worker<a class="headerlink" href="#1-configure-otlp-export-in-your-worker" title="Permanent link">&para;</a></h3>
@@ -3463,8 +3485,14 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <tr>
 <td><code>awa.maintenance.promote_duration</code></td>
 <td>Histogram (s)</td>
-<td>state</td>
-<td>Promotion time</td>
+<td>state, error.type</td>
+<td>Promotion time. A batch that failed is recorded with <code>error.type</code>; the batch counter and size count successful batches only</td>
+</tr>
+<tr>
+<td><code>awa.maintenance.branch.duration</code></td>
+<td>Histogram (s)</td>
+<td>branch, error.type</td>
+<td>Wall-clock time of each run of a maintenance leader branch (<code>promote_scheduled</code>, <code>rescue_heartbeat</code>, <code>rotate_claim</code>, …). A run that hit an error carries <code>error.type</code>, so a branch failing on every tick is <code>rate(awa_maintenance_branch_duration_seconds_count{error_type!=""}[5m]) &gt; 0</code>, whichever runtime leads</td>
 </tr>
 <tr>
 <td><code>awa.maintenance.promote.lane_contention</code></td>
@@ -3507,6 +3535,51 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Gauge (s)</td>
 <td>rescue_kind</td>
 <td>Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; <code>0</code> when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader</td>
+</tr>
+<tr>
+<td><code>awa.maintenance.leader</code></td>
+<td>Gauge</td>
+<td>runtime.instance_id</td>
+<td><code>1</code> on the runtime holding the maintenance leader lock, <code>0</code> on every other runtime, one series per runtime even when several clients share a process. Summed over a fleet it is <code>1</code>: <code>0</code> means nothing promotes, rescues or prunes, and more than <code>1</code> past a handover means two leaders</td>
+</tr>
+</tbody>
+</table>
+<p><code>error.type</code> is a low-cardinality class, never an error message: <code>bind_limit</code> (more bind parameters than Postgres accepts), <code>timeout</code> (<code>statement_timeout</code>, a cancelled statement, or no pool connection in time), <code>lock_not_available</code> (<code>lock_timeout</code> or <code>NOWAIT</code>), <code>deadlock</code>, <code>serialization_failure</code>, <code>connection</code>, <code>database</code> for any other database error, or the <code>AwaError</code> variant (<code>validation</code>, <code>serialization</code>, …).</p>
+<h3 id="queue-health">Queue health<a class="headerlink" href="#queue-health" title="Permanent link">&para;</a></h3>
+<p>Published by the maintenance leader every <code>queue_stats_interval</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>awa.queue.depth</code></td>
+<td>Gauge</td>
+<td>queue, state</td>
+<td>Jobs per queue and state</td>
+</tr>
+<tr>
+<td><code>awa.queue.lag</code></td>
+<td>Gauge (s)</td>
+<td>queue</td>
+<td>Age of the oldest available job</td>
+</tr>
+<tr>
+<td><code>awa.queue.due.depth</code></td>
+<td>Gauge</td>
+<td>queue, state (<code>scheduled</code>, <code>retryable</code>)</td>
+<td>Deferred jobs whose <code>run_at</code> has passed but that are not yet promoted</td>
+</tr>
+<tr>
+<td><code>awa.queue.due.lag</code></td>
+<td>Gauge (s)</td>
+<td>queue, state (<code>scheduled</code>, <code>retryable</code>)</td>
+<td>Age of the oldest of those, <code>0</code> when none is due: the deferred counterpart of <code>awa.queue.lag</code>. It grows when promotion stops, which <code>awa.queue.depth{state="scheduled"}</code> can't tell from work scheduled for later</td>
 </tr>
 </tbody>
 </table>
