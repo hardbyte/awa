@@ -48,4 +48,52 @@ test.describe("DLQ page", () => {
     await expect(page.getByRole("button", { name: /Retry matching/ })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Purge matching" })).toBeEnabled();
   });
+
+  for (const { button, endpoint, opKind, confirm, verb } of [
+    { button: /Retry matching/, endpoint: "/api/dlq/retry-matching", opKind: "retry_from_dlq", confirm: "Retry", verb: "retry" },
+    { button: /Purge matching/, endpoint: "/api/dlq/purge-matching", opKind: "purge_dlq", confirm: "Purge", verb: "purge" },
+  ]) {
+    test(`${verb} matching submits a batch operation and links to it`, async ({ page }) => {
+      const id = "0b2c4d6e-0000-4000-8000-000000000000";
+      let body: unknown = null;
+      await page.route(
+        (url) => url.pathname === endpoint,
+        async (route) => {
+          body = route.request().postDataJSON();
+          await route.fulfill({
+            status: 202,
+            json: {
+              id,
+              op_kind: opKind,
+              filter: { queue: "e2e_dlq" },
+              spec: { op_kind: opKind },
+              state: "pending",
+              submitted_by: "http",
+              submitted_at: new Date().toISOString(),
+              started_at: null,
+              finalized_at: null,
+              cursor: null,
+              total_matched: null,
+              processed: 0,
+              skipped: 0,
+              errored: 0,
+              last_error: null,
+              runner_instance: null,
+              retention_until: null,
+              updated_at: new Date().toISOString(),
+            },
+          });
+        }
+      );
+      await page.goto(DLQ_PAGE);
+      await page.getByRole("button", { name: button }).click();
+      await page.getByRole("alertdialog").getByRole("button", { name: confirm, exact: true }).click();
+
+      const status = page.getByTestId("dlq-batch-submitted");
+      await expect(status).toContainText(`Submitted ${verb} of the matching DLQ rows as batch operation 0b2c4d6e`);
+      expect(body).toEqual({ filter: { queue: "e2e_dlq" } });
+      await status.getByRole("link", { name: /batch operations page/ }).click();
+      await expect(page).toHaveURL(/\/batch-ops$/);
+    });
+  }
 });
