@@ -173,19 +173,20 @@ async fn assert_producer_does_not_deadlock_with_queue_storage_batch(producer: Pr
     provision_lanes(&pool, &config, &[&first_queue, &second_queue]).await;
 
     let first_reservation = reservation_lock_key(&pool, &first_queue).await;
-    let second_provisioning = provisioning_lock_key(&pool, &second_queue).await;
+    let second_reservation = reservation_lock_key(&pool, &second_queue).await;
 
     // The gate stalls the QueueStorage batch after it has reserved its first
     // lane and before it reaches its second.
     let mut gate = pool.begin().await.expect("begin gate transaction");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(second_provisioning)
+        .bind(second_reservation)
         .execute(&mut *gate)
         .await
         .expect("take gate lock");
 
-    // A fresh store has an empty lane cache, so it provisions each lane under
-    // the lock the gate holds.
+    // The batch reserves its second lane under the lock the gate holds. A
+    // producer that takes lanes in canonical order waits on the first lane
+    // and never reaches the gate.
     let storage_batch = {
         let pool = pool.clone();
         let config = config.clone();
@@ -195,7 +196,7 @@ async fn assert_producer_does_not_deadlock_with_queue_storage_batch(producer: Pr
             store.enqueue_params_batch(&pool, &jobs).await
         })
     };
-    wait_for_advisory_waiter(&pool, second_provisioning).await;
+    wait_for_advisory_waiter(&pool, second_reservation).await;
 
     // The competing producer lists the lanes in the opposite order, and so
     // reaches for the first lane's reservation lock, which the batch holds.
