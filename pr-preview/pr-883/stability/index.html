@@ -2768,12 +2768,7 @@ prefix are user-owned and pass through untouched.</p>
 statement, asserted nightly by <code>scripts/compat-matrix.sh</code> against <strong>pinned release
 artifacts</strong> (<a href="https://github.com/hardbyte/awa/issues/367">#367</a>):</p>
 <ul>
-<li><strong>One minor behind (0.6.2 binary, 0.7 schema in <code>columns</code> authority):</strong> full
-  lifecycle supported — enqueue, claim, complete, cancel — on a finalized cluster.
-  0.6.2 is the required stepping-stone and recognizes this exact forward-compatible
-  schema shape. The pinned <code>awa-pg==0.6.0</code> wheel remains a data-plane regression leg,
-  but 0.6.0/0.6.1 must never invoke <code>awa migrate</code> on a 0.7 schema. After the one-way
-  ring-authority flip, pre-ledger binaries are deliberately fenced and unsupported.</li>
+<li><strong>One minor behind (0.6.2 or later binary, 0.7 schema in <code>columns</code> authority):</strong> full lifecycle supported — enqueue, claim, complete, cancel — on a finalized cluster. 0.6.2 is the required stepping-stone and recognizes this exact forward-compatible schema shape; 0.6.19 is recommended, since the release gate rehearses the rolling upgrade from it; the matrix runs the lifecycle on the pinned <code>awa-pg==0.6.2</code> and <code>awa-pg==0.6.19</code> wheels. 0.6.0/0.6.1 are not supported rolling-upgrade sources and must never invoke <code>awa migrate</code> on a 0.7 schema. After the one-way ring-authority flip, binaries before 0.7 are unsupported: their workers refuse to start, and binaries that read the ring cursor columns directly (0.6.18 and earlier) fail loudly on their next ring write, which the matrix asserts against 0.6.2. 0.6.19 reads the cursor through <code>enqueue_ring_cursor()</code>, which follows the ledger after the flip.</li>
 <li><strong>Two minors behind (0.5.x binary, finalized schema):</strong> asymmetric. <em>Producers</em> keep
   working — the <code>awa.jobs</code> compatibility routing sends their inserts to the active engine.
   <em>Workers</em> are inert: they claim from the canonical hot table, which is empty on a
@@ -2781,8 +2776,7 @@ artifacts</strong> (<a href="https://github.com/hardbyte/awa/issues/367">#367</a
 <li><strong>Newer binary, older unfinalized schema:</strong> <code>awa migrate</code> refuses loudly (exit non-zero,
   message names the exact finalize steps) rather than upgrading over live canonical work —
   the <a href="../adr/037-canonical-engine-deprecation/">ADR-037</a> gate. Asserted against a 0.5.7-era
-  schema carrying a canonical job; the pre-migrate-0.6 variant of this leg activates
-  automatically once the 0.7 line ships its first migration.</li>
+  schema and an unfinalized schema installed by 0.6.19, each carrying a canonical job.</li>
 <li>The 0.7 boundary additionally requires a finalized queue-storage transition (ADR-037).</li>
 </ul>
 <h2 id="relationship-to-release-notes">Relationship to release notes<a class="headerlink" href="#relationship-to-release-notes" title="Permanent link">&para;</a></h2>
@@ -2817,7 +2811,7 @@ checks it:</p>
 </ul>
 <h3 id="periodic-ownership-v045">Periodic ownership (v045)<a class="headerlink" href="#periodic-ownership-v045" title="Permanent link">&para;</a></h3>
 <p>The opt-in owner protocol leaves unowned additive registration unchanged. Its
-mixed-version guarantee covers the released 0.6.7 automatic cron enqueue and
+mixed-version guarantee covers the released 0.6.19 automatic cron enqueue and
 additive UPSERT paths on the expanded schema, tested by
 <code>scripts/rehearse-cron-ownership.sh</code>. Fresh legacy runtimes block automatic
 retirement. Owned-schedule operator actions require current CLI/API clients;
