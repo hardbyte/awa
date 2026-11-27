@@ -5884,6 +5884,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
         }
+        let authority = self.ring_authority_tx(&mut tx).await?;
 
         // Drop any partial-migration leftover tables before the main
         // TRUNCATE. If `prepare_schema` crashed mid-migration, the
@@ -5972,10 +5973,16 @@ impl QueueStorage {
             (RingFamily::Claim, self.claim_slot_count()),
         ] {
             let state = family.state_relname();
+            // Under compat authority the singleton columns are the cursor and
+            // restart with the ledger.
+            let cursor_columns = match authority {
+                RingAuthority::Columns => ", current_slot = 0, generation = 0",
+                RingAuthority::Ledger => "",
+            };
             sqlx::query(audited_sql(format!(
                 r#"
                 UPDATE {schema}.{state}
-                SET slot_count = $1
+                SET slot_count = $1{cursor_columns}
                 WHERE singleton = TRUE
                 "#
             )))
@@ -5995,34 +6002,28 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
         }
 
-        for slot in 0..self.queue_slot_count() {
-            sqlx::query(audited_sql(format!(
-                "INSERT INTO {schema}.queue_ring_slots (slot) VALUES ($1)"
-            )))
-            .bind(slot as i32)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        }
-
-        for slot in 0..self.lease_slot_count() {
-            sqlx::query(audited_sql(format!(
-                "INSERT INTO {schema}.lease_ring_slots (slot) VALUES ($1)"
-            )))
-            .bind(slot as i32)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        }
-
-        for slot in 0..self.claim_slot_count() {
-            sqlx::query(audited_sql(format!(
-                "INSERT INTO {schema}.claim_ring_slots (slot) VALUES ($1)"
-            )))
-            .bind(slot as i32)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        // Per-slot generations as 0.6 seeds them under compat authority, and
+        // as the installer seeds them under ledger authority.
+        for (family, slot_count) in [
+            (RingFamily::Queue, self.queue_slot_count()),
+            (RingFamily::Lease, self.lease_slot_count()),
+            (RingFamily::Claim, self.claim_slot_count()),
+        ] {
+            let slots = family.slots_relname();
+            for slot in 0..slot_count {
+                let generation: i64 = match authority {
+                    RingAuthority::Columns if slot == 0 => 0,
+                    _ => -1,
+                };
+                sqlx::query(audited_sql(format!(
+                    "INSERT INTO {schema}.{slots} (slot, generation) VALUES ($1, $2)"
+                )))
+                .bind(slot as i32)
+                .bind(generation)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            }
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
