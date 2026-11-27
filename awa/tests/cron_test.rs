@@ -18,6 +18,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+/// `test_end_to_end_periodic_job_enqueued` runs a leader whose cron evaluator
+/// fires every due row in `awa.cron_jobs`, not only its own, and a schedule
+/// that has never fired is due as soon as it exists. While that leader runs it
+/// can fire another test's schedule and move its `last_enqueued_at`, so the
+/// end-to-end test holds this lock for writing and every other test for
+/// reading.
+static CRON_EVALUATOR: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
@@ -103,6 +111,7 @@ struct DailyReport {
 
 #[tokio::test]
 async fn test_canonical_schema_creates_cron_jobs_table() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
@@ -122,6 +131,7 @@ async fn test_canonical_schema_creates_cron_jobs_table() {
 
 #[tokio::test]
 async fn test_migration_idempotent() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
 
     // Running migrations again should be a no-op
@@ -134,6 +144,7 @@ async fn test_migration_idempotent() {
 
 #[tokio::test]
 async fn test_upsert_inserts_new_schedule() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_insert_new"]).await;
 
@@ -159,6 +170,7 @@ async fn test_upsert_inserts_new_schedule() {
 
 #[tokio::test]
 async fn test_upsert_updates_existing_schedule() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_upsert_update"]).await;
 
@@ -196,6 +208,7 @@ async fn test_upsert_updates_existing_schedule() {
 
 #[tokio::test]
 async fn test_upsert_of_an_unchanged_schedule_writes_nothing() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_upsert_unchanged"]).await;
 
@@ -241,6 +254,7 @@ async fn test_upsert_of_an_unchanged_schedule_writes_nothing() {
 
 #[tokio::test]
 async fn test_multi_deployment_no_orphan_deletion() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["deploy_a_job", "deploy_b_job"]).await;
 
@@ -271,6 +285,7 @@ async fn test_multi_deployment_no_orphan_deletion() {
 
 #[tokio::test]
 async fn test_atomic_cte_mark_and_insert() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_atomic_enqueue"]).await;
     let queue = "cron_atomic_cte";
@@ -318,6 +333,7 @@ async fn test_atomic_cte_mark_and_insert() {
 
 #[tokio::test]
 async fn test_atomic_cte_dedup_second_call() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_dedup_cte"]).await;
     let queue = "cron_atomic_dedup";
@@ -346,6 +362,7 @@ async fn test_atomic_cte_dedup_second_call() {
 
 #[tokio::test]
 async fn test_no_backfill_only_latest_fire() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_no_backfill"]).await;
     let queue = "cron_no_backfill";
@@ -399,6 +416,7 @@ async fn test_no_backfill_only_latest_fire() {
 
 #[tokio::test]
 async fn test_delete_cron_job() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["test_delete"]).await;
 
@@ -416,6 +434,7 @@ async fn test_delete_cron_job() {
 
 #[tokio::test]
 async fn test_end_to_end_periodic_job_enqueued() {
+    let _cron_evaluator = CRON_EVALUATOR.write().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["e2e_test"]).await;
     let queue = "cron_e2e";
@@ -485,6 +504,7 @@ async fn test_end_to_end_periodic_job_enqueued() {
 
 #[tokio::test]
 async fn test_periodic_job_builder_with_job_args_trait() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let job = PeriodicJob::builder("typed_test", "0 9 * * *")
         .timezone("Pacific/Auckland")
         .queue("reports")
@@ -504,6 +524,7 @@ async fn test_periodic_job_builder_with_job_args_trait() {
 
 #[tokio::test]
 async fn test_cron_job_with_tags_and_metadata() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["tagged_job"]).await;
     let queue = "cron_tags_meta";
@@ -547,6 +568,7 @@ async fn test_cron_job_with_tags_and_metadata() {
 
 #[tokio::test]
 async fn test_pause_sets_paused_at_and_paused_by() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["pause_sets_fields"]).await;
 
@@ -573,6 +595,7 @@ async fn test_pause_sets_paused_at_and_paused_by() {
 
 #[tokio::test]
 async fn test_pause_unknown_returns_false() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["pause_unknown"]).await;
 
@@ -585,6 +608,7 @@ async fn test_pause_unknown_returns_false() {
 
 #[tokio::test]
 async fn test_atomic_enqueue_refuses_while_paused() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["pause_blocks_enqueue"]).await;
     let queue = "cron_pause_blocks";
@@ -624,6 +648,7 @@ async fn test_atomic_enqueue_refuses_while_paused() {
 
 #[tokio::test]
 async fn test_resume_re_enables_enqueue() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["resume_enables"]).await;
     let queue = "cron_resume_enables";
@@ -661,6 +686,7 @@ async fn test_resume_re_enables_enqueue() {
 
 #[tokio::test]
 async fn test_pause_preserves_last_enqueued_at() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["pause_preserves"]).await;
     let queue = "cron_pause_preserves";
@@ -707,6 +733,7 @@ async fn test_pause_preserves_last_enqueued_at() {
 
 #[tokio::test]
 async fn test_upsert_preserves_pause_state() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["upsert_preserves_pause"]).await;
 
@@ -745,6 +772,7 @@ async fn test_upsert_preserves_pause_state() {
 
 #[tokio::test]
 async fn test_trigger_works_on_paused_schedule() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["trigger_on_paused"]).await;
     let queue = "cron_trigger_paused";
@@ -784,6 +812,7 @@ async fn test_trigger_works_on_paused_schedule() {
 
 #[tokio::test]
 async fn test_resume_unknown_returns_false() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     let pool = setup().await;
     clean_cron_names(&pool, &["resume_unknown"]).await;
 
@@ -796,6 +825,7 @@ async fn test_resume_unknown_returns_false() {
 
 #[tokio::test]
 async fn test_delete_clears_paused_row() {
+    let _cron_evaluator = CRON_EVALUATOR.read().await;
     // Pause then delete must work — delete_cron_job is name-keyed and
     // doesn't care about pause state.
     let pool = setup().await;
