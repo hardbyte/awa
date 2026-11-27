@@ -1,5 +1,6 @@
 //! Runtime guard tests for shutdown drain, deadline cancellation signalling,
 //! and UniqueConflict field population.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig};
 use awa_model::{insert_with, migrations, InsertOpts};

@@ -9,6 +9,7 @@
 //!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test insert_many_batch_test -- --nocapture`
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::unique::compute_unique_key;
 use awa::model::{

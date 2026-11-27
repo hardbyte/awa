@@ -1,6 +1,7 @@
 //! With `queue_stripe_count > 1` a logical queue `q` is stored and claimed as
 //! physical stripes `q#0` … `q#N-1`. Per-queue client settings are keyed by
 //! the logical name, so they must apply to jobs claimed from its stripes.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 

@@ -2,6 +2,7 @@
 //!
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 #[path = "../../awa-model/src/storage_footprint_sql.rs"]

@@ -12,6 +12,7 @@
 //! for the engine matrix.
 
 #![allow(dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod ci_timing;
 mod persona_soak;
 

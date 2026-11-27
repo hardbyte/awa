@@ -2,6 +2,7 @@
 //!
 //! These are intentionally ignored in normal CI and are meant for the slower
 //! nightly/manual chaos lane.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::audited_sql;

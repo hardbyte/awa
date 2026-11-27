@@ -10,6 +10,7 @@
 //! the conflicted row is cancelled (the claim holder wins).
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, JobArgs, JobResult, QueueConfig, UniqueOpts};
 use awa_model::{insert_with, migrations, InsertOpts, JobState};

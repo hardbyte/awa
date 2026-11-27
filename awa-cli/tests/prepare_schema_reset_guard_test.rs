@@ -4,6 +4,7 @@
 //! it and leave the database unrecoverable.
 //!
 //! See `docs/queue-storage-substrate.md` for the contract.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use assert_cmd::Command;
 use awa_testing::setup::TestDatabase;

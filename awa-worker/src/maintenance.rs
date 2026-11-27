@@ -2,6 +2,7 @@ use crate::executor::DlqPolicy;
 use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use crate::sync::MutexExt;
 use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
@@ -799,10 +800,7 @@ impl MaintenanceBranchTracker {
         arm_cooldown: bool,
         now: Instant,
     ) -> Option<BranchTimer<'a>> {
-        let mut branches = self
-            .branches
-            .lock()
-            .expect("maintenance branch tracker mutex");
+        let mut branches = self.branches.lock_unpoisoned();
         let state = branches.entry(branch).or_default();
 
         // Phase 1: cooldown gate. Purely wall-clock; the branch stays
@@ -893,10 +891,7 @@ impl MaintenanceBranchTracker {
     /// wall-clock duration so the next fire of the same branch can apply
     /// the overrun check.
     fn record_finish(&self, branch: &'static str, duration: Duration) {
-        let mut branches = self
-            .branches
-            .lock()
-            .expect("maintenance branch tracker mutex");
+        let mut branches = self.branches.lock_unpoisoned();
         let state = branches.entry(branch).or_default();
         state.last_duration = Some(duration);
     }
@@ -979,7 +974,7 @@ impl PruneBackoffTracker {
     /// Returns true when the caller should skip this tick's prune.
     /// Side effect: decrements `skip_remaining` when non-zero.
     fn should_skip(&self, branch: &'static str) -> bool {
-        let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let mut branches = self.branches.lock_unpoisoned();
         let state = branches.entry(branch).or_default();
         if state.skip_remaining > 0 {
             state.skip_remaining -= 1;
@@ -992,7 +987,7 @@ impl PruneBackoffTracker {
     /// Update backoff state: active data backs off, lock contention retries
     /// next tick, successful pruning resets, and no-work outcomes are neutral.
     fn record_outcome(&self, branch: &'static str, outcome: &PruneOutcome) {
-        let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let mut branches = self.branches.lock_unpoisoned();
         let state = branches.entry(branch).or_default();
         match outcome {
             PruneOutcome::Pruned {
@@ -1031,7 +1026,7 @@ impl PruneBackoffTracker {
         let offset = initialized_slots - 1;
         let target_generation = cursor_generation - offset;
         let target_slot = (i64::from(current_slot) - offset).rem_euclid(slot_count as i64) as i32;
-        let branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let branches = self.branches.lock_unpoisoned();
         let (slot, generation) = branches.get(branch)?.last_pruned?;
         (slot == target_slot && generation == target_generation).then_some((slot, generation))
     }
@@ -1405,12 +1400,7 @@ impl QueueStoragePromoter {
     /// Rows that promotion, by a tick or a lane waiter, cancelled as
     /// duplicates since the last call.
     pub fn take_cancelled(&self) -> Vec<JobRow> {
-        std::mem::take(
-            &mut *self
-                .cancelled
-                .lock()
-                .expect("cancelled duplicates poisoned"),
-        )
+        std::mem::take(&mut *self.cancelled.lock_unpoisoned())
     }
 
     /// One promotion tick for `state`: batches until one selects fewer rows
@@ -1423,7 +1413,7 @@ impl QueueStoragePromoter {
         cancel: &CancellationToken,
     ) -> Result<usize, AwaError> {
         {
-            let mut waiters = self.waiters.lock().expect("lane waiters poisoned");
+            let mut waiters = self.waiters.lock_unpoisoned();
             while waiters.try_join_next().is_some() {}
         }
 
@@ -1481,8 +1471,7 @@ impl QueueStoragePromoter {
 
     fn waiting_lanes(&self, state: JobState) -> Vec<PromotionLane> {
         self.waiting
-            .lock()
-            .expect("waiting lanes poisoned")
+            .lock_unpoisoned()
             .iter()
             .filter(|(waiting_state, _)| *waiting_state == state)
             .map(|(_, lane)| lane.clone())
@@ -1492,7 +1481,7 @@ impl QueueStoragePromoter {
     fn hand_off(&self, state: JobState, lane: PromotionLane) {
         let key = (state, lane);
         {
-            let mut waiting = self.waiting.lock().expect("waiting lanes poisoned");
+            let mut waiting = self.waiting.lock_unpoisoned();
             if waiting.len() >= self.max_waiters {
                 self.metrics.record_promotion_lane_contention(
                     state.as_str(),
@@ -1520,13 +1509,10 @@ impl QueueStoragePromoter {
         let store = Arc::clone(&self.store);
         let metrics = self.metrics.clone();
         let cancelled = Arc::clone(&self.cancelled);
-        self.waiters
-            .lock()
-            .expect("lane waiters poisoned")
-            .spawn(async move {
-                promote_waiting_lane(&pool, &store, &metrics, &cancelled, &guard.key).await;
-                drop(guard);
-            });
+        self.waiters.lock_unpoisoned().spawn(async move {
+            promote_waiting_lane(&pool, &store, &metrics, &cancelled, &guard.key).await;
+            drop(guard);
+        });
     }
 }
 
@@ -1547,9 +1533,7 @@ impl Drop for WaitingLane {
 
 fn record_cancelled(into: &std::sync::Mutex<Vec<JobRow>>, cancelled: Vec<JobRow>) {
     if !cancelled.is_empty() {
-        into.lock()
-            .expect("cancelled duplicates poisoned")
-            .extend(cancelled);
+        into.lock_unpoisoned().extend(cancelled);
     }
 }
 
@@ -2242,6 +2226,7 @@ impl MaintenanceService {
                                 std::future::pending::<()>().await;
                             }
                         }, if vacuum_queue_timer.is_some() => {
+                            #[expect(clippy::expect_used, reason = "the arm is guarded by the paired timer being Some")]
                             let interval = vacuum_queue_interval
                                 .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
                             if term.is_cancelled() { return; }
@@ -2260,6 +2245,7 @@ impl MaintenanceService {
                                 std::future::pending::<()>().await;
                             }
                         }, if vacuum_lease_timer.is_some() => {
+                            #[expect(clippy::expect_used, reason = "the arm is guarded by the paired timer being Some")]
                             let interval = vacuum_lease_interval
                                 .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
                             if term.is_cancelled() { return; }
@@ -2278,6 +2264,7 @@ impl MaintenanceService {
                                 std::future::pending::<()>().await;
                             }
                         }, if vacuum_claim_timer.is_some() => {
+                            #[expect(clippy::expect_used, reason = "the arm is guarded by the paired timer being Some")]
                             let interval = vacuum_claim_interval
                                 .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
                             if term.is_cancelled() { return; }
@@ -2577,10 +2564,7 @@ impl MaintenanceService {
 
         // Track the continuously-clean window in-process.
         let ready_since = {
-            let mut since = self
-                .ring_authority_flip_aware_since
-                .lock()
-                .expect("ring_authority_flip_aware_since poisoned");
+            let mut since = self.ring_authority_flip_aware_since.lock_unpoisoned();
             if status.blocking_instances > 0 || status.live_instances == 0 {
                 // A pre-flip binary is live (or the fleet is momentarily
                 // empty — never flip a fleet we cannot see). Reset the
@@ -2610,10 +2594,7 @@ impl MaintenanceService {
                 // A blocking binary re-registered between the window check
                 // and the transactional gate: reset and wait again.
                 warn!(error = %err, schema, "auto-flip refused by the transactional gate; will retry");
-                *self
-                    .ring_authority_flip_aware_since
-                    .lock()
-                    .expect("ring_authority_flip_aware_since poisoned") = None;
+                *self.ring_authority_flip_aware_since.lock_unpoisoned() = None;
             }
         }
     }
@@ -5271,11 +5252,9 @@ impl MaintenanceService {
     /// Runs as part of the leader's cleanup cycle (not on every snapshot publish).
     #[tracing::instrument(skip(self), name = "maintenance.cleanup_runtime_snapshots")]
     async fn cleanup_stale_runtime_snapshots(&self) {
-        if let Err(err) = awa_model::admin::cleanup_runtime_snapshots(
-            &self.pool,
-            chrono::TimeDelta::try_hours(24).unwrap(),
-        )
-        .await
+        if let Err(err) =
+            awa_model::admin::cleanup_runtime_snapshots(&self.pool, chrono::TimeDelta::hours(24))
+                .await
         {
             branch_failed(&err);
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
@@ -5292,7 +5271,7 @@ impl MaintenanceService {
             return;
         }
         let max_age = chrono::TimeDelta::from_std(self.descriptor_retention)
-            .unwrap_or_else(|_| chrono::TimeDelta::try_days(30).unwrap());
+            .unwrap_or_else(|_| chrono::TimeDelta::days(30));
         for table in ["awa.queue_descriptors", "awa.job_kind_descriptors"] {
             match awa_model::admin::cleanup_stale_descriptors(&self.pool, table, max_age).await {
                 Ok(deleted) if deleted > 0 => {

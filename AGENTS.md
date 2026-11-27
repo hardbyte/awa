@@ -29,6 +29,16 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tes
 Read the redirected log and check the real exit status; do not trust a green
 exit code from a piped or backgrounded command.
 
+### Lint policy
+
+Production code must not use `unwrap`, `expect`, `panic!` or `unsafe`
+(`[workspace.lints]`; `awa-python` repeats the table). A call that cannot
+fail keeps its `expect` under `#[expect(clippy::expect_used, reason = "…")]` on
+the smallest enclosing statement. Std `Mutex`/`RwLock` guards go through the
+`lock_unpoisoned` / `read_unpoisoned` / `write_unpoisoned` helpers in each
+crate's `sync` module. Integration test roots (`*/tests/*.rs`) carry
+`#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`.
+
 ### Version matrix
 
 CI runs the sharded Rust suite and the queue-storage leg against **Postgres 17,

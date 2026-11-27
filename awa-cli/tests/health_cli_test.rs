@@ -4,6 +4,7 @@
 //! case), so no schema isolation is needed.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use assert_cmd::Command;
 use sqlx::postgres::PgPoolOptions;

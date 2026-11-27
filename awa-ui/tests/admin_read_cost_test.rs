@@ -20,6 +20,7 @@
 //! - Nothing may expand retained completion arrays: TOAST reads must stay
 //!   flat. A completion batch's member arrays are TOASTed, so expanding old
 //!   batches shows up there.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::{QueueStorage, QueueStorageConfig};
 use axum::body::{to_bytes, Body};

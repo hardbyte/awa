@@ -1,4 +1,5 @@
 //! The role-free transition must work on an unfinalized 0.6 schema, without DDL.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use awa_model::{migrations, storage};
 use serde_json::json;
 use sqlx::PgPool;

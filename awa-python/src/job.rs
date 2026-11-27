@@ -7,6 +7,8 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::sync::MutexExt;
+
 /// Python representation of a callback token.
 #[pyclass(frozen, name = "CallbackToken", skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -404,7 +406,7 @@ impl PyJob {
     fn progress(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // During dispatch, read from the live buffer
         if let Some(ref buffer) = self.progress_buffer {
-            let guard = buffer.lock().expect("progress lock poisoned");
+            let guard = buffer.lock_unpoisoned();
             match guard.latest() {
                 Some(value) => return json_to_py(py, value),
                 None => return Ok(py.None()),
@@ -426,7 +428,7 @@ impl PyJob {
             )
         })?;
 
-        let mut guard = buffer.lock().expect("progress lock poisoned");
+        let mut guard = buffer.lock_unpoisoned();
         guard.set_progress(percent, message.as_deref());
         Ok(())
     }
@@ -444,7 +446,7 @@ impl PyJob {
             pyo3::exceptions::PyValueError::new_err("update_metadata requires a dict")
         })?;
 
-        let mut guard = buffer.lock().expect("progress lock poisoned");
+        let mut guard = buffer.lock_unpoisoned();
         if !guard.merge_metadata(obj) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "progress.metadata is not a JSON object; cannot merge",
@@ -472,7 +474,7 @@ impl PyJob {
 
         crate::async_bridge::future_into_py(py, async move {
             let (snapshot, target_generation) = {
-                let guard = buffer.lock().expect("progress lock poisoned");
+                let guard = buffer.lock_unpoisoned();
                 match guard.pending_snapshot() {
                     Some(pair) => pair,
                     None => return Ok(()),
@@ -514,7 +516,7 @@ impl PyJob {
                 }
             }
 
-            let mut guard = buffer.lock().expect("progress lock poisoned");
+            let mut guard = buffer.lock_unpoisoned();
             guard.ack(target_generation);
 
             Ok(())
@@ -541,7 +543,7 @@ impl PyJob {
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let (snapshot, target_generation) = {
-                    let guard = buffer.lock().expect("progress lock poisoned");
+                    let guard = buffer.lock_unpoisoned();
                     match guard.pending_snapshot() {
                         Some(pair) => pair,
                         None => return Ok(()),
@@ -582,7 +584,7 @@ impl PyJob {
                     }
                 }
 
-                let mut guard = buffer.lock().expect("progress lock poisoned");
+                let mut guard = buffer.lock_unpoisoned();
                 guard.ack(target_generation);
 
                 Ok(())

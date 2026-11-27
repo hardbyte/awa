@@ -7,6 +7,7 @@
 //! advisory lock (so process-per-test runners stay safe too).
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, JobArgs, JobResult, QueueConfig};
 use awa_model::{insert_with, migrations, InsertOpts};

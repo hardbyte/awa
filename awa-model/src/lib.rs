@@ -22,6 +22,7 @@ mod read_transaction;
 pub mod reschedule;
 pub mod storage;
 mod storage_footprint_sql;
+pub(crate) mod sync;
 pub mod tag_index;
 pub mod trace;
 pub mod unique;

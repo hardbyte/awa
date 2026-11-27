@@ -2189,6 +2189,10 @@ impl Client {
                 .map(|_| Arc::new(tokio::sync::Semaphore::new(config.min_workers as usize)));
 
             for claimer_idx in 0..claimers {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "weighted_local exists exactly when the overflow pool does, and hard_reserved otherwise"
+                )]
                 let concurrency = if let Some(overflow_pool) = &self.overflow_pool {
                     ConcurrencyMode::Weighted {
                         local_semaphore: weighted_local
@@ -2735,6 +2739,10 @@ impl RuntimeReporterState {
         awa_model::cron_reconciliation::lock(&mut tx).await?;
         admin::upsert_runtime_snapshot(&mut *tx, &snapshot).await?;
         if let Some(config) = &self.periodic_reconciliation {
+            #[expect(
+                clippy::expect_used,
+                reason = "the manifest is prepared whenever periodic reconciliation is configured"
+            )]
             awa_model::cron_reconciliation::publish(
                 &mut tx,
                 self.instance_id,

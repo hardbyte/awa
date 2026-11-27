@@ -1,6 +1,7 @@
 //! Integration tests for CEL callback expressions.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::admin::{self, CallbackConfig, DefaultAction};
 use awa::model::migrations;

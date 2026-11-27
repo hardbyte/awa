@@ -12,6 +12,7 @@
 //! and prune never reclaims an unclaimed one. A producer may instead fail with
 //! a retryable serialization failure (SQLSTATE 40001), which the test retries
 //! the way an application retry loop would.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::{
     audited_sql, insert, migrations, storage, AwaError, InsertOpts, InsertParams, QueueStorage,

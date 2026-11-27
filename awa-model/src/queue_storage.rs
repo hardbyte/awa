@@ -6,6 +6,7 @@ use crate::insert::prepare_row_raw;
 use crate::isolation::BeginReadCommitted;
 use crate::output::AttemptError;
 use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
+use crate::sync::MutexExt;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, SubsecRound, Utc};
@@ -2579,7 +2580,12 @@ impl RuntimePayload {
     }
 
     fn into_json(self) -> serde_json::Value {
-        serde_json::to_value(self).expect("runtime payload serializes")
+        #[expect(
+            clippy::expect_used,
+            reason = "RuntimePayload fields always convert to a JSON value"
+        )]
+        let value = serde_json::to_value(self).expect("runtime payload serializes");
+        value
     }
 
     fn errors_option(&self) -> Option<Vec<serde_json::Value>> {
@@ -2602,6 +2608,10 @@ impl RuntimePayload {
     }
 
     fn insert_callback_result(&mut self, payload: Option<serde_json::Value>) {
+        #[expect(
+            clippy::expect_used,
+            reason = "from_json and Default keep metadata a JSON object"
+        )]
         let metadata = self
             .metadata
             .as_object_mut()
@@ -3008,6 +3018,10 @@ fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
 }
 
 fn write_copy_json(buf: &mut Vec<u8>, value: &serde_json::Value) {
+    #[expect(
+        clippy::expect_used,
+        reason = "a serde_json::Value always serializes to JSON"
+    )]
     let json = serde_json::to_string(value).expect("JSON serialization should not fail");
     write_copy_field(buf, &json);
 }
@@ -4383,12 +4397,17 @@ fn select_claimed_ready_body<'a>(
             row.live_body
         }
     };
+    #[expect(clippy::expect_used, reason = "candidate groups are built nonempty")]
     let strongest = candidates
         .iter()
         .map(&rank)
         .max()
         .expect("ready body group is nonempty");
     let mut best = candidates.iter().filter(|row| rank(row) == strongest);
+    #[expect(
+        clippy::expect_used,
+        reason = "the strongest rank belongs to a candidate"
+    )]
     let ready = best.next().expect("ready body rank has a candidate");
     if best.next().is_some() {
         return Err(HydrateError::Ambiguous(vec![(
@@ -5045,10 +5064,7 @@ impl QueueStorage {
 
     /// Start fresh fill-age windows after acquiring maintenance leadership.
     pub fn reset_rotation_observations(&self) {
-        self.slot_fill_observations
-            .lock()
-            .expect("slot fill observations poisoned")
-            .clear();
+        self.slot_fill_observations.lock_unpoisoned().clear();
     }
 
     fn uses_queue_striping(&self) -> bool {
@@ -5458,6 +5474,10 @@ impl QueueStorage {
         ready_rows: &[RuntimeReadyRow],
         deferred_rows: &[DeferredJobRow],
     ) -> Vec<(Vec<u8>, i64)> {
+        #[expect(
+            clippy::expect_used,
+            reason = "ready rows are assigned job ids before unique claims are built"
+        )]
         let ready_claims = ready_rows
             .iter()
             .filter(|row| unique_state_claims(row.unique_states.as_deref(), JobState::Available))
@@ -5737,6 +5757,7 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
+                #[expect(clippy::expect_used, reason = "the slot is read whenever the legacy claims table exists")]
                 sqlx::query(audited_sql(format!(
                     r#"
                 INSERT INTO {schema}.lease_claims (
@@ -5767,6 +5788,7 @@ impl QueueStorage {
             }
 
             if closures_legacy_exists {
+                #[expect(clippy::expect_used, reason = "the slot is read whenever the legacy closures table exists")]
                 sqlx::query(audited_sql(format!(
                     r#"
                 INSERT INTO {schema}.lease_claim_closures (
@@ -6077,14 +6099,8 @@ impl QueueStorage {
         // queue_meta may have a new shard configuration for the next round.
         // Clear the caches so the next shard_for_enqueue / claim calls
         // re-observe DB state.
-        self.enqueue_shards_cache
-            .lock()
-            .expect("enqueue_shards_cache poisoned")
-            .clear();
-        self.claimer_gates
-            .lock()
-            .expect("claimer gate cache poisoned")
-            .clear();
+        self.enqueue_shards_cache.lock_unpoisoned().clear();
+        self.claimer_gates.lock_unpoisoned().clear();
         // Generations restart at zero, so a proof kept from before the reset
         // could match a slot's new generation.
         self.claim_slot_proofs
@@ -6356,8 +6372,7 @@ impl QueueStorage {
     ) -> Result<i16, AwaError> {
         if let Some(cached) = self
             .enqueue_shards_cache
-            .lock()
-            .expect("enqueue_shards_cache poisoned")
+            .lock_unpoisoned()
             .get(queue)
             .copied()
         {
@@ -6378,8 +6393,7 @@ impl QueueStorage {
 
         let shards = shards.max(1);
         self.enqueue_shards_cache
-            .lock()
-            .expect("enqueue_shards_cache poisoned")
+            .lock_unpoisoned()
             .insert(queue.to_string(), shards);
 
         Ok(self.pick_shard(shards, ordering_key))
@@ -9098,23 +9112,17 @@ impl QueueStorage {
 
     #[doc(hidden)]
     pub fn cached_claimer_lease_count(&self) -> usize {
-        self.claimer_gates
-            .lock()
-            .expect("claimer gate cache poisoned")
-            .len()
+        self.claimer_gates.lock_unpoisoned().len()
     }
 
     fn cache_claimer_gate(&self, key: (String, Uuid), lease: QueueClaimerLeaseRow) {
-        self.claimer_gates
-            .lock()
-            .expect("claimer gate cache poisoned")
-            .insert(
-                key,
-                CachedClaimerGate {
-                    checked_at: Instant::now(),
-                    lease,
-                },
-            );
+        self.claimer_gates.lock_unpoisoned().insert(
+            key,
+            CachedClaimerGate {
+                checked_at: Instant::now(),
+                lease,
+            },
+        );
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
@@ -9350,8 +9358,7 @@ impl QueueStorage {
         let gate_key = (queue.to_string(), instance_id);
         let cached_lease = self
             .claimer_gates
-            .lock()
-            .expect("claimer gate cache poisoned")
+            .lock_unpoisoned()
             .get(&gate_key)
             .filter(|gate| {
                 gate.checked_at.elapsed() < CLAIMER_GATE_CACHE_TTL
@@ -9375,10 +9382,7 @@ impl QueueStorage {
                     )
                     .await?
                 else {
-                    self.claimer_gates
-                        .lock()
-                        .expect("claimer gate cache poisoned")
-                        .remove(&gate_key);
+                    self.claimer_gates.lock_unpoisoned().remove(&gate_key);
                     return Ok(Vec::new());
                 };
                 self.cache_claimer_gate(gate_key.clone(), lease);
@@ -9426,10 +9430,7 @@ impl QueueStorage {
             match refreshed {
                 Some(refreshed) => self.cache_claimer_gate(gate_key, refreshed),
                 None => {
-                    self.claimer_gates
-                        .lock()
-                        .expect("claimer gate cache poisoned")
-                        .remove(&gate_key);
+                    self.claimer_gates.lock_unpoisoned().remove(&gate_key);
                 }
             }
         }
@@ -9658,6 +9659,10 @@ impl QueueStorage {
             let priorities: Vec<i16> = group.iter().map(|entry| entry.claim.priority).collect();
             let attempts: Vec<i16> = group.iter().map(|entry| entry.job.attempt).collect();
             let run_leases: Vec<i64> = group.iter().map(|entry| entry.job.run_lease).collect();
+            #[expect(
+                clippy::expect_used,
+                reason = "fast completion candidates require a receipt id"
+            )]
             let receipt_ids: Vec<i64> = group
                 .iter()
                 .map(|entry| {
@@ -10150,12 +10155,14 @@ impl QueueStorage {
                 let receipt_receipt_ids: Vec<i64> = receipt_claimed
                     .iter()
                     .map(|entry| {
-                        entry
-                            .claim
-                            .receipt_id
-                            .expect("receipt-backed slow completion requires receipt_id")
+                        entry.claim.receipt_id.ok_or_else(|| {
+                            AwaError::Validation(format!(
+                                "receipt-backed claim of job {} run lease {} has no receipt_id",
+                                entry.job.id, entry.job.run_lease
+                            ))
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 let receipt_claim_batch_ids: Vec<Option<i64>> = receipt_claimed
                     .iter()
                     .map(|entry| entry.claim.claim_batch_id)
@@ -11165,6 +11172,10 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if !deleted_waiting.is_empty() {
+            #[expect(
+                clippy::expect_used,
+                reason = "hydration returns one row per deleted lease and the deleted set is nonempty"
+            )]
             let waiting = self
                 .hydrate_deleted_leases_tx(tx, deleted_waiting, true)
                 .await?
@@ -11606,6 +11617,10 @@ impl QueueStorage {
         if deleted_lease.is_empty() {
             return Ok(None);
         }
+        #[expect(
+            clippy::expect_used,
+            reason = "hydration returns one row per deleted lease and the deleted set is nonempty"
+        )]
         let lease = self
             .hydrate_deleted_leases_tx(tx, deleted_lease, true)
             .await?
@@ -18651,6 +18666,10 @@ impl QueueStorage {
             .await?;
 
         let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
+        #[expect(
+            clippy::expect_used,
+            reason = "hydration returns one row per deleted lease and the deleted set is nonempty"
+        )]
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -18756,6 +18775,10 @@ impl QueueStorage {
             .await?;
 
         let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
+        #[expect(
+            clippy::expect_used,
+            reason = "hydration returns one row per deleted lease and the deleted set is nonempty"
+        )]
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -18841,6 +18864,10 @@ impl QueueStorage {
             .await?;
 
         let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
+        #[expect(
+            clippy::expect_used,
+            reason = "hydration returns one row per deleted lease and the deleted set is nonempty"
+        )]
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let ready_payload =
@@ -22153,10 +22180,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
         let has_rows = sampled_rows > 0;
-        let mut observations = self
-            .slot_fill_observations
-            .lock()
-            .expect("slot fill observations poisoned");
+        let mut observations = self.slot_fill_observations.lock_unpoisoned();
         if !has_rows {
             observations.remove(&family);
             return Ok(false);

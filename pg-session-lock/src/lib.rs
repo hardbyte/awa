@@ -178,6 +178,10 @@ impl SessionAdvisoryLock {
     /// return to the pool when it is dropped, for a holder that keeps the lock
     /// until its connection ends.
     pub fn into_connection_closed_on_drop(mut self) -> PoolConnection<Postgres> {
+        #[expect(
+            clippy::expect_used,
+            reason = "the connection is present until the lock is released or the holder is dropped"
+        )]
         let mut conn = self
             .conn
             .take()
@@ -188,9 +192,15 @@ impl SessionAdvisoryLock {
 
     /// The connection holding the lock.
     pub fn connection(&mut self) -> &mut PgConnection {
-        self.conn
+        #[expect(
+            clippy::expect_used,
+            reason = "the connection is present until the lock is released or the holder is dropped"
+        )]
+        let conn = self
+            .conn
             .as_mut()
-            .expect("the connection is held until release or drop")
+            .expect("the connection is held until release or drop");
+        conn
     }
 
     /// The lock key.

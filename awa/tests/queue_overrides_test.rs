@@ -8,6 +8,7 @@
 //! pins the behavior, not the production 10s cadence.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, JobArgs, JobResult, QueueConfig};
 use awa_model::admin::{

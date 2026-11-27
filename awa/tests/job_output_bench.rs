@@ -14,6 +14,7 @@
 //! `OUTPUT_BENCH_SCENARIOS` picks scenarios by index (for example `0,2`).
 //! WAL is measured across the whole drain, so it includes claims and
 //! completions; compare the rows with each other.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{Client, JobArgs, JobResult, QueueConfig, MAX_OUTPUT_BYTES};
 use awa_testing::setup::TestDatabase;

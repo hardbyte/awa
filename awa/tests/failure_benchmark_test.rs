@@ -15,6 +15,7 @@
 //!
 //! Each test emits human-readable summaries and one @@BENCH_JSON@@ JSONL
 //! record per scenario using the shared schema (schema_version=1).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod bench_output;
 

@@ -7,6 +7,7 @@ mod errors;
 mod filter;
 mod job;
 mod partitioned_queue;
+mod sync;
 mod telemetry;
 mod transaction;
 mod worker;

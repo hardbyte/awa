@@ -4,6 +4,7 @@
 //!   cargo test --package awa-model --features tokio-postgres --test bridge_tokio_pg_test
 
 #![cfg(feature = "tokio-postgres")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::bridge::tokio_pg;
 use awa_model::job::{InsertOpts, UniqueOpts};

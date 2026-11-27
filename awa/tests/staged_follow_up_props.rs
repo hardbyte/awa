@@ -5,6 +5,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test.
 //! PROPTEST_CASES raises the case count (default 256 per engine).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::{FollowUps, InsertOpts, JobArgs, UniqueOpts};
 use awa_testing::setup::TestDatabase;

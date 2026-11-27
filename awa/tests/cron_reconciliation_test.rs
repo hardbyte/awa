@@ -1,5 +1,6 @@
 //! Isolated database tests for the owner protocol, independent of other suites'
 //! runtime snapshots and deliberately stale legacy participants.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod ci_timing;
 
 use awa::model::{cron, cron_reconciliation as reconcile, migrations};

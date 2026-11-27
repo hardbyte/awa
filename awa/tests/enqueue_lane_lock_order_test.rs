@@ -18,6 +18,7 @@
 //!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test enqueue_lane_lock_order_test -- --nocapture`
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::audited_sql;
 use awa::model::{

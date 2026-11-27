@@ -7,6 +7,7 @@
 //!
 //! Requires a running Postgres instance.
 //! Set DATABASE_URL or use the default: postgres://postgres:awa@localhost:5432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::{insert_with, migrations, InsertOpts, UniqueOpts};
 use awa::{Client, EnqueueRequest, JobArgs, JobError, JobResult, JobState, QueueConfig};

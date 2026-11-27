@@ -1,4 +1,5 @@
 //! `awa dlq retry` wakes the queue's claimers before the process exits.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use assert_cmd::Command;
 use std::time::Duration;

@@ -55,6 +55,7 @@
 //!   cargo test -p awa --test rolling_transition_rehearsal_test \
 //!     -- --ignored --nocapture
 //! ```
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::audited_sql;

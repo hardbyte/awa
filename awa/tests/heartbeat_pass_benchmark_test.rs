@@ -10,6 +10,7 @@
 //! runtime refills a few freed workers at a time), and times a heartbeat pass
 //! over them in the heartbeat service's 500-attempt chunks.
 //! `AWA_HEARTBEAT_BENCH_SIZES` overrides the sizes.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::queue_storage::ClaimHeartbeatRef;
 use awa::model::{insert, migrations, QueueStorage, QueueStorageConfig};

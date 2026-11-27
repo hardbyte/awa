@@ -49,6 +49,7 @@
 //!   cargo test -p awa --test receipt_plane_regression_gate \
 //!     -- --ignored --nocapture
 //! ```
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use awa::audited_sql;

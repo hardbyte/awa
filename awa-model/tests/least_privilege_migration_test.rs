@@ -15,6 +15,7 @@
 //! asserts `migrations::run` reaches `CURRENT_VERSION`. It fails against the
 //! old scan idiom (with `permission denied for schema pg_toast`) and passes
 //! once discovery uses catalog lookups gated on `has_schema_privilege()`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::audited_sql;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

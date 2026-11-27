@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["postgres", "sqlx", "advisory-lock", "lock", "leader-election"]
 categories = ["database", "asynchronous", "concurrency"]
 
+[lints]
+workspace = true
+
 [dependencies]
 sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
 

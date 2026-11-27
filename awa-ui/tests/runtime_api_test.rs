@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use awa_model::admin::{
     self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeOverview, RuntimeSnapshotInput, StorageCapability, TransitionRole,

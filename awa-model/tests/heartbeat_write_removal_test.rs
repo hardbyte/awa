@@ -6,6 +6,7 @@
 //! after migrate / prepare_schema) and the behavioral invariant
 //! (heartbeat_batch on a receipts-mode store does not write
 //! leases.heartbeat_at).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::audited_sql;
 use awa_model::{QueueStorage, QueueStorageConfig};

@@ -5,6 +5,7 @@
 //! the on-page slack; the insert+delete-only siblings (`ready_entries`,
 //! `done_entries`, `lease_claim_closures`) intentionally stay at the
 //! default fillfactor=100.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa_model::audited_sql;
 use sqlx::postgres::PgPoolOptions;

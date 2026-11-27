@@ -3,6 +3,7 @@ use crate::follow_ups::{FollowUps, StageError};
 use crate::output::{OutputError, OutputSlot, TypedOutputSlot};
 pub use crate::runtime::ProgressState;
 use crate::storage::RuntimeStorage;
+use crate::sync::MutexExt;
 use awa_model::{AwaError, CallbackConfig, JobArgs, JobOutput, JobRow, QueueStorage};
 use sqlx::PgPool;
 use std::any::Any;
@@ -453,7 +454,7 @@ impl JobContext {
     ///
     /// `percent` is clamped to 0-100. For progress without a message, pass `""`.
     pub fn set_progress(&self, percent: u8, message: &str) {
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let mut guard = self.progress.lock_unpoisoned();
         guard.set_progress(percent, Some(message));
     }
 
@@ -466,10 +467,10 @@ impl JobContext {
             .as_object()
             .ok_or_else(|| AwaError::Validation("update_metadata requires a JSON object".into()))?;
 
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let mut guard = self.progress.lock_unpoisoned();
         if !guard.merge_metadata(obj) {
             return Err(AwaError::Validation(
-                "progress.metadata is not a JSON object; cannot merge".into(),
+                "progress or progress.metadata is not a JSON object; cannot merge".into(),
             ));
         }
         Ok(())
@@ -481,7 +482,7 @@ impl JobContext {
     /// or the job is no longer in running state (rescued/cancelled).
     pub async fn flush_progress(&self) -> Result<(), AwaError> {
         let (snapshot, target_generation) = {
-            let guard = self.progress.lock().expect("progress lock poisoned");
+            let guard = self.progress.lock_unpoisoned();
             match guard.pending_snapshot() {
                 Some(pair) => pair,
                 None => return Ok(()),
@@ -520,7 +521,7 @@ impl JobContext {
             }
         }
 
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let mut guard = self.progress.lock_unpoisoned();
         guard.ack(target_generation);
 
         Ok(())

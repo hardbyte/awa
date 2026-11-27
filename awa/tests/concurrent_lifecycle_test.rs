@@ -14,6 +14,7 @@
 //!   cargo test --release --package awa --test concurrent_lifecycle_test \
 //!   -- --ignored --nocapture
 //! ```
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod bench_output;
 

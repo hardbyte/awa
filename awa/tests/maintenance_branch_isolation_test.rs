@@ -7,6 +7,7 @@
 //! long a due scheduled job then waits to be promoted, whether an attempt
 //! past its deadline is still rescued, whether stored schedules keep firing,
 //! and whether losing the leader lock still stops promotion.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[path = "ci_timing.rs"]
 mod ci_timing;

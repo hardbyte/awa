@@ -4,6 +4,7 @@
 //! Uses a mock HTTP server (axum) to simulate function endpoints.
 
 #![cfg(feature = "http-worker")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use awa::model::admin;
 use awa::{HttpWorker, HttpWorkerConfig, HttpWorkerMode, JobArgs, JobState};

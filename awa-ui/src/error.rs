@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
@@ -99,10 +99,11 @@ impl IntoResponse for ApiError {
         if retry {
             response
                 .headers_mut()
-                .insert("retry-after", "1".parse().unwrap());
-            response
-                .headers_mut()
-                .insert("cache-control", "private, no-store".parse().unwrap());
+                .insert("retry-after", HeaderValue::from_static("1"));
+            response.headers_mut().insert(
+                "cache-control",
+                HeaderValue::from_static("private, no-store"),
+            );
         }
         response
     }

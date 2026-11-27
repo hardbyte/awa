@@ -7,6 +7,9 @@ description = "SeaORM integration helpers for the Awa job queue"
 repository.workspace = true
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 awa.workspace = true
 sea-orm.workspace = true

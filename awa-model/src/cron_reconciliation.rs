@@ -337,6 +337,10 @@ async fn evaluate_locked(
             .max(0);
         if persist {
             if synced_hash != p.desired_hash {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "a plan with no blockers has exactly one desired hash"
+                )]
                 sync_definitions(
                     conn,
                     owner,

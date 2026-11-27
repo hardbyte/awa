@@ -1,6 +1,7 @@
 //! API test for GET /api/cron — verifies next_fire_at is present.
 //!
 //! Requires DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};

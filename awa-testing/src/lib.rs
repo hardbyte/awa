@@ -2,6 +2,12 @@
 //!
 //! Provides `TestClient` for integration testing of job handlers.
 
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helpers fail the calling test by panicking"
+)]
+
 pub mod setup;
 
 use awa_model::audited_sql;

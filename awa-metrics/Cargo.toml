@@ -15,6 +15,9 @@ categories = ["asynchronous"]
 # intentionally minimal — just the OTel metric handles and `record_*`
 # methods — but it is part of the public dep tree.
 
+[lints]
+workspace = true
+
 [dependencies]
 awa-model.workspace = true
 opentelemetry.workspace = true

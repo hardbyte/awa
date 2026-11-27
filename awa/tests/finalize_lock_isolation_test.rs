@@ -6,6 +6,7 @@
 //! attempt's handler returns `Completed` meanwhile, its completion waits on
 //! that lock. These tests check that completions of jobs in other queues,
 //! which share only the runtime's completion pipeline with it, still finish.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 

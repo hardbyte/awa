@@ -387,6 +387,10 @@ pub const EXTENDED_FILTER_MIN_RUNTIME: &str = "0.7.0-alpha.2";
 pub(crate) async fn require_fleet_for_extended_filters(
     pool: &sqlx::PgPool,
 ) -> Result<(), AwaError> {
+    #[expect(
+        clippy::expect_used,
+        reason = "the floor is a compile-time constant valid semver"
+    )]
     let minimum = semver::Version::parse(EXTENDED_FILTER_MIN_RUNTIME)
         .expect("the extended-filter runtime floor is valid semver");
     let live: Vec<(String, String)> = sqlx::query_as(

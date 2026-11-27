@@ -1,5 +1,6 @@
 //! Cancel a real public read after PostgreSQL has entered its transaction,
 //! before SQLx receives ReadyForQuery. No sleeps or custom BEGIN statements.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod ci_timing;
 
