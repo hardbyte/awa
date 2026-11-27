@@ -235,11 +235,21 @@ awa dlq list --queue emails --limit 20
 awa dlq retry <id>                       # resets attempt/lease, re-runs
 awa dlq retry-bulk --queue emails        # bulk; --all required with no filter
 awa dlq purge --kind SendEmail           # destructive; --all required if unfiltered
+awa dlq purge --kind SendEmail --wait    # wait for the batch operation to finish
 ```
 
 - Retry resets the job to `attempt=0`, `run_lease=0` on the runnable path with
   its stored queue/priority and immediate `run_at`. Use the programmatic retry
   APIs to override those.
+- `retry-bulk` and `purge` submit a `retry_from_dlq` / `purge_dlq` batch
+  operation (`submitted_by: "cli"`) and print its id; nothing changes until a
+  worker's maintenance leader applies it. Follow it with
+  `awa batch-ops get <id>`, or pass `--wait` to poll until it finishes and
+  print processed/skipped/errored (non-zero exit if it fails).
+- Python's `bulk_retry_from_dlq` and `purge_dlq` submit the same operations
+  (`submitted_by: "python"`) and return them. `purge_dlq_before` purges in one
+  transaction up to a `before_id` / `before_dlq_at` cursor (one is required)
+  and returns a count.
 - `retry-bulk`, `purge`, and `move` require `--all` when no filter is given —
   the guard against reviving or wiping the whole DLQ. Purge is unrecoverable;
   prefer `retry-bulk` if you might want the data back.
@@ -271,8 +281,8 @@ awa batch-ops cancel <id>
   `POST /api/dlq/retry-matching` / `/purge-matching` submit a `retry_from_dlq`
   / `purge_dlq` operation and answer `202` with it; follow it on the Batch
   Operations page or with `awa batch-ops get`. Nothing changes until a worker's
-  maintenance leader runs it. `awa dlq retry-bulk` and `purge` still act in one
-  transaction and print a count.
+  maintenance leader runs it. `awa dlq retry-bulk` and `purge` submit the same
+  operations.
 - An item whose row another transaction holds stays pending and is retried on
   a later chunk; one whose retry hits a unique key held by a newer job is
   recorded `errored` and the rest proceed.

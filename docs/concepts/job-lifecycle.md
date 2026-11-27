@@ -70,7 +70,7 @@ A crash ends every attempt running in that process, not just the poison one, so 
 1. **Recognise it.** The job's error history repeats one message across attempts. `awa job dump <id>` shows each attempt; a run of `presumed dead` or `hard deadline exceeded` errors points at the process, not the handler's own error path.
 2. **Stop one job.** `awa job cancel <id>`. A running handler is signalled to stop. One stuck in blocking or CPU-bound code keeps its worker slot until it returns, but the job stays cancelled: a late finish is ignored.
 3. **Stop a kind.** `awa queue pause <queue>` holds everything on the queue while you deploy a fix. Until a fix ships, the bound above ends each poison job after `max_attempts`.
-4. **Redrive after the fix.** `awa dlq retry-bulk --queue <queue> --kind <kind>` re-runs the dead-lettered jobs with a fresh attempt budget.
+4. **Redrive after the fix.** `awa dlq retry-bulk --queue <queue> --kind <kind>` submits a batch operation that re-runs the dead-lettered jobs with a fresh attempt budget; add `--wait` to wait for the maintenance leader to finish it.
 
 ## Where to go next
 
