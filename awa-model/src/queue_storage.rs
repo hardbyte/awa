@@ -20148,15 +20148,16 @@ impl QueueStorage {
             .iter()
             .map(|row| (row.job_id, row.run_lease))
             .collect();
-        self.tombstone_dlq_ready_bodies_tx(tx, &attempts).await
+        self.tombstone_earlier_ready_bodies_tx(tx, &attempts).await
     }
 
-    /// Tombstone the ready bodies of jobs whose DLQ rows were deleted, given
-    /// as `(job_id, run_lease)` of each deleted row. A dead-lettered job's
-    /// bodies are those of its earlier attempts, with a smaller `run_lease`;
-    /// without a tombstone a retained body reads as an available job once
-    /// the DLQ row is gone.
-    async fn tombstone_dlq_ready_bodies_tx<'a>(
+    /// Tombstone the ready bodies of a job's earlier attempts, given as
+    /// `(job_id, run_lease)` of each deleted DLQ or terminal row: every ready
+    /// body of that job with a smaller `run_lease`. Without a tombstone a
+    /// retained body reads as an available job once the row is gone. A body
+    /// with the same or a larger `run_lease`, such as a job retried out of
+    /// the DLQ, is kept.
+    async fn tombstone_earlier_ready_bodies_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         attempts: &[(i64, i64)],
@@ -20188,8 +20189,9 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// Tombstone the exact ready bodies of terminal rows just deleted from
-    /// done_entries, so a retained body does not read as an available job.
+    /// Tombstone the ready bodies of terminal rows just deleted from
+    /// done_entries, the exact body of each and those of its job's earlier
+    /// attempts, so a retained body does not read as an available job.
     async fn tombstone_done_ready_bodies_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -20233,7 +20235,11 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        Ok(())
+        let attempts: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.tombstone_earlier_ready_bodies_tx(tx, &attempts).await
     }
 
     /// Release the unique claims of the DLQ rows `deleted` removed. A DLQ
@@ -20734,7 +20740,7 @@ impl QueueStorage {
             .iter()
             .map(|row| (row.job_id, row.run_lease))
             .collect();
-        self.tombstone_dlq_ready_bodies_tx(&mut tx, &dlq_attempts)
+        self.tombstone_earlier_ready_bodies_tx(&mut tx, &dlq_attempts)
             .await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;

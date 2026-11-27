@@ -755,6 +755,47 @@ async fn admin_discard_failed_leaves_no_job_behind() {
     assert!(claim_ready(&pool, &store).await.is_empty());
 }
 
+/// Fail each of `ids` again after a retry, so each job has a ready body from
+/// each of two attempts.
+async fn fail_again_after_retry(pool: &PgPool, store: &QueueStorage, ids: &[i64]) {
+    for &id in ids {
+        admin::retry(pool, id).await.unwrap().unwrap();
+    }
+    for job in claim_all(pool, store, ids.len()).await {
+        store
+            .fail_terminal(pool, job.id, job.run_lease, "boom again", None)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn discarding_a_job_that_failed_twice_leaves_no_earlier_attempt_behind() {
+    let (_db, pool, store) = setup().await;
+    let batch = failed_jobs(&pool, &store, 0, 2).await;
+    fail_again_after_retry(&pool, &store, &batch).await;
+    let op = submit(
+        &pool,
+        BatchOperationSpec::Discard,
+        JobFilter::new().queue(QUEUE),
+    )
+    .await;
+    let op = run_to_completion(&pool, op.id).await;
+    assert_counters(&op, 2, 2, 0, 0);
+    for &id in &batch {
+        assert_job_gone(&pool, &store, id).await;
+    }
+
+    let direct = failed_jobs(&pool, &store, 10, 2).await;
+    fail_again_after_retry(&pool, &store, &direct).await;
+    assert_eq!(admin::discard_failed(&pool, KIND).await.unwrap(), 2);
+    for &id in &direct {
+        assert_job_gone(&pool, &store, id).await;
+    }
+    assert!(claim_ready(&pool, &store).await.is_empty());
+}
+
 #[tokio::test]
 async fn dlq_purges_leave_no_job_behind() {
     let (_db, pool, store) = setup().await;
