@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import pytest
 
 import awa
-from test_dlq import _move_ready_to_failed_done
+from test_dlq import _delete_batch_operation, _move_ready_to_failed_done
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -122,8 +122,11 @@ def test_dlq_helpers_take_the_filter(client):
         )
         == 0
     ), "a cursor keeps the rest of the filter"
-    assert client.bulk_retry_from_dlq(queue=queue, filter={"tag": "order:3"}) == 1
-    assert client.dlq_depth(queue=queue) == 4
+    operation = client.bulk_retry_from_dlq(queue=queue, filter={"tag": "order:3"})
+    _delete_batch_operation(client, operation["id"])
+    assert operation["op_kind"] == "retry_from_dlq"
+    assert operation["filter"] == {"queue": queue, "tag": "order:3"}
+    assert client.dlq_depth(queue=queue) == 5
 
 
 def test_batch_preview_uses_the_same_population(client):

@@ -64,9 +64,9 @@ awa --database-url $DATABASE_URL serve
 | `dlq depth [--queue Q]` | Total DLQ rows, optionally split by queue |
 | `dlq list` | List DLQ entries with `--kind` / `--queue` / `--tag` / `--before-*` filters |
 | `dlq retry <id>` | Retry a single DLQ row |
-| `dlq retry-bulk` | Retry every DLQ row matching the filter (`--all` required if no filter is given) |
+| `dlq retry-bulk` | Submit a `retry_from_dlq` batch operation for the DLQ rows matching the filter (`--all` required if no filter is given; `--wait` to wait for it) |
 | `dlq move` | Move existing failed terminal rows into the DLQ |
-| `dlq purge` | Delete DLQ rows matching the filter (`--all` required if no filter is given) |
+| `dlq purge` | Submit a `purge_dlq` batch operation for the DLQ rows matching the filter (`--all` required if no filter is given; `--wait` to wait for it) |
 | `storage status` | Current storage-transition state |
 | `storage prepare --engine E` | Prepare a future storage engine without changing routing |
 | `storage prepare-queue-storage-schema` | Materialize the queue-storage schema (tables, indexes, functions) |
@@ -94,7 +94,7 @@ See [`docs/upgrade-0.5-to-0.6.md`](../docs/upgrade-0.5-to-0.6.md) for the full p
 
 ## Dead Letter Queue
 
-`dlq retry-bulk` and `dlq purge` require an explicit filter (`--kind`, `--queue`, or `--tag`) or `--all`. This is intentional — a bare bulk retry / purge with no filter would touch every DLQ row, which is almost never what you want. See [`docs/dead-letter-queue.md`](../docs/dead-letter-queue.md).
+`dlq retry-bulk` and `dlq purge` require an explicit filter (`--kind`, `--queue`, or `--tag`) or `--all`. This is intentional — a bare bulk retry / purge with no filter would touch every DLQ row, which is almost never what you want. Both submit a batch operation that the maintenance leader applies while a worker runs, and print its id; follow it with `awa batch-ops get <id>` or pass `--wait`. See [`docs/dead-letter-queue.md`](../docs/dead-letter-queue.md).
 
 ## Web UI
 

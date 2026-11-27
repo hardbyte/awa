@@ -371,3 +371,17 @@ def test_dlq_list_renders_nested_job_fields(sync_client_qs):
 
     # Cleanup so reruns stay idempotent.
     sync_client_qs.purge_dlq(queue=queue)
+
+
+def test_dlq_retry_all_submits_a_batch_operation(sync_client_qs):
+    queue = "pydlq_cli_retry_all"
+    result = _cli("--database-url", DATABASE_URL, "dlq", "retry-all", "--queue", queue)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("Submitted retry_from_dlq batch operation "), result.stdout
+    operation_id = result.stdout.split()[4]
+    operation = sync_client_qs.get_batch_operation(operation_id)
+    tx = sync_client_qs.transaction()
+    tx.execute("DELETE FROM awa.batch_operations WHERE id = $1::uuid", operation_id)
+    tx.commit()
+    assert operation["filter"] == {"queue": queue}
+    assert operation["submitted_by"] == "python"

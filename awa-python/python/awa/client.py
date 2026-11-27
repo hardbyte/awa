@@ -699,8 +699,9 @@ class AsyncClient:
         tag: str | None = None,
         filter: JobFilter | None = None,
         allow_all: bool = False,
-    ) -> int:
-        """Bulk-retry DLQ rows matching the filter. Returns revived count."""
+    ) -> BatchOperation:
+        """Submit a `retry_from_dlq` batch operation for the DLQ rows matching
+        the filter and return it; the maintenance leader applies it."""
         return await self._raw.bulk_retry_from_dlq(
             kind=kind, queue=queue, tag=tag, filter=filter, allow_all=allow_all
         )
@@ -1658,8 +1659,9 @@ class Client:
         tag: str | None = None,
         filter: JobFilter | None = None,
         allow_all: bool = False,
-    ) -> int:
-        """Bulk-retry DLQ rows matching the filter."""
+    ) -> BatchOperation:
+        """Submit a `retry_from_dlq` batch operation for the DLQ rows matching
+        the filter and return it; the maintenance leader applies it."""
         return self._raw.bulk_retry_from_dlq_sync(
             kind=kind, queue=queue, tag=tag, filter=filter, allow_all=allow_all
         )

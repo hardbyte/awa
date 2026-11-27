@@ -476,13 +476,16 @@ async def _dispatch_dlq(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         else:
             print(f"Retried DLQ job {args.id} → job state {job.state}")
     elif dc == "retry-all":
-        count = await client.bulk_retry_from_dlq(
+        operation = await client.bulk_retry_from_dlq(
             kind=args.kind,
             queue=args.queue,
             tag=args.tag,
             allow_all=args.all,
         )
-        print(f"Retried {count} DLQ rows.")
+        print(
+            f"Submitted {operation['op_kind']} batch operation {operation['id']} "
+            f"({operation['state']})."
+        )
     elif dc == "purge":
         count = await client.purge_dlq(
             kind=args.kind,

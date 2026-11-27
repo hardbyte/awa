@@ -189,6 +189,12 @@ async def _move_ready_to_failed_done_async(client: awa.AsyncClient, job_id: int)
         )
 
 
+def _delete_batch_operation(client: awa.Client, operation_id: str) -> None:
+    tx = client.transaction()
+    tx.execute("DELETE FROM awa.batch_operations WHERE id = $1::uuid", operation_id)
+    tx.commit()
+
+
 @pytest.fixture
 def sync_client():
     client = awa.Client(DATABASE_URL)
@@ -283,9 +289,13 @@ def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
     with pytest.raises(awa.ValidationError):
         sync_client.bulk_retry_from_dlq()
 
-    retried = sync_client.bulk_retry_from_dlq(allow_all=True)
-    assert retried == 1
-    assert sync_client.dlq_depth(queue="pydlq_retry_all") == 0
+    operation = sync_client.bulk_retry_from_dlq(allow_all=True)
+    _delete_batch_operation(sync_client, operation["id"])
+    assert operation["op_kind"] == "retry_from_dlq"
+    assert operation["state"] == "pending"
+    assert operation["submitted_by"] == "python"
+    assert operation["filter"] == {}
+    assert sync_client.dlq_depth(queue="pydlq_retry_all") == 1, "submitting changes no row"
 
     purge_job = sync_client.insert(DlqPyJob(value="purge_all"), queue="pydlq_purge_all")
     _move_ready_to_failed_done(sync_client, purge_job.id)
@@ -295,7 +305,7 @@ def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
         sync_client.purge_dlq()
 
     purged = sync_client.purge_dlq(allow_all=True)
-    assert purged == 1
+    assert purged == 2
     assert sync_client.dlq_depth(queue="pydlq_purge_all") == 0
 
 
@@ -448,6 +458,15 @@ async def test_async_dlq_flow():
 
         depth = await client.dlq_depth(queue="pydlq_async")
         assert depth == 1
+
+        operation = await client.bulk_retry_from_dlq(queue="pydlq_async")
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.batch_operations WHERE id = $1::uuid", operation["id"])
+        await tx.commit()
+        assert operation["op_kind"] == "retry_from_dlq"
+        assert operation["submitted_by"] == "python"
+        assert operation["filter"] == {"queue": "pydlq_async"}
+        assert await client.dlq_depth(queue="pydlq_async") == 1
 
         revived = await client.retry_from_dlq(job.id)
         assert revived is not None
