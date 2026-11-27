@@ -11,7 +11,7 @@ import {
   bulkRetryDlq,
   bulkPurgeDlq,
 } from "@/lib/api";
-import type { DlqRow, ListDlqParams } from "@/lib/api";
+import type { BatchOperation, DlqRow, ListDlqParams } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
@@ -88,6 +88,15 @@ export function DlqPage() {
     queryFn: fetchDlqDepth,
   });
 
+  // The bulk actions submit a batch operation, which the maintenance leader
+  // applies a chunk at a time after the request returns.
+  const [submitted, setSubmitted] = useState<BatchOperation | null>(null);
+  const onSubmitted = (operation: BatchOperation) => {
+    setSubmitted(operation);
+    void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
+    toast.success(`Submitted batch operation ${operation.id.slice(0, 8)}`);
+  };
+
   const retryFilterMutation = useMutation({
     mutationFn: () =>
       bulkRetryDlq({
@@ -98,13 +107,8 @@ export function DlqPage() {
         created_at_gte: toRfc3339(searchFilters.createdGte),
         created_at_lt: toRfc3339(searchFilters.createdLt),
       }),
-    onSuccess: (res) => {
-      void queryClient.invalidateQueries({ queryKey: ["dlq"] });
-      void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Retried ${res.count} DLQ row(s)`);
-    },
-    onError: () => toast.error("Failed to retry DLQ rows"),
+    onSuccess: onSubmitted,
+    onError: (error) => toast.error(`Failed to submit the DLQ retry: ${error.message}`),
   });
 
   const purgeFilterMutation = useMutation({
@@ -117,12 +121,8 @@ export function DlqPage() {
         created_at_gte: toRfc3339(searchFilters.createdGte),
         created_at_lt: toRfc3339(searchFilters.createdLt),
       }),
-    onSuccess: (res) => {
-      void queryClient.invalidateQueries({ queryKey: ["dlq"] });
-      void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
-      toast.success(`Purged ${res.count} DLQ row(s)`);
-    },
-    onError: () => toast.error("Failed to purge DLQ rows"),
+    onSuccess: onSubmitted,
+    onError: (error) => toast.error(`Failed to submit the DLQ purge: ${error.message}`),
   });
 
   const [showRetryConfirm, setShowRetryConfirm] = useState(false);
@@ -199,6 +199,19 @@ export function DlqPage() {
             Purge matching
           </Button>
         </div>
+      )}
+
+      {submitted && (
+        <p className="text-sm" role="status" data-testid="dlq-batch-submitted">
+          Submitted {submitted.op_kind === "purge_dlq" ? "purge" : "retry"} of
+          the matching DLQ rows as batch operation{" "}
+          <span className="font-mono">{submitted.id.slice(0, 8)}</span>. The rows
+          change as the maintenance leader runs it;{" "}
+          <Link to="/batch-ops" className="underline">
+            follow it on the batch operations page
+          </Link>
+          .
+        </p>
       )}
 
       {searchError && (
@@ -295,7 +308,7 @@ export function DlqPage() {
         isOpen={showRetryConfirm}
         onOpenChange={setShowRetryConfirm}
         title="Retry DLQ rows"
-        description="This retries every DLQ row matching the current filter and resets each attempt back to a fresh runnable job."
+        description="This submits a batch operation that retries every DLQ row matching the current filter, resetting each to a fresh runnable job. The maintenance leader applies it a chunk at a time."
         confirmLabel="Retry"
         confirmIntent="primary"
         onConfirm={() => retryFilterMutation.mutate()}
@@ -305,7 +318,7 @@ export function DlqPage() {
         isOpen={showPurgeConfirm}
         onOpenChange={setShowPurgeConfirm}
         title="Purge DLQ rows"
-        description="This permanently deletes every DLQ row matching the current filter."
+        description="This submits a batch operation that permanently deletes every DLQ row matching the current filter. The maintenance leader applies it a chunk at a time."
         confirmLabel="Purge"
         confirmIntent="danger"
         onConfirm={() => purgeFilterMutation.mutate()}

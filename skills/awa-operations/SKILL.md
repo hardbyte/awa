@@ -249,6 +249,34 @@ awa dlq purge --kind SendEmail           # destructive; --all required if unfilt
 - Enabling `dlq_enabled` does not retroactively move existing `failed` rows.
   Move them explicitly with `awa dlq move --reason ... [--all]`.
 
+For large sets, run bulk actions as durable batch operations, which the
+maintenance leader applies a chunk per transaction with progress, cancellation
+and retention:
+
+```bash
+awa batch-ops preview --op-kind retry_from_dlq --filter '{"queue":"emails"}'
+awa batch-ops submit  --op-kind retry_from_dlq --filter '{"queue":"emails"}'
+awa batch-ops submit  --op-kind purge_dlq --filter '{"kind":"SendEmail"}'
+awa batch-ops get <id>                    # state, processed/skipped/errored
+awa batch-ops cancel <id>
+```
+
+- Kinds: `retry`, `cancel`, `discard`, `move_to_dlq` (spec `{"reason":...}`),
+  `retry_from_dlq`, `purge_dlq`, plus `set_priority` and `move_queue`. Each
+  accepts only the states it can act on; `retry_from_dlq` and `purge_dlq` act
+  on DLQ rows only.
+- The admin UI's DLQ "retry/purge all matching" buttons and
+  `POST /api/dlq/retry-matching` / `/purge-matching` submit a `retry_from_dlq`
+  / `purge_dlq` operation and answer `202` with it; follow it on the Batch
+  Operations page or with `awa batch-ops get`. Nothing changes until a worker's
+  maintenance leader runs it. `awa dlq retry-bulk` and `purge` still act in one
+  transaction and print a count.
+- An item whose row another transaction holds stays pending and is retried on
+  a later chunk; one whose retry hits a unique key held by a newer job is
+  recorded `errored` and the rest proceed.
+- Submit the new kinds only once every runtime runs 0.7 or later; an older
+  maintenance leader marks an operation of a kind it doesn't know as failed.
+
 ## Cron
 
 The default CLI cron surface includes `list` and `remove <name>`. Pause, resume, and

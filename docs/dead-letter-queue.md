@@ -100,6 +100,8 @@ awa batch-ops submit --op-kind move_to_dlq --filter '{"queue":"billing"}' --spec
 
 The same kinds are in the admin UI's batch operations page, `POST /api/batch-ops` and the Python client's `submit_batch_operation`. See [ADR-030](adr/030-batch-operations.md#bulk-action-operations) for each kind's eligible jobs.
 
+The admin UI's DLQ page submits its **Retry matching** and **Purge matching** actions as `retry_from_dlq` and `purge_dlq` batch operations, and links to the batch operations page to follow them. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` do the same: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge`, `awa dlq retry-bulk` and `awa dlq purge` still act in one transaction and report a count.
+
 ## Retention
 
 The maintenance leader periodically prunes DLQ rows older than the configured retention window. See [Configuration](configuration.md) for the `dlq_retention_*` knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.

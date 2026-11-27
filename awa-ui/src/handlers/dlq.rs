@@ -1,7 +1,9 @@
 use axum::extract::{Path, RawQuery, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use awa_model::batch_operations::{self, BatchOperation, BatchOperationSpec, SubmitBatchOperation};
 use awa_model::dlq::{self, DlqRow, RetryFromDlqOpts};
 use awa_model::{AwaError, DlqPage, JobFilter};
 
@@ -161,11 +163,46 @@ pub async fn bulk_retry_dlq(
     retry_matching_filter(&state, &payload.filter(), payload.all).await
 }
 
+/// Submits a `retry_from_dlq` batch operation for the filter and answers
+/// `202 Accepted` with it; the maintenance leader applies it a chunk at a time.
 pub async fn retry_dlq_matching(
     State(state): State<AppState>,
     Json(payload): Json<MatchingPayload>,
-) -> Result<Json<CountResponse>, ApiError> {
-    retry_matching_filter(&state, payload.filter()?, payload.all).await
+) -> Result<(StatusCode, Json<BatchOperation>), ApiError> {
+    submit_matching(&state, BatchOperationSpec::RetryFromDlq, payload).await
+}
+
+/// Submits a `purge_dlq` batch operation for the filter and answers
+/// `202 Accepted` with it; the maintenance leader applies it a chunk at a time.
+pub async fn purge_dlq_matching(
+    State(state): State<AppState>,
+    Json(payload): Json<MatchingPayload>,
+) -> Result<(StatusCode, Json<BatchOperation>), ApiError> {
+    submit_matching(&state, BatchOperationSpec::PurgeDlq, payload).await
+}
+
+/// `submitted_by` of the batch operations the matching endpoints submit.
+const MATCHING_SUBMITTED_BY: &str = "http";
+
+async fn submit_matching(
+    state: &AppState,
+    spec: BatchOperationSpec,
+    payload: MatchingPayload,
+) -> Result<(StatusCode, Json<BatchOperation>), ApiError> {
+    state.require_writable()?;
+    let filter = payload.filter()?.clone();
+    let operation = batch_operations::submit_batch_operation(
+        &state.pool,
+        SubmitBatchOperation {
+            spec,
+            filter,
+            submitted_by: Some(MATCHING_SUBMITTED_BY.to_string()),
+            allow_all: payload.all,
+        },
+    )
+    .await?;
+    state.invalidate_dashboard_caches();
+    Ok((StatusCode::ACCEPTED, Json(operation)))
 }
 
 async fn retry_matching_filter(
@@ -208,13 +245,6 @@ pub async fn bulk_purge_dlq(
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
     purge_matching_filter(&state, &payload.filter(), payload.all).await
-}
-
-pub async fn purge_dlq_matching(
-    State(state): State<AppState>,
-    Json(payload): Json<MatchingPayload>,
-) -> Result<Json<CountResponse>, ApiError> {
-    purge_matching_filter(&state, payload.filter()?, payload.all).await
 }
 
 async fn purge_matching_filter(
