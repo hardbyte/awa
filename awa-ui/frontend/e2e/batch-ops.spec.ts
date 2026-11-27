@@ -211,18 +211,18 @@ test.describe("Batch operations page", () => {
 
     await page.goto("/batch-ops?queue=e2e_test");
     const submit = page.getByRole("button", { name: "Submit" });
-    await page.getByLabel("Operation").selectOption("retry");
+    await page.getByRole("combobox", { name: /^Operation/ }).selectOption("retry");
     await page.getByRole("button", { name: "Preview" }).click();
     await expect(submit).toBeEnabled();
 
-    await page.getByLabel("Operation").selectOption("purge_dlq");
+    await page.getByRole("combobox", { name: /^Operation/ }).selectOption("purge_dlq");
     await expect(submit).toBeDisabled();
     await expect(page.getByTestId("batch-submit-hint")).toHaveText(
       "Operation or filter changed; preview again"
     );
     await expect(page.getByTestId("batch-preview-count")).toHaveCount(0);
 
-    await page.getByLabel("Operation").selectOption("retry");
+    await page.getByRole("combobox", { name: /^Operation/ }).selectOption("retry");
     await expect(submit).toBeEnabled();
   });
 
