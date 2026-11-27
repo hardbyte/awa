@@ -6,17 +6,20 @@
 # those skews with PINNED RELEASE ARTIFACTS (awa-pg wheels from PyPI — the
 # compiled runtime, not a source build of an old tag):
 #
-#   forward-0.6.6   latest released 0.6.x lifecycle (enqueue/claim/complete/
-#                   cancel) against the newest schema. Proves additive refresh
-#                   migrations past the 0.6 migrator's recognized ceiling
-#                   (v043, e.g. the #422 jobs_compat refresh) do not need a
-#                   0.6.x patch: workers carry no version gate, only the
-#                   migrator does.
-#   forward-0.6.2   supported N-1 lifecycle (enqueue/claim/complete/cancel)
-#                   against the newest schema in columns authority, followed
-#                   by a post-flip fence check.
-#   forward-0.6.0   older data-plane regression leg against columns authority;
-#                   0.6.0 must not run migrate against the newer schema.
+#   forward-0.6.19  latest released 0.6.x lifecycle (enqueue/claim/complete/
+#                   cancel) against the newest schema in columns authority.
+#                   Proves additive refresh migrations past the 0.6 migrator's
+#                   recognized ceiling (v043, e.g. the #422 jobs_compat refresh)
+#                   do not need a 0.6.x patch: workers carry no version gate,
+#                   only the migrator does.
+#   forward-0.6.2   the same lifecycle on the oldest supported rolling-upgrade
+#                   source (the required 0.6.2 stepping-stone).
+#   post-flip       after the ring-authority flip, a 0.6.2 artifact, which
+#                   reads the ring cursor columns directly, is fenced: its
+#                   cancel fails loudly and the compat cursor stays poisoned.
+#                   0.6.19 reads the cursor through enqueue_ring_cursor(),
+#                   which follows the ledger after the flip, so it cannot
+#                   exercise this fence.
 #   forward-0.5.7   producers still route through the compat layer to the
 #                   active engine; workers are inert (canonical hot table is
 #                   empty on a finalized cluster). Asserted, not assumed.
@@ -24,10 +27,10 @@
 #                   live canonical work refuses loudly (ADR-037 gate) —
 #                   message content and exit code asserted.
 #
-#   backward-0.6     the newest `awa migrate` against an UNFINALIZED 0.6-final
-#                   schema with canonical work also refuses (v041 exists, so
-#                   there are pending migrations to gate), while the same
-#                   schema finalized upgrades cleanly.
+#   backward-0.6    the newest `awa migrate` against an UNFINALIZED schema
+#                   installed by the latest 0.6.x release, with canonical work,
+#                   also refuses (v041 exists, so there are pending migrations
+#                   to gate), while the same schema finalized upgrades cleanly.
 #
 # The support statement lives in docs/stability.md.
 set -euo pipefail
@@ -99,10 +102,8 @@ SQL
 # current-wheel shutdown is separately regressed on Python 3.12 in CI.
 COMPAT_PYTHON=${COMPAT_PYTHON:-3.13.12}
 echo "── setup: pinned release artifacts (PyPI wheels, Python ${COMPAT_PYTHON})"
-uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-060
-uv pip install --quiet --python .compat-venv-060 "awa-pg==0.6.0"
-uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-066
-uv pip install --quiet --python .compat-venv-066 "awa-pg==0.6.6"
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-0619
+uv pip install --quiet --python .compat-venv-0619 "awa-pg==0.6.19"
 uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-062
 uv pip install --quiet --python .compat-venv-062 "awa-pg==0.6.2"
 uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-057
@@ -116,7 +117,7 @@ if ! [[ "$repetitions" =~ ^[1-9][0-9]*$ ]] || [ "$repetitions" -gt 1000 ]; then
   exit 2
 fi
 for ((iteration=1; iteration<=repetitions; iteration++)); do
-  for version in 0.6.6 0.6.2 0.6.0; do
+  for version in 0.6.19 0.6.2; do
     suffix=${version//./}
     echo "── leg: forward-${version}, repetition ${iteration}/${repetitions}"
     DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION="$version" COMPAT_QUEUE="compat_forward_${suffix}" \
@@ -177,7 +178,7 @@ BACK06_DB=awa_compat_backward_06
 echo "── leg: backward guard (0.6-final unfinalized schema with work refuses; finalized upgrades)"
 psql_admin "DROP DATABASE IF EXISTS ${BACK06_DB} WITH (FORCE)"
 psql_admin "CREATE DATABASE ${BACK06_DB}"
-DATABASE_URL="${BASE_URL}/${BACK06_DB}" .compat-venv-060/bin/python - <<'PY'
+DATABASE_URL="${BASE_URL}/${BACK06_DB}" .compat-venv-0619/bin/python - <<'PY'
 import asyncio, os
 from dataclasses import dataclass
 import awa
@@ -190,7 +191,7 @@ async def main():
     client = awa.AsyncClient(os.environ["DATABASE_URL"])
     await client.migrate()
     await client.insert(LegacyJob(marker="stranded"), queue="compat_backward")
-    print("0.6.0 schema prepared with canonical job")
+    print("0.6.19 schema prepared with canonical job")
 
 asyncio.run(main())
 PY
@@ -217,7 +218,7 @@ UP06_DB=awa_compat_upgrade_06
 echo "── leg: the supported upgrade — finalized 0.6 schema with work migrates cleanly"
 psql_admin "DROP DATABASE IF EXISTS ${UP06_DB} WITH (FORCE)"
 psql_admin "CREATE DATABASE ${UP06_DB}"
-DATABASE_URL="${BASE_URL}/${UP06_DB}" .compat-venv-060/bin/python -c "
+DATABASE_URL="${BASE_URL}/${UP06_DB}" .compat-venv-0619/bin/python -c "
 import asyncio, os, awa
 async def main():
     client = awa.AsyncClient(os.environ['DATABASE_URL'])
@@ -235,7 +236,7 @@ VALUES ('queue_storage', 'awa', now())
 ON CONFLICT (backend) DO UPDATE
 SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
 SQL
-DATABASE_URL="${BASE_URL}/${UP06_DB}" .compat-venv-060/bin/python -c "
+DATABASE_URL="${BASE_URL}/${UP06_DB}" .compat-venv-0619/bin/python -c "
 import asyncio, os, awa
 from dataclasses import dataclass
 @dataclass

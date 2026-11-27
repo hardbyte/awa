@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             println!(
                 "{}",
-                serde_json::json!({"artifact":"awa=0.6.7","enqueued":result.is_some()})
+                serde_json::json!({"artifact":"awa=0.6.19","enqueued":result.is_some()})
             );
         }
         "serve" => {
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .leader_election_interval(Duration::from_millis(100))
                 .build()?;
             client.start().await?;
-            println!("READY awa=0.6.7");
+            println!("READY awa=0.6.19");
             use tokio::io::AsyncBufReadExt;
             let mut line = String::new();
             tokio::io::BufReader::new(tokio::io::stdin())

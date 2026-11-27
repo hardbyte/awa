@@ -663,7 +663,7 @@ names and enable complete-set registration. Inspect `awa cron plan OWNER` before
 removing declarations. A stopped fleet is an outage, never a delete signal;
 use explicit `cron retire-owner OWNER --apply` for decommissioning.
 
-Use current operator clients for owned schedules. The released 0.6.7 automatic
+Use current operator clients for owned schedules. The released 0.6.19 automatic
 enqueue and additive UPSERT paths are fenced on retired rows; old manual trigger
 uses a separate read/insert path and is outside the owned-schedule operator
 contract. Old physical deletion is rejected. Existing jobs and retries are not
