@@ -20,6 +20,8 @@ The 2026-07-12 production-style rehearsal established useful baseline evidence: 
 
 v042 was redesigned around an additive schema, explicit authority, and a runtime flip. It is the first application of this policy, but not a claim that every policy requirement was already met. In particular, during a migrate-first interval with only 0.6.2 workers, crash and heartbeat rescue remain available, but deadline rescue for newly written compact claim batches resumes only when a 0.7 runtime takes maintenance leadership — starting a 0.7 worker is not sufficient while a 0.6 runtime remains leader. That transitional limitation is documented in the 0.7 upgrade guide and is covered by the rehearsal in #427 (the compact deadline-rescue handoff cell). Future changes must either preserve maintenance semantics in N-1 or document and approve an explicit policy exception before release.
 
+*Note (2026-11-27):* the deadline-rescue limitation above holds for released 0.6.12 and older; from 0.6.13 the released fleet drops the overdue handler and its heartbeat rescue retries the job. The rehearsal cell now asserts that the expired attempt is rescued exactly once and completes, whichever runtime rescues it.
+
 ## Decision
 
 ### 1. Rolling is the default release contract
