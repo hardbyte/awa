@@ -4,8 +4,9 @@ import type { BatchOperationFilter, BatchOperationPreview, JobCount } from "@/li
 
 /**
  * Whether a filter names which jobs a batch operation changes. State and
- * `dead_lettered` don't: every eligible job is available or scheduled and
- * live, so the server refuses a filter that has nothing else.
+ * `dead_lettered` don't: each operation kind acts on a fixed set of states
+ * and either live or dead-lettered jobs, so a state alone still names every
+ * job in it and the server refuses a filter that has nothing else.
  */
 export function isNarrowing(filter: BatchOperationFilter): boolean {
   const tags = filter.tag === undefined ? [] : [filter.tag].flat();
@@ -52,8 +53,12 @@ function list(value: string | string[] | number[]): string {
   return [value].flat().join(", ");
 }
 
-/** The jobs a filter selects, in words. */
-export function describeFilter(filter: BatchOperationFilter): string {
+/** The jobs a filter selects, in words. `scope` names the jobs a filter
+ * without a state selects. */
+export function describeFilter(
+  filter: BatchOperationFilter,
+  scope: string = "available or scheduled"
+): string {
   const states = filter.state === undefined ? [] : [filter.state].flat();
   const parts: string[] = [];
   if (filter.queue) parts.push(`queue ${filter.queue}`);
@@ -62,6 +67,6 @@ export function describeFilter(filter: BatchOperationFilter): string {
   if (filter.ids && filter.ids.length > 0) parts.push(`id ${list(filter.ids)}`);
   if (filter.created_at_gte) parts.push(`created from ${filter.created_at_gte}`);
   if (filter.created_at_lt) parts.push(`created before ${filter.created_at_lt}`);
-  const scope = states.length > 0 ? states.join(" or ") : "available or scheduled";
-  return parts.length > 0 ? `${scope} jobs with ${parts.join(", ")}` : `${scope} jobs`;
+  const selected = states.length > 0 ? states.join(" or ") : scope;
+  return parts.length > 0 ? `${selected} jobs with ${parts.join(", ")}` : `${selected} jobs`;
 }

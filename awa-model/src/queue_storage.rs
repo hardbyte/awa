@@ -3358,6 +3358,16 @@ struct CancelJobTxResult {
     lane: Option<(String, i16)>,
 }
 
+/// What a by-ids bulk action did inside its transaction: the jobs it acted
+/// on, and the wakeups and claim-cursor advances
+/// [`QueueStorage::finish_bulk_action`] applies once the transaction commits.
+#[derive(Default)]
+pub(crate) struct BulkActionOutcome {
+    pub(crate) job_ids: BTreeSet<i64>,
+    wake_queues: BTreeSet<String>,
+    claim_cursor_advances: Vec<ClaimCursorAdvance>,
+}
+
 struct ReadyBatchMoveResult {
     moved: bool,
 }
@@ -11017,6 +11027,18 @@ impl QueueStorage {
             return Ok(Some((ready_row, waiting.state)));
         }
 
+        self.take_terminal_retry_row_tx(tx, job_id).await
+    }
+
+    /// Remove a failed or cancelled job's terminal row and return its ready
+    /// row and the state it leaves, without enqueueing it. A terminal row
+    /// another transaction holds locked is left alone.
+    async fn take_terminal_retry_row_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<(ExistingReadyRow, JobState)>, AwaError> {
+        let schema = self.schema();
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
         let terminal: Option<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
@@ -11126,6 +11148,44 @@ impl QueueStorage {
         tx.commit().await.map_err(map_sqlx_error)?;
         self.wake_queues_after_commit(pool, rows.iter().map(|row| row.queue.clone()));
         Ok((rows, unique_ids.len() as u64))
+    }
+
+    /// Retry the failed and cancelled jobs among `ids` on the caller's
+    /// transaction. Waiting jobs and jobs in any other state are left alone.
+    /// The retried rows' unique claims change in one key-ordered pass before
+    /// any lane is reserved; a key held by another job fails the call with
+    /// [`AwaError::UniqueConflict`], after which the transaction must be
+    /// rolled back.
+    pub(crate) async fn retry_terminal_jobs_by_ids_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+    ) -> Result<BulkActionOutcome, AwaError> {
+        let unique_ids: BTreeSet<i64> = ids.iter().copied().collect();
+        let mut outcome = BulkActionOutcome::default();
+        let mut taken = Vec::with_capacity(unique_ids.len());
+        for job_id in &unique_ids {
+            if let Some((ready_row, old_state)) =
+                self.take_terminal_retry_row_tx(tx, *job_id).await?
+            {
+                outcome.job_ids.insert(ready_row.job_id);
+                outcome.wake_queues.insert(ready_row.queue.clone());
+                taken.push((ready_row, Some(old_state)));
+            }
+        }
+        self.insert_existing_ready_rows_inner_tx(tx, taken, false)
+            .await?;
+        Ok(outcome)
+    }
+
+    /// Wake the queues and advance the claim cursors a committed bulk
+    /// action left behind.
+    pub(crate) async fn finish_bulk_action(&self, pool: &PgPool, outcome: BulkActionOutcome) {
+        self.wake_queues_after_commit(pool, outcome.wake_queues);
+        if !outcome.claim_cursor_advances.is_empty() {
+            self.advance_claim_cursors(pool, &outcome.claim_cursor_advances)
+                .await;
+        }
     }
 
     /// Write a `<outcome>` closure row for any matching open receipt.
@@ -12100,13 +12160,44 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
-        self.lock_claim_heads_of_jobs_tx(&mut tx, ids).await?;
+        let (rows, claim_cursor_advances) = self.cancel_jobs_by_ids_inner_tx(&mut tx, ids).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        self.advance_claim_cursors(pool, &claim_cursor_advances)
+            .await;
+        Ok(rows)
+    }
+
+    /// [`Self::cancel_jobs_by_ids`] on the caller's transaction. The claim
+    /// cursors advance in [`Self::finish_bulk_action`] after it commits.
+    pub(crate) async fn cancel_jobs_by_ids_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+    ) -> Result<BulkActionOutcome, AwaError> {
+        if ids.is_empty() {
+            return Ok(BulkActionOutcome::default());
+        }
+        let (rows, claim_cursor_advances) = self.cancel_jobs_by_ids_inner_tx(tx, ids).await?;
+        Ok(BulkActionOutcome {
+            job_ids: rows.iter().map(|row| row.id).collect(),
+            wake_queues: BTreeSet::new(),
+            claim_cursor_advances,
+        })
+    }
+
+    /// Cancel `ids` with one key-ordered unique-claim pass, after locking the
+    /// claim heads of their lanes and before ensuring any lane.
+    async fn cancel_jobs_by_ids_inner_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+    ) -> Result<(Vec<JobRow>, Vec<ClaimCursorAdvance>), AwaError> {
+        self.lock_claim_heads_of_jobs_tx(tx, ids).await?;
         let mut results = Vec::with_capacity(ids.len());
         for job_id in ids {
-            results.extend(self.cancel_job_tx(&mut tx, *job_id).await?);
+            results.extend(self.cancel_job_tx(tx, *job_id).await?);
         }
-        self.apply_cancel_claim_changes_tx(&mut tx, &results)
-            .await?;
+        self.apply_cancel_claim_changes_tx(tx, &results).await?;
         let mut rows = Vec::with_capacity(results.len());
         let mut claim_cursor_advances = Vec::new();
         let mut lanes = BTreeSet::new();
@@ -12118,12 +12209,9 @@ impl QueueStorage {
             rows.push(result.row);
         }
         for (queue, priority) in &lanes {
-            self.ensure_lane(&mut tx, queue, *priority, 0).await?;
+            self.ensure_lane(tx, queue, *priority, 0).await?;
         }
-        tx.commit().await.map_err(map_sqlx_error)?;
-        self.advance_claim_cursors(pool, &claim_cursor_advances)
-            .await;
-        Ok(rows)
+        Ok((rows, claim_cursor_advances))
     }
 
     /// Cancel every available, scheduled, retryable and waiting job in
@@ -19708,15 +19796,73 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let rows = self
+            .insert_moved_failed_into_dlq_tx(&mut tx, moved, dlq_reason)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows.len() as u64)
+    }
+
+    /// Move the failed, non-dead-lettered jobs among `ids` into the DLQ on
+    /// the caller's transaction. Jobs in any other state are left alone.
+    pub(crate) async fn move_failed_to_dlq_by_ids_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+        dlq_reason: &str,
+    ) -> Result<BulkActionOutcome, AwaError> {
+        let mut outcome = BulkActionOutcome::default();
+        if ids.is_empty() {
+            return Ok(outcome);
+        }
+        let schema = self.schema();
+        let done_projection = done_row_projection("done", "ready");
+        let ready_join = done_ready_join(schema, "done", "ready");
+        let moved: Vec<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH deleted AS (
+                DELETE FROM {schema}.done_entries
+                WHERE job_id = ANY($1::bigint[])
+                  AND state = 'failed'
+                RETURNING *
+            )
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
+            FROM deleted AS done
+            {ready_join}
+            "#
+        )))
+        .bind(ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if moved.is_empty() {
+            return Ok(outcome);
+        }
+        let rows = self
+            .insert_moved_failed_into_dlq_tx(tx, moved, dlq_reason)
+            .await?;
+        outcome.job_ids = rows.iter().map(|row| row.job_id).collect();
+        Ok(outcome)
+    }
+
+    /// Write failed rows just deleted from done_entries into the DLQ:
+    /// close their receipts, take them off the live terminal counters and
+    /// insert them as DLQ rows at their retained lane priority.
+    async fn insert_moved_failed_into_dlq_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        moved: Vec<HydratedTerminalRow>,
+        dlq_reason: &str,
+    ) -> Result<Vec<DlqJobRow>, AwaError> {
         let (moved, body_priorities): (Vec<_>, Vec<_>) = moved
             .into_iter()
             .map(|row| (row.terminal, row.body_priority))
             .unzip();
-        self.ensure_terminal_removed_receipt_closures_tx(&mut tx, &moved)
+        self.ensure_terminal_removed_receipt_closures_tx(tx, &moved)
             .await?;
         // Bulk DLQ move deletes from done_entries. Append negative deltas by
         // the per-group magnitudes of the moved rows.
-        self.decrement_live_terminal_counters_tx(&mut tx, &Self::done_rows_to_counter_keys(&moved))
+        self.decrement_live_terminal_counters_tx(tx, &Self::done_rows_to_counter_keys(&moved))
             .await?;
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
@@ -19727,10 +19873,9 @@ impl QueueStorage {
                 row.into_dlq_row(dlq_reason.to_string(), dlq_at)
             })
             .collect();
-        self.insert_dlq_rows_tx(&mut tx, &rows, Some(JobState::Failed))
+        self.insert_dlq_rows_tx(tx, &rows, Some(JobState::Failed))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(rows.len() as u64)
+        Ok(rows)
     }
 
     /// Release the unique claims of the DLQ rows `deleted` removed. A DLQ
@@ -19801,6 +19946,31 @@ impl QueueStorage {
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(deleted.len() as u64)
+    }
+
+    /// Delete the DLQ rows of `ids` on the caller's transaction, releasing
+    /// their unique claims.
+    pub(crate) async fn purge_dlq_by_ids_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+    ) -> Result<BulkActionOutcome, AwaError> {
+        let mut outcome = BulkActionOutcome::default();
+        if ids.is_empty() {
+            return Ok(outcome);
+        }
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            "DELETE FROM {}.dlq_entries WHERE job_id = ANY($1::bigint[]) \
+             RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema()
+        )))
+        .bind(ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(tx, &deleted).await?;
+        outcome.job_ids = deleted.iter().map(|row| row.job_id).collect();
+        Ok(outcome)
     }
 
     /// Delete one DLQ row, releasing its unique claim.
@@ -20035,6 +20205,72 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let revived = moved.len() as u64;
+        let queues = self.revive_deleted_dlq_rows_tx(&mut tx, moved).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues);
+        Ok(revived)
+    }
+
+    /// Move the DLQ rows of `ids` back to ready on the caller's transaction.
+    /// A unique key held by another job fails the call with
+    /// [`AwaError::UniqueConflict`], after which the transaction must be
+    /// rolled back.
+    pub(crate) async fn retry_from_dlq_by_ids_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+    ) -> Result<BulkActionOutcome, AwaError> {
+        let mut outcome = BulkActionOutcome::default();
+        if ids.is_empty() {
+            return Ok(outcome);
+        }
+        let schema = self.schema();
+        let moved: Vec<DlqJobRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE job_id = ANY($1::bigint[])
+            RETURNING
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                COALESCE(payload, '{{}}'::jsonb) AS payload,
+                dlq_reason,
+                dlq_at,
+                original_run_lease
+            "#
+        )))
+        .bind(ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if moved.is_empty() {
+            return Ok(outcome);
+        }
+        outcome.job_ids = moved.iter().map(|row| row.job_id).collect();
+        outcome.wake_queues = self.revive_deleted_dlq_rows_tx(tx, moved).await?;
+        Ok(outcome)
+    }
+
+    /// Enqueue DLQ rows just deleted from dlq_entries as fresh ready rows
+    /// in their own queue and priority, and return the queues to wake.
+    async fn revive_deleted_dlq_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        moved: Vec<DlqJobRow>,
+    ) -> Result<BTreeSet<String>, AwaError> {
         let run_at = Utc::now();
         let mut queues = BTreeSet::new();
         let mut ready_rows = Vec::with_capacity(moved.len());
@@ -20051,13 +20287,9 @@ impl QueueStorage {
                 payload.into_json(),
             ));
         }
-
-        let revived = ready_rows.len() as u64;
-        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Failed))
+        self.insert_existing_ready_rows_tx(tx, ready_rows, Some(JobState::Failed))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        self.wake_queues_after_commit(pool, queues);
-        Ok(revived)
+        Ok(queues)
     }
 
     pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
@@ -20144,6 +20376,67 @@ impl QueueStorage {
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok((deleted_done.len() + deleted_dlq.len()) as u64)
+    }
+
+    /// Delete the failed terminal rows of `ids` on the caller's transaction,
+    /// releasing their unique claims. DLQ rows and jobs in any other state
+    /// are left alone.
+    pub(crate) async fn discard_failed_by_ids_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+    ) -> Result<BulkActionOutcome, AwaError> {
+        let mut outcome = BulkActionOutcome::default();
+        if ids.is_empty() {
+            return Ok(outcome);
+        }
+        let schema = self.schema();
+        let done_projection = done_row_projection("done", "ready");
+        let ready_join = done_ready_join(schema, "done", "ready");
+        let deleted_done: Vec<DoneJobRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH deleted AS (
+                DELETE FROM {schema}.done_entries
+                WHERE job_id = ANY($1::bigint[])
+                  AND state = 'failed'
+                RETURNING *
+            )
+            SELECT {done_projection}
+            FROM deleted AS done
+            {ready_join}
+            "#
+        )))
+        .bind(ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if deleted_done.is_empty() {
+            return Ok(outcome);
+        }
+
+        self.ensure_terminal_removed_receipt_closures_tx(tx, &deleted_done)
+            .await?;
+        self.decrement_live_terminal_counters_tx(
+            tx,
+            &Self::done_rows_to_counter_keys(&deleted_done),
+        )
+        .await?;
+        let changes = deleted_done
+            .iter()
+            .filter_map(|row| {
+                unique_claim_change(
+                    row.job_id,
+                    row.unique_key.as_deref(),
+                    row.unique_states.as_deref(),
+                    Some(row.state),
+                    None,
+                )
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        outcome.job_ids = deleted_done.iter().map(|row| row.job_id).collect();
+        Ok(outcome)
     }
 
     pub async fn fail_retryable(

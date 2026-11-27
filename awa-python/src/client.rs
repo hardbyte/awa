@@ -4072,6 +4072,17 @@ fn parse_batch_operation_spec(
                 .transpose()?;
             Ok(BatchOperationSpec::MoveQueue { queue, priority })
         }
+        BatchOperationKind::Retry => Ok(BatchOperationSpec::Retry),
+        BatchOperationKind::Cancel => Ok(BatchOperationSpec::Cancel),
+        BatchOperationKind::Discard => Ok(BatchOperationSpec::Discard),
+        BatchOperationKind::MoveToDlq => {
+            let reason = optional_dict_item(dict, "reason")?
+                .map(|value| value.extract::<String>())
+                .transpose()?;
+            Ok(BatchOperationSpec::MoveToDlq { reason })
+        }
+        BatchOperationKind::RetryFromDlq => Ok(BatchOperationSpec::RetryFromDlq),
+        BatchOperationKind::PurgeDlq => Ok(BatchOperationSpec::PurgeDlq),
     }
 }
 

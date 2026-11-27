@@ -39,7 +39,16 @@ DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT = 8
 DEFAULT_QUEUE_STORAGE_CLAIM_SLOT_COUNT = 8
 DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT = 1
 
-BatchOperationKind = Literal["set_priority", "move_queue"]
+BatchOperationKind = Literal[
+    "set_priority",
+    "move_queue",
+    "retry",
+    "cancel",
+    "discard",
+    "move_to_dlq",
+    "retry_from_dlq",
+    "purge_dlq",
+]
 BatchOperationState = Literal[
     "pending",
     "scanning",
@@ -513,19 +522,19 @@ class AsyncClient:
         self,
         op_kind: BatchOperationKind,
         *,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None = None,
         filter: BatchOperationFilter | None = None,
     ) -> BatchOperationPreview:
         """Preview a durable batch operation without submitting it."""
         return await self._raw.preview_batch_operation(
-            op_kind, spec, filter=filter
+            op_kind, spec or {}, filter=filter
         )
 
     async def submit_batch_operation(
         self,
         op_kind: BatchOperationKind,
         *,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None = None,
         filter: BatchOperationFilter | None = None,
         submitted_by: str | None = None,
         allow_all: bool = False,
@@ -533,7 +542,7 @@ class AsyncClient:
         """Submit a durable batch operation for maintenance-led execution."""
         return await self._raw.submit_batch_operation(
             op_kind,
-            spec,
+            spec or {},
             filter=filter,
             submitted_by=submitted_by,
             allow_all=allow_all,
@@ -1428,17 +1437,17 @@ class Client:
         self,
         op_kind: BatchOperationKind,
         *,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None = None,
         filter: BatchOperationFilter | None = None,
     ) -> BatchOperationPreview:
         """Preview a durable batch operation without submitting it."""
-        return self._raw.preview_batch_operation_sync(op_kind, spec, filter=filter)
+        return self._raw.preview_batch_operation_sync(op_kind, spec or {}, filter=filter)
 
     def submit_batch_operation(
         self,
         op_kind: BatchOperationKind,
         *,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None = None,
         filter: BatchOperationFilter | None = None,
         submitted_by: str | None = None,
         allow_all: bool = False,
@@ -1446,7 +1455,7 @@ class Client:
         """Submit a durable batch operation for maintenance-led execution."""
         return self._raw.submit_batch_operation_sync(
             op_kind,
-            spec,
+            spec or {},
             filter=filter,
             submitted_by=submitted_by,
             allow_all=allow_all,

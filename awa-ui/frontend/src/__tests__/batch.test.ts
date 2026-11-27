@@ -97,4 +97,11 @@ describe("describeFilter", () => {
   it("names a chosen state", () => {
     expect(describeFilter({ queue: "q", state: "scheduled" })).toBe("scheduled jobs with queue q");
   });
+
+  it("names the operation kind's states when no state is chosen", () => {
+    expect(describeFilter({ queue: "q" }, "dead-lettered")).toBe("dead-lettered jobs with queue q");
+    expect(describeFilter({ queue: "q", state: "cancelled" }, "failed or cancelled")).toBe(
+      "cancelled jobs with queue q"
+    );
+  });
 });
