@@ -106,9 +106,10 @@ Awa runs mixed-version fleets during a rollout; the constraints are version
 specific, so follow the matching upgrade doc. The 0.6 → 0.7 upgrade is the
 current worked example and its shape generalizes:
 
-1. **Stepping stone first.** Roll the entire fleet to 0.6.2+ before applying the
-   0.7 (v043) ring-rotation migration. 0.6.0/0.6.1 misclassify a newer schema
-   destructively (#392).
+1. **Stepping stone first.** Roll the entire fleet to 0.6.2 or later before
+   applying the 0.7 (v043) ring-rotation migration; 0.6.19 is recommended, as
+   the release gate rehearses the upgrade from it. 0.6.0/0.6.1 misclassify a
+   newer schema destructively (#392).
 2. **Finalize storage.** A 0.7 binary refuses `awa migrate` unless the storage
    transition is finalized (`storage status` shows `state=active`,
    `current_engine=queue_storage`) or the install is fresh.
@@ -124,9 +125,10 @@ Crash-safety facts to respect:
 - After the flip, roll back only to another 0.7 build. The flip poisons the
   compatibility cursor fields and a database trigger rejects old-style cursor
   advances, so a returning pre-flip binary fails loudly.
-- While a v043 fleet is still all-0.6.2, deadline-based rescue resumes only once
-  a 0.7 runtime takes maintenance leadership. Roll the maintenance leader
-  promptly.
+- While a v043 fleet is still all-0.6 on 0.6.12 or older, deadline-based
+  rescue resumes only once a 0.7 runtime takes maintenance leadership. From
+  0.6.13 the released fleet drops the overdue handler and its heartbeat rescue
+  retries the job. Roll the maintenance leader promptly.
 
 The `flip-ring-authority` step itself has a hard guard — see Storage
 Transitions below.
@@ -233,11 +235,21 @@ awa dlq list --queue emails --limit 20
 awa dlq retry <id>                       # resets attempt/lease, re-runs
 awa dlq retry-bulk --queue emails        # bulk; --all required with no filter
 awa dlq purge --kind SendEmail           # destructive; --all required if unfiltered
+awa dlq purge --kind SendEmail --wait    # wait for the batch operation to finish
 ```
 
 - Retry resets the job to `attempt=0`, `run_lease=0` on the runnable path with
   its stored queue/priority and immediate `run_at`. Use the programmatic retry
   APIs to override those.
+- `retry-bulk` and `purge` submit a `retry_from_dlq` / `purge_dlq` batch
+  operation (`submitted_by: "cli"`) and print its id; nothing changes until a
+  worker's maintenance leader applies it. Follow it with
+  `awa batch-ops get <id>`, or pass `--wait` to poll until it finishes and
+  print processed/skipped/errored (non-zero exit if it fails).
+- Python's `bulk_retry_from_dlq` and `purge_dlq` submit the same operations
+  (`submitted_by: "python"`) and return them. `purge_dlq_before` purges in one
+  transaction up to a `before_id` / `before_dlq_at` cursor (one is required)
+  and returns a count.
 - `retry-bulk`, `purge`, and `move` require `--all` when no filter is given —
   the guard against reviving or wiping the whole DLQ. Purge is unrecoverable;
   prefer `retry-bulk` if you might want the data back.
@@ -269,8 +281,8 @@ awa batch-ops cancel <id>
   `POST /api/dlq/retry-matching` / `/purge-matching` submit a `retry_from_dlq`
   / `purge_dlq` operation and answer `202` with it; follow it on the Batch
   Operations page or with `awa batch-ops get`. Nothing changes until a worker's
-  maintenance leader runs it. `awa dlq retry-bulk` and `purge` still act in one
-  transaction and print a count.
+  maintenance leader runs it. `awa dlq retry-bulk` and `purge` submit the same
+  operations.
 - An item whose row another transaction holds stays pending and is retried on
   a later chunk; one whose retry hits a unique key held by a newer job is
   recorded `errored` and the rest proceed.

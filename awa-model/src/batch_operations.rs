@@ -158,7 +158,7 @@ impl TryFrom<&str> for BatchOperationState {
 }
 
 impl BatchOperationState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Scanning => "scanning",

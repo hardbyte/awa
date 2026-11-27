@@ -51,9 +51,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "awa"
-version = "0.6.7"
+version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a349b70e12bb08aa648e0358875962b038ca299f7b59deb090eb564683e0dc7"
+checksum = "a8cac7108d540a3ec6a7ee7802a09947e0f7e07bb7c0b2ea7d0cbfbdfb4c3676"
 dependencies = [
  "awa-macros",
  "awa-model",
@@ -74,9 +74,9 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.6.7"
+version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f43c8f6e738b3e78498380cb4e821c2bd7292c3fdde96a1368b21cf8393dd4fb"
+checksum = "151bb6ee1270a7207c27d1e5201c1912b63f919c1296d6a9dea88b0411a2d21c"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -86,9 +86,9 @@ dependencies = [
 
 [[package]]
 name = "awa-metrics"
-version = "0.6.7"
+version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88f889c417bd9e35f82cca87fe640117158585e604f80dbdd333a6ef8868e7b9"
+checksum = "2635fab9dec1ac6671b0b7876ea8a930c13b65222865c76b8b864f3af62de14f"
 dependencies = [
  "awa-model",
  "opentelemetry",
@@ -96,9 +96,9 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.6.7"
+version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c03851c15609b84db492bc0d0239f1f633ea183d42db1e1f9da974a0c371a559"
+checksum = "0feaa117f47a71a1d7a1bf8dc6bfce915f5c01cb318af60da8a3fb5419c05460"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -117,9 +117,9 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.6.7"
+version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe533630cc9f4f3b3b59367aec4d9b45d72019b254efa88dbcbfb10562f5d3"
+checksum = "5db0df13302cf97137cd2cb387555a375c100de3d899f4ce6ae28af19abd14ff"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -488,6 +488,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -507,6 +518,7 @@ checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
@@ -1708,6 +1720,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

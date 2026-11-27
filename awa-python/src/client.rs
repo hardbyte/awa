@@ -1560,7 +1560,7 @@ impl PyClient {
         let filter = parse_batch_operation_filter(py, filter.as_ref())?;
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let operation = awa_model::batch_operations::submit_batch_operation(
+            submit_operation(
                 &pool,
                 SubmitBatchOperation {
                     spec,
@@ -1570,8 +1570,6 @@ impl PyClient {
                 },
             )
             .await
-            .map_err(map_awa_error)?;
-            Python::attach(|py| batch_operation_to_py(py, &operation))
         })
     }
 
@@ -1727,9 +1725,9 @@ impl PyClient {
         })
     }
 
-    /// Bulk retry DLQ rows matching a filter dict and/or kind/queue/tag.
-    /// Returns the count of revived jobs. Requires a filter unless
-    /// `allow_all=True`.
+    /// Submit a `retry_from_dlq` batch operation for the DLQ rows matching a
+    /// filter dict and/or kind/queue/tag, and return it. Requires a filter
+    /// unless `allow_all=True`.
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, allow_all=false))]
     fn bulk_retry_from_dlq<'py>(
         &self,
@@ -1740,23 +1738,20 @@ impl PyClient {
         filter: Option<Py<PyAny>>,
         allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let filter = crate::filter::with_legacy_fields(
-            crate::filter::parse_job_filter(py, filter.as_ref())?,
+        let request = dlq_batch_operation(
+            py,
+            BatchOperationSpec::RetryFromDlq,
             kind,
             queue,
             tag,
+            filter,
+            allow_all,
         )?;
         let pool = self.pool.clone();
-        let metrics = self.metrics.clone();
-        crate::async_bridge::future_into_py(py, async move {
-            let count = awa_model::dlq::bulk_retry_from_dlq_matching(&pool, &filter, allow_all)
-                .await
-                .map_err(map_awa_error)?;
-            if count > 0 {
-                metrics.record_dlq_retried(filter.queue.as_deref(), count);
-            }
-            Ok(count)
-        })
+        crate::async_bridge::future_into_py(
+            py,
+            async move { submit_operation(&pool, request).await },
+        )
     }
 
     /// Move an already-failed job (in `jobs_hot`) into the DLQ. Returns the
@@ -1845,11 +1840,42 @@ impl PyClient {
         })
     }
 
-    /// Purge DLQ rows matching a filter dict and/or kind/queue/tag. Requires
-    /// a filter unless `allow_all=True`.
+    /// Submit a `purge_dlq` batch operation for the DLQ rows matching a
+    /// filter dict and/or kind/queue/tag, and return it. Requires a filter
+    /// unless `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, allow_all=false))]
+    fn purge_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        filter: Option<Py<PyAny>>,
+        allow_all: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = dlq_batch_operation(
+            py,
+            BatchOperationSpec::PurgeDlq,
+            kind,
+            queue,
+            tag,
+            filter,
+            allow_all,
+        )?;
+        let pool = self.pool.clone();
+        crate::async_bridge::future_into_py(
+            py,
+            async move { submit_operation(&pool, request).await },
+        )
+    }
+
+    /// Purge, in one transaction, the DLQ rows matching a filter dict and/or
+    /// kind/queue/tag that sort before the `(before_dlq_at, before_id)`
+    /// cursor, and return how many were deleted. Requires at least one of
+    /// `before_id` / `before_dlq_at`, and a filter unless `allow_all=True`.
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, before_id=None, before_dlq_at=None, allow_all=false))]
     #[allow(clippy::too_many_arguments)]
-    fn purge_dlq<'py>(
+    fn purge_dlq_before<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
@@ -1860,6 +1886,7 @@ impl PyClient {
         before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        require_dlq_cursor(before_id, before_dlq_at)?;
         let filter = crate::filter::with_legacy_fields(
             crate::filter::parse_job_filter(py, filter.as_ref())?,
             kind,
@@ -3193,20 +3220,15 @@ impl PyClient {
         let filter = parse_batch_operation_filter(py, filter.as_ref())?;
         let pool = self.pool.clone();
         py.detach(|| {
-            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let operation = awa_model::batch_operations::submit_batch_operation(
-                    &pool,
-                    SubmitBatchOperation {
-                        spec,
-                        filter,
-                        submitted_by,
-                        allow_all,
-                    },
-                )
-                .await
-                .map_err(map_awa_error)?;
-                Python::attach(|py| batch_operation_to_py(py, &operation))
-            })
+            pyo3_async_runtimes::tokio::get_runtime().block_on(submit_operation(
+                &pool,
+                SubmitBatchOperation {
+                    spec,
+                    filter,
+                    submitted_by,
+                    allow_all,
+                },
+            ))
         })
     }
 
@@ -3413,25 +3435,19 @@ impl PyClient {
         tag: Option<String>,
         filter: Option<Py<PyAny>>,
         allow_all: bool,
-    ) -> PyResult<u64> {
-        let filter = crate::filter::with_legacy_fields(
-            crate::filter::parse_job_filter(py, filter.as_ref())?,
+    ) -> PyResult<Py<PyAny>> {
+        let request = dlq_batch_operation(
+            py,
+            BatchOperationSpec::RetryFromDlq,
             kind,
             queue,
             tag,
+            filter,
+            allow_all,
         )?;
         let pool = self.pool.clone();
-        let metrics = self.metrics.clone();
         py.detach(|| {
-            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::bulk_retry_from_dlq_matching(&pool, &filter, allow_all)
-                    .await
-                    .map_err(map_awa_error)?;
-                if count > 0 {
-                    metrics.record_dlq_retried(filter.queue.as_deref(), count);
-                }
-                Ok(count)
-            })
+            pyo3_async_runtimes::tokio::get_runtime().block_on(submit_operation(&pool, request))
         })
     }
 
@@ -3513,9 +3529,34 @@ impl PyClient {
         })
     }
 
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, allow_all=false))]
+    fn purge_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        filter: Option<Py<PyAny>>,
+        allow_all: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let request = dlq_batch_operation(
+            py,
+            BatchOperationSpec::PurgeDlq,
+            kind,
+            queue,
+            tag,
+            filter,
+            allow_all,
+        )?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(submit_operation(&pool, request))
+        })
+    }
+
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, before_id=None, before_dlq_at=None, allow_all=false))]
     #[allow(clippy::too_many_arguments)]
-    fn purge_dlq_sync(
+    fn purge_dlq_before_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
@@ -3526,6 +3567,7 @@ impl PyClient {
         before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
     ) -> PyResult<u64> {
+        require_dlq_cursor(before_id, before_dlq_at)?;
         let filter = crate::filter::with_legacy_fields(
             crate::filter::parse_job_filter(py, filter.as_ref())?,
             kind,
@@ -4103,6 +4145,51 @@ fn optional_dict_item<'py>(
 fn required_dict_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
     optional_dict_item(dict, key)?.ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!("batch operation spec missing '{key}'"))
+    })
+}
+
+async fn submit_operation(pool: &PgPool, request: SubmitBatchOperation) -> PyResult<Py<PyAny>> {
+    let operation = awa_model::batch_operations::submit_batch_operation(pool, request)
+        .await
+        .map_err(map_awa_error)?;
+    Python::attach(|py| batch_operation_to_py(py, &operation))
+}
+
+fn require_dlq_cursor(
+    before_id: Option<i64>,
+    before_dlq_at: Option<DateTime<Utc>>,
+) -> PyResult<()> {
+    if before_id.is_none() && before_dlq_at.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "purge_dlq_before needs before_id or before_dlq_at; use purge_dlq to purge every matching row",
+        ));
+    }
+    Ok(())
+}
+
+/// `submitted_by` of the batch operations the DLQ bulk helpers submit.
+const DLQ_SUBMITTED_BY: &str = "python";
+
+fn dlq_batch_operation(
+    py: Python<'_>,
+    spec: BatchOperationSpec,
+    kind: Option<String>,
+    queue: Option<String>,
+    tag: Option<String>,
+    filter: Option<Py<PyAny>>,
+    allow_all: bool,
+) -> PyResult<SubmitBatchOperation> {
+    let filter = crate::filter::with_legacy_fields(
+        crate::filter::parse_job_filter(py, filter.as_ref())?,
+        kind,
+        queue,
+        tag,
+    )?;
+    Ok(SubmitBatchOperation {
+        spec,
+        filter,
+        submitted_by: Some(DLQ_SUBMITTED_BY.to_string()),
+        allow_all,
     })
 }
 

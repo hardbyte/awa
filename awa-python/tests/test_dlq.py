@@ -5,6 +5,7 @@ dedicated queue_storage schema and materialize failed rows inside that schema
 before exercising list/retry/purge behavior.
 """
 
+import datetime as dt
 import os
 from dataclasses import dataclass
 
@@ -189,6 +190,12 @@ async def _move_ready_to_failed_done_async(client: awa.AsyncClient, job_id: int)
         )
 
 
+def _delete_batch_operation(client: awa.Client, operation_id: str) -> None:
+    tx = client.transaction()
+    tx.execute("DELETE FROM awa.batch_operations WHERE id = $1::uuid", operation_id)
+    tx.commit()
+
+
 @pytest.fixture
 def sync_client():
     client = awa.Client(DATABASE_URL)
@@ -245,9 +252,13 @@ def test_bulk_move_and_purge(sync_client):
     assert moved == 3
     assert sync_client.dlq_depth(queue=queue) == 3
 
-    purged = sync_client.purge_dlq(queue=queue)
-    assert purged == 3
-    assert sync_client.dlq_depth(queue=queue) == 0
+    operation = sync_client.purge_dlq(queue=queue)
+    _delete_batch_operation(sync_client, operation["id"])
+    assert operation["op_kind"] == "purge_dlq"
+    assert operation["state"] == "pending"
+    assert operation["submitted_by"] == "python"
+    assert operation["filter"] == {"queue": queue}
+    assert sync_client.dlq_depth(queue=queue) == 3, "submitting changes no row"
 
 
 def test_retry_from_dlq_revives(sync_client):
@@ -283,9 +294,13 @@ def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
     with pytest.raises(awa.ValidationError):
         sync_client.bulk_retry_from_dlq()
 
-    retried = sync_client.bulk_retry_from_dlq(allow_all=True)
-    assert retried == 1
-    assert sync_client.dlq_depth(queue="pydlq_retry_all") == 0
+    operation = sync_client.bulk_retry_from_dlq(allow_all=True)
+    _delete_batch_operation(sync_client, operation["id"])
+    assert operation["op_kind"] == "retry_from_dlq"
+    assert operation["state"] == "pending"
+    assert operation["submitted_by"] == "python"
+    assert operation["filter"] == {}
+    assert sync_client.dlq_depth(queue="pydlq_retry_all") == 1, "submitting changes no row"
 
     purge_job = sync_client.insert(DlqPyJob(value="purge_all"), queue="pydlq_purge_all")
     _move_ready_to_failed_done(sync_client, purge_job.id)
@@ -294,9 +309,16 @@ def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
     with pytest.raises(awa.ValidationError):
         sync_client.purge_dlq()
 
-    purged = sync_client.purge_dlq(allow_all=True)
-    assert purged == 1
-    assert sync_client.dlq_depth(queue="pydlq_purge_all") == 0
+    operation = sync_client.purge_dlq(allow_all=True)
+    _delete_batch_operation(sync_client, operation["id"])
+    assert operation["op_kind"] == "purge_dlq"
+    assert operation["filter"] == {}
+    assert sync_client.dlq_depth(queue="pydlq_purge_all") == 1, "submitting changes no row"
+
+    with pytest.raises(ValueError, match="before_id or before_dlq_at"):
+        sync_client.purge_dlq_before(allow_all=True)
+    with pytest.raises(ValueError, match="before_id or before_dlq_at"):
+        sync_client.purge_dlq_before(queue="pydlq_purge_all")
 
 
 def test_list_dlq_composite_cursor_walks_non_monotonic_dlq_at(sync_client):
@@ -368,7 +390,8 @@ def test_list_dlq_composite_cursor_walks_non_monotonic_dlq_at(sync_client):
     )
 
     # Cleanup so the queue's depth is back to zero for any later test.
-    sync_client.purge_dlq(queue=queue, allow_all=True)
+    after_all = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+    assert sync_client.purge_dlq_before(queue=queue, before_dlq_at=after_all) == 4
 
 
 def test_list_and_purge_with_before_dlq_at_only(sync_client):
@@ -393,7 +416,7 @@ def test_list_and_purge_with_before_dlq_at_only(sync_client):
     paged = sync_client.list_dlq(queue=queue, before_dlq_at=listed[0].dlq_at)
     assert [entry.job.id for entry in paged] == [older.id]
 
-    purged = sync_client.purge_dlq(queue=queue, before_dlq_at=listed[0].dlq_at)
+    purged = sync_client.purge_dlq_before(queue=queue, before_dlq_at=listed[0].dlq_at)
     assert purged == 1
     remaining = sync_client.list_dlq(queue=queue)
     assert [entry.job.id for entry in remaining] == [newer.id]
@@ -448,6 +471,26 @@ async def test_async_dlq_flow():
 
         depth = await client.dlq_depth(queue="pydlq_async")
         assert depth == 1
+
+        operation = await client.bulk_retry_from_dlq(queue="pydlq_async")
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.batch_operations WHERE id = $1::uuid", operation["id"])
+        await tx.commit()
+        assert operation["op_kind"] == "retry_from_dlq"
+        assert operation["submitted_by"] == "python"
+        assert operation["filter"] == {"queue": "pydlq_async"}
+        assert await client.dlq_depth(queue="pydlq_async") == 1
+
+        operation = await client.purge_dlq(queue="pydlq_async")
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.batch_operations WHERE id = $1::uuid", operation["id"])
+        await tx.commit()
+        assert operation["op_kind"] == "purge_dlq"
+        assert operation["submitted_by"] == "python"
+        assert operation["filter"] == {"queue": "pydlq_async"}
+        assert await client.dlq_depth(queue="pydlq_async") == 1
+        with pytest.raises(ValueError, match="before_id or before_dlq_at"):
+            await client.purge_dlq_before(queue="pydlq_async")
 
         revived = await client.retry_from_dlq(job.id)
         assert revived is not None

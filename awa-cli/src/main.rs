@@ -565,6 +565,73 @@ fn parse_batch_operation_state(
     }
 }
 
+/// `submitted_by` of the batch operations `awa dlq retry-bulk` and `purge` submit.
+const DLQ_SUBMITTED_BY: &str = "cli";
+
+/// How often `--wait` reads the operation back.
+const BATCH_OPERATION_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Submits a DLQ batch operation for the maintenance leader to apply and,
+/// with `wait`, polls it until it is finalized.
+async fn submit_dlq_batch_operation(
+    pool: &sqlx::PgPool,
+    spec: awa_model::batch_operations::BatchOperationSpec,
+    filter: awa_model::JobFilter,
+    all: bool,
+    wait: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use awa_model::batch_operations::{self, BatchOperationState, SubmitBatchOperation};
+
+    let operation = batch_operations::submit_batch_operation(
+        pool,
+        SubmitBatchOperation {
+            spec,
+            filter,
+            submitted_by: Some(DLQ_SUBMITTED_BY.to_string()),
+            allow_all: all,
+        },
+    )
+    .await?;
+    let id = operation.id;
+    println!(
+        "Submitted {} batch operation {id} ({}).",
+        operation.op_kind.as_str(),
+        operation.state.as_str()
+    );
+    if !wait {
+        println!(
+            "The maintenance leader applies it while a worker runs; follow it with `awa batch-ops get {id}`."
+        );
+        return Ok(());
+    }
+    let operation = loop {
+        let operation = batch_operations::get_batch_operation(pool, id).await?;
+        if matches!(
+            operation.state,
+            BatchOperationState::Completed
+                | BatchOperationState::Cancelled
+                | BatchOperationState::Failed
+        ) {
+            break operation;
+        }
+        tokio::time::sleep(BATCH_OPERATION_WAIT_POLL).await;
+    };
+    println!(
+        "Batch operation {id} {}: {} processed, {} skipped, {} errored.",
+        operation.state.as_str(),
+        operation.processed,
+        operation.skipped,
+        operation.errored
+    );
+    if let Some(last_error) = operation.last_error.as_deref() {
+        println!("Last error: {last_error}");
+    }
+    if operation.state == BatchOperationState::Failed {
+        return Err(format!("batch operation {id} failed").into());
+    }
+    Ok(())
+}
+
 fn parse_batch_operation_spec(
     op_kind: &str,
     spec: &str,
@@ -678,7 +745,7 @@ enum DlqCommands {
     },
     /// Retry a single DLQ'd job by id
     Retry { id: i64 },
-    /// Retry DLQ rows in bulk matching the filter
+    /// Submit a batch operation retrying the DLQ rows matching the filter
     RetryBulk {
         #[command(flatten)]
         filter: FilterArgs,
@@ -687,6 +754,9 @@ enum DlqCommands {
         /// the entire DLQ.
         #[arg(long)]
         all: bool,
+        /// Wait for the batch operation to finish and print its counters
+        #[arg(long)]
+        wait: bool,
     },
     /// Move existing failed terminal rows into the DLQ
     Move {
@@ -700,7 +770,7 @@ enum DlqCommands {
         #[arg(long)]
         all: bool,
     },
-    /// Purge (delete) DLQ rows matching the filter
+    /// Submit a batch operation purging (deleting) the DLQ rows matching the filter
     Purge {
         #[command(flatten)]
         filter: FilterArgs,
@@ -709,6 +779,9 @@ enum DlqCommands {
         /// the DLQ.
         #[arg(long)]
         all: bool,
+        /// Wait for the batch operation to finish and print its counters
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -1615,17 +1688,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 None => println!("No DLQ row with id {id}"),
                             }
                         }
-                        DlqCommands::RetryBulk { filter, all } => {
-                            let count = awa_model::dlq::bulk_retry_from_dlq_matching(
+                        DlqCommands::RetryBulk { filter, all, wait } => {
+                            submit_dlq_batch_operation(
                                 &pool,
-                                &filter.job_filter()?,
+                                awa_model::batch_operations::BatchOperationSpec::RetryFromDlq,
+                                filter.job_filter()?,
                                 all,
+                                wait,
                             )
                             .await?;
-                            if count > 0 {
-                                metrics.record_dlq_retried(filter.queue.as_deref(), count);
-                            }
-                            println!("Retried {count} DLQ rows.");
                         }
                         DlqCommands::Move {
                             kind,
@@ -1652,17 +1723,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             println!("Moved {count} failed jobs into the DLQ.");
                         }
-                        DlqCommands::Purge { filter, all } => {
-                            let count = awa_model::dlq::purge_dlq_matching(
+                        DlqCommands::Purge { filter, all, wait } => {
+                            submit_dlq_batch_operation(
                                 &pool,
-                                &filter.job_filter()?,
+                                awa_model::batch_operations::BatchOperationSpec::PurgeDlq,
+                                filter.job_filter()?,
                                 all,
+                                wait,
                             )
                             .await?;
-                            if count > 0 {
-                                metrics.record_dlq_purged(filter.queue.as_deref(), count);
-                            }
-                            println!("Purged {count} DLQ rows.");
                         }
                     }
                 }
