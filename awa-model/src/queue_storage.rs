@@ -4033,16 +4033,17 @@ fn stripe_of_sql(queue: &str, logical: &str, usize_max: &str) -> String {
     )
 }
 
-/// The unique-claim fields of a deleted DLQ row.
+/// The unique-claim fields and attempt of a deleted DLQ row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DeletedDlqRow {
     job_id: i64,
     state: JobState,
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
+    run_lease: i64,
 }
 
-const DELETED_DLQ_COLUMNS: &str = "job_id, state, unique_key, unique_states";
+const DELETED_DLQ_COLUMNS: &str = "job_id, state, unique_key, unique_states, run_lease";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DlqJobRow {
@@ -19878,6 +19879,106 @@ impl QueueStorage {
         Ok(rows)
     }
 
+    /// Release the unique claims of the DLQ rows `deleted` removed, then
+    /// tombstone the ready bodies their jobs left behind.
+    async fn finish_deleted_dlq_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: &[DeletedDlqRow],
+    ) -> Result<(), AwaError> {
+        self.release_deleted_dlq_claims_tx(tx, deleted).await?;
+        let attempts: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.tombstone_dlq_ready_bodies_tx(tx, &attempts).await
+    }
+
+    /// Tombstone the ready bodies of jobs whose DLQ rows were deleted, given
+    /// as `(job_id, run_lease)` of each deleted row. A dead-lettered job's
+    /// bodies are those of its earlier attempts, with a smaller `run_lease`;
+    /// without a tombstone a retained body reads as an available job once
+    /// the DLQ row is gone.
+    async fn tombstone_dlq_ready_bodies_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        attempts: &[(i64, i64)],
+    ) -> Result<(), AwaError> {
+        if attempts.is_empty() {
+            return Ok(());
+        }
+        let (job_ids, run_leases): (Vec<i64>, Vec<i64>) = attempts.iter().copied().unzip();
+        let schema = self.schema();
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.ready_tombstones (
+                ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+            )
+            SELECT ready.ready_slot, ready.ready_generation, ready.queue, ready.priority,
+                   ready.enqueue_shard, ready.lane_seq, ready.job_id
+            FROM unnest($1::bigint[], $2::bigint[]) AS dead(job_id, run_lease)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.job_id = dead.job_id
+             AND ready.run_lease < dead.run_lease
+            ON CONFLICT DO NOTHING
+            "#
+        )))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Tombstone the exact ready bodies of terminal rows just deleted from
+    /// done_entries, so a retained body does not read as an available job.
+    async fn tombstone_done_ready_bodies_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: &[DoneJobRow],
+    ) -> Result<(), AwaError> {
+        if deleted.is_empty() {
+            return Ok(());
+        }
+        let slots: Vec<i32> = deleted.iter().map(|row| row.ready_slot).collect();
+        let generations: Vec<i64> = deleted.iter().map(|row| row.ready_generation).collect();
+        let queues: Vec<&str> = deleted.iter().map(|row| row.queue.as_str()).collect();
+        let shards: Vec<i16> = deleted.iter().map(|row| row.enqueue_shard).collect();
+        let sequences: Vec<i64> = deleted.iter().map(|row| row.lane_seq).collect();
+        let job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
+        let schema = self.schema();
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.ready_tombstones (
+                ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+            )
+            SELECT ready.ready_slot, ready.ready_generation, ready.queue, ready.priority,
+                   ready.enqueue_shard, ready.lane_seq, ready.job_id
+            FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[])
+                AS body(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = body.ready_slot
+             AND ready.ready_generation = body.ready_generation
+             AND ready.queue = body.queue
+             AND ready.enqueue_shard = body.enqueue_shard
+             AND ready.lane_seq = body.lane_seq
+             AND ready.job_id = body.job_id
+            ON CONFLICT DO NOTHING
+            "#
+        )))
+        .bind(&slots)
+        .bind(&generations)
+        .bind(&queues)
+        .bind(&shards)
+        .bind(&sequences)
+        .bind(&job_ids)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
     /// Release the unique claims of the DLQ rows `deleted` removed. A DLQ
     /// row is a failed job, and a unique key whose states include `failed`
     /// stays claimed while the row exists; deleting the row without this
@@ -19942,8 +20043,7 @@ impl QueueStorage {
             .fetch_all(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
-        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
-            .await?;
+        self.finish_deleted_dlq_rows_tx(&mut tx, &deleted).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(deleted.len() as u64)
     }
@@ -19968,7 +20068,7 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        self.release_deleted_dlq_claims_tx(tx, &deleted).await?;
+        self.finish_deleted_dlq_rows_tx(tx, &deleted).await?;
         outcome.job_ids = deleted.iter().map(|row| row.job_id).collect();
         Ok(outcome)
     }
@@ -19984,8 +20084,7 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
-            .await?;
+        self.finish_deleted_dlq_rows_tx(&mut tx, &deleted).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(!deleted.is_empty())
     }
@@ -20046,8 +20145,7 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
-            .await?;
+        self.finish_deleted_dlq_rows_tx(&mut tx, &deleted).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(deleted.len() as u64)
     }
@@ -20373,6 +20471,14 @@ impl QueueStorage {
             .collect();
         self.apply_unique_claim_changes_tx(&mut tx, changes, false)
             .await?;
+        self.tombstone_done_ready_bodies_tx(&mut tx, &deleted_done)
+            .await?;
+        let dlq_attempts: Vec<(i64, i64)> = deleted_dlq
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.tombstone_dlq_ready_bodies_tx(&mut tx, &dlq_attempts)
+            .await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok((deleted_done.len() + deleted_dlq.len()) as u64)
@@ -20434,6 +20540,8 @@ impl QueueStorage {
             })
             .collect();
         self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        self.tombstone_done_ready_bodies_tx(tx, &deleted_done)
             .await?;
         outcome.job_ids = deleted_done.iter().map(|row| row.job_id).collect();
         Ok(outcome)

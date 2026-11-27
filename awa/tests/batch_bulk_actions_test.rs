@@ -176,6 +176,16 @@ async fn stored_terminal_rows(pool: &PgPool, store: &QueueStorage, id: i64) -> i
     .unwrap()
 }
 
+/// Asserts the job reads as gone: no row of it is left live.
+async fn assert_job_gone(pool: &PgPool, store: &QueueStorage, id: i64) {
+    let got = admin::get_job(pool, id).await;
+    assert!(
+        matches!(got, Err(AwaError::JobNotFound { .. })),
+        "job {id} should be gone, got {got:?}"
+    );
+    assert_eq!(stored_terminal_rows(pool, store, id).await, 0, "job {id}");
+}
+
 async fn claim_ready(pool: &PgPool, store: &QueueStorage) -> Vec<i64> {
     store
         .claim_runtime_batch(pool, QUEUE, 100, Duration::from_secs(300))
@@ -401,7 +411,7 @@ async fn discard_deletes_failed_jobs_but_not_the_dlq() {
     assert_counters(&op, 7, 7, 0, 0);
     assert_all_processed(&item_outcomes(&pool, op.id).await, &ids);
     for &id in &ids {
-        assert_eq!(stored_terminal_rows(&pool, &store, id).await, 0, "job {id}");
+        assert_job_gone(&pool, &store, id).await;
     }
     assert!(claim_ready(&pool, &store).await.is_empty());
     assert!(is_dead_lettered(&pool, dead).await);
@@ -508,7 +518,7 @@ async fn purge_dlq_deletes_rows_and_releases_their_unique_claims() {
     assert_counters(&op, 7, 7, 0, 0);
     assert_all_processed(&item_outcomes(&pool, op.id).await, &ids);
     for (&id, key) in ids.iter().zip(&keys) {
-        assert_eq!(stored_terminal_rows(&pool, &store, id).await, 0, "job {id}");
+        assert_job_gone(&pool, &store, id).await;
         assert_eq!(unique_claim_owner(&pool, key).await, None, "job {id}");
     }
     assert_eq!(job_state(&pool, failed).await, JobState::Failed);
@@ -730,4 +740,148 @@ fn bulk_action_specs_use_the_op_kind_tag() {
         serde_json::from_value::<BatchOperationSpec>(json!({ "op_kind": "move_to_dlq" })).unwrap(),
         BatchOperationSpec::MoveToDlq { reason: None }
     );
+}
+
+#[tokio::test]
+async fn admin_discard_failed_leaves_no_job_behind() {
+    let (_db, pool, store) = setup().await;
+    let ids = failed_jobs(&pool, &store, 0, 3).await;
+    let dead = dlq_jobs(&pool, &store, 10, 1, InsertOpts::default()).await[0];
+
+    assert_eq!(admin::discard_failed(&pool, KIND).await.unwrap(), 4);
+    for &id in ids.iter().chain([&dead]) {
+        assert_job_gone(&pool, &store, id).await;
+    }
+    assert!(claim_ready(&pool, &store).await.is_empty());
+}
+
+#[tokio::test]
+async fn dlq_purges_leave_no_job_behind() {
+    let (_db, pool, store) = setup().await;
+    let ids = dlq_jobs(&pool, &store, 0, 3, InsertOpts::default()).await;
+
+    assert!(dlq::purge_dlq_job(&pool, ids[0]).await.unwrap());
+    assert_job_gone(&pool, &store, ids[0]).await;
+    assert_eq!(
+        dlq::purge_dlq_matching(&pool, &JobFilter::new().queue(QUEUE), false)
+            .await
+            .unwrap(),
+        2
+    );
+    for &id in &ids[1..] {
+        assert_job_gone(&pool, &store, id).await;
+    }
+    assert!(claim_ready(&pool, &store).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_retried_dlq_job_keeps_its_new_body_when_purged_again() {
+    let (_db, pool, store) = setup().await;
+    let id = dlq_jobs(&pool, &store, 0, 1, InsertOpts::default()).await[0];
+    dlq::retry_from_dlq(&pool, id, &Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    let job = claim_all(&pool, &store, 1).await.remove(0);
+    assert_eq!(job.id, id);
+    store
+        .fail_to_dlq(&pool, job.id, job.run_lease, "poison", "again", None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(dlq::purge_dlq_job(&pool, id).await.unwrap());
+    assert_job_gone(&pool, &store, id).await;
+}
+
+/// A job whose row another transaction holds when its chunk runs is still
+/// eligible: it stays pending, the rest of the chunk applies, and a later
+/// chunk retries it once the lock is released.
+#[tokio::test]
+async fn a_locked_job_stays_pending_until_a_later_chunk_reaches_it() {
+    let (_db, pool, store) = setup().await;
+    let ids = failed_jobs(&pool, &store, 0, 7).await;
+    let locked = ids[1];
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT job_id FROM {}.done_entries WHERE job_id = $1 FOR UPDATE",
+        store.schema()
+    )))
+    .bind(locked)
+    .fetch_all(holder.as_mut())
+    .await
+    .unwrap();
+
+    let op = submit(
+        &pool,
+        BatchOperationSpec::Retry,
+        JobFilter::new().queue(QUEUE),
+    )
+    .await;
+    let runner = Uuid::new_v4();
+    // Three chunks reach every job once, and a fourth revisits the locked
+    // one while it is still held.
+    for _ in 0..4 {
+        let outcome = batch_operations::run_one_batch_operation_chunk(&pool, runner, CHUNK)
+            .await
+            .unwrap();
+        assert!(outcome.claimed && !outcome.finalized, "{outcome:?}");
+    }
+    let running = batch_operations::get_batch_operation(&pool, op.id)
+        .await
+        .unwrap();
+    assert_eq!(running.state, BatchOperationState::Running);
+    assert_eq!(
+        (running.processed, running.skipped, running.errored),
+        (6, 0, 0)
+    );
+    let items = item_outcomes(&pool, op.id).await;
+    assert_eq!(items[&locked].0, "pending");
+    assert_eq!(job_state(&pool, locked).await, JobState::Failed);
+    for &id in ids.iter().filter(|&&id| id != locked) {
+        assert_eq!(items[&id].0, "processed", "job {id}");
+        assert_eq!(job_state(&pool, id).await, JobState::Available, "job {id}");
+    }
+
+    holder.rollback().await.unwrap();
+    let op = run_to_completion(&pool, op.id).await;
+    assert_counters(&op, 7, 7, 0, 0);
+    assert_all_processed(&item_outcomes(&pool, op.id).await, &ids);
+    assert_eq!(job_state(&pool, locked).await, JobState::Available);
+}
+
+/// Items left pending because their rows were locked are revisited only
+/// after every untried item has had its turn.
+#[tokio::test]
+async fn contended_items_do_not_hold_back_untried_ones() {
+    let (_db, pool, store) = setup().await;
+    let ids = failed_jobs(&pool, &store, 0, 7).await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT job_id FROM {}.done_entries WHERE job_id = ANY($1) FOR UPDATE",
+        store.schema()
+    )))
+    .bind(&ids[..CHUNK as usize])
+    .fetch_all(holder.as_mut())
+    .await
+    .unwrap();
+
+    let op = submit(
+        &pool,
+        BatchOperationSpec::Retry,
+        JobFilter::new().queue(QUEUE),
+    )
+    .await;
+    let runner = Uuid::new_v4();
+    let first = batch_operations::run_one_batch_operation_chunk(&pool, runner, CHUNK)
+        .await
+        .unwrap();
+    assert_eq!((first.processed, first.skipped), (0, 0));
+    let second = batch_operations::run_one_batch_operation_chunk(&pool, runner, CHUNK)
+        .await
+        .unwrap();
+    assert_eq!((second.processed, second.skipped), (CHUNK, 0));
+    holder.rollback().await.unwrap();
+    let op = run_to_completion(&pool, op.id).await;
+    assert_counters(&op, 7, 7, 0, 0);
 }

@@ -862,26 +862,51 @@ async fn insert_operation_items(
     Ok(())
 }
 
+/// The next chunk of pending items: untried items in job-id order, then, to
+/// fill the chunk, items an earlier chunk tried and left pending, least
+/// recently tried first. A pending item's `processed_at` is the time it was
+/// last tried.
 async fn claim_pending_items(
     pool: &PgPool,
     operation_id: Uuid,
     limit: i64,
 ) -> Result<Vec<i64>, AwaError> {
-    sqlx::query_scalar(
+    let limit = limit.max(1);
+    let mut job_ids: Vec<i64> = sqlx::query_scalar(
         r#"
         SELECT job_id
         FROM awa.batch_operation_items
-        WHERE operation_id = $1 AND state = 'pending'
+        WHERE operation_id = $1 AND state = 'pending' AND processed_at IS NULL
         ORDER BY job_id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
         "#,
     )
     .bind(operation_id)
-    .bind(limit.max(1))
+    .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(map_sqlx_error)
+    .map_err(map_sqlx_error)?;
+    let remaining = limit - job_ids.len() as i64;
+    if remaining > 0 {
+        let tried: Vec<i64> = sqlx::query_scalar(
+            r#"
+            SELECT job_id
+            FROM awa.batch_operation_items
+            WHERE operation_id = $1 AND state = 'pending' AND processed_at IS NOT NULL
+            ORDER BY processed_at ASC, job_id ASC
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(operation_id)
+        .bind(remaining)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        job_ids.extend(tried);
+    }
+    Ok(job_ids)
 }
 
 async fn skip_pending_items(pool: &PgPool, operation_id: Uuid) -> Result<i64, AwaError> {
@@ -974,6 +999,8 @@ enum ItemOutcome {
     Processed,
     Skipped,
     Errored(String),
+    /// Not reached but still eligible, so left pending for a later chunk.
+    Pending,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -995,6 +1022,7 @@ async fn apply_items(
         match apply_item(pool, operation_id, spec, job_id).await {
             Ok(ItemOutcome::Processed) => counts.processed += 1,
             Ok(ItemOutcome::Skipped) => counts.skipped += 1,
+            Ok(ItemOutcome::Pending) => {}
             Ok(ItemOutcome::Errored(_)) | Err(_) => counts.errored += 1,
         }
     }
@@ -1002,11 +1030,13 @@ async fn apply_items(
 }
 
 /// Apply a bulk-action `spec` to the whole chunk in one READ COMMITTED
-/// transaction that also records every item's outcome: processed when the
-/// action reached the job, skipped when the job was no longer eligible. If
-/// that transaction fails, for example on a unique-claim conflict, it rolls
-/// back and each item is applied in a transaction of its own, so a failing
-/// job is recorded as errored and the rest still apply.
+/// transaction that also records the items the action reached as processed.
+/// Each item it did not reach is then recorded as skipped if its job is no
+/// longer eligible, or left pending for a later chunk if it still is, as
+/// when another transaction held its row. If the chunk transaction fails,
+/// for example on a unique-claim conflict, it rolls back and each item is
+/// applied in a transaction of its own, so a failing job is recorded as
+/// errored and the rest still apply.
 async fn apply_chunk(
     pool: &PgPool,
     operation_id: Uuid,
@@ -1015,9 +1045,16 @@ async fn apply_chunk(
 ) -> Result<ChunkCounts, AwaError> {
     let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     match apply_chunk_tx(&mut tx, operation_id, spec, job_ids).await {
-        Ok((store, outcome, counts)) => {
+        Ok((store, outcome, mut counts)) => {
             tx.commit().await.map_err(map_sqlx_error)?;
+            let unreached: Vec<i64> = job_ids
+                .iter()
+                .copied()
+                .filter(|job_id| !outcome.job_ids.contains(job_id))
+                .collect();
             store.finish_bulk_action(pool, outcome).await;
+            counts.skipped =
+                settle_unreached(pool, &store, operation_id, spec.kind(), &unreached).await?;
             Ok(counts)
         }
         Err(_) => {
@@ -1035,42 +1072,35 @@ async fn apply_chunk_tx(
 ) -> Result<(QueueStorage, BulkActionOutcome, ChunkCounts), AwaError> {
     let store = active_store_in_tx(tx).await?;
     let outcome = apply_bulk_action_tx(tx, &store, spec, job_ids).await?;
-    let processed: Vec<i64> = outcome.job_ids.iter().copied().collect();
-    let (processed_count, skipped_count): (i64, i64) = sqlx::query_as(
+    let processed: Vec<i64> = job_ids
+        .iter()
+        .copied()
+        .filter(|job_id| outcome.job_ids.contains(job_id))
+        .collect();
+    let processed_count: i64 = sqlx::query_scalar(
         r#"
-        WITH outcomes AS (
-            SELECT job_id,
-                   CASE WHEN job_id = ANY($3::bigint[]) THEN 'processed' ELSE 'skipped' END
-                       AS outcome
-            FROM unnest($2::bigint[]) AS job_id
-        ),
-        recorded AS (
+        WITH recorded AS (
             UPDATE awa.batch_operation_items AS items
-            SET state = outcomes.outcome,
+            SET state = 'processed',
                 error = NULL,
                 processed_at = clock_timestamp()
-            FROM outcomes
             WHERE items.operation_id = $1
-              AND items.job_id = outcomes.job_id
+              AND items.job_id = ANY($2::bigint[])
               AND items.state = 'pending'
-            RETURNING items.state
+            RETURNING items.job_id
         ),
         counts AS (
-            SELECT count(*) FILTER (WHERE state = 'processed')::bigint AS processed,
-                   count(*) FILTER (WHERE state = 'skipped')::bigint AS skipped
-            FROM recorded
+            SELECT count(*)::bigint AS processed FROM recorded
         )
         UPDATE awa.batch_operations AS op
         SET processed = op.processed + counts.processed,
-            skipped = op.skipped + counts.skipped,
             updated_at = clock_timestamp()
         FROM counts
         WHERE op.id = $1
-        RETURNING counts.processed, counts.skipped
+        RETURNING counts.processed
         "#,
     )
     .bind(operation_id)
-    .bind(job_ids)
     .bind(&processed)
     .fetch_one(tx.as_mut())
     .await
@@ -1080,10 +1110,86 @@ async fn apply_chunk_tx(
         outcome,
         ChunkCounts {
             processed: processed_count,
-            skipped: skipped_count,
+            skipped: 0,
             errored: 0,
         },
     ))
+}
+
+/// Record the items among `job_ids` that a bulk action did not reach: as
+/// skipped when the job's current row is gone or outside `kind`'s eligible
+/// states and DLQ scope, and otherwise left pending with `processed_at` set
+/// to now, so the runner tries untried items before revisiting them. The
+/// current rows are read without waiting on row locks. Returns how many were
+/// skipped.
+async fn settle_unreached(
+    pool: &PgPool,
+    store: &QueueStorage,
+    operation_id: Uuid,
+    kind: BatchOperationKind,
+    job_ids: &[i64],
+) -> Result<i64, AwaError> {
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    let eligible: Vec<i64> = store
+        .load_jobs_without_output(pool, job_ids, None)
+        .await?
+        .into_iter()
+        .filter(|(job, dead_lettered)| {
+            kind.eligible_states().contains(&job.state)
+                && match kind.dlq_scope() {
+                    DlqScope::Excluded => !dead_lettered,
+                    DlqScope::Only => *dead_lettered,
+                }
+        })
+        .map(|(job, _)| job.id)
+        .collect();
+    sqlx::query_scalar(
+        r#"
+        WITH outcomes AS (
+            SELECT job_id, job_id = ANY($3::bigint[]) AS eligible
+            FROM unnest($2::bigint[]) AS job_id
+        ),
+        tried AS (
+            UPDATE awa.batch_operation_items AS items
+            SET processed_at = clock_timestamp()
+            FROM outcomes
+            WHERE items.operation_id = $1
+              AND items.job_id = outcomes.job_id
+              AND items.state = 'pending'
+              AND outcomes.eligible
+            RETURNING items.job_id
+        ),
+        skipped AS (
+            UPDATE awa.batch_operation_items AS items
+            SET state = 'skipped',
+                error = NULL,
+                processed_at = clock_timestamp()
+            FROM outcomes
+            WHERE items.operation_id = $1
+              AND items.job_id = outcomes.job_id
+              AND items.state = 'pending'
+              AND NOT outcomes.eligible
+            RETURNING items.job_id
+        ),
+        counts AS (
+            SELECT count(*)::bigint AS skipped FROM skipped
+        )
+        UPDATE awa.batch_operations AS op
+        SET skipped = op.skipped + counts.skipped,
+            updated_at = clock_timestamp()
+        FROM counts
+        WHERE op.id = $1
+        RETURNING counts.skipped
+        "#,
+    )
+    .bind(operation_id)
+    .bind(job_ids)
+    .bind(&eligible)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)
 }
 
 async fn apply_bulk_action_tx(
@@ -1139,7 +1245,18 @@ async fn apply_item(
     let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
     let (outcome, finish) = match apply_to_job_tx(&mut tx, spec, job_id).await {
         Ok((true, finish)) => (ItemOutcome::Processed, finish),
-        Ok((false, finish)) => (ItemOutcome::Skipped, finish),
+        Ok((false, Some((store, finish)))) => {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            store.finish_bulk_action(pool, finish).await;
+            let skipped =
+                settle_unreached(pool, &store, operation_id, spec.kind(), &[job_id]).await?;
+            return Ok(if skipped > 0 {
+                ItemOutcome::Skipped
+            } else {
+                ItemOutcome::Pending
+            });
+        }
+        Ok((false, None)) => (ItemOutcome::Skipped, None),
         Err(err) => {
             tx.rollback().await.map_err(map_sqlx_error)?;
             let outcome = ItemOutcome::Errored(format!("job_id={job_id}: {err}"));
@@ -1167,6 +1284,7 @@ async fn record_item_outcome_tx(
         ItemOutcome::Processed => ("processed", None, 1_i64, 0_i64, 0_i64),
         ItemOutcome::Skipped => ("skipped", None, 0_i64, 1_i64, 0_i64),
         ItemOutcome::Errored(error) => ("errored", Some(error.as_str()), 0_i64, 0_i64, 1_i64),
+        ItemOutcome::Pending => return Ok(()),
     };
     sqlx::query(
         r#"
