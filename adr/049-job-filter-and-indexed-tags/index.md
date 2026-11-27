@@ -105,6 +105,10 @@ Each consumer applies the filter, then its own eligibility:
 | `find_jobs`: the admin UI jobs page, `awa job list`, Python `find_jobs` | all | id descending, `before_id` keyset, `limit` clamped to 1–1000 |
 | `count_jobs`: the UI's match count | all | exact up to 10,000; above that, "10,000+" |
 | Batch preview and scan (`set_priority`, `move_queue`) | `available`, `scheduled` (ADR-030) | id ascending, up to the scan's upper bound |
+| Batch preview and scan (`retry`) | `failed`, `cancelled`, not dead-lettered (ADR-030) | id ascending, up to the scan's upper bound |
+| Batch preview and scan (`cancel`) | `available`, `scheduled`, `retryable`, `running`, `waiting_external` (ADR-030) | id ascending, up to the scan's upper bound |
+| Batch preview and scan (`discard`, `move_to_dlq`) | `failed`, not dead-lettered (ADR-030) | id ascending, up to the scan's upper bound |
+| Batch preview and scan (`retry_from_dlq`, `purge_dlq`) | dead-lettered (ADR-030) | id ascending, up to the scan's upper bound |
 | `list_dlq`, `purge_dlq`, `bulk_retry_from_dlq` | dead-lettered | `(dlq_at, id)` descending |
 
 A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue, tag, ids or a created bound) unless the caller passes `allow_all`. `state: failed` and `dead_lettered: true` don't count: every DLQ row already matches them.

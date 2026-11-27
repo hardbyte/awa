@@ -2779,6 +2779,26 @@
 <td>id ascending, up to the scan's upper bound</td>
 </tr>
 <tr>
+<td>Batch preview and scan (<code>retry</code>)</td>
+<td><code>failed</code>, <code>cancelled</code>, not dead-lettered (ADR-030)</td>
+<td>id ascending, up to the scan's upper bound</td>
+</tr>
+<tr>
+<td>Batch preview and scan (<code>cancel</code>)</td>
+<td><code>available</code>, <code>scheduled</code>, <code>retryable</code>, <code>running</code>, <code>waiting_external</code> (ADR-030)</td>
+<td>id ascending, up to the scan's upper bound</td>
+</tr>
+<tr>
+<td>Batch preview and scan (<code>discard</code>, <code>move_to_dlq</code>)</td>
+<td><code>failed</code>, not dead-lettered (ADR-030)</td>
+<td>id ascending, up to the scan's upper bound</td>
+</tr>
+<tr>
+<td>Batch preview and scan (<code>retry_from_dlq</code>, <code>purge_dlq</code>)</td>
+<td>dead-lettered (ADR-030)</td>
+<td>id ascending, up to the scan's upper bound</td>
+</tr>
+<tr>
 <td><code>list_dlq</code>, <code>purge_dlq</code>, <code>bulk_retry_from_dlq</code></td>
 <td>dead-lettered</td>
 <td><code>(dlq_at, id)</code> descending</td>

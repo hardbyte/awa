@@ -1443,6 +1443,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#large-sets-batch-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Large sets: batch operations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#retention" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2550,6 +2561,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#large-sets-batch-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Large sets: batch operations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#retention" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2673,6 +2695,18 @@
 </span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>awa<span class="w"> </span>dlq<span class="w"> </span>purge<span class="w"> </span>--all
 </span></code></pre></div>
 <p>Purging is destructive: the rows are deleted from <code>dlq_entries</code> and not recoverable through the DLQ tools. Use with care; prefer <code>retry-bulk</code> if you might want the data back.</p>
+<h2 id="large-sets-batch-operations">Large sets: batch operations<a class="headerlink" href="#large-sets-batch-operations" title="Permanent link">&para;</a></h2>
+<p><code>awa dlq retry-bulk</code>, <code>move</code> and <code>purge</code> act on every matching row in one transaction, and a unique conflict on any retried row aborts the whole retry. For a large set, submit the same action as a durable batch operation: the maintenance leader applies it a chunk at a time, records each row as processed, skipped or errored, and can be previewed, watched and cancelled. A retried row whose unique key a newer job holds is recorded as errored and the rest are retried. Purging releases the purged rows' unique claims.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Retry dead-lettered rows on a queue</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>awa<span class="w"> </span>batch-ops<span class="w"> </span>submit<span class="w"> </span>--op-kind<span class="w"> </span>retry_from_dlq<span class="w"> </span>--filter<span class="w"> </span><span class="s1">'{"queue":"billing"}'</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="c1"># Purge dead-lettered rows of a kind</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>awa<span class="w"> </span>batch-ops<span class="w"> </span>submit<span class="w"> </span>--op-kind<span class="w"> </span>purge_dlq<span class="w"> </span>--filter<span class="w"> </span><span class="s1">'{"kind":"charge_card"}'</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="c1"># Move failed rows into the DLQ with a reason</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>awa<span class="w"> </span>batch-ops<span class="w"> </span>submit<span class="w"> </span>--op-kind<span class="w"> </span>move_to_dlq<span class="w"> </span>--filter<span class="w"> </span><span class="s1">'{"queue":"billing"}'</span><span class="w"> </span>--spec<span class="w"> </span><span class="s1">'{"reason":"triage"}'</span>
+</span></code></pre></div>
+<p>The same kinds are in the admin UI's batch operations page, <code>POST /api/batch-ops</code> and the Python client's <code>submit_batch_operation</code>. See <a href="../adr/030-batch-operations/#bulk-action-operations">ADR-030</a> for each kind's eligible jobs.</p>
 <h2 id="retention">Retention<a class="headerlink" href="#retention" title="Permanent link">&para;</a></h2>
 <p>The maintenance leader periodically prunes DLQ rows older than the configured retention window. See <a href="../configuration/">Configuration</a> for the <code>dlq_retention_*</code> knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.</p>
 <h2 id="programmatic-access">Programmatic access<a class="headerlink" href="#programmatic-access" title="Permanent link">&para;</a></h2>

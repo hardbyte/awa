@@ -381,6 +381,24 @@ operation = await client.submit_batch_operation(
 )
 ```
 
+### Bulk actions as batch operations
+
+Retrying, cancelling, discarding and dead-lettering jobs by filter are batch operation kinds too: `retry` (failed and cancelled jobs), `cancel` (available, scheduled, retryable, running and waiting jobs), `discard` (failed jobs), `move_to_dlq` (failed jobs, with an optional `reason`), `retry_from_dlq` and `purge_dlq` (dead-lettered jobs). Each applies a chunk of jobs per transaction, where `awa job retry-failed`, `awa job discard` and the `awa dlq` bulk commands act on the whole set in one. A filter naming a state the kind does not act on is refused. See [ADR-030](../adr/030-batch-operations/index.md#bulk-action-operations).
+
+```bash
+awa batch-ops preview --op-kind retry --filter '{"kind":"send_email","state":"failed"}'
+awa batch-ops submit --op-kind retry --filter '{"kind":"send_email","state":"failed"}'
+awa batch-ops submit --op-kind cancel --filter '{"queue":"imports","tag":"batch:42"}'
+```
+
+```python
+operation = await client.submit_batch_operation(
+    "move_to_dlq",
+    spec={"reason": "triage"},
+    filter={"queue": "billing"},
+)
+```
+
 Batch-operation history is retained for `AWA_BATCH_OP_RETENTION_DAYS` days (default `90`). Use `awa batch-ops purge --before <timestamp>` for explicit cleanup of finalized operations.
 
 ## Queue and job-kind descriptors

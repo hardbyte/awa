@@ -116,11 +116,7 @@ admin UI fetches it when the filter changes rather than on every poll.
 
 ## From a search to a batch operation
 
-On the jobs page, a filter that can match available or scheduled jobs offers
-**Change priority or queue of matching jobs**, which opens the batch
-operations form with the same filter. Batch operations act only on available
-and scheduled jobs, so the preview counts those; running, waiting and finished
-jobs in the same filter are left alone.
+On the jobs page, a filter that can match available or scheduled jobs offers **Change priority or queue of matching jobs**, which opens the batch operations form with the same filter. `set_priority` and `move_queue` act only on available and scheduled jobs, so the preview counts those; running, waiting and finished jobs in the same filter are left alone. The other operation kinds (`retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq`, `purge_dlq`) each act on their own set of states, listed in [ADR-030](../adr/030-batch-operations/index.md#bulk-action-operations), and the preview counts only those.
 
 A batch operation whose filter uses several tags, several states or
 `dead_lettered` is refused while a runtime older than 0.7.0-alpha.2 is live:

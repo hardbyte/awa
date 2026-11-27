@@ -85,6 +85,23 @@ awa dlq purge --all
 
 Purging is destructive: the rows are deleted from `dlq_entries` and not recoverable through the DLQ tools. Use with care; prefer `retry-bulk` if you might want the data back.
 
+## Large sets: batch operations
+
+`awa dlq retry-bulk`, `move` and `purge` act on every matching row in one transaction, and a unique conflict on any retried row aborts the whole retry. For a large set, submit the same action as a durable batch operation: the maintenance leader applies it a chunk at a time, records each row as processed, skipped or errored, and can be previewed, watched and cancelled. A retried row whose unique key a newer job holds is recorded as errored and the rest are retried. Purging releases the purged rows' unique claims.
+
+```bash
+# Retry dead-lettered rows on a queue
+awa batch-ops submit --op-kind retry_from_dlq --filter '{"queue":"billing"}'
+
+# Purge dead-lettered rows of a kind
+awa batch-ops submit --op-kind purge_dlq --filter '{"kind":"charge_card"}'
+
+# Move failed rows into the DLQ with a reason
+awa batch-ops submit --op-kind move_to_dlq --filter '{"queue":"billing"}' --spec '{"reason":"triage"}'
+```
+
+The same kinds are in the admin UI's batch operations page, `POST /api/batch-ops` and the Python client's `submit_batch_operation`. See [ADR-030](../adr/030-batch-operations/index.md#bulk-action-operations) for each kind's eligible jobs.
+
 ## Retention
 
 The maintenance leader periodically prunes DLQ rows older than the configured retention window. See [Configuration](../configuration/index.md) for the `dlq_retention_*` knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.
