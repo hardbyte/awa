@@ -286,8 +286,13 @@ awa batch-ops cancel <id>
 - An item whose row another transaction holds stays pending and is retried on
   a later chunk; one whose retry hits a unique key held by a newer job is
   recorded `errored` and the rest proceed.
-- Submit the new kinds only once every runtime runs 0.7 or later; an older
-  maintenance leader marks an operation of a kind it doesn't know as failed.
+- An older maintenance leader marks an operation of a kind it doesn't know as
+  failed, so submitting `retry`, `cancel`, `discard`, `move_to_dlq`,
+  `retry_from_dlq` or `purge_dlq` is refused, naming the runtimes, while a live
+  runtime reports a version older than 0.7.0-alpha.2. Finish the rollout and
+  submit again once stopped runtimes are no longer live: their `last_seen_at`
+  is older than three snapshot intervals (at least 30 seconds). Their rows stay
+  in `awa.runtime_instances` for a day, so don't wait for them to disappear.
 
 ## Cron
 

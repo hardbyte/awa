@@ -50,7 +50,17 @@ enum DlqScope {
     Only,
 }
 
+/// The first version whose maintenance leader runs the kinds v063 added. An
+/// older leader cannot read an operation of one of them and marks it failed.
+pub const BULK_ACTION_KINDS_MIN_RUNTIME: &str = "0.7.0-alpha.2";
+
 impl BatchOperationKind {
+    /// Whether this kind arrived with v063, so only a leader at
+    /// [`BULK_ACTION_KINDS_MIN_RUNTIME`] or later can run it.
+    pub fn is_bulk_action(self) -> bool {
+        !matches!(self, Self::SetPriority | Self::MoveQueue)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SetPriority => "set_priority",
@@ -365,6 +375,15 @@ pub async fn submit_batch_operation(
     if request.filter.uses_extended_fields() {
         crate::filter::require_fleet_for_extended_filters(pool).await?;
     }
+    let op_kind = request.spec.kind();
+    if op_kind.is_bulk_action() {
+        crate::filter::require_live_runtimes_at_least(
+            pool,
+            BULK_ACTION_KINDS_MIN_RUNTIME,
+            &format!("a {} batch operation", op_kind.as_str()),
+        )
+        .await?;
+    }
     // A state alone still names every job in it, so it needs `allow_all`
     // as an empty filter does.
     if !request.filter.is_scoped() && !request.allow_all {
@@ -374,7 +393,6 @@ pub async fn submit_batch_operation(
                 .to_string(),
         ));
     }
-    let op_kind = request.spec.kind();
     let id = Uuid::new_v4();
     sqlx::query_as::<_, BatchOperation>(
         r#"
