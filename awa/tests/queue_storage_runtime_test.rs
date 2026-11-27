@@ -7139,6 +7139,109 @@ async fn test_compat_mode_rotate_advances_columns_and_ledger_together() {
     );
 }
 
+/// `reset` on a schema upgraded from 0.6, before and after the ledger flip:
+/// the per-slot `generation` has no default there, and under compat
+/// authority the singleton columns are the cursor.
+#[tokio::test]
+async fn test_reset_restarts_the_rings_of_a_schema_upgraded_from_0_6_before_the_flip() {
+    reset_restarts_the_rings_of_a_schema_upgraded_from_0_6("columns").await;
+}
+
+#[tokio::test]
+async fn test_reset_restarts_the_rings_of_a_schema_upgraded_from_0_6_after_the_flip() {
+    reset_restarts_the_rings_of_a_schema_upgraded_from_0_6("ledger").await;
+}
+
+async fn reset_restarts_the_rings_of_a_schema_upgraded_from_0_6(authority: &str) {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = format!("awa_qs_reset_upgraded_{authority}");
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.clone(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    if authority == "columns" {
+        set_ring_authority(&pool, &schema, "columns").await;
+    }
+    for ring in ["queue", "lease", "claim"] {
+        sqlx::raw_sql(audited_sql(format!(
+            "ALTER TABLE {schema}.{ring}_ring_slots ALTER COLUMN generation DROP DEFAULT; \
+                 INSERT INTO {schema}.{ring}_ring_rotations (generation, slot) VALUES (1, 1); \
+                 UPDATE {schema}.{ring}_ring_slots SET generation = 1 WHERE slot = 1"
+        )))
+        .execute(&pool)
+        .await
+        .expect("shape the ring as a 0.6 upgrade one rotation in");
+        if authority == "columns" {
+            sqlx::raw_sql(audited_sql(format!(
+                    "UPDATE {schema}.{ring}_ring_state SET current_slot = 1, generation = 1 WHERE singleton; \
+                     ALTER TABLE {schema}.{ring}_ring_state \
+                         ALTER COLUMN current_slot SET NOT NULL, \
+                         ALTER COLUMN generation SET NOT NULL"
+                )))
+                .execute(&pool)
+                .await
+                .expect("shape the compat cursor as 0.6 left it");
+        }
+    }
+
+    store.reset(&pool).await.expect("reset an upgraded schema");
+
+    assert_eq!(ring_authority(&pool, &schema).await, authority);
+    for ring in ["queue", "lease", "claim"] {
+        assert_eq!(
+            ring_cursor(&pool, &schema, ring).await,
+            (0, 0),
+            "{authority}: {ring} ledger restarts at genesis"
+        );
+        let expected_columns = if authority == "columns" {
+            (0, 0)
+        } else {
+            (-1, -1)
+        };
+        assert_eq!(
+            ring_columns_cursor(&pool, &schema, ring).await,
+            expected_columns,
+            "{authority}: {ring} singleton columns"
+        );
+        let generations: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
+            "SELECT generation FROM {schema}.{ring}_ring_slots ORDER BY slot"
+        )))
+        .fetch_all(&pool)
+        .await
+        .expect("read per-slot generations");
+        let first = if authority == "columns" { 0 } else { -1 };
+        assert_eq!(generations[0], first, "{authority}: {ring} slot 0");
+        assert!(
+            generations[1..].iter().all(|generation| *generation == -1),
+            "{authority}: {ring} sealed slots never rotated through: {generations:?}"
+        );
+    }
+
+    store
+        .enqueue_batch(&pool, "reset_upgraded_q", 1, 3)
+        .await
+        .expect("enqueue after reset");
+    let outcome = store.rotate(&pool).await.expect("rotate after reset");
+    assert!(
+        matches!(
+            outcome,
+            awa_model::RotateOutcome::Rotated {
+                slot: 1,
+                generation: 1
+            }
+        ),
+        "{authority}: rotate after reset advances to (slot 1, gen 1); got {outcome:?}"
+    );
+}
+
 /// #371 staged upgrade: an interleaved old (0.6) binary advances ONLY the
 /// singleton columns (it knows nothing of the ledger). The next 0.7 compat
 /// rotate must reconcile — backfilling the ledger up to the column cursor —
