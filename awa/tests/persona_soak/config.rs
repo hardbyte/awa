@@ -31,10 +31,12 @@ pub enum Persona {
     ShardOps,
     /// A separate process that claims as much as it can and is SIGKILLed again and again.
     ClaimAbandon,
+    /// Producers that enqueue inside their own REPEATABLE READ and SERIALIZABLE transactions.
+    Txn,
 }
 
 impl Persona {
-    pub const ALL: [Persona; 14] = [
+    pub const ALL: [Persona; 15] = [
         Persona::Mia,
         Persona::Tom,
         Persona::Priya,
@@ -49,6 +51,7 @@ impl Persona {
         Persona::Fanout,
         Persona::ShardOps,
         Persona::ClaimAbandon,
+        Persona::Txn,
     ];
 
     pub fn name(self) -> &'static str {
@@ -67,6 +70,7 @@ impl Persona {
             Persona::Fanout => "fanout",
             Persona::ShardOps => "shardops",
             Persona::ClaimAbandon => "abandon",
+            Persona::Txn => "txn",
         }
     }
 
@@ -87,7 +91,7 @@ impl FromStr for Persona {
             .into_iter()
             .find(|persona| persona.name() == value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops,abandon")
+                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops,abandon,txn")
             })
     }
 }
@@ -169,6 +173,24 @@ pub struct SoakConfig {
     pub queue_rotate_interval: Option<Duration>,
     pub claim_rotate_interval: Option<Duration>,
     pub prune_lock_timeout: Option<Duration>,
+    /// Statement and lock timeouts of the oracle's periodic samples, and the statement
+    /// timeout of its final reconciliation.
+    pub sampler_statement_timeout: Duration,
+    pub sampler_lock_timeout: Duration,
+    pub final_statement_timeout: Duration,
+    /// Largest share, in percent, of one check's periodic samples that may be skipped
+    /// by a timeout before the run is incomplete.
+    pub sampler_max_skip_percent: u64,
+    /// Statement and lock timeouts of diagnostic reads that can hold a lock ring prune
+    /// waits for: the txn persona's samples and the open-claims capture.
+    pub diag_statement_timeout: Duration,
+    pub diag_lock_timeout: Duration,
+    /// Transactional producers: how many run concurrently, the share of their
+    /// transactions that are SERIALIZABLE rather than REPEATABLE READ, and the longest
+    /// pause between a transaction's first read and its enqueue.
+    pub txn_producers: u64,
+    pub txn_serializable_percent: u64,
+    pub txn_hold: Duration,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -318,6 +340,29 @@ impl SoakConfig {
                 .map(Duration::from_millis),
             prune_lock_timeout: env_parse::<u64>("AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS")
                 .map(Duration::from_millis),
+            sampler_statement_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS").unwrap_or(10_000),
+            ),
+            sampler_lock_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS").unwrap_or(1_000),
+            ),
+            final_statement_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_FINAL_STATEMENT_TIMEOUT_MS").unwrap_or(300_000),
+            ),
+            sampler_max_skip_percent: env_parse::<u64>("AWA_SOAK_SAMPLER_MAX_SKIP_PERCENT")
+                .unwrap_or(20)
+                .min(100),
+            diag_statement_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_DIAG_STATEMENT_TIMEOUT_MS").unwrap_or(2_000),
+            ),
+            diag_lock_timeout: Duration::from_millis(
+                env_parse("AWA_SOAK_DIAG_LOCK_TIMEOUT_MS").unwrap_or(100),
+            ),
+            txn_producers: env_parse("AWA_SOAK_TXN_PRODUCERS").unwrap_or(16),
+            txn_serializable_percent: env_parse::<u64>("AWA_SOAK_TXN_SERIALIZABLE_PERCENT")
+                .unwrap_or(50)
+                .min(100),
+            txn_hold: Duration::from_millis(env_parse("AWA_SOAK_TXN_HOLD_MS").unwrap_or(40)),
         })
     }
 

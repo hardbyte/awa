@@ -11,7 +11,7 @@
 # Environment:
 #   AWA_SOAK_SECONDS          load phase length per engine (default 900)
 #   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos,
-#                             watchers,support,uiops,impatient,python,fanout,shardops,abandon
+#                             watchers,support,uiops,impatient,python,fanout,shardops,abandon,txn
 #   AWA_SOAK_SEED             fixes the workload mix and chaos schedule
 #   AWA_SOAK_SCALE            multiplies rates and queue counts (default 1)
 #   AWA_SOAK_SHARDOPS_SCALE   multiplies the shardops persona's rates on its own (default 1)
@@ -27,6 +27,11 @@
 #   AWA_SOAK_ABANDON_BOUND_SECONDS
 #                             seconds after a kill within which the rescue backlog must clear and the
 #                             claim ring must be free to rotate (default 120)
+#   AWA_SOAK_TXN_PRODUCERS, AWA_SOAK_TXN_SERIALIZABLE_PERCENT, AWA_SOAK_TXN_HOLD_MS
+#                             the txn persona's concurrent producers (default 16), the share of its
+#                             transactions that are SERIALIZABLE rather than REPEATABLE READ
+#                             (default 50) and the longest pause between a transaction's first
+#                             read and its enqueue (default 40)
 #   AWA_SOAK_RESCUE_INTERVAL_SECONDS
 #                             heartbeat and deadline rescue interval of every runtime (default: the
 #                             harness's 3 s and 2 s; the library default for heartbeat rescue is 30 s)
@@ -44,17 +49,32 @@
 #                             may rise by at most the given MiB over the stall (default 128)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
-#   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
+#   SOAK_MAX_CONNECTIONS      server max_connections (default 480)
 #   SOAK_PG_CPUS              CPU limit for each database container (default: none)
 #   SOAK_PG_MEMORY            memory limit for each database container, as `docker run --memory`
 #                             takes it (default: none)
 #   SOAK_PG_ARGS              extra server arguments for pg17 and pg18, e.g.
 #                             "-c log_lock_waits=on -c deadlock_timeout=5ms"
 #   SOAK_KEEP_SERVER_LOG      set to 1 to write server.log for a run that passed too
+#   SOAK_PG_STAT_STATEMENTS   set to 0 to run without pg_stat_statements; by default it is loaded and
+#                             the soak database's top statements by total time are appended to
+#                             <engine>/pg-stat-statements.tsv every 60 s (cumulative, with epoch_ms)
 #   AWA_SOAK_QUEUE_ROTATE_MS, AWA_SOAK_CLAIM_ROTATE_MS, AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS
 #                             queue and claim ring rotation intervals and the prune lock timeout
 #                             of every in-process runtime (default: the library's 1000, 1000 and 10)
-#   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0; the
+#   AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS, AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS
+#                             statement and lock timeouts of the oracle's periodic samples (default
+#                             10000 and 1000); a sample cut short is skipped and counted per check
+#   AWA_SOAK_SAMPLER_MAX_SKIP_PERCENT
+#                             share of one check's periodic samples that may be skipped before the
+#                             run is inconclusive (default 20)
+#   AWA_SOAK_DIAG_STATEMENT_TIMEOUT_MS, AWA_SOAK_DIAG_LOCK_TIMEOUT_MS
+#                             statement and lock timeouts of the txn persona's reads and the
+#                             open-claims capture at claim-ring stalls (default 2000 and 100)
+#   AWA_SOAK_FINAL_STATEMENT_TIMEOUT_MS
+#                             statement and lock timeout of the final reconciliation (default 300000)
+#   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0, built by
+#                             docker/pg18-cassert/Dockerfile; the
 #                             -epqlog5 build, which logs every partition-pruning setup with its
 #                             query text, is opt-in for diagnosing pruning crashes)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
@@ -76,7 +96,10 @@ cd "$(dirname "$0")/.."
 
 SECONDS_PER_ENGINE="${AWA_SOAK_SECONDS:-900}"
 BASE_PORT="${SOAK_BASE_PORT:-15471}"
-MAX_CONNECTIONS="${SOAK_MAX_CONNECTIONS:-400}"
+MAX_CONNECTIONS="${SOAK_MAX_CONNECTIONS:-480}"
+STATEMENT_ARGS=()
+[ "${SOAK_PG_STAT_STATEMENTS:-1}" = 1 ] &&
+  STATEMENT_ARGS=(-c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=top -c pg_stat_statements.max=2000)
 CASSERT_IMAGE="${SOAK_CASSERT_IMAGE:-awa-pg18-cassert:18.6-O0}"
 RESULTS_DIR="${SOAK_RESULTS_DIR:-$PWD/soak-results/$(date +%Y%m%d-%H%M%S)}"
 ENGINES=("$@")
@@ -101,10 +124,17 @@ fi
 export AWA_SOAK_PYTHON="${AWA_SOAK_PYTHON:-$PWD/awa-python/.venv/bin/python}"
 export AWA_SOAK_AWA_BIN="${AWA_SOAK_AWA_BIN:-${CARGO_TARGET_DIR:-$PWD/target}/release/awa}"
 CONTAINERS=()
-STATS_PID=""
+SAMPLER_PIDS=()
+
+stop_samplers() {
+  for pid in "${SAMPLER_PIDS[@]:-}"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  done
+  SAMPLER_PIDS=()
+}
 
 cleanup() {
-  [ -n "$STATS_PID" ] && kill "$STATS_PID" 2>/dev/null
+  stop_samplers
   for container in "${CONTAINERS[@]:-}"; do
     [ -n "$container" ] && docker rm -f -v "$container" >/dev/null 2>&1
   done
@@ -117,19 +147,19 @@ start_container() {
   local cpu_args=()
   [ -n "${SOAK_PG_CPUS:-}" ] && cpu_args=(--cpus "$SOAK_PG_CPUS")
   [ -n "${SOAK_PG_MEMORY:-}" ] && cpu_args+=(--memory "$SOAK_PG_MEMORY")
-  local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a ")
+  local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a " ${STATEMENT_ARGS[@]+"${STATEMENT_ARGS[@]}"})
   local extra=()
   read -r -a extra <<<"${SOAK_PG_ARGS:-}"
-  common+=("${extra[@]}")
+  common+=(${extra[@]+"${extra[@]}"})
   case "$engine" in
     pg17)
-      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
+      docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -e POSTGRES_PASSWORD=test -p "127.0.0.1:$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
     pg18)
-      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
+      docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -e POSTGRES_PASSWORD=test -p "127.0.0.1:$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
     pg18-cassert)
       # The image ships an initialised, trust-authenticated cluster in /data. Parallel query is
       # off: at -O0 a handful of admin reads would otherwise take every core.
-      local pgargs='-c listen_addresses=0.0.0.0 -c max_connections='"$MAX_CONNECTIONS"' -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 -c max_parallel_workers_per_gather=0 -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0'
+      local pgargs='-c listen_addresses=0.0.0.0 -c max_connections='"$MAX_CONNECTIONS"' -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 -c max_parallel_workers_per_gather=0 -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0 '"${STATEMENT_ARGS[*]}"
       case "$CASSERT_IMAGE" in
         *epqlog*)
           # The instrumented build logs an AWAEPQ line, with the full query text, for every
@@ -137,7 +167,7 @@ start_container() {
           # collector writes into a FIFO whose reader drops those messages and keeps the rest
           # (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
           SOAK_PG_LOG_FILE=/data/log/pg-filtered.log
-          docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" sh -c '
+          docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -p "127.0.0.1:$port:5432" "$CASSERT_IMAGE" sh -c '
             mkdir -p /data/log
             rm -f /data/log/pg.log /data/log/pg-filtered.log
             mkfifo /data/log/pg.log
@@ -153,7 +183,7 @@ start_container() {
             exec postgres -D /data '"$pgargs"'' >/dev/null ;;
         *)
           SOAK_PG_LOG_FILE=/data/log/pg.log
-          docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" \
+          docker run -d --name "$name" --shm-size=1g ${cpu_args[@]+"${cpu_args[@]}"} -p "127.0.0.1:$port:5432" "$CASSERT_IMAGE" \
             sh -c 'mkdir -p /data/log && exec postgres -D /data '"$pgargs" >/dev/null ;;
       esac ;;
     *)
@@ -185,6 +215,25 @@ sample_stats() {
   done
 }
 
+# The soak database's top statements by total execution time, cumulative since the server
+# started, every 60 s: per-window costs are the differences between snapshots by queryid.
+sample_statements() {
+  local name="$1" database="$2" out="$3"
+  printf 'epoch_ms\tqueryid\tcalls\ttotal_exec_ms\trows\tshared_blks_hit\tshared_blks_read\tquery\n' >"$out"
+  while true; do
+    docker exec "$name" psql -U postgres -d postgres -Atq -c "COPY (
+      SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint, s.queryid, s.calls,
+             round(s.total_exec_time::numeric, 1), s.rows, s.shared_blks_hit, s.shared_blks_read,
+             left(regexp_replace(s.query, '\s+', ' ', 'g'), 300)
+      FROM pg_stat_statements AS s
+      JOIN pg_database AS d ON d.oid = s.dbid
+      WHERE d.datname = '$database'
+      ORDER BY s.total_exec_time DESC
+      LIMIT 100) TO STDOUT" >>"$out" 2>/dev/null
+    sleep 60
+  done
+}
+
 if [ -n "${SOAK_TEST_BIN:-}" ]; then
   harness_cmd=("$SOAK_TEST_BIN" persona_soak --ignored --nocapture --exact)
 else
@@ -206,18 +255,26 @@ for index in "${!ENGINES[@]}"; do
   log_env=(AWA_SOAK_PG_CONTAINER="$name")
   [ "$engine" = pg18-cassert ] && log_env+=(AWA_SOAK_PG_CONTAINER_LOG="$SOAK_PG_LOG_FILE")
 
+  database="awa_soak_${engine//-/_}"
   sample_stats "$name" "$out/container-stats.csv" &
-  STATS_PID=$!
+  SAMPLER_PIDS+=($!)
+  if [ ${#STATEMENT_ARGS[@]} -gt 0 ]; then
+    if docker exec "$name" psql -U postgres -d postgres -Atqc 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements' >/dev/null 2>&1; then
+      sample_statements "$name" "$database" "$out/pg-stat-statements.tsv" &
+      SAMPLER_PIDS+=($!)
+    else
+      echo "   pg_stat_statements unavailable; continuing without it"
+    fi
+  fi
 
-  env AWA_SOAK_DATABASE_URL="postgres://postgres:test@localhost:$port/awa_soak_${engine//-/_}" \
+  env AWA_SOAK_DATABASE_URL="postgres://postgres:test@localhost:$port/$database" \
     AWA_SOAK_SECONDS="$SECONDS_PER_ENGINE" \
     AWA_SOAK_REPORT_DIR="$out" \
     "${log_env[@]}" \
     "${harness_cmd[@]}" >"$out/run.log" 2>&1
   status=$?
 
-  kill "$STATS_PID" 2>/dev/null
-  STATS_PID=""
+  stop_samplers
   if [ $status -ne 0 ]; then
     overall=1
     echo "   FAILED (exit $status); see $out/report.md and $out/reproducer.md"

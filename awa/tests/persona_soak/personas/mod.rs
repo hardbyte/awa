@@ -11,6 +11,7 @@ pub mod python;
 pub mod sam;
 pub mod shardops;
 pub mod tom;
+pub mod txn;
 pub mod ui;
 
 use super::config::Persona;

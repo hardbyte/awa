@@ -13,8 +13,9 @@ use super::stop::Stop;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Connections kept free of persona pools: oracle, chaos sessions, admin probes.
-const HEADROOM: u32 = 14;
+/// Connections kept free of persona pools: oracle, final reconciliation, chaos
+/// sessions, admin probes.
+const HEADROOM: u32 = 18;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
@@ -29,9 +30,15 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         config.database_name()
     );
     db::recreate_database(&config).await?;
-    let oracle_pool = db::connect_pool(&config.database_url, "soak_oracle", 4)
-        .await
-        .map_err(|error| format!("oracle connect: {error}"))?;
+    let oracle_pool = db::connect_sampler_pool(
+        &config.database_url,
+        "soak_oracle",
+        4,
+        config.sampler_statement_timeout,
+        config.sampler_lock_timeout,
+    )
+    .await
+    .map_err(|error| format!("oracle connect: {error}"))?;
     let info = db::server_info(&oracle_pool)
         .await
         .map_err(|error| format!("server info: {error}"))?;
@@ -112,6 +119,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         Persona::Fanout,
         Persona::ShardOps,
         Persona::ClaimAbandon,
+        Persona::Txn,
     ] {
         if shared.config.has(persona) {
             tasks.push((persona, spawn_persona(persona, shared.clone())));
@@ -192,7 +200,17 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         .quiesced
         .store(quiesced, std::sync::atomic::Ordering::Relaxed);
     shared.note("run", format!("quiesced: {quiesced}"));
-    super::terminal_proof::observe(&shared, &oracle_pool).await;
+    let final_pool = db::connect_sampler_pool(
+        &shared.config.database_url,
+        "soak_oracle_final",
+        4,
+        shared.config.final_statement_timeout,
+        shared.config.final_statement_timeout,
+    )
+    .await
+    .map_err(|error| format!("final reconciliation connect: {error}"))?;
+    oracle.begin_final_phase(final_pool.clone());
+    super::terminal_proof::observe(&shared, &final_pool).await;
     oracle.final_check(quiesced).await;
     let excerpts = oracle.crash_scan();
     for excerpt in &excerpts {
@@ -205,7 +223,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let log_tail = watch.log_since_start(&shared.config);
     if shared.config.has(Persona::ShardOps) {
         match &log_tail {
-            Some(log) => super::shard_oracle::scan_server_log(&shared, &oracle_pool, log).await,
+            Some(log) => super::shard_oracle::scan_server_log(&shared, &final_pool, log).await,
             None => shared.note(
                 "run",
                 "no Postgres log source is configured, so permission errors raised inside the runtimes are not scanned",
@@ -269,6 +287,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
     }
     super::gate_metrics::reconcile(&shared);
+    shared.evaluate_sample_skips();
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
@@ -284,6 +303,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     {
         eprintln!("could not write the maintenance metrics: {error}");
     }
+    final_pool.close().await;
     oracle_pool.close().await;
     Ok(shared)
 }
@@ -308,6 +328,7 @@ fn spawn_persona(
             Persona::Fanout => personas::fanout::run(shared).await,
             Persona::ShardOps => personas::shardops::run(shared).await,
             Persona::ClaimAbandon => personas::abandon::run(shared).await,
+            Persona::Txn => personas::txn::run(shared).await,
         }
     })
 }

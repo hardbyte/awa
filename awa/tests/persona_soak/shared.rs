@@ -239,6 +239,64 @@ impl Shared {
         }
     }
 
+    /// Counts a periodic sample of `check` that was attempted.
+    pub fn sample_attempted(&self, check: &str) {
+        self.run.add(&format!("sampler_attempts.{check}"), 1);
+    }
+
+    /// A failed sample of `check`. One cut short by the sampler's statement or lock timeout
+    /// (SQLSTATE 57014 or 55P03) outside the final phase is skipped and counted per check, so
+    /// measuring never holds a lock prune waits for; any other failure, and any failure in the
+    /// final phase, leaves the evidence incomplete.
+    pub fn sample_failed(&self, check: &str, what: &str, error: &sqlx::Error, final_phase: bool) {
+        let timed_out = error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .is_some_and(|code| code == "57014" || code == "55P03");
+        if timed_out && !final_phase {
+            self.run.add(&format!("sampler_skips.{check}"), 1);
+            return;
+        }
+        self.incomplete(format!("{what}: {error}"), vec![]);
+    }
+
+    /// Reports the per-check skip counts and marks the run incomplete when any check skipped
+    /// more than the configured share of its periodic samples.
+    pub fn evaluate_sample_skips(&self) {
+        let counters = self.run.counters();
+        let mut total_skipped = 0;
+        for (name, attempts) in &counters {
+            let Some(check) = name.strip_prefix("sampler_attempts.") else {
+                continue;
+            };
+            let skipped = counters
+                .get(&format!("sampler_skips.{check}"))
+                .copied()
+                .unwrap_or(0);
+            total_skipped += skipped;
+            if skipped == 0 {
+                continue;
+            }
+            let percent = skipped as f64 * 100.0 / (*attempts).max(1) as f64;
+            self.note(
+                "oracle",
+                format!(
+                    "{check}: {skipped} of {attempts} periodic sample(s) ({percent:.1}%) hit the sampler's statement or lock timeout and were skipped"
+                ),
+            );
+            if percent > self.config.sampler_max_skip_percent as f64 {
+                self.incomplete(
+                    format!(
+                        "{check} skipped {skipped} of {attempts} periodic samples ({percent:.1}%), above the {}% limit",
+                        self.config.sampler_max_skip_percent
+                    ),
+                    vec![],
+                );
+            }
+        }
+        self.run.add("oracle_samples_skipped", total_skipped);
+    }
+
     /// Records a non-fatal finding: something worth a bug report that is not one of the
     /// invariants the soak fails on.
     pub fn finding(&self, kind: &str, summary: impl Into<String>, rows: Vec<String>) {
