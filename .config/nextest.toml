@@ -16,6 +16,7 @@ slow-timeout = { period = "60s" }
 [test-groups]
 migrations = { max-threads = 1 }
 bulk-rescue-backlog = { max-threads = 1 }
+cron-evaluator = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'binary(migration_test)'
@@ -27,3 +28,11 @@ test-group = 'migrations'
 [[profile.default.overrides]]
 filter = 'binary(bulk_rescue_test) and test(/^rescue_drains_/)'
 test-group = 'bulk-rescue-backlog'
+
+# cron_test's end-to-end test runs a leader whose cron evaluator fires every
+# due schedule in the table, including other tests'. Under `cargo test` the
+# CRON_EVALUATOR lock in the file keeps them apart; nextest runs each test in
+# its own process, so the binary runs one test at a time here instead.
+[[profile.default.overrides]]
+filter = 'binary(cron_test)'
+test-group = 'cron-evaluator'
