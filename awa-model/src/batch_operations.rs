@@ -328,13 +328,18 @@ pub struct BatchOperationPreview {
     pub sample: Vec<JobRow>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct BatchOperationRunOutcome {
     pub claimed: bool,
     pub finalized: bool,
     pub processed: i64,
     pub skipped: i64,
     pub errored: i64,
+    /// Kind of the operation this call applied a chunk of; `None` when it
+    /// applied no items.
+    pub op_kind: Option<BatchOperationKind>,
+    /// The operation filter's `queue`, set only with `op_kind`.
+    pub queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -618,6 +623,8 @@ async fn run_one_batch_operation_chunk_locked(
         processed,
         skipped,
         errored,
+        op_kind: Some(operation.op_kind),
+        queue: operation.filter.0.queue.clone(),
     })
 }
 

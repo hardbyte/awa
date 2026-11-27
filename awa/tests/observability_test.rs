@@ -1177,3 +1177,171 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
     );
     assert_eq!(leader, Some(1.0), "the only runtime leads");
 }
+
+/// The last cumulative value of the `u64` counter `name` for `queue`.
+fn counter_for_queue(
+    resource_metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    name: &str,
+    queue: &str,
+) -> Option<u64> {
+    let mut value = None;
+    for rm in resource_metrics {
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    for point in sum.data_points() {
+                        if point.attributes().any(|kv| {
+                            kv.key.as_str() == "awa.job.queue" && kv.value.as_str() == queue
+                        }) {
+                            value = Some(point.value());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+
+/// A `retry_from_dlq` or `purge_dlq` batch operation run by the maintenance
+/// leader counts its processed rows in `awa.job.dlq_retried` and
+/// `awa.job.dlq_purged`, attributed to the filter's queue, as the synchronous
+/// DLQ paths do.
+#[tokio::test]
+async fn test_dlq_batch_operations_emit_dlq_metrics() {
+    use awa::model::batch_operations::{
+        self, BatchOperationSpec, BatchOperationState, SubmitBatchOperation,
+    };
+    use awa::model::queue_storage::QueueStorage;
+    use awa::JobFilter;
+
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let db = awa_testing::setup::TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool)
+        .await
+        .unwrap()
+        .expect("queue storage should be active");
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    let retry_queue = "observ_dlq_batch_retry";
+    let purge_queue = "observ_dlq_batch_purge";
+    for (queue, count) in [(retry_queue, 2), (purge_queue, 3)] {
+        for n in 0..count {
+            insert_with(
+                &pool,
+                &ObservableJob {
+                    value: format!("{queue} {n}"),
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert job");
+        }
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, count, Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), count as usize);
+        for claim in claimed {
+            store
+                .fail_to_dlq(
+                    &pool,
+                    claim.job.id,
+                    claim.job.run_lease,
+                    "poison",
+                    "bad",
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("job is dead-lettered");
+        }
+    }
+    let mut operations = Vec::new();
+    for (spec, queue) in [
+        (BatchOperationSpec::RetryFromDlq, retry_queue),
+        (BatchOperationSpec::PurgeDlq, purge_queue),
+    ] {
+        let operation = batch_operations::submit_batch_operation(
+            &pool,
+            SubmitBatchOperation {
+                spec,
+                filter: JobFilter::new().queue(queue).dead_lettered(true),
+                submitted_by: Some("test".into()),
+                allow_all: false,
+            },
+        )
+        .await
+        .expect("Failed to submit batch operation");
+        operations.push(operation.id);
+    }
+
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    // The runtime polls a queue of its own, so the retried jobs stay put.
+    let client = Client::builder(pool.clone())
+        .queue(
+            "observ_dlq_batch_runner",
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .register::<ObservableJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+        .leader_election_interval(Duration::from_millis(100))
+        .build()
+        .expect("Failed to build client");
+    client.start().await.expect("Failed to start client");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut done = true;
+        for id in &operations {
+            let operation = batch_operations::get_batch_operation(&pool, *id)
+                .await
+                .expect("Failed to read batch operation");
+            done &= operation.state == BatchOperationState::Completed;
+        }
+        if done || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    client.shutdown(Duration::from_secs(5)).await;
+    for id in &operations {
+        let operation = batch_operations::get_batch_operation(&pool, *id)
+            .await
+            .expect("Failed to read batch operation");
+        assert_eq!(operation.state, BatchOperationState::Completed, "{id}");
+    }
+
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to get finished metrics");
+    let observed = (
+        counter_for_queue(&resource_metrics, "awa.job.dlq_retried", retry_queue),
+        counter_for_queue(&resource_metrics, "awa.job.dlq_purged", purge_queue),
+        counter_for_queue(&resource_metrics, "awa.job.dlq_retried", purge_queue),
+        counter_for_queue(&resource_metrics, "awa.job.dlq_purged", retry_queue),
+    );
+    let _ = meter_provider.shutdown();
+    assert_eq!(
+        observed,
+        (Some(2), Some(3), None, None),
+        "(retried {retry_queue}, purged {purge_queue}, retried {purge_queue}, purged {retry_queue})"
+    );
+}

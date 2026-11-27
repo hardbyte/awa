@@ -2420,12 +2420,36 @@ impl MaintenanceService {
                     finalized = outcome.finalized,
                     "processed batch operation chunk"
                 );
+                self.record_batch_operation_metrics(&outcome);
             }
             Ok(_) => {}
             Err(err) => {
                 branch_failed(&err);
                 warn!(error = %err, "failed to process batch operation chunk");
             }
+        }
+    }
+
+    /// Counts the DLQ rows a `retry_from_dlq` or `purge_dlq` chunk processed,
+    /// as the synchronous DLQ retry and purge paths do.
+    fn record_batch_operation_metrics(
+        &self,
+        outcome: &awa_model::batch_operations::BatchOperationRunOutcome,
+    ) {
+        use awa_model::batch_operations::BatchOperationKind;
+        let Ok(processed) = u64::try_from(outcome.processed) else {
+            return;
+        };
+        if processed == 0 {
+            return;
+        }
+        let queue = outcome.queue.as_deref();
+        match outcome.op_kind {
+            Some(BatchOperationKind::RetryFromDlq) => {
+                self.metrics.record_dlq_retried(queue, processed)
+            }
+            Some(BatchOperationKind::PurgeDlq) => self.metrics.record_dlq_purged(queue, processed),
+            _ => {}
         }
     }
 
