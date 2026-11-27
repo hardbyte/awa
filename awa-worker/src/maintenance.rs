@@ -2096,6 +2096,7 @@ impl MaintenanceService {
                             if sqlx::query("SELECT 1").execute(leader_lock.connection()).await.is_err() {
                                 warn!("Leader connection lost, re-entering election loop");
                                 self.leader.store(false, Ordering::SeqCst);
+                                self.record_leader_metric(false);
                                 Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
                                 term.cancel();
                                 return;
@@ -2275,6 +2276,7 @@ impl MaintenanceService {
             tokio::join!(leader_check, recovery, hygiene);
             self.leader.store(false, Ordering::SeqCst);
             self.record_leader_metric(false);
+            self.clear_due_work();
             self.clear_queue_ring_pin();
             Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
             if self.cancel.is_cancelled() {
@@ -5346,6 +5348,20 @@ impl MaintenanceService {
         };
         for (queue, state, depth, lag) in points {
             self.metrics.record_queue_due(&queue, &state, depth, lag);
+        }
+    }
+
+    /// Record 0 for every due gauge this runtime recorded, when it stops
+    /// leading and so stops updating them.
+    fn clear_due_work(&self) {
+        let recorded = std::mem::take(
+            &mut *self
+                .due_recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (queue, state) in recorded {
+            self.metrics.record_queue_due(&queue, &state, 0, 0.0);
         }
     }
 

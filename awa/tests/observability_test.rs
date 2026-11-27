@@ -1120,6 +1120,28 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
     };
 
     client.shutdown(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to get finished metrics");
+    let last_point = |name: &str, scheduled_of_queue: bool| {
+        metric_points(&resource_metrics, name)
+            .into_iter()
+            .rev()
+            .find(|(attrs, _)| {
+                !scheduled_of_queue
+                    || (attrs.get("awa.job.queue").map(String::as_str) == Some(queue)
+                        && attrs.get("awa.job.state").map(String::as_str) == Some("scheduled"))
+            })
+            .map(|(_, value)| value)
+    };
+    let after_leading = (
+        last_point("awa.queue.due.depth", true),
+        last_point("awa.queue.due.lag", true),
+        last_point("awa.maintenance.leader", false),
+    );
     for deferred in deferred_tables {
         sqlx::raw_sql(awa::audited_sql(format!(
             "DROP TRIGGER IF EXISTS observ_refuse_promotion ON {deferred};
@@ -1137,6 +1159,11 @@ async fn failing_promotion_emits_error_type_and_due_lag(queue_storage: bool) {
     let _ = meter_provider.shutdown();
 
     let (failed_branch, failed_batch, due_depth, due_lag, leader) = observed;
+    assert_eq!(
+        after_leading,
+        (Some(0.0), Some(0.0), Some(0.0)),
+        "a runtime that stops leading zeroes its due gauges and its leader gauge"
+    );
     assert!(failed_branch, "the promote branch records error.type");
     assert!(failed_batch, "the failed batch is recorded with error.type");
     assert_eq!(
