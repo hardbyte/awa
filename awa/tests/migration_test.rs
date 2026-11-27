@@ -1,121 +1,59 @@
 //! Migration tests: step-through upgrade, data survival, idempotency,
 //! and migration_sql() consistency.
 //!
-//! Shared-database tests serialize through a Postgres advisory lock (plus a
-//! process-local mutex); clone-backed tests run independently. CI shards this
-//! binary with `cargo nextest --partition`.
+//! Every test owns its database (`TestDatabase::canonical` clones a migrated
+//! one, `TestDatabase::empty` starts bare). A migration replay or queue-storage
+//! schema install takes thousands of relation locks in one transaction, and the
+//! cluster's shared lock table (`max_locks_per_transaction` x `max_connections`)
+//! holds only a few such transactions at once, so every test that runs one
+//! holds `serialize_lock_heavy_ddl` for its whole duration; the remaining tests
+//! use light statements on a clone and run freely. CI shards this binary with
+//! `cargo nextest --partition`.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::audited_sql;
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
 use awa::{InsertOpts, InsertParams, JobArgs, UniqueOpts};
-use awa_testing::setup::TestDatabase;
+use awa_testing::setup::{database_url, TestDatabase};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
 use std::str::FromStr;
-use std::sync::OnceLock;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// Serialize all migration tests to prevent parallel schema drops.
-static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-const MIGRATION_TEST_LOCK_KEY: i64 = 0x6177616d69677231;
+const LOCK_HEAVY_DDL_LOCK_KEY: i64 = 0x6177616d69677231;
 
-fn test_mutex() -> &'static Mutex<()> {
-    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+/// Held for the duration of a test that runs lock-heavy DDL.
+struct LockHeavyDdlGuard {
+    _connection: PgConnection,
 }
 
-struct MigrationTestGuard {
-    _local: tokio::sync::MutexGuard<'static, ()>,
-    _conn: PgConnection,
-}
-
-async fn acquire_migration_guard() -> MigrationTestGuard {
-    let local = test_mutex().lock().await;
-    ensure_migration_database().await;
-    let mut conn = PgConnection::connect(&migration_database_url())
+/// Serialize lock-heavy DDL (migration replays and queue-storage schema
+/// installs) across the threads and processes that share a cluster, so their
+/// relation locks never overlap enough to exhaust the shared lock table. Take
+/// it once at the top of a test, never in a helper: the lock is not re-entrant
+/// across connections. It is held on the `postgres` database, which every
+/// checkout of the suite has in common, and released when the guard drops.
+async fn serialize_lock_heavy_ddl() -> LockHeavyDdlGuard {
+    let admin_options = PgConnectOptions::from_str(&database_url())
+        .expect("DATABASE_URL should parse")
+        .database("postgres");
+    let mut connection = PgConnection::connect_with(&admin_options)
         .await
-        .expect("Failed to open migration test lock connection");
+        .expect("Failed to open migration replay lock connection");
+    // advisory-lock: `connection` is dedicated and closes when the guard drops.
     sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_TEST_LOCK_KEY)
-        .execute(&mut conn)
+        .bind(LOCK_HEAVY_DDL_LOCK_KEY)
+        .execute(&mut connection)
         .await
-        .expect("Failed to acquire migration test advisory lock");
-    MigrationTestGuard {
-        _local: local,
-        _conn: conn,
+        .expect("Failed to acquire migration replay advisory lock");
+    LockHeavyDdlGuard {
+        _connection: connection,
     }
 }
 
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-fn replace_database_name(url: &str, db_name: &str) -> String {
-    let (base, query) = match url.split_once('?') {
-        Some((base, query)) => (base, Some(query)),
-        None => (url, None),
-    };
-    let (prefix, _old_db) = base
-        .rsplit_once('/')
-        .expect("DATABASE_URL must include a database name");
-    let mut out = format!("{prefix}/{db_name}");
-    if let Some(query) = query {
-        out.push('?');
-        out.push_str(query);
-    }
-    out
-}
-
-fn migration_database_url() -> String {
-    replace_database_name(&database_url(), "awa_migration_test")
-}
-
-fn admin_database_url() -> String {
-    replace_database_name(&database_url(), "postgres")
-}
-
-async fn ensure_migration_database() {
-    let mut admin = PgConnection::connect(&admin_database_url())
-        .await
-        .expect("Failed to connect to admin database");
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'awa_migration_test')",
-    )
-    .fetch_one(&mut admin)
-    .await
-    .expect("Failed to check migration database existence");
-    if !exists {
-        // Tolerate the duplicate-database race: under per-test processes
-        // (cargo-nextest CI shards) another test can create it between the
-        // existence check and this statement.
-        if let Err(err) = sqlx::raw_sql("CREATE DATABASE awa_migration_test")
-            .execute(&mut admin)
-            .await
-        {
-            let duplicate = matches!(
-                &err,
-                sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("42P04")
-            );
-            assert!(duplicate, "Failed to create migration test database: {err}");
-        }
-    }
-}
-
-async fn pool() -> PgPool {
-    ensure_migration_database().await;
-    PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&migration_database_url())
-        .await
-        .expect("Failed to connect to migration test database — is Postgres running?")
-}
-
-/// Drop and recreate the awa schema for a clean migration test.
+/// Drop the awa schema, leaving the database empty.
 async fn reset_schema(pool: &PgPool) {
     sqlx::raw_sql("DROP SCHEMA IF EXISTS awa CASCADE")
         .execute(pool)
@@ -224,15 +162,22 @@ async fn create_login_role(pool: &PgPool, role: &str) {
     .expect("test role should be created");
 }
 
-async fn drop_login_role(pool: &PgPool, role: &str) {
+/// Drop a login role created for a test database. Roles are cluster-wide but
+/// their privileges live in each database that grants them, so the role's
+/// grants in `db` go first.
+async fn drop_login_role(db: &TestDatabase, role: &str) {
     assert_safe_generated_role_name(role);
-    let _ = sqlx::query(audited_sql(format!("DROP ROLE IF EXISTS {role}")))
-        .execute(pool)
-        .await;
+    sqlx::raw_sql(audited_sql(format!(
+        "DROP OWNED BY {role}; DROP ROLE IF EXISTS {role}"
+    )))
+    .execute(db.pool())
+    .await
+    .expect("test role should be dropped");
 }
 
-async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: bool) {
+async fn grant_runtime_privileges(db: &TestDatabase, role: &str, include_truncate: bool) {
     assert_safe_generated_role_name(role);
+    let database = db.name();
     let table_privileges = if include_truncate {
         "SELECT, INSERT, UPDATE, DELETE, TRUNCATE"
     } else {
@@ -240,7 +185,7 @@ async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: b
     };
     sqlx::raw_sql(audited_sql(format!(
         r#"
-        GRANT CONNECT ON DATABASE awa_migration_test TO {role};
+        GRANT CONNECT ON DATABASE {database} TO {role};
         GRANT USAGE ON SCHEMA awa TO {role};
         GRANT USAGE, SELECT ON SEQUENCE awa.jobs_id_seq TO {role};
         GRANT {table_privileges} ON ALL TABLES IN SCHEMA awa TO {role};
@@ -248,15 +193,15 @@ async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: b
         REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM {role};
         "#
     )))
-    .execute(pool)
+    .execute(db.pool())
     .await
     .expect("runtime grants should apply");
 }
 
-async fn runtime_pool_for_role(role: &str) -> PgPool {
+async fn runtime_pool_for_role(db: &TestDatabase, role: &str) -> PgPool {
     assert_safe_generated_role_name(role);
-    let options = PgConnectOptions::from_str(&migration_database_url())
-        .expect("migration database URL should parse")
+    let options = PgConnectOptions::from_str(&db.url())
+        .expect("test database URL should parse")
         .username(role)
         .password("awa_test_password");
     PgPoolOptions::new()
@@ -368,9 +313,9 @@ async fn insert_runtime_instance_with_role(pool: &PgPool, capability: &str, tran
 
 #[tokio::test]
 async fn test_fresh_install_reaches_current_version() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     migrations::run(&pool).await.unwrap();
     let version = migrations::current_version(&pool).await.unwrap();
@@ -385,9 +330,9 @@ async fn test_fresh_install_reaches_current_version() {
 
 #[tokio::test]
 async fn test_migrations_are_idempotent() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     migrations::run(&pool).await.unwrap();
     migrations::run(&pool).await.unwrap();
@@ -472,6 +417,7 @@ fn assert_snapshots_match(before: &[String], after: &[String], context: &str) {
 /// "Did not error" is not enough — the resulting catalog must be identical.
 #[tokio::test]
 async fn test_full_migration_replay_converges_to_identical_schema() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
 
@@ -510,9 +456,9 @@ async fn test_full_migration_replay_converges_to_identical_schema() {
 /// that exact file against the schema it just produced.
 #[tokio::test]
 async fn test_every_migration_is_individually_re_runnable() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     let mut conn = pool.acquire().await.expect("acquire");
     for (version, _, sql) in migrations::migration_sql() {
@@ -609,9 +555,9 @@ async fn disarm_migration_abort(pool: &PgPool) {
 /// schema that the next run would have to reconcile.
 #[tokio::test]
 async fn test_failed_fresh_install_rolls_back_every_step() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     // `runtime_instances` is created by v002, so v001 has fully applied by the
     // time the abort fires.
@@ -652,6 +598,7 @@ async fn test_failed_fresh_install_rolls_back_every_step() {
 /// it, leaving the recorded version untouched.
 #[tokio::test]
 async fn test_failed_upgrade_leaves_prior_schema_untouched() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
 
@@ -699,13 +646,13 @@ async fn test_failed_upgrade_leaves_prior_schema_untouched() {
 /// leaking out to concurrent readers would be caught too.
 #[tokio::test]
 async fn test_aborted_migration_is_never_visible_to_another_session() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     // Observer connection, taken before the run so it never contends for the
     // migration advisory lock.
-    let mut observer = PgConnection::connect(&migration_database_url())
+    let mut observer = PgConnection::connect(&db.url())
         .await
         .expect("observer connection");
 
@@ -752,11 +699,10 @@ fn assert_storage_not_finalized(err: &awa::AwaError, expected_state: &str) {
 
 #[tokio::test]
 async fn test_migrate_gate_allows_effectively_fresh_canonical() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
     // Canonical state, no prepared engine, no jobs, no live runtimes —
@@ -772,11 +718,10 @@ async fn test_migrate_gate_allows_effectively_fresh_canonical() {
 
 #[tokio::test]
 async fn test_migrate_gate_allows_active_cluster() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance(&pool, "queue_storage").await;
     // Rewind one version so the pending range crosses v043. The live runtime
@@ -794,11 +739,10 @@ async fn test_migrate_gate_allows_active_cluster() {
 
 #[tokio::test]
 async fn test_migrate_gate_refuses_canonical_cluster_with_jobs() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     sqlx::raw_sql(
         r#"
         SELECT awa.insert_job_compat(
@@ -820,11 +764,10 @@ async fn test_migrate_gate_refuses_canonical_cluster_with_jobs() {
 
 #[tokio::test]
 async fn test_migrate_gate_refuses_prepared_state() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     storage::prepare(
         &pool,
         "queue_storage",
@@ -842,11 +785,10 @@ async fn test_migrate_gate_refuses_prepared_state() {
 
 #[tokio::test]
 async fn test_migrate_gate_refuses_mixed_transition_state() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     sqlx::raw_sql(
         r#"
         UPDATE awa.storage_transition_state
@@ -869,11 +811,10 @@ async fn test_migrate_gate_refuses_mixed_transition_state() {
 
 #[tokio::test]
 async fn test_migrate_gate_refuses_recently_live_canonical_runtime() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     insert_runtime_instance(&pool, "canonical").await;
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
@@ -898,17 +839,15 @@ async fn test_migrate_gate_refuses_recently_live_canonical_runtime() {
 /// be writable by the same role (triggers run as the invoker).
 #[tokio::test]
 async fn test_admin_refresh_needs_no_truncate_privilege() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let suffix = Uuid::new_v4().simple().to_string();
     let runtime_without_truncate = format!("awa_runtime_no_truncate_{suffix}");
     create_login_role(&pool, &runtime_without_truncate).await;
-    grant_runtime_privileges(&pool, &runtime_without_truncate, false).await;
+    grant_runtime_privileges(&db, &runtime_without_truncate, false).await;
 
-    let runtime_pool = runtime_pool_for_role(&runtime_without_truncate).await;
+    let runtime_pool = runtime_pool_for_role(&db, &runtime_without_truncate).await;
     sqlx::query(
         "INSERT INTO awa.jobs (kind, queue, args) VALUES ('grants_probe', 'grants_probe_q', '{}'::jsonb)",
     )
@@ -923,7 +862,7 @@ async fn test_admin_refresh_needs_no_truncate_privilege() {
         .expect("full metadata refresh must not require TRUNCATE");
     runtime_pool.close().await;
 
-    drop_login_role(&pool, &runtime_without_truncate).await;
+    drop_login_role(&db, &runtime_without_truncate).await;
 }
 
 #[tokio::test]
@@ -947,9 +886,9 @@ async fn test_install_queue_storage_substrate_is_not_public_executable() {
 
 #[tokio::test]
 async fn test_step_through_upgrade_preserves_data() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     let v1_sql = migrations::migration_sql();
     let (v1_version, _, v1_up) = &v1_sql[0];
@@ -1092,6 +1031,7 @@ async fn test_step_through_upgrade_preserves_data() {
 
 #[tokio::test]
 async fn test_migration_sql_matches_run() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
 
@@ -1127,6 +1067,7 @@ async fn test_migration_sql_matches_run() {
 
 #[tokio::test]
 async fn test_substrate_replay_preserves_current_claimer_owner_index() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool();
     let mut tx = pool.begin().await.unwrap();
@@ -1196,9 +1137,9 @@ async fn test_substrate_replay_preserves_current_claimer_owner_index() {
 
 #[tokio::test]
 async fn test_v023_migrates_legacy_default_queue_storage_tables() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     for (_version, _desc, sql) in migrations::migration_sql_range(0, 22) {
         sqlx::raw_sql(audited_sql(sql.clone()))
@@ -1321,9 +1262,9 @@ async fn test_v023_migrates_legacy_default_queue_storage_tables() {
 
 #[tokio::test]
 async fn test_v027_rebuckets_existing_terminal_live_counts() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     for (_version, _desc, sql) in migrations::migration_sql_range(0, 26) {
         sqlx::raw_sql(audited_sql(sql.clone()))
@@ -1399,9 +1340,9 @@ async fn test_v027_rebuckets_existing_terminal_live_counts() {
 
 #[tokio::test]
 async fn test_legacy_version_upgrade() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     let v1_sql = &migrations::migration_sql()[0].2;
     sqlx::raw_sql(audited_sql(v1_sql.clone()))
@@ -1480,9 +1421,9 @@ async fn test_legacy_version_upgrade() {
 
 #[tokio::test]
 async fn test_migration_sql_range_produces_valid_schema() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     // Apply only V1+V2 via range, then verify V2 artifacts exist but V3+ don't.
     for (_version, _desc, sql) in migrations::migration_sql_range(0, 2) {
@@ -1549,11 +1490,8 @@ async fn test_migration_sql_range_produces_valid_schema() {
 
 #[tokio::test]
 async fn test_storage_prepare_keeps_canonical_routing() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let status = storage::status(&pool).await.unwrap();
     assert_eq!(status.current_engine, "canonical");
@@ -1620,11 +1558,9 @@ async fn test_storage_prepare_keeps_canonical_routing() {
 
 #[tokio::test]
 async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     prepare_queue_storage_schema(&pool, "awa_queue_storage_prepared").await;
 
@@ -1713,11 +1649,9 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
 
 #[tokio::test]
 async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_v031_index";
     prepare_queue_storage_schema(&pool, schema).await;
@@ -1787,11 +1721,9 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
 /// install helper the migration re-invokes.
 #[tokio::test]
 async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_v042_deadline";
     prepare_queue_storage_schema(&pool, schema).await;
@@ -1890,18 +1822,6 @@ async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
-
-    // Clean up so a later `migrations::run` (this or another test) does not
-    // reinstall this schema through the discovery loops. With the v043
-    // ledger loop now running alongside the v042 compact-deadline loop, a
-    // leaked probe schema multiplies the single-tx lock footprint of the
-    // reinstall and can trip max_locks_per_transaction under concurrency.
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("compact-deadline probe schema should drop cleanly");
 }
 
 async fn rollups_failed_column_exists(pool: &PgPool, schema: &str) -> bool {
@@ -1924,11 +1844,9 @@ async fn rollups_failed_column_exists(pool: &PgPool, schema: &str) -> bool {
 
 #[tokio::test]
 async fn test_v032_backfills_queue_storage_pruned_failed_rollup_column() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_v032_rollups";
     prepare_queue_storage_schema(&pool, schema).await;
@@ -2013,23 +1931,11 @@ async fn ring_state_cursor_columns_exist(pool: &PgPool, schema: &str) -> bool {
 /// the ledger (the inverse seed).
 #[tokio::test]
 async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_v043_ledger";
-    // Drop any leftover from a prior interrupted run BEFORE migrating: the
-    // v043 discovery loop reinstalls every existing queue-storage schema,
-    // and reinstalling a stale copy here only wastes a large single-tx
-    // lock footprint (and can trip max_locks_per_transaction).
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("leftover ledger probe schema should drop cleanly");
-
-    migrations::run(&pool).await.unwrap();
 
     prepare_queue_storage_schema(&pool, schema).await;
 
@@ -2194,15 +2100,6 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
-
-    // Clean up so a later `migrations::run` (this or another test) does not
-    // reinstall this schema through the v043 discovery loop.
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("ledger probe schema should drop cleanly");
 }
 
 /// #371 v043 staged upgrade: a FRESH queue-storage install starts directly
@@ -2211,19 +2108,11 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
 /// resolves through the authority machinery.
 #[tokio::test]
 async fn test_v043_fresh_install_starts_in_ledger_authority() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_v043_fresh";
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("leftover fresh probe schema should drop cleanly");
-
-    migrations::run(&pool).await.unwrap();
 
     // Fresh install of a custom schema (never existed before).
     prepare_queue_storage_schema(&pool, schema).await;
@@ -2247,22 +2136,13 @@ async fn test_v043_fresh_install_starts_in_ledger_authority() {
     .await
     .expect("ring_cursor('queue') should resolve on a fresh install");
     assert_eq!((slot, generation), (0, 0), "fresh genesis cursor is (0, 0)");
-
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("fresh probe schema should drop cleanly");
 }
 
 #[tokio::test]
 async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_ready_probe";
     prepare_queue_storage_schema(&pool, schema).await;
@@ -2459,19 +2339,11 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
 
 #[tokio::test]
 async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_current_shape() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_trusted_marker";
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("queue storage test schema should drop cleanly");
     let store =
         QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
     store
@@ -2527,19 +2399,11 @@ async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_curren
 
 #[tokio::test]
 async fn test_v030_preserves_untrusted_terminal_counter_marker_on_empty_schema() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let schema = "awa_queue_storage_untrusted_marker";
-    sqlx::query(audited_sql(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&pool)
-    .await
-    .expect("queue storage test schema should drop cleanly");
     let store =
         QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
     store
@@ -2579,11 +2443,9 @@ async fn test_v030_preserves_untrusted_terminal_counter_marker_on_empty_schema()
 
 #[tokio::test]
 async fn test_install_queue_storage_backend_activates_routing_and_state() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     install_queue_storage_backend(&pool, "awa_queue_storage_active").await;
 
@@ -2644,11 +2506,9 @@ async fn test_install_queue_storage_backend_activates_routing_and_state() {
 
 #[tokio::test]
 async fn test_active_queue_storage_schema_survives_missing_backend_marker() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     install_queue_storage_backend(&pool, "awa_queue_storage_missing_marker").await;
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
@@ -2703,11 +2563,8 @@ async fn test_active_queue_storage_schema_survives_missing_backend_marker() {
 
 #[tokio::test]
 async fn test_storage_prepare_rejects_current_engine() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let err = storage::prepare(&pool, "canonical", serde_json::json!({}))
         .await
@@ -2721,11 +2578,8 @@ async fn test_storage_prepare_rejects_current_engine() {
 
 #[tokio::test]
 async fn test_storage_prepare_same_details_is_idempotent() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let details = serde_json::json!({
         "schema": "awa_queue_storage"
@@ -2746,11 +2600,8 @@ async fn test_storage_prepare_same_details_is_idempotent() {
 
 #[tokio::test]
 async fn test_storage_abort_from_canonical_is_noop() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let before = storage::status(&pool).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2763,11 +2614,10 @@ async fn test_storage_abort_from_canonical_is_noop() {
 
 #[tokio::test]
 async fn test_storage_abort_from_empty_mixed_transition_returns_to_canonical() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
 
     sqlx::query(
@@ -2808,11 +2658,10 @@ async fn test_storage_abort_from_empty_mixed_transition_returns_to_canonical() {
 
 #[tokio::test]
 async fn test_storage_abort_from_mixed_transition_rejects_live_queue_storage_runtimes() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
 
     sqlx::query(
@@ -2851,11 +2700,10 @@ async fn test_storage_abort_from_mixed_transition_rejects_live_queue_storage_run
 
 #[tokio::test]
 async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
 
     sqlx::query(
@@ -2914,11 +2762,10 @@ async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
 
 #[tokio::test]
 async fn test_storage_abort_from_mixed_transition_rejects_compact_terminal_rows() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
 
     sqlx::query(
@@ -2993,11 +2840,10 @@ async fn test_storage_abort_from_mixed_transition_rejects_compact_terminal_rows(
 
 #[tokio::test]
 async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_runtime() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, "awa_enter_mixed").await;
 
     let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
@@ -3063,12 +2909,11 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
 
 #[tokio::test]
 async fn test_storage_finalize_requires_empty_backlog_but_allows_drain_runtimes() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let schema = "awa_finalize_transition";
-    reset_schema(&pool).await;
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, schema).await;
 
     let err = storage::finalize(&pool).await.unwrap_err();
@@ -3137,12 +2982,11 @@ async fn test_storage_finalize_requires_empty_backlog_but_allows_drain_runtimes(
 
 #[tokio::test]
 async fn test_storage_status_report_surfaces_enter_mixed_transition_readiness() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let schema = "awa_status_report_enter";
-    reset_schema(&pool).await;
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, schema).await;
     storage::prepare(
         &pool,
@@ -3183,12 +3027,11 @@ async fn test_storage_status_report_surfaces_enter_mixed_transition_readiness() 
 
 #[tokio::test]
 async fn test_storage_status_report_surfaces_finalize_blockers() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let schema = "awa_status_report_finalize";
-    reset_schema(&pool).await;
 
-    migrations::run(&pool).await.unwrap();
     prepare_queue_storage_schema(&pool, schema).await;
     storage::prepare(
         &pool,
@@ -3237,12 +3080,11 @@ async fn test_storage_status_report_surfaces_finalize_blockers() {
 
 #[tokio::test]
 async fn test_mixed_transition_routes_compat_producers_into_queue_storage() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let schema = "awa_migration_mixed_transition";
-    reset_schema(&pool).await;
 
-    migrations::run(&pool).await.unwrap();
     install_queue_storage_backend(&pool, schema).await;
 
     sqlx::query(
@@ -3326,12 +3168,11 @@ async fn test_mixed_transition_routes_compat_producers_into_queue_storage() {
 
 #[tokio::test]
 async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let schema = "awa_migration_active_queue_storage";
-    reset_schema(&pool).await;
 
-    migrations::run(&pool).await.unwrap();
     install_queue_storage_backend(&pool, schema).await;
 
     sqlx::query(
@@ -3462,11 +3303,10 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
 
 #[tokio::test]
 async fn test_insert_many_uses_insert_job_compat_after_non_canonical_activation() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
 
     let queue = "compat_insert_many";
@@ -3504,11 +3344,10 @@ async fn test_insert_many_uses_insert_job_compat_after_non_canonical_activation(
 
 #[tokio::test]
 async fn test_insert_many_copy_uses_insert_job_compat_after_non_canonical_activation() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
 
     let queue = "compat_insert_many_copy";
@@ -3546,11 +3385,10 @@ async fn test_insert_many_copy_uses_insert_job_compat_after_non_canonical_activa
 
 #[tokio::test]
 async fn test_insert_many_copy_preserves_unique_skip_after_non_canonical_activation() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
 
     let queue = "compat_copy_unique";
@@ -3729,6 +3567,7 @@ async fn test_inserts_succeed_when_singleton_missing() {
 
 #[tokio::test]
 async fn test_v011_reseeds_singleton_when_upgrading_from_v010() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
 
@@ -3765,9 +3604,9 @@ async fn test_v011_reseeds_singleton_when_upgrading_from_v010() {
 
 #[tokio::test]
 async fn test_legacy_v3_only_upgrade() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     let v1_sql = &migrations::migration_sql()[0].2;
     sqlx::raw_sql(audited_sql(v1_sql.clone()))
@@ -3843,11 +3682,8 @@ async fn test_legacy_v3_only_upgrade() {
 /// closes the 0.6 fresh-install UX gap (issue #197).
 #[tokio::test]
 async fn test_auto_finalize_promotes_fresh_install() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let baseline = storage::status(&pool).await.unwrap();
     assert_eq!(baseline.state, "canonical");
@@ -3894,11 +3730,8 @@ async fn test_auto_finalize_promotes_fresh_install() {
 /// canonical drain is observable.
 #[tokio::test]
 async fn test_auto_finalize_refuses_when_canonical_jobs_exist() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     sqlx::query(
         "INSERT INTO awa.jobs_hot (kind, queue, args, state, priority) \
@@ -3924,11 +3757,9 @@ async fn test_auto_finalize_refuses_when_canonical_jobs_exist() {
 /// set and auto-finalize must defer to the staged path.
 #[tokio::test]
 async fn test_auto_finalize_refuses_when_prepared_engine_is_set() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     storage::prepare(
         &pool,
         "queue_storage",
@@ -3958,11 +3789,9 @@ async fn test_auto_finalize_refuses_when_prepared_engine_is_set() {
 /// install.
 #[tokio::test]
 async fn test_auto_finalize_refuses_when_runtime_is_live() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
-    migrations::run(&pool).await.unwrap();
     insert_runtime_instance(&pool, "canonical").await;
 
     let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
@@ -3981,16 +3810,14 @@ async fn test_auto_finalize_refuses_when_runtime_is_live() {
 
 // ── Concurrency & cancellation safety (migration advisory lock) ───
 
-/// Build a dedicated pool with a specific connection ceiling — the shared
-/// `pool()` caps at 2, too few to genuinely race several runners at once.
-async fn pool_with_max_connections(max: u32) -> PgPool {
-    ensure_migration_database().await;
+/// Build a dedicated pool on `db` with a specific connection ceiling — the
+/// database's own pool is too small to genuinely race several runners at once.
+fn pool_with_max_connections(db: &TestDatabase, max: u32) -> PgPool {
     PgPoolOptions::new()
         .max_connections(max)
         .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect(&migration_database_url())
-        .await
-        .expect("Failed to connect to migration test database — is Postgres running?")
+        .connect_lazy(&db.url())
+        .expect("test database URL should parse")
 }
 
 /// Race N concurrent `run()` calls against a fresh database and assert they
@@ -4001,11 +3828,11 @@ async fn pool_with_max_connections(max: u32) -> PgPool {
 /// a single application.
 #[tokio::test]
 async fn test_concurrent_runs_apply_once_and_converge() {
-    let _guard = acquire_migration_guard().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
 
     const RACERS: usize = 8;
-    let pool = pool_with_max_connections(RACERS as u32 + 2).await;
-    reset_schema(&pool).await;
+    let pool = pool_with_max_connections(&db, RACERS as u32 + 2);
 
     // `migrations::run` is `!Send` (it holds a pooled connection / transaction
     // across awaits), so the racers run on a LocalSet rather than tokio::spawn.
@@ -4072,16 +3899,16 @@ async fn test_concurrent_runs_apply_once_and_converge() {
 /// connection happened to close — this test would then hang on the final run.
 #[tokio::test]
 async fn test_cancelled_run_does_not_strand_migration_lock() {
-    let _guard = acquire_migration_guard().await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
 
-    let pool = pool_with_max_connections(4).await;
-    reset_schema(&pool).await;
+    let pool = pool_with_max_connections(&db, 4);
     migrations::run(&pool).await.expect("initial migrate");
 
     // Hold ACCESS EXCLUSIVE on awa.schema_version so a racing run parks *while
     // holding the migration advisory lock*: run() acquires the xact lock, then
     // blocks on its early `SELECT MAX(version) FROM awa.schema_version`.
-    let mut blocker = PgConnection::connect(&migration_database_url())
+    let mut blocker = PgConnection::connect(&db.url())
         .await
         .expect("blocker connection should open");
     let mut blocker_tx = blocker.begin().await.expect("blocker begin");
@@ -4132,12 +3959,9 @@ async fn test_cancelled_run_does_not_strand_migration_lock() {
 /// mutation of `schema_version` (count + max unchanged).
 #[tokio::test]
 async fn test_migrate_refuses_schema_newer_than_binary() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    // Bring the schema to CURRENT_VERSION the normal way.
-    migrations::run(&pool).await.expect("initial migrate");
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     // Record a version one past what this binary knows — the supported
     // rolling-deploy skew (older binary, newer schema).
@@ -4194,9 +4018,9 @@ async fn test_migrate_refuses_schema_newer_than_binary() {
 /// *behind* still upgrades.
 #[tokio::test]
 async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
-    let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
+    let _serialized = serialize_lock_heavy_ddl().await;
+    let db = TestDatabase::empty().await;
+    let pool = db.pool().clone();
 
     // Fresh install → CURRENT_VERSION.
     migrations::run(&pool).await.expect("fresh migrate");
@@ -4298,6 +4122,7 @@ async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
 /// runtime reports a version below the v043 compatibility floor.
 #[tokio::test]
 async fn test_runtime_version_floor_override_allows_old_live_runtime() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
     // Finalize (so the ADR-037 gate passes), add a live worker, then rewind so
@@ -4326,6 +4151,7 @@ async fn test_runtime_version_floor_override_allows_old_live_runtime() {
 
 #[tokio::test]
 async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
     simulate_non_canonical_compat_routing(&pool).await;
@@ -4367,6 +4193,7 @@ async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
 
 #[tokio::test]
 async fn test_runtime_version_floor_ignores_stale_old_runtime() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
     simulate_non_canonical_compat_routing(&pool).await;
@@ -4394,6 +4221,7 @@ async fn test_runtime_version_floor_ignores_stale_old_runtime() {
 /// rerun `awa migrate` during normal live traffic.
 #[tokio::test]
 async fn test_live_migration_retries_hot_table_deadlock() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
     simulate_non_canonical_compat_routing(&pool).await;
@@ -4490,6 +4318,7 @@ async fn test_live_migration_retries_hot_table_deadlock() {
 /// the pre-flight — a live worker is fine for a no-op run.
 #[tokio::test]
 async fn test_exclusive_window_skipped_for_noncrossing_range() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
     assert_eq!(
@@ -4513,6 +4342,7 @@ async fn test_exclusive_window_skipped_for_noncrossing_range() {
 
 #[tokio::test]
 async fn v048_generated_bundle_refreshes_a_stale_installer() {
+    let _serialized = serialize_lock_heavy_ddl().await;
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool();
     // A stale-installer sentinel makes the missing dependency observable. It
