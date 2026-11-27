@@ -361,7 +361,12 @@ where
                   AND p.proargtypes[1] = 'bigint'::regtype
                   AND p.proargtypes[2] = 'double precision'::regtype
                   AND p.proargtypes[3] = 'double precision'::regtype
-                  AND p.proargnames @> ARRAY['receipt_id', 'claim_batch_id', 'claim_batch_index']
+                  AND (
+                      SELECT count(*)
+                      FROM unnest(p.proargnames, p.proargmodes) AS arg(name, mode)
+                      WHERE arg.mode IN ('o', 'b', 't')
+                        AND arg.name IN ('receipt_id', 'claim_batch_id', 'claim_batch_index')
+                  ) = 3
             )
         "#,
     )
