@@ -896,7 +896,26 @@ pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErro
             finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
             callback_id = NULL, callback_timeout_at = NULL,
             callback_filter = NULL, callback_on_complete = NULL,
-            callback_on_fail = NULL, callback_transform = NULL
+            callback_on_fail = NULL, callback_transform = NULL,
+            unique_states = CASE
+                WHEN state = 'cancelled' THEN COALESCE(
+                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
+                     FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
+                     WHERE entry->>'error' IN (
+                           'snoozed as duplicate: unique claim held by a newer job',
+                           'retried as duplicate: unique claim held by a newer job',
+                           'promoted as duplicate: unique claim held by another job',
+                           'rescued as duplicate: heartbeat stale and unique claim held by a newer job',
+                           'rescued as duplicate: deadline expired and unique claim held by a newer job',
+                           'rescued as duplicate: callback timed out and unique claim held by a newer job'
+                       )
+                       AND entry->>'duplicate_unique_states' IS NOT NULL
+                     ORDER BY n DESC
+                     LIMIT 1),
+                    unique_states
+                )
+                ELSE unique_states
+            END
         WHERE id = $1 AND state IN ('failed', 'cancelled', 'waiting_external')
         RETURNING *
         "#,
@@ -4198,7 +4217,26 @@ pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaEr
             finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
             callback_id = NULL, callback_timeout_at = NULL,
             callback_filter = NULL, callback_on_complete = NULL,
-            callback_on_fail = NULL, callback_transform = NULL
+            callback_on_fail = NULL, callback_transform = NULL,
+            unique_states = CASE
+                WHEN state = 'cancelled' THEN COALESCE(
+                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
+                     FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
+                     WHERE entry->>'error' IN (
+                           'snoozed as duplicate: unique claim held by a newer job',
+                           'retried as duplicate: unique claim held by a newer job',
+                           'promoted as duplicate: unique claim held by another job',
+                           'rescued as duplicate: heartbeat stale and unique claim held by a newer job',
+                           'rescued as duplicate: deadline expired and unique claim held by a newer job',
+                           'rescued as duplicate: callback timed out and unique claim held by a newer job'
+                       )
+                       AND entry->>'duplicate_unique_states' IS NOT NULL
+                     ORDER BY n DESC
+                     LIMIT 1),
+                    unique_states
+                )
+                ELSE unique_states
+            END
         WHERE id = ANY($1) AND state IN ('failed', 'cancelled', 'waiting_external')
         RETURNING *
         "#,
