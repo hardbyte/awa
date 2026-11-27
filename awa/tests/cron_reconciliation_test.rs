@@ -457,7 +457,7 @@ async fn failed_start_does_not_publish_authority() {
 /// Released executable built by scripts/rehearse-cron-ownership.sh. Exercises
 /// released functions and a real old maintenance leader, not copied SQL.
 #[sqlx::test]
-#[ignore = "requires the released 0.6.7 probe; scripts/rehearse-cron-ownership.sh"]
+#[ignore = "requires the released 0.6.19 probe; scripts/rehearse-cron-ownership.sh"]
 async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
     use sqlx::ConnectOptions;
     use std::process::Stdio;
@@ -614,7 +614,7 @@ async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
     current.shutdown(Duration::from_secs(5)).await;
     println!(
         "{}",
-        serde_json::json!({"protocol":"cron-ownership-v1","old_artifact":"awa=0.6.7","schema":migrations::CURRENT_VERSION,"live_old_leader_fenced":true,"released_upsert_preserves_tombstone":true,"released_atomic_enqueue_fenced":true})
+        serde_json::json!({"protocol":"cron-ownership-v1","old_artifact":"awa=0.6.19","schema":migrations::CURRENT_VERSION,"live_old_leader_fenced":true,"released_upsert_preserves_tombstone":true,"released_atomic_enqueue_fenced":true})
     );
 }
 

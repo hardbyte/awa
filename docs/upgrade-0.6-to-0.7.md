@@ -361,7 +361,7 @@ When the first ready row at or after a lane's claim cursor is spent (cancelled, 
 
 v061 rewrites `<schema>.claim_ready_runtime` in the default and every discovered custom queue-storage schema from its own definition, so its signature, owner, privileges and settings are unchanged; the per-slot claim functions carry no spent prefix and are not touched. A function that already carries the change is left alone, so a replay and a fresh install are no-ops. On a database coming from 0.6.19, whose `claim_spent_prefix_gaps` schema patch crosses the gaps without the generation bound, v061 adds the bound. It reinstalls no table or trigger and takes no lock on any `awa` or queue-storage table; a claim in flight finishes on the old body.
 
-v061 changes only the function's body: its name, arguments and results are unchanged, so binaries before v061 call it the same way before and after the migration. No rehearsal runs them against the migrated schema; `claim_spent_prefix_gaps_test` checks that the rewrite keeps the function in place and matches the installer. External migration runners apply the complete `awa migrate --sql --from 60 --to 61` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
+v061 changes only the function's body: its name, arguments and results are unchanged, so binaries before v061 call it the same way before and after the migration. The release gate's compat matrix and rolling-upgrade rehearsal run released 0.6.19 workers, and the compat matrix also 0.6.2 workers, against the migrated schema, but none of their workloads leaves rolled-back reservations at a lane's head; `claim_spent_prefix_gaps_test` checks that the rewrite keeps the function in place and matches the installer. External migration runners apply the complete `awa migrate --sql --from 60 --to 61` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
 
 ## v062: ring generation floor
 
@@ -487,7 +487,8 @@ upgrade supporting a mixed 0.6.2/0.7 fleet.
 > modifying them, and refuses to restart after the authority flip. Do not run a
 > 0.7 migration while a 0.6.0 or 0.6.1 binary can invoke `awa migrate`; those
 > releases contain the destructive newer-schema misclassification fixed by
-> [#392](https://github.com/hardbyte/awa/issues/392).
+> [#392](https://github.com/hardbyte/awa/issues/392). 0.6.19 is recommended: it is the
+> release the release gate rehearses the rolling upgrade from.
 
 `awa migrate` enforces this stepping-stone: v043 is refused while any runtime with a
 fresh heartbeat reports a version below 0.6.2 or an unparseable version. The
@@ -537,8 +538,9 @@ orders are supported:
 If you migrate first, roll 0.7 workers promptly. An all-0.6.2 fleet on v043 remains safe:
 crash and heartbeat rescue are batch-aware, but 0.6.2's deadline-rescue sweep does not read
 the v042 compact claim batches used for newly claimed deadline jobs. Deadline-based rescue
-for those jobs resumes when a 0.7 runtime takes maintenance leadership. Roll the
-0.6 maintenance leader promptly after migrating. Awa's built-in
+for those jobs resumes when a 0.7 runtime takes maintenance leadership. This holds for
+released 0.6.12 and older; from 0.6.13 the released fleet drops the overdue handler and its
+heartbeat rescue retries the job. Roll the 0.6 maintenance leader promptly after migrating. Awa's built-in
 migrator applies v041-v043 in one transaction, so other sessions see v040 or v043, never an
 intermediate version. An external migration runner that commits each version separately can
 expose v041/v042; a restarting 0.6.2 worker refuses those transient schemas and connects
@@ -663,7 +665,7 @@ names and enable complete-set registration. Inspect `awa cron plan OWNER` before
 removing declarations. A stopped fleet is an outage, never a delete signal;
 use explicit `cron retire-owner OWNER --apply` for decommissioning.
 
-Use current operator clients for owned schedules. The released 0.6.7 automatic
+Use current operator clients for owned schedules. The released 0.6.19 automatic
 enqueue and additive UPSERT paths are fenced on retired rows; old manual trigger
 uses a separate read/insert path and is outside the owned-schedule operator
 contract. Old physical deletion is rejected. Existing jobs and retries are not

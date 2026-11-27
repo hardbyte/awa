@@ -115,6 +115,11 @@ async def main() -> None:
             start_kwargs["queue_storage_schema"] = qs_schema
         if transition_role:
             start_kwargs["storage_transition_role"] = transition_role
+        queue_rotate_interval_ms = os.environ.get("MIXED_QUEUE_ROTATE_INTERVAL_MS")
+        if queue_rotate_interval_ms:
+            start_kwargs["queue_storage_queue_rotate_interval_ms"] = int(
+                queue_rotate_interval_ms
+            )
         queue_config = {"name": queue, "max_workers": 1}
         if deadline_duration_ms:
             queue_config["deadline_duration_ms"] = deadline_duration_ms

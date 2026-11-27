@@ -1,5 +1,5 @@
 #!/bin/sh
-# Actual crates.io 0.6.7 cron paths against the candidate schema.
+# Actual crates.io 0.6.19 cron paths against the candidate schema.
 set -eu
 : "${DATABASE_URL:?set DATABASE_URL to a disposable PostgreSQL database}"
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
