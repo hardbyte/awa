@@ -646,17 +646,73 @@ struct BranchTimer<'a> {
 }
 
 impl<'a> BranchTimer<'a> {
-    /// Stop the timer, record the duration into both the per-branch
-    /// histogram and the tracker's state. Must be called once after the
-    /// body returns — there is no `Drop` impl so a panic-mid-body would
-    /// leave the histogram un-recorded, which is fine: a panicking
-    /// maintenance branch is a bigger story than the missing sample.
+    /// Run the branch body, then stop the timer: see [`Self::finish_with`].
+    /// A failure the body reports through [`branch_failed`] is recorded as
+    /// the sample's `error.type`.
+    async fn run<T>(self, body: impl std::future::Future<Output = T>) -> T {
+        let (value, failure) = BRANCH_FAILURE
+            .scope(std::cell::Cell::new(None), async {
+                let value = body.await;
+                (value, BRANCH_FAILURE.with(std::cell::Cell::get))
+            })
+            .await;
+        self.finish_with(failure);
+        value
+    }
+
+    #[cfg(test)]
     fn finish(self) {
+        self.finish_with(None);
+    }
+
+    /// Stop the timer, record the duration into both the per-branch
+    /// histogram, with `error_type` when the body failed, and the tracker's
+    /// state. Must be called once after the body returns — there is no
+    /// `Drop` impl so a panic-mid-body would leave the histogram
+    /// un-recorded, which is fine: a panicking maintenance branch is a
+    /// bigger story than the missing sample.
+    fn finish_with(self, error_type: Option<&'static str>) {
         let duration = self.started_at.elapsed();
         self.metrics
-            .record_maintenance_branch_duration(self.branch, duration);
+            .record_maintenance_branch_outcome(self.branch, duration, error_type);
         self.tracker.record_finish(self.branch, duration);
     }
+}
+
+tokio::task_local! {
+    /// The `error.type` of the first failure the maintenance branch body
+    /// running on this task reported, if any. Scoped by [`BranchTimer::run`].
+    static BRANCH_FAILURE: std::cell::Cell<Option<&'static str>>;
+}
+
+/// An error a maintenance branch reports, by its low-cardinality class.
+trait BranchError {
+    fn branch_error_type(&self) -> &'static str;
+}
+
+impl BranchError for AwaError {
+    fn branch_error_type(&self) -> &'static str {
+        self.error_type()
+    }
+}
+
+impl BranchError for sqlx::Error {
+    fn branch_error_type(&self) -> &'static str {
+        awa_model::sqlx_error_type(self)
+    }
+}
+
+/// Mark the maintenance branch body running on this task as failed, so its
+/// `awa.maintenance.branch.duration` sample carries `error.type`. The first
+/// failure of a run names it. Outside a branch body, such as the sync a new
+/// leader runs before its loops start, it does nothing.
+fn branch_failed(err: &impl BranchError) {
+    let error_type = err.branch_error_type();
+    let _ = BRANCH_FAILURE.try_with(|failure| {
+        if failure.get().is_none() {
+            failure.set(Some(error_type));
+        }
+    });
 }
 
 /// Owns the per-branch overrun state for the maintenance leader's loops.
@@ -1116,6 +1172,12 @@ const PRUNE_BRANCH_QUEUE: &str = "queue";
 /// Tasks: heartbeat rescue, deadline rescue, scheduled promotion, cleanup,
 /// periodic job sync and evaluation.
 pub struct MaintenanceService {
+    /// The runtime this service belongs to, which keys its
+    /// `awa.maintenance.leader` series.
+    instance_id: Option<Uuid>,
+    /// The `(queue, state)` keys the last queue-health pass recorded due
+    /// gauges for; see [`DueWork::points`].
+    due_recorded: std::sync::Mutex<HashSet<(String, String)>>,
     pool: PgPool,
     metrics: crate::metrics::AwaMetrics,
     cancel: CancellationToken,
@@ -1205,7 +1267,71 @@ const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
 const CRON_CATCH_UP_LIMIT: usize = 1_000;
 const TERMINAL_COUNT_ROLLUP_MAX_SLOTS_PER_TICK: usize = 4;
-type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
+type QueueStorageMetricRow = (
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<f64>,
+    i64,
+    i64,
+    Option<f64>,
+    Option<f64>,
+);
+
+/// Due, unpromoted deferred jobs by `(queue, state)`: how many, and the age
+/// of the oldest, summed and maxed across the storage planes a leader
+/// promotes.
+#[derive(Default)]
+struct DueWork(HashMap<(String, String), (i64, f64)>);
+
+impl DueWork {
+    fn add(&mut self, queue: String, state: String, depth: i64, lag: f64) {
+        let entry = self.0.entry((queue, state)).or_insert((0, 0.0));
+        entry.0 += depth;
+        entry.1 = entry.1.max(lag.max(0.0));
+    }
+
+    /// The `(queue, state, depth, lag)` points to record: both states of
+    /// every queue in `queues` and every queue with due work, with zeroes
+    /// where none is due, and zeroes for each key in `recorded`, the keys the
+    /// previous pass recorded, that this pass would leave out. Without the
+    /// last, a queue that drops out of the queue list, such as a canonical
+    /// queue once a storage transition has drained it, would keep its last
+    /// depth and lag. `recorded` becomes this pass's keys.
+    fn points(
+        mut self,
+        queues: impl Iterator<Item = String>,
+        recorded: &mut HashSet<(String, String)>,
+    ) -> Vec<(String, String, i64, f64)> {
+        let mut points = Vec::new();
+        for queue in queues {
+            for state in ["scheduled", "retryable"] {
+                let key = (queue.clone(), state.to_string());
+                let (depth, lag) = self.0.remove(&key).unwrap_or((0, 0.0));
+                points.push((key.0, key.1, depth, lag));
+            }
+        }
+        for ((queue, state), (depth, lag)) in self.0 {
+            points.push((queue, state, depth, lag));
+        }
+        let current: HashSet<(String, String)> = points
+            .iter()
+            .map(|(queue, state, _, _)| (queue.clone(), state.clone()))
+            .collect();
+        for (queue, state) in recorded.drain() {
+            if !current.contains(&(queue.clone(), state.clone())) {
+                points.push((queue, state, 0, 0.0));
+            }
+        }
+        *recorded = current;
+        points
+    }
+}
 
 /// How long a promotion transaction waits on one lane's locks before the
 /// leader hands the lane to a dedicated waiter and goes on without it.
@@ -1306,7 +1432,17 @@ impl QueueStoragePromoter {
             // Lanes commit on their own, so record the rows of lanes that
             // committed before a later lane failed.
             record_cancelled(&self.cancelled, cancelled);
-            let outcome = outcome?;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.metrics.record_promotion_batch_failure(
+                        state.as_str(),
+                        batch_started.elapsed(),
+                        err.error_type(),
+                    );
+                    return Err(err);
+                }
+            };
             self.metrics.record_promotion_batch(
                 state.as_str(),
                 outcome.promoted as u64,
@@ -1445,6 +1581,11 @@ async fn promote_waiting_lane(
                 }
             }
             Err(err) => {
+                metrics.record_promotion_batch_failure(
+                    state.as_str(),
+                    batch_started.elapsed(),
+                    err.error_type(),
+                );
                 error!(
                     queue = %lane.queue,
                     priority = lane.priority,
@@ -1514,6 +1655,8 @@ impl MaintenanceService {
         lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
     ) -> Self {
         Self {
+            instance_id: None,
+            due_recorded: std::sync::Mutex::new(HashSet::new()),
             pool,
             metrics,
             cancel,
@@ -1565,6 +1708,13 @@ impl MaintenanceService {
             ring_authority_auto_flip_stable_period: Duration::from_secs(600), // 10min
             ring_authority_flip_aware_since: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The runtime this service belongs to: its `awa.maintenance.leader`
+    /// series carries the id as `awa.runtime.instance_id`.
+    pub(crate) fn instance_id(mut self, instance: Uuid) -> Self {
+        self.instance_id = Some(instance);
+        self
     }
 
     /// #456: register the configured queue-storage runtime of a
@@ -1751,12 +1901,19 @@ impl MaintenanceService {
         self
     }
 
+    fn record_leader_metric(&self, leader: bool) {
+        let instance_id = self.instance_id.map(|id| id.to_string());
+        self.metrics
+            .record_maintenance_leader(instance_id.as_deref(), leader);
+    }
+
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
         self.alive.store(true, Ordering::SeqCst);
         let _alive_guard = MaintenanceAliveGuard(self.alive.clone());
         self.leader.store(false, Ordering::SeqCst);
+        self.record_leader_metric(false);
 
         loop {
             // Try to acquire advisory lock for leader election.
@@ -1789,6 +1946,7 @@ impl MaintenanceService {
 
             debug!("Elected as maintenance leader");
             self.leader.store(true, Ordering::SeqCst);
+            self.record_leader_metric(true);
             if let Some(runtime) = self.storage.queue_storage() {
                 runtime.store.reset_rotation_observations();
             }
@@ -1938,6 +2096,7 @@ impl MaintenanceService {
                             if sqlx::query("SELECT 1").execute(leader_lock.connection()).await.is_err() {
                                 warn!("Leader connection lost, re-entering election loop");
                                 self.leader.store(false, Ordering::SeqCst);
+                                self.record_leader_metric(false);
                                 Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
                                 term.cancel();
                                 return;
@@ -1954,8 +2113,7 @@ impl MaintenanceService {
                         origin = heartbeat_rescue_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
-                                let backlog = self.rescue_stale_heartbeats(origin).await;
-                                timer.finish();
+                                let backlog = timer.run(self.rescue_stale_heartbeats(origin)).await;
                                 if backlog {
                                     heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
                                 }
@@ -1964,8 +2122,7 @@ impl MaintenanceService {
                         origin = deadline_rescue_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
-                                let backlog = self.rescue_expired_deadlines(origin).await;
-                                timer.finish();
+                                let backlog = timer.run(self.rescue_expired_deadlines(origin)).await;
                                 if backlog {
                                     deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
                                 }
@@ -1974,8 +2131,7 @@ impl MaintenanceService {
                         origin = callback_rescue_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
-                                let backlog = self.rescue_expired_callbacks(origin).await;
-                                timer.finish();
+                                let backlog = timer.run(self.rescue_expired_callbacks(origin)).await;
                                 if backlog {
                                     callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
                                 }
@@ -1984,8 +2140,7 @@ impl MaintenanceService {
                         _ = promote_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
-                                self.promote_scheduled(&promoters).await;
-                                timer.finish();
+                                timer.run(self.promote_scheduled(&promoters)).await;
                             }
                         }
                     }
@@ -2007,40 +2162,37 @@ impl MaintenanceService {
                         _ = cleanup_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("cleanup", self.cleanup_interval, &self.metrics) {
-                                self.cleanup_completed().await;
-                                self.cleanup_dlq_rows().await;
-                                self.cleanup_batch_operations().await;
-                                self.cleanup_stale_runtime_snapshots().await;
-                                self.cleanup_stale_descriptors().await;
-                                timer.finish();
+                                timer.run(async {
+                                    self.cleanup_completed().await;
+                                    self.cleanup_dlq_rows().await;
+                                    self.cleanup_batch_operations().await;
+                                    self.cleanup_stale_runtime_snapshots().await;
+                                    self.cleanup_stale_descriptors().await;
+                                }).await;
                             }
                         }
                         _ = cron_sync_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("cron_sync", self.cron_sync_interval, &self.metrics) {
-                                self.sync_periodic_jobs_to_db().await;
-                                timer.finish();
+                                timer.run(self.sync_periodic_jobs_to_db()).await;
                             }
                         }
                         _ = queue_stats_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("queue_stats", self.queue_stats_interval, &self.metrics) {
-                                self.publish_queue_health_metrics().await;
-                                timer.finish();
+                                timer.run(self.publish_queue_health_metrics()).await;
                             }
                         }
                         _ = dirty_key_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics) {
-                                self.recompute_dirty_admin_metadata().await;
-                                timer.finish();
+                                timer.run(self.recompute_dirty_admin_metadata()).await;
                             }
                         }
                         _ = metadata_reconciliation_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics) {
-                                self.refresh_admin_metadata().await;
-                                timer.finish();
+                                timer.run(self.refresh_admin_metadata()).await;
                             }
                         }
                         // Aging only rewrites waiting priorities, so it is
@@ -2048,22 +2200,19 @@ impl MaintenanceService {
                         _ = priority_aging_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("priority_aging", self.priority_aging_interval, &self.metrics) {
-                                self.age_waiting_priorities().await;
-                                timer.finish();
+                                timer.run(self.age_waiting_priorities()).await;
                             }
                         }
                         _ = batch_operations_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin("batch_operations", self.batch_operations_interval, &self.metrics) {
-                                self.process_batch_operation().await;
-                                timer.finish();
+                                timer.run(self.process_batch_operation()).await;
                             }
                         }
                         _ = terminal_count_rollup_timer.tick() => {
                             if term.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin_without_cooldown("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
-                                self.rollup_terminal_count_deltas().await;
-                                timer.finish();
+                                timer.run(self.rollup_terminal_count_deltas()).await;
                             }
                         }
                         _ = async {
@@ -2080,8 +2229,7 @@ impl MaintenanceService {
                                 continue;
                             }
                             if let Some(timer) = branch_tracker.try_begin("rotate_queue", interval, &self.metrics) {
-                                let idle = self.rotate_queue_storage_queue(&prune_tracker).await;
-                                timer.finish();
+                                let idle = timer.run(self.rotate_queue_storage_queue(&prune_tracker)).await;
                                 queue_idle_backoff.record(idle);
                             }
                         }
@@ -2099,8 +2247,7 @@ impl MaintenanceService {
                                 continue;
                             }
                             if let Some(timer) = branch_tracker.try_begin("rotate_lease", interval, &self.metrics) {
-                                let idle = self.rotate_queue_storage_leases(&prune_tracker).await;
-                                timer.finish();
+                                let idle = timer.run(self.rotate_queue_storage_leases(&prune_tracker)).await;
                                 lease_idle_backoff.record(idle);
                             }
                         }
@@ -2118,8 +2265,7 @@ impl MaintenanceService {
                                 continue;
                             }
                             if let Some(timer) = branch_tracker.try_begin("rotate_claim", interval, &self.metrics) {
-                                let idle = self.rotate_queue_storage_claims(&prune_tracker).await;
-                                timer.finish();
+                                let idle = timer.run(self.rotate_queue_storage_claims(&prune_tracker)).await;
                                 claim_idle_backoff.record(idle);
                             }
                         }
@@ -2129,6 +2275,8 @@ impl MaintenanceService {
 
             tokio::join!(leader_check, recovery, hygiene);
             self.leader.store(false, Ordering::SeqCst);
+            self.record_leader_metric(false);
+            self.clear_due_work();
             self.clear_queue_ring_pin();
             Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
             if self.cancel.is_cancelled() {
@@ -2210,12 +2358,16 @@ impl MaintenanceService {
                             debug!(owner = %owner, hash = ?plan.desired_hash, blockers = ?plan.blockers, blocking_instances = ?plan.blocking_instances, grace_remaining_ms = plan.grace_remaining_ms, proposed_retirements = plan.retirements.len(), applied = plan.applied, "Periodic reconciliation");
                         }
                         Err(err) => {
+                            branch_failed(&err);
                             error!(owner = %owner, error = %err, "Periodic reconciliation failed")
                         }
                     }
                 }
             }
-            Err(err) => error!(error = %err, "Failed to load cron reconciliation owners"),
+            Err(err) => {
+                branch_failed(&err);
+                error!(error = %err, "Failed to load cron reconciliation owners");
+            }
         }
 
         if self.periodic_jobs.is_empty() {
@@ -2224,6 +2376,7 @@ impl MaintenanceService {
 
         for job in self.periodic_jobs.iter() {
             if let Err(err) = upsert_cron_job(&self.pool, job).await {
+                branch_failed(&err);
                 error!(name = %job.name, error = %err, "Failed to sync periodic job");
             }
         }
@@ -2248,7 +2401,10 @@ impl MaintenanceService {
                 );
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to process batch operation chunk"),
+            Err(err) => {
+                branch_failed(&err);
+                warn!(error = %err, "failed to process batch operation chunk");
+            }
         }
     }
 
@@ -2259,7 +2415,10 @@ impl MaintenanceService {
                 debug!(deleted, "cleaned up expired batch operations");
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to clean up expired batch operations"),
+            Err(err) => {
+                branch_failed(&err);
+                warn!(error = %err, "failed to clean up expired batch operations");
+            }
         }
     }
 
@@ -2292,7 +2451,10 @@ impl MaintenanceService {
                     "rolled up queue-storage terminal count deltas"
                 );
             }
-            Err(err) => warn!(error = %err, "failed to roll up terminal count deltas"),
+            Err(err) => {
+                branch_failed(&err);
+                warn!(error = %err, "failed to roll up terminal count deltas");
+            }
         }
 
         // #371: the append-only prune-rollup deltas and ring-rotation
@@ -2309,7 +2471,10 @@ impl MaintenanceService {
                 );
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to fold terminal rollup deltas"),
+            Err(err) => {
+                branch_failed(&err);
+                warn!(error = %err, "failed to fold terminal rollup deltas");
+            }
         }
 
         match runtime.store.fold_ring_rotation_ledgers(&self.pool).await {
@@ -2321,7 +2486,10 @@ impl MaintenanceService {
                 );
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to trim ring rotation ledgers"),
+            Err(err) => {
+                branch_failed(&err);
+                warn!(error = %err, "failed to trim ring rotation ledgers");
+            }
         }
 
         // #371 staged upgrade: piggyback the leader's rollup tick to
@@ -2765,6 +2933,7 @@ impl MaintenanceService {
                 )
             }
             Err(err) => {
+                branch_failed(&err);
                 warn!(error = %err, "Failed to read runtime snapshots for stale-heartbeat rescue");
                 (false, None)
             }
@@ -2914,6 +3083,7 @@ impl MaintenanceService {
                 self.record_rescued_dlq_moves(&rescued, dlq_runtime, "heartbeat_stale");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
             }
             _ => {}
@@ -2934,6 +3104,7 @@ impl MaintenanceService {
             }
             Ok(_) => None,
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to resolve the active queue-storage schema");
                 None
             }
@@ -3098,6 +3269,7 @@ impl MaintenanceService {
                 self.record_rescued_dlq_moves(&rescued, dlq_runtime, "deadline_exceeded");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
             }
             _ => {}
@@ -3272,6 +3444,7 @@ impl MaintenanceService {
                 self.record_rescued_dlq_moves(&rescued, dlq_runtime, "callback_timeout");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
             }
             _ => {}
@@ -3350,6 +3523,7 @@ impl MaintenanceService {
                 debug!(count = ids.len(), "Aged job priorities");
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to age job priorities");
             }
             _ => {}
@@ -3443,11 +3617,13 @@ impl MaintenanceService {
                             );
                         }
                         Err(err) => {
+                            branch_failed(&err);
                             error!(job_id = id, error = %err, rescue_kind, "Failed to cancel unique-conflicted job");
                         }
                     }
                 }
                 Err(err) => {
+                    branch_failed(&err);
                     error!(job_id = id, error = %err, rescue_kind, "Per-row rescue failed");
                 }
             }
@@ -3660,6 +3836,7 @@ impl MaintenanceService {
         let mut tx = match self.pool.begin_read_committed().await {
             Ok(tx) => tx,
             Err(err) => {
+                branch_failed(&err);
                 error!(
                     job_id = job.id,
                     kind = %job.kind,
@@ -3677,6 +3854,7 @@ impl MaintenanceService {
         match result {
             Ok(()) => {
                 if let Err(err) = tx.commit().await {
+                    branch_failed(&err);
                     error!(
                         job_id = job.id,
                         kind = %job.kind,
@@ -3687,6 +3865,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(
                     job_id = job.id,
                     kind = %job.kind,
@@ -3730,6 +3909,7 @@ impl MaintenanceService {
             .promote_due_state(JobState::Scheduled, "scheduled jobs", promoters)
             .await
         {
+            branch_failed(&err);
             error!(error = %err, "Failed to promote scheduled jobs");
         }
         if let Err(err) = self
@@ -3740,6 +3920,7 @@ impl MaintenanceService {
             )
             .await
         {
+            branch_failed(&err);
             error!(error = %err, "Failed to promote retryable jobs");
         }
         self.deliver_promotion_cancellations(promoters).await;
@@ -3843,23 +4024,39 @@ impl MaintenanceService {
             if self.cancel.is_cancelled() {
                 break;
             }
-            let (promoted, cancelled, queues) = match self.promote_due_batch(state).await {
+            let batch_started = Instant::now();
+            let batch = match self.promote_due_batch(state).await {
                 Err(err) if is_unique_violation(&err) => {
                     warn!(
                         error = %err,
                         state,
                         "Batched promotion hit a unique-claim conflict; promoting row by row"
                     );
-                    let (promoted, queues, cancelled) =
-                        self.promote_canonical_per_row(state).await?;
+                    self.promote_canonical_per_row(state)
+                        .await
+                        .map(|(promoted, queues, cancelled)| (promoted, queues, Some(cancelled)))
+                }
+                Err(err) => Err(AwaError::Database(err)),
+                Ok((promoted, queues)) => Ok((promoted, queues, None)),
+            };
+            let (promoted, queues, cancelled) = match batch {
+                Ok(batch) => batch,
+                Err(err) => {
+                    self.metrics.record_promotion_batch_failure(
+                        state,
+                        batch_started.elapsed(),
+                        err.error_type(),
+                    );
+                    return Err(err);
+                }
+            };
+            let cancelled = match cancelled {
+                Some(cancelled) => {
                     self.handle_duplicate_cancellations("promotion", &cancelled, false)
                         .await;
-                    (promoted, cancelled.len(), queues)
+                    cancelled.len()
                 }
-                other => {
-                    let (promoted, queues) = other.map_err(AwaError::Database)?;
-                    (promoted, 0, queues)
-                }
+                None => 0,
             };
             promoted_total += promoted;
             notified_queues.extend(queues);
@@ -4221,6 +4418,7 @@ impl MaintenanceService {
                 idle_cursor
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rotate queue storage queue segments");
                 return false;
             }
@@ -4315,6 +4513,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.metrics.record_prune_error("queue");
+                branch_failed(&err);
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
         }
@@ -4416,6 +4615,7 @@ impl MaintenanceService {
                 idle_cursor
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rotate queue storage lease segments");
                 return false;
             }
@@ -4475,6 +4675,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.metrics.record_prune_error("lease");
+                branch_failed(&err);
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
         }
@@ -4526,6 +4727,7 @@ impl MaintenanceService {
                 idle_cursor
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to rotate queue storage claim segments");
                 return false;
             }
@@ -4585,6 +4787,7 @@ impl MaintenanceService {
             }
             Err(err) => {
                 self.metrics.record_prune_error("claim");
+                branch_failed(&err);
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }
@@ -4658,6 +4861,7 @@ impl MaintenanceService {
                 total_deleted += result.rows_affected();
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to clean up old jobs (global pass)");
             }
             _ => {}
@@ -4698,6 +4902,7 @@ impl MaintenanceService {
                     );
                 }
                 Err(err) => {
+                    branch_failed(&err);
                     error!(
                         queue = %queue_name,
                         messaging.destination.name = %queue_name,
@@ -4749,6 +4954,7 @@ impl MaintenanceService {
                 self.metrics.record_dlq_purged(None, deleted);
             }
             Err(err) => {
+                branch_failed(&err);
                 error!(error = %err, "Failed to clean up DLQ rows (global pass)");
             }
             _ => {}
@@ -4777,6 +4983,7 @@ impl MaintenanceService {
                     self.metrics.record_dlq_purged(Some(queue), deleted);
                 }
                 Err(err) => {
+                    branch_failed(&err);
                     error!(queue, error = %err, "Failed to clean up DLQ rows");
                 }
                 _ => {}
@@ -4955,6 +5162,7 @@ impl MaintenanceService {
         )
         .await
         {
+            branch_failed(&err);
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
         }
     }
@@ -4977,6 +5185,7 @@ impl MaintenanceService {
                 }
                 Ok(_) => {}
                 Err(err) => {
+                    branch_failed(&err);
                     tracing::warn!(table, error = %err, "Failed to clean up stale descriptors");
                 }
             }
@@ -4996,6 +5205,7 @@ impl MaintenanceService {
                 tracing::debug!(count, "Recomputed dirty admin metadata keys");
             }
             Err(err) => {
+                branch_failed(&err);
                 tracing::warn!(error = %err, "Failed to recompute dirty admin metadata");
             }
             _ => {}
@@ -5010,6 +5220,7 @@ impl MaintenanceService {
             return;
         }
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
+            branch_failed(&err);
             tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
     }
@@ -5025,6 +5236,7 @@ impl MaintenanceService {
         let stats = match awa_model::admin::queue_overviews(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
+                branch_failed(&err);
                 tracing::warn!(error = %err, "Failed to query queue stats for metrics");
                 return;
             }
@@ -5052,6 +5264,105 @@ impl MaintenanceService {
                 self.metrics.record_queue_lag(queue, lag_seconds);
             }
         }
+
+        // A canonical leader also promotes the active standby queue-storage
+        // plane's backlog (#456), so its due work counts here too.
+        let mut due = DueWork::default();
+        let canonical = self.collect_canonical_due(&mut due).await;
+        let standby = match self.active_standby_queue_storage().await {
+            Some(standby) => {
+                self.collect_queue_storage_due(standby.store.schema(), &mut due)
+                    .await
+            }
+            None => Ok(()),
+        };
+        if let Err(err) = canonical.and(standby) {
+            branch_failed(&err);
+            tracing::warn!(error = %err, "Failed to query due deferred jobs for metrics");
+            return;
+        }
+        self.record_due_work(stats.iter().map(|stat| stat.queue.clone()), due);
+    }
+
+    /// Due, unpromoted canonical deferred jobs, through the partial due
+    /// indexes on `awa.scheduled_jobs (run_at, id, queue) WHERE state = ...`.
+    async fn collect_canonical_due(&self, due: &mut DueWork) -> Result<(), sqlx::Error> {
+        let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(
+            r#"
+            SELECT queue, 'scheduled', count(*)::bigint,
+                   EXTRACT(EPOCH FROM now() - min(run_at))::double precision
+            FROM awa.scheduled_jobs
+            WHERE state = 'scheduled' AND run_at <= now()
+            GROUP BY queue
+            UNION ALL
+            SELECT queue, 'retryable', count(*)::bigint,
+                   EXTRACT(EPOCH FROM now() - min(run_at))::double precision
+            FROM awa.scheduled_jobs
+            WHERE state = 'retryable' AND run_at <= now()
+            GROUP BY queue
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (queue, state, depth, lag) in rows {
+            due.add(queue, state, depth, lag);
+        }
+        Ok(())
+    }
+
+    /// Due, unpromoted deferred jobs of a queue-storage plane other than the
+    /// one whose stats query already reports them.
+    async fn collect_queue_storage_due(
+        &self,
+        schema: &str,
+        due: &mut DueWork,
+    ) -> Result<(), sqlx::Error> {
+        let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(audited_sql(format!(
+            r#"
+            SELECT queue, state::text, count(*)::bigint,
+                   EXTRACT(EPOCH FROM now() - min(run_at))::double precision
+            FROM {schema}.deferred_jobs
+            WHERE state IN ('scheduled', 'retryable') AND run_at <= now()
+            GROUP BY queue, state
+            "#
+        )))
+        .fetch_all(&self.pool)
+        .await?;
+        for (queue, state, depth, lag) in rows {
+            due.add(queue, state, depth, lag);
+        }
+        Ok(())
+    }
+
+    /// Record `due` for every queue in `queues`, every queue with due work
+    /// and every queue recorded last pass, with zeroes where none is due, so
+    /// a gauge falls back to 0 once its backlog is promoted or its queue is
+    /// gone. See [`DueWork::points`].
+    fn record_due_work(&self, queues: impl Iterator<Item = String>, due: DueWork) {
+        let points = {
+            let mut recorded = self
+                .due_recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            due.points(queues, &mut recorded)
+        };
+        for (queue, state, depth, lag) in points {
+            self.metrics.record_queue_due(&queue, &state, depth, lag);
+        }
+    }
+
+    /// Record 0 for every due gauge this runtime recorded, when it stops
+    /// leading and so stops updating them.
+    fn clear_due_work(&self) {
+        let recorded = std::mem::take(
+            &mut *self
+                .due_recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (queue, state) in recorded {
+            self.metrics.record_queue_due(&queue, &state, 0, 0.0);
+        }
     }
 
     async fn publish_queue_storage_health_metrics(
@@ -5075,7 +5386,8 @@ impl MaintenanceService {
         // through QueueStorage::queue_counts_exact() / admin::state_counts().
         let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(audited_sql(format!(
             "{} SELECT queue, available, running, waiting_external, scheduled, retryable, \
-             failed_done, failed_dlq, lag_seconds FROM signals ORDER BY queue",
+             failed_done, failed_dlq, lag_seconds, due_scheduled, due_retryable, \
+             due_scheduled_lag, due_retryable_lag FROM signals ORDER BY queue",
             awa_model::queue_storage::queue_signals_sql(
                 schema,
                 awa_model::queue_storage::QueueSignalReads::Gauge,
@@ -5086,10 +5398,14 @@ impl MaintenanceService {
         {
             Ok(rows) => rows,
             Err(err) => {
+                branch_failed(&err);
                 tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
                 return;
             }
         };
+
+        let mut due = DueWork::default();
+        let mut queues = Vec::with_capacity(rows.len());
 
         for (
             queue,
@@ -5101,6 +5417,10 @@ impl MaintenanceService {
             failed_done,
             failed_dlq,
             lag_seconds,
+            due_scheduled,
+            due_retryable,
+            due_scheduled_lag,
+            due_retryable_lag,
         ) in rows
         {
             self.metrics
@@ -5115,11 +5435,38 @@ impl MaintenanceService {
             self.metrics
                 .record_queue_depth(&queue, "waiting_external", waiting_external);
             self.metrics.record_dlq_depth(&queue, failed_dlq);
+            if due_scheduled > 0 {
+                due.add(
+                    queue.clone(),
+                    "scheduled".into(),
+                    due_scheduled,
+                    due_scheduled_lag.unwrap_or(0.0),
+                );
+            }
+            if due_retryable > 0 {
+                due.add(
+                    queue.clone(),
+                    "retryable".into(),
+                    due_retryable,
+                    due_retryable_lag.unwrap_or(0.0),
+                );
+            }
+            queues.push(queue.clone());
 
             if let Some(lag_seconds) = lag_seconds {
                 self.metrics.record_queue_lag(&queue, lag_seconds);
             }
         }
+
+        // A queue-storage leader also promotes the canonical plane while a
+        // storage transition drains it (#456), so its due work counts here
+        // too. Once the canonical tables are empty this reads nothing.
+        if let Err(err) = self.collect_canonical_due(&mut due).await {
+            branch_failed(&err);
+            tracing::warn!(error = %err, "Failed to query due canonical jobs for metrics");
+            return;
+        }
+        self.record_due_work(queues.into_iter(), due);
     }
 }
 
@@ -6009,6 +6356,49 @@ mod tests {
                 .await
                 .expect("count leftover canonical hot rows");
         assert_eq!(leftover, 0, "no stuck canonical rows may remain");
+    }
+
+    /// A queue/state whose due work was recorded, and which then drops out
+    /// of both the queue list and the due rows, is recorded once more at 0,
+    /// so its gauges do not keep the last depth and lag.
+    #[test]
+    fn due_gauges_of_a_vanished_queue_fall_back_to_zero() {
+        let mut recorded = HashSet::new();
+        let mut due = DueWork::default();
+        due.add("canonical_only".into(), "scheduled".into(), 3, 600.0);
+        let mut first = due.points(std::iter::once("kept".to_string()), &mut recorded);
+        first.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        assert_eq!(
+            first,
+            vec![
+                ("canonical_only".into(), "scheduled".into(), 3, 600.0),
+                ("kept".into(), "retryable".into(), 0, 0.0),
+                ("kept".into(), "scheduled".into(), 0, 0.0),
+            ]
+        );
+
+        let mut second =
+            DueWork::default().points(std::iter::once("kept".to_string()), &mut recorded);
+        second.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        assert_eq!(
+            second,
+            vec![
+                ("canonical_only".into(), "scheduled".into(), 0, 0.0),
+                ("kept".into(), "retryable".into(), 0, 0.0),
+                ("kept".into(), "scheduled".into(), 0, 0.0),
+            ],
+            "the vanished queue is set back to 0"
+        );
+
+        let third = DueWork::default().points(std::iter::empty(), &mut recorded);
+        assert_eq!(
+            third.len(),
+            2,
+            "each key is zeroed once after it vanishes: {third:?}"
+        );
+        assert!(DueWork::default()
+            .points(std::iter::empty(), &mut recorded)
+            .is_empty());
     }
 
     #[test]

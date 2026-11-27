@@ -2075,6 +2075,7 @@ impl Client {
                 _ => None,
             },
         )
+        .instance_id(self.runtime_instance_id)
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);
@@ -2989,6 +2990,10 @@ impl RuntimeReporterState {
         if let Err(err) = self.publish_evidence().await {
             warn!(error = %err, "Failed to publish runtime snapshot");
         }
+        self.metrics.record_maintenance_leader(
+            Some(&self.instance_id.to_string()),
+            self.leader.load(Ordering::SeqCst),
+        );
 
         if self.queue_storage_capable {
             match transition::status_report(&self.pool).await {

@@ -1183,6 +1183,31 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
+/// The number of receipt claims a claim slot holds, row-local and compact.
+/// Reads only the slot's claim partitions.
+pub(crate) fn claim_slot_claimed_count_sql(schema: &str, slot: usize) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM {claims})::bigint \
+              + (SELECT COALESCE(sum(claimed_count), 0) FROM {batches})::bigint",
+        claims = claim_child_name(schema, slot),
+        batches = claim_batch_child_name(schema, slot),
+    )
+}
+
+/// The number of receipt claims the closure ledgers of a claim slot close,
+/// row-local and compact. When it equals [`claim_slot_claimed_count_sql`],
+/// every claim in the slot is closed: the proof claim prune makes before it
+/// truncates the slot (see `claim_prune_has_open_claims_tx`). Reads only the
+/// slot's closure partitions.
+pub(crate) fn claim_slot_closed_count_sql(schema: &str, slot: usize) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM {closures})::bigint \
+              + (SELECT COALESCE(sum(closed_count), 0) FROM {closure_batches})::bigint",
+        closures = closure_child_name(schema, slot),
+        closure_batches = claim_closure_batch_child_name(schema, slot),
+    )
+}
+
 pub(crate) fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
     usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
@@ -1292,14 +1317,15 @@ fn receipt_evidence_sql(
 /// `oldest_run_at` is the earliest `run_at` among those rows, not the first
 /// row's: a queue move or priority aging appends an older job behind newer
 /// ones.
+///
+/// This form reads each lane's head sequences live; the admin reads bind
+/// heads captured earlier in their snapshot through
+/// [`available_by_queue_sql_from`].
 pub fn available_by_queue_sql(schema: &str) -> String {
-    format!(
-        r#"
-        SELECT
-            heads.queue,
-            COALESCE(sum(lane.available), 0)::bigint AS available,
-            min(lane.oldest_run_at) AS oldest_run_at
-        FROM (
+    available_by_queue_sql_from(
+        schema,
+        &format!(
+            r#"
             SELECT
                 claims.queue,
                 claims.priority,
@@ -1311,7 +1337,35 @@ pub fn available_by_queue_sql(schema: &str) -> String {
               ON enqueues.queue = claims.queue
              AND enqueues.priority = claims.priority
              AND enqueues.enqueue_shard = claims.enqueue_shard
-        ) AS heads
+            "#
+        ),
+    )
+}
+
+/// Each lane's head sequences captured earlier in a snapshot read, bound as
+/// `$1` to `$5`, as rows of `(queue, priority, enqueue_shard, claim_seq,
+/// next_seq)`.
+///
+/// Sequence values do not obey MVCC: a statement that reads them live in a
+/// snapshot taken earlier sees claims advance them that its snapshot cannot
+/// see, and a job claimed in between is neither available nor running. A
+/// read that runs several statements in one snapshot captures the heads in
+/// its first, which also takes the snapshot, and binds them to the rest.
+pub(crate) const CAPTURED_LANE_HEADS_SQL: &str =
+    "SELECT queue, priority, enqueue_shard, claim_seq, next_seq \
+     FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[], $5::bigint[]) \
+     AS captured(queue, priority, enqueue_shard, claim_seq, next_seq)";
+
+/// [`available_by_queue_sql`] over the lanes and head sequences of `heads`,
+/// a query yielding `(queue, priority, enqueue_shard, claim_seq, next_seq)`.
+pub(crate) fn available_by_queue_sql_from(schema: &str, heads: &str) -> String {
+    format!(
+        r#"
+        SELECT
+            heads.queue,
+            COALESCE(sum(lane.available), 0)::bigint AS available,
+            min(lane.oldest_run_at) AS oldest_run_at
+        FROM ({heads}) AS heads
         CROSS JOIN LATERAL (
             {lane_rows}
         ) AS lane
@@ -1397,13 +1451,20 @@ pub enum QueueSignalReads {
     /// Counts available rows exactly, and also counts receipt-backed running
     /// claims and completions in the last hour from completion batches and
     /// `done_entries`. For the admin queue views.
+    ///
+    /// Reads no claim-ring partition and no head sequence itself: `$1` to
+    /// `$5` are the lane heads captured earlier in the read's snapshot (see
+    /// [`CAPTURED_LANE_HEADS_SQL`]), and `$6` is the queue of each open
+    /// receipt claim, a `text[]` read one claim slot at a time.
     Admin,
 }
 
 /// Per-queue counts that never expand terminal history, ending in a
 /// `signals` CTE with `queue`, `available`, `running`, `waiting_external`,
-/// `scheduled`, `retryable`, `failed_done`, `failed_dlq`, `lag_seconds` and
-/// `completed_last_hour`.
+/// `scheduled`, `retryable`, `failed_done`, `failed_dlq`, `lag_seconds`,
+/// `completed_last_hour`, and the due, unpromoted deferred jobs:
+/// `due_scheduled`, `due_retryable` and the age of the oldest of each,
+/// `due_scheduled_lag` and `due_retryable_lag` (NULL when none is due).
 ///
 /// With [`QueueSignalReads::Gauge`], `available` is the sequence-head signal,
 /// an upper bound as in [`QueueStorage::queue_counts_fast`]; with
@@ -1411,8 +1472,23 @@ pub enum QueueSignalReads {
 /// whose completion batches expand and join back to `ready_entries`, so the
 /// cost follows live work rather than retained history.
 pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
-    let (ready, lag, receipt_running, completed_recent) = match reads {
+    let (head_signal, ready, lag, receipt_running, completed_recent) = match reads {
         QueueSignalReads::Gauge => (
+            format!(
+                r#"
+            SELECT
+                enqueues.queue,
+                enqueues.priority,
+                enqueues.enqueue_shard,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq
+            FROM {schema}.queue_enqueue_heads AS enqueues
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = enqueues.queue
+             AND claims.priority = enqueues.priority
+             AND claims.enqueue_shard = enqueues.enqueue_shard
+            "#
+            ),
             // Enqueued minus claimed: an upper bound, since a tombstoned
             // row or a sequence gap still counts until the claimer passes.
             r#"
@@ -1477,7 +1553,8 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             "SELECT NULL::text AS queue, 0::bigint AS completed_last_hour WHERE false".to_string(),
         ),
         QueueSignalReads::Admin => (
-            available_by_queue_sql(schema),
+            CAPTURED_LANE_HEADS_SQL.to_string(),
+            available_by_queue_sql_from(schema, CAPTURED_LANE_HEADS_SQL),
             // The oldest available job, as before queue storage: it reads the
             // same backlog rows the exact count already reads.
             r#"
@@ -1489,10 +1566,11 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             WHERE oldest_run_at IS NOT NULL
             "#
             .to_string(),
-            format!(
-                "SELECT queue, count(*)::bigint AS running FROM ({}) AS open_claims GROUP BY queue",
-                open_receipt_running_claims_sql(schema)
-            ),
+            // Open receipt claims, read slot by slot beforehand and bound
+            // as `$6` (see `admin::queue_storage_open_claims`).
+            "SELECT queue, count(*)::bigint AS running \
+             FROM unnest($6::text[]) AS open_claims(queue) GROUP BY queue"
+                .to_string(),
             format!(
                 r#"
                 WITH recent_tombstones AS MATERIALIZED (
@@ -1554,17 +1632,7 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
     format!(
         r#"
         WITH head_signal AS (
-            SELECT
-                enqueues.queue,
-                enqueues.priority,
-                enqueues.enqueue_shard,
-                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
-                {schema}.sequence_next_value(claims.seq_name) AS claim_seq
-            FROM {schema}.queue_enqueue_heads AS enqueues
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = enqueues.queue
-             AND claims.priority = enqueues.priority
-             AND claims.enqueue_shard = enqueues.enqueue_shard
+            {head_signal}
         ),
         queues AS (
             SELECT DISTINCT queue
@@ -1613,7 +1681,17 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             SELECT
                 queue,
                 count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
-                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
+                count(*) FILTER (WHERE state = 'scheduled' AND run_at <= now())::bigint
+                    AS due_scheduled,
+                count(*) FILTER (WHERE state = 'retryable' AND run_at <= now())::bigint
+                    AS due_retryable,
+                EXTRACT(EPOCH FROM now() - min(run_at) FILTER (
+                    WHERE state = 'scheduled' AND run_at <= now()
+                ))::double precision AS due_scheduled_lag,
+                EXTRACT(EPOCH FROM now() - min(run_at) FILTER (
+                    WHERE state = 'retryable' AND run_at <= now()
+                ))::double precision AS due_retryable_lag
             FROM {schema}.deferred_jobs
             GROUP BY queue
         ),
@@ -1650,7 +1728,11 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
                 COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
                 COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
                 lag.lag_seconds,
-                COALESCE(completed_recent.completed_last_hour, 0)::bigint AS completed_last_hour
+                COALESCE(completed_recent.completed_last_hour, 0)::bigint AS completed_last_hour,
+                COALESCE(deferred.due_scheduled, 0)::bigint AS due_scheduled,
+                COALESCE(deferred.due_retryable, 0)::bigint AS due_retryable,
+                deferred.due_scheduled_lag,
+                deferred.due_retryable_lag
             FROM queues
             LEFT JOIN ready ON ready.queue = queues.queue
             LEFT JOIN lag ON lag.queue = queues.queue
@@ -4596,12 +4678,35 @@ pub struct QueueStorage {
     /// once instead of each probing again during an outage.
     job_output_probe_failed_at: Mutex<Option<std::time::Instant>>,
     job_output_probes: AtomicU64,
+    /// Whether each sealed claim slot's claims were all closed when rescue
+    /// last counted them; see [`Self::rescue_slot_order_tx`].
+    claim_slot_proofs: Mutex<HashMap<i32, ClaimSlotProof>>,
 }
 
 /// How long a negative answer about the output columns is trusted before
 /// the catalog is checked again, so a binary that started before the
 /// migration picks the columns up without a restart.
 const JOB_OUTPUT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether a sealed claim slot's claims were all closed, by the counts claim
+/// prune proves before it truncates a slot, at its ring generation.
+#[derive(Debug, Clone, Copy)]
+struct ClaimSlotProof {
+    generation: i64,
+    closed: bool,
+    proven_at: Instant,
+}
+
+/// How long rescue trusts a sealed claim slot's [`ClaimSlotProof`] before it
+/// counts the slot again.
+///
+/// A claim reads the current claim slot without a lock, so a claim
+/// transaction in flight when the ring rotates can still commit into the slot
+/// just sealed. A slot proven closed before such a claim commits looks closed
+/// to rescue until it is counted again, so the claim's rescue waits at most
+/// this long. Prune does not use these proofs: it counts under its
+/// `ACCESS EXCLUSIVE` lock, which waits for every such claim.
+const CLAIM_SLOT_PROOF_TTL: Duration = Duration::from_secs(30);
 
 impl QueueStorage {
     pub fn new(config: QueueStorageConfig) -> Result<Self, AwaError> {
@@ -4655,6 +4760,7 @@ impl QueueStorage {
             job_output_probe: tokio::sync::Mutex::new(()),
             job_output_probe_failed_at: Mutex::new(None),
             job_output_probes: AtomicU64::new(0),
+            claim_slot_proofs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -5923,6 +6029,12 @@ impl QueueStorage {
         self.claimer_gates
             .lock()
             .expect("claimer gate cache poisoned")
+            .clear();
+        // Generations restart at zero, so a proof kept from before the reset
+        // could match a slot's new generation.
+        self.claim_slot_proofs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.reset_rotation_observations();
         Ok(())
@@ -15305,7 +15417,142 @@ impl QueueStorage {
             }
         }
         slots.retain(|slot| !options.skip_slots.contains(slot));
+        let closed = self.closed_sealed_claim_slots_tx(tx, &slots).await?;
+        slots.retain(|slot| !closed.contains(slot));
         Ok(slots)
+    }
+
+    /// The sealed slots among `slots` whose claims are all closed, so rescue
+    /// has nothing to find in them.
+    ///
+    /// Each rotation leaves a sealed slot of every claim taken in it, most of
+    /// them closed, and the slot stays until prune reclaims it. Rescue walks a
+    /// slot's claims from a cursor, a bounded window per batch, so without
+    /// this it walked the closed claims of every large sealed slot ahead of
+    /// the slot holding a dead worker's claims, and found those minutes late.
+    ///
+    /// A slot is proven by counts, as claim prune proves it before truncating:
+    /// claims in the slot against closures in its ledgers. Each count runs in
+    /// a savepoint rolled back at once, so the slot's partitions are not held
+    /// for the rest of the rescue transaction. A proof is kept for its slot's
+    /// generation for [`CLAIM_SLOT_PROOF_TTL`]. The current slot is never
+    /// skipped.
+    async fn closed_sealed_claim_slots_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slots: &[i32],
+    ) -> Result<HashSet<i32>, AwaError> {
+        let schema = self.schema();
+        // A slot at or past the cursor read here is current or became current
+        // during this call, so it is never proven. Under ledger authority a
+        // slot with no ledger row has never been current and takes
+        // generation -1 until the ring first rotates into it.
+        let authority = self.ring_authority_tx(tx).await?;
+        let (current_slot, current_generation) = self
+            .ring_cursor_tx(tx, RingFamily::Claim, authority)
+            .await?;
+        let generations_sql = match authority {
+            RingAuthority::Ledger => format!(
+                "SELECT slot, max(generation) FROM {schema}.claim_ring_rotations \
+                 WHERE slot = ANY($1) GROUP BY slot"
+            ),
+            RingAuthority::Columns => format!(
+                "SELECT slot, generation FROM {schema}.claim_ring_slots WHERE slot = ANY($1)"
+            ),
+        };
+        let generations: HashMap<i32, i64> =
+            sqlx::query_as::<_, (i32, i64)>(audited_sql(generations_sql))
+                .bind(slots)
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?
+                .into_iter()
+                .collect();
+
+        let mut closed = HashSet::new();
+        for &slot in slots {
+            let generation = generations.get(&slot).copied().unwrap_or(-1);
+            if slot == current_slot || generation >= current_generation {
+                continue;
+            }
+            let cached = self
+                .claim_slot_proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&slot)
+                .copied()
+                .filter(|proof| {
+                    proof.generation == generation
+                        && proof.proven_at.elapsed() < CLAIM_SLOT_PROOF_TTL
+                });
+            let is_closed = match cached {
+                Some(proof) => proof.closed,
+                None => {
+                    let is_closed = self.claim_slot_proven_closed_tx(tx, slot).await?;
+                    self.claim_slot_proofs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            slot,
+                            ClaimSlotProof {
+                                generation,
+                                closed: is_closed,
+                                proven_at: Instant::now(),
+                            },
+                        );
+                    is_closed
+                }
+            };
+            if is_closed {
+                closed.insert(slot);
+            }
+        }
+        Ok(closed)
+    }
+
+    /// Whether every claim in claim slot `slot` is closed, by counts: see
+    /// [`claim_slot_closed_count_sql`]. A slot with no claims is closed
+    /// without reading its closure partitions.
+    async fn claim_slot_proven_closed_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slot: i32,
+    ) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        let slot_index = ring_slot_number(slot, "claim")?;
+        sqlx::query("SAVEPOINT awa_rescue_slot_proof")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        // Unprepared, like the rescue walks: each statement names one slot's
+        // partitions, and a pooled connection would keep every one of them.
+        let proven = async {
+            let claimed: i64 = sqlx::query_scalar(audited_sql(claim_slot_claimed_count_sql(
+                schema, slot_index,
+            )))
+            .persistent(false)
+            .fetch_one(tx.as_mut())
+            .await?;
+            if claimed == 0 {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            let closed: i64 =
+                sqlx::query_scalar(audited_sql(claim_slot_closed_count_sql(schema, slot_index)))
+                    .persistent(false)
+                    .fetch_one(tx.as_mut())
+                    .await?;
+            Ok(claimed == closed)
+        }
+        .await;
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_rescue_slot_proof")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        sqlx::query("RELEASE SAVEPOINT awa_rescue_slot_proof")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        proven.map_err(map_sqlx_error)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -22,6 +22,9 @@ Two rule sets, pick whichever matches your observability stack:
 | `awa_maintenance_branch_overrunning` _(Prom only)_ | info | a maintenance branch overran its interval in every 10m window, for 15m | no overruns for 10m |
 | `awa_dlq_growing` _(Prom only)_ | info | a queue's DLQ depth rose over the last hour, for 30m | depth stops rising |
 | `awa_pg_long_transaction` _(Postgres only)_ | warning | the oldest open transaction on the database is older than 5m, for 2m | it commits or aborts |
+| `awa_maintenance_branch_failing` _(Prom only)_ | critical | a maintenance branch's runs carry `error.type` for 5m | the branch runs cleanly |
+| `awa_promotion_due_lag_high` _(Prom only)_ | critical | a due `scheduled` or `retryable` job has waited > 10m to be promoted, for 5m | due lag drops below 10m |
+| `awa_maintenance_leader_count` _(Prom only)_ | critical | the fleet's summed `awa_maintenance_leader` is not 1 for 5m, counting no reporting runtime as 0 | exactly one runtime leads |
 
 The ring rules read awa's maintenance counters. A lease or claim ring cannot rotate past an attempt that is still running, so workloads whose jobs routinely run longer than 15 minutes should lengthen `awa_ring_rotation_stalled`'s window or its `for`.
 
