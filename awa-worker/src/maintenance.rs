@@ -31,6 +31,22 @@ use uuid::Uuid;
 
 /// Detached lifecycle hook tasks maintenance may have outstanding at once.
 const MAINTENANCE_LIFECYCLE_EVENT_CAPACITY: usize = 1024;
+/// `application_name` of the connection the leader runs ring idle checks on.
+const IDLE_CHECK_APPLICATION_NAME: &str = "awa-maintenance-idle-check";
+
+/// Closes an idle check connection, giving up after a second on a session the
+/// server no longer answers.
+async fn close_idle_check_conn(conn: sqlx::PgConnection) {
+    use sqlx::Connection;
+    let _ = tokio::time::timeout(Duration::from_secs(1), conn.close()).await;
+}
+
+#[derive(Clone, Copy)]
+enum GatedRing {
+    Queue,
+    Lease,
+    Claim,
+}
 
 /// What per-row canonical promotion did with one due row.
 enum PerRowPromotion {
@@ -1218,6 +1234,9 @@ pub struct MaintenanceService {
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
     queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
+    /// The connection the leader runs the ring idle checks on while it leads,
+    /// detached from the pool so it does not take a pool slot.
+    idle_check_conn: std::sync::Mutex<Option<sqlx::PgConnection>>,
     /// Batches each rescue kind has started under this service, across
     /// passes, for the slot-order rotation.
     rescue_batches_started: std::sync::Mutex<HashMap<RescueKind, usize>>,
@@ -1681,6 +1700,7 @@ impl MaintenanceService {
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
             queue_ring_pin: std::sync::Mutex::new(QueueRingPinReport::default()),
+            idle_check_conn: std::sync::Mutex::new(None),
             rescue_batches_started: std::sync::Mutex::new(HashMap::new()),
             rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
@@ -2278,6 +2298,7 @@ impl MaintenanceService {
             self.record_leader_metric(false);
             self.clear_due_work();
             self.clear_queue_ring_pin();
+            self.release_idle_check_conn().await;
             Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
             if self.cancel.is_cancelled() {
                 debug!("Maintenance service shutting down");
@@ -4372,16 +4393,94 @@ impl MaintenanceService {
         Ok((promoted, queues))
     }
 
+    /// Rotates `ring` through its idle gate, running the gate's probe on
+    /// [`Self::idle_check_conn`]. A failed call closes that connection, and
+    /// the next call opens a fresh one.
+    async fn gated_rotate(
+        &self,
+        runtime: &QueueStorageRuntime,
+        ring: GatedRing,
+    ) -> Result<RotateOutcome, AwaError> {
+        let mut conn = self.take_idle_check_conn().await?;
+        let store = &runtime.store;
+        let cadence = runtime.rotation_cadence;
+        let outcome = match ring {
+            GatedRing::Queue => {
+                store
+                    .rotate_with_cadence_on(&mut conn, &self.pool, cadence)
+                    .await
+            }
+            GatedRing::Lease => {
+                store
+                    .rotate_leases_with_cadence_on(&mut conn, &self.pool, cadence)
+                    .await
+            }
+            GatedRing::Claim => {
+                store
+                    .rotate_claims_with_cadence_on(&mut conn, &self.pool, cadence)
+                    .await
+            }
+        };
+        let surplus = if outcome.is_ok() {
+            let mut slot = self
+                .idle_check_conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(conn);
+                None
+            } else {
+                Some(conn)
+            }
+        } else {
+            Some(conn)
+        };
+        if let Some(conn) = surplus {
+            close_idle_check_conn(conn).await;
+        }
+        outcome
+    }
+
+    async fn take_idle_check_conn(&self) -> Result<sqlx::PgConnection, AwaError> {
+        let held = self
+            .idle_check_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(conn) = held {
+            return Ok(conn);
+        }
+        // Detached, the connection never returns to the pool and does not count
+        // against the pool's size, and the pool may open a replacement.
+        let mut conn = self.pool.acquire().await?.detach();
+        if let Err(err) = sqlx::query("SELECT set_config('application_name', $1, false)")
+            .bind(IDLE_CHECK_APPLICATION_NAME)
+            .execute(&mut conn)
+            .await
+        {
+            close_idle_check_conn(conn).await;
+            return Err(err.into());
+        }
+        Ok(conn)
+    }
+
+    async fn release_idle_check_conn(&self) {
+        let held = self
+            .idle_check_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(conn) = held {
+            close_idle_check_conn(conn).await;
+        }
+    }
+
     async fn rotate_queue_storage_queue(&self, prune_tracker: &PruneBackoffTracker) -> bool {
         let Some(runtime) = self.storage.queue_storage() else {
             return false;
         };
 
-        let idle_cursor = match runtime
-            .store
-            .rotate_with_cadence(&self.pool, runtime.rotation_cadence)
-            .await
-        {
+        let idle_cursor = match self.gated_rotate(runtime, GatedRing::Queue).await {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("queue", &outcome);
                 let idle_cursor = match &outcome {
@@ -4580,11 +4679,7 @@ impl MaintenanceService {
             return false;
         };
 
-        let idle_cursor = match runtime
-            .store
-            .rotate_leases_with_cadence(&self.pool, runtime.rotation_cadence)
-            .await
-        {
+        let idle_cursor = match self.gated_rotate(runtime, GatedRing::Lease).await {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("lease", &outcome);
                 let idle_cursor = match &outcome {
@@ -4690,11 +4785,7 @@ impl MaintenanceService {
             return false;
         };
 
-        let idle_cursor = match runtime
-            .store
-            .rotate_claims_with_cadence(&self.pool, runtime.rotation_cadence)
-            .await
-        {
+        let idle_cursor = match self.gated_rotate(runtime, GatedRing::Claim).await {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("claim", &outcome);
                 let idle_cursor = match &outcome {
