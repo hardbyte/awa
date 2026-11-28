@@ -3,8 +3,8 @@
 #
 # The suite is split into parallel CI shards so wall-clock cost is the
 # slowest shard, not the sum. migration_test is partitioned per-test with
-# cargo-nextest (each test in its own process; the suite's Postgres
-# advisory locks already serialize schema access across processes). The
+# cargo-nextest (each test in its own process and its own database; tests that
+# replay the migration chain serialize through a Postgres advisory lock). The
 # other named awa binaries form the `heavy` shard; EVERY OTHER awa test
 # binary is the `rest` shard, computed by subtraction — a new test file
 # lands in `rest` automatically and can never be forgotten. The remaining

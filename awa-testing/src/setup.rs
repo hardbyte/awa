@@ -290,18 +290,23 @@ pub async fn wait_for_counts(
     }
 }
 
-/// A throwaway database holding the fully migrated `awa` schema.
+/// A throwaway database owned by one test.
 ///
+/// [`Self::canonical`] and its variants hold the fully migrated `awa` schema.
 /// The first call in a process builds a template database by running the
-/// migration chain once; every `TestDatabase` is then a `CREATE DATABASE ...
-/// TEMPLATE` clone of it, which takes on the order of 100 ms instead of a
-/// full replay. Each instance owns a distinct database, so tests holding one
-/// can run in parallel without coordinating schema resets, and the database
-/// is dropped when the value goes out of scope.
+/// migration chain once; every such `TestDatabase` is then a `CREATE DATABASE
+/// ... TEMPLATE` clone of it, which takes on the order of 100 ms instead of a
+/// full replay. [`Self::empty`] is a plain `CREATE DATABASE` with no `awa`
+/// schema, for tests that run the migrations themselves. Each instance owns a
+/// distinct database, so tests holding one can run in parallel without
+/// coordinating schema resets, and the database is dropped, with its
+/// connections, when the value goes out of scope.
 ///
 /// The template name carries a fingerprint of the migration SQL, so a changed
-/// migration selects a new template. Other templates and abandoned clones
-/// are retained; each instance only drops its own clone.
+/// migration selects a new template; other templates are retained. A clone
+/// abandoned by a killed process is dropped by the first test database a later
+/// process creates once it is more than an hour old, unless something is still
+/// connected to it.
 pub struct TestDatabase {
     name: String,
     admin_url: String,
@@ -311,8 +316,13 @@ pub struct TestDatabase {
 const TEMPLATE_PREFIX: &str = "awa_tpl_";
 const CLONE_PREFIX: &str = "awa_t_";
 const TEMPLATE_BUILD_LOCK_KEY: i64 = 0x6177615f7470;
+const CLONE_TEMPLATE_ATTEMPTS: u32 = 20;
+const CLONE_TEMPLATE_RETRY_DELAY: Duration = Duration::from_millis(100);
+const ABANDONED_CLONE_AGE_SECS: u64 = 60 * 60;
+const OBJECT_IN_USE_SQLSTATE: &str = "55006";
 
 static CANONICAL_TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+static ABANDONED_CLONE_SWEEP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 static CLONE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl TestDatabase {
@@ -340,26 +350,42 @@ impl TestDatabase {
         let template = CANONICAL_TEMPLATE
             .get_or_init(ensure_canonical_template)
             .await;
+        Self::create(Some(template), max_connections).await
+    }
+
+    /// A fresh database with no `awa` schema, for tests that run the
+    /// migrations themselves.
+    pub async fn empty() -> Self {
+        Self::create(None, 5).await
+    }
+
+    async fn create(template: Option<&str>, max_connections: u32) -> Self {
         let admin_url = admin_database_url();
         let mut admin = connect(&admin_url).await;
+        ABANDONED_CLONE_SWEEP
+            .get_or_init(|| drop_abandoned_clones(&mut admin))
+            .await;
         let name = format!(
             "{CLONE_PREFIX}{}_{}_{}",
             unix_time_secs(),
             std::process::id(),
             CLONE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        sqlx::raw_sql(audited_sql(format!(
-            "CREATE DATABASE {name} TEMPLATE {template}"
-        )))
-        .execute(&mut admin)
-        .await
-        .expect("cloning the test template database should succeed");
+        match template {
+            Some(template) => create_database_from_template(&mut admin, &name, template).await,
+            None => {
+                sqlx::raw_sql(audited_sql(format!("CREATE DATABASE {name}")))
+                    .execute(&mut admin)
+                    .await
+                    .expect("creating the empty test database should succeed");
+            }
+        }
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(Duration::from_secs(10))
             .connect(&replace_database_name(&admin_url, &name))
             .await
-            .expect("connecting to the cloned test database should succeed");
+            .expect("connecting to the test database should succeed");
         Self {
             name,
             admin_url,
@@ -405,6 +431,71 @@ impl Drop for TestDatabase {
             });
         });
         let _ = cleanup.join();
+    }
+}
+
+/// Clone `template` into `name`, retrying while Postgres reports the template
+/// in use (an autovacuum worker connected to it blocks `CREATE DATABASE`).
+async fn create_database_from_template(
+    admin: &mut sqlx::postgres::PgConnection,
+    name: &str,
+    template: &str,
+) {
+    let mut attempt = 1;
+    loop {
+        let result = sqlx::raw_sql(audited_sql(format!(
+            "CREATE DATABASE {name} TEMPLATE {template}"
+        )))
+        .execute(&mut *admin)
+        .await;
+        match result {
+            Ok(_) => return,
+            Err(sqlx::Error::Database(db_err))
+                if db_err.code().as_deref() == Some(OBJECT_IN_USE_SQLSTATE)
+                    && attempt < CLONE_TEMPLATE_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(CLONE_TEMPLATE_RETRY_DELAY).await;
+            }
+            Err(err) => panic!(
+                "cloning the test template database should succeed (attempt {attempt}): {err}"
+            ),
+        }
+    }
+}
+
+/// The creation time embedded in a clone database name
+/// (`awa_t_<unix secs>_<pid>_<counter>`), or `None` for any other name.
+fn clone_creation_time(database_name: &str) -> Option<u64> {
+    let mut parts = database_name.strip_prefix(CLONE_PREFIX)?.split('_');
+    let created: u64 = parts.next()?.parse().ok()?;
+    let is_number = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    (is_number(parts.next()) && is_number(parts.next()) && parts.next().is_none())
+        .then_some(created)
+}
+
+/// Drop clones older than [`ABANDONED_CLONE_AGE_SECS`]. Without `FORCE`, a
+/// database that still has a connection is left alone, so a live test in
+/// another process is safe; failures are ignored.
+async fn drop_abandoned_clones(admin: &mut sqlx::postgres::PgConnection) {
+    let Ok(names) = sqlx::query_scalar::<_, String>(
+        "SELECT datname FROM pg_database WHERE starts_with(datname, $1)",
+    )
+    .bind(CLONE_PREFIX)
+    .fetch_all(&mut *admin)
+    .await
+    else {
+        return;
+    };
+    let cutoff = unix_time_secs().saturating_sub(ABANDONED_CLONE_AGE_SECS);
+    for name in names {
+        if clone_creation_time(&name).is_some_and(|created| created < cutoff) {
+            let _ = sqlx::raw_sql(audited_sql(format!("DROP DATABASE IF EXISTS {name}")))
+                .execute(&mut *admin)
+                .await;
+        }
     }
 }
 
@@ -566,5 +657,59 @@ mod tests {
         .execute(&mut admin)
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn clone_creation_time_requires_the_exact_clone_shape() {
+        assert_eq!(
+            clone_creation_time("awa_t_1700000000_42_7"),
+            Some(1_700_000_000)
+        );
+        for name in [
+            "awa_t_1700000000_42",
+            "awa_t_1700000000_42_7_9",
+            "awa_t_x_42_7",
+            "awa_t_1700000000__7",
+            "awa_t_0_0123abcd_old",
+            "awa_tpl_0123456789abcdef",
+            "awa_test",
+            "postgres",
+        ] {
+            assert_eq!(clone_creation_time(name), None, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_drops_only_old_unconnected_clones() {
+        let unique = uuid::Uuid::new_v4().as_u128() % 1_000_000_000_000;
+        let abandoned = database_guard(format!("{CLONE_PREFIX}1_{}_{unique}", std::process::id()));
+        let in_use = database_guard(format!(
+            "{CLONE_PREFIX}1_{}_{}",
+            std::process::id(),
+            unique + 1
+        ));
+        let recent = database_guard(format!(
+            "{CLONE_PREFIX}{}_{}_{}",
+            unix_time_secs(),
+            std::process::id(),
+            unique + 2
+        ));
+        let mut admin = connect(&admin_database_url()).await;
+        for database in [&abandoned, &in_use, &recent] {
+            sqlx::raw_sql(audited_sql(format!("CREATE DATABASE {}", database.name())))
+                .execute(&mut admin)
+                .await
+                .unwrap();
+        }
+        let _connection = PgPoolOptions::new()
+            .connect(&in_use.url())
+            .await
+            .expect("connecting to the in-use clone");
+
+        drop_abandoned_clones(&mut admin).await;
+
+        assert!(!database_exists(&mut admin, abandoned.name()).await);
+        assert!(database_exists(&mut admin, in_use.name()).await);
+        assert!(database_exists(&mut admin, recent.name()).await);
     }
 }
