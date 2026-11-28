@@ -1010,6 +1010,12 @@ class AsyncClient:
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
         raising it further.
+
+        Queue dicts also accept ``ring_pin_aging_escalation`` (default
+        ``True``). While one of the queue's lanes keeps queue prune from
+        reclaiming the oldest sealed ring slot, the queue claims with a
+        shorter priority-aging interval so that lane's oldest row is served;
+        ``False`` always claims with ``priority_aging_interval_ms``.
         """
         return await self._raw.start(
             queues,

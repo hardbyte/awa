@@ -4,6 +4,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Changed
+
+- **A queue whose own lane keeps queue prune from reclaiming the queue ring is claimed oldest-first across priorities until the lane is released** ([#886](https://github.com/hardbyte/awa/issues/886), [#779](https://github.com/hardbyte/awa/issues/779)). On queue storage, a lower-priority lane of a queue with `priority_aging_interval` zero (strict priority) that stays starved by higher-priority lanes of the same queue pins the oldest ring slot, so storage is not reclaimed for any queue. The maintenance leader has reported such a lane since 0.6.18. Now every runtime that serves a queue reads the lanes pinning the ring about every 10 seconds (one query per runtime, about 10 ms on a schema with 1,200 lanes), and while a lane of the queue above priority 1 pins it, claims the queue with an aging interval of the lane's head age divided by its priority minus one, at least one second, so the lane's head reaches effective priority 1. Until the lane leaves the pin the queue is served oldest-first across priorities for rows older than the pinned head; the configured interval applies again as soon as it does, and the shorter interval is used only when it is shorter than the configured one. It helps only when the starved head is older than the heads of the lanes above it. It changes nothing for a paused queue or one no runtime serves, and rate limits, permits and `max_workers` are unchanged. Set `QueueConfig.ring_pin_aging_escalation` to `false` (Rust), or `ring_pin_aging_escalation=False` in a Python queue dict or `PartitionedQueue.queue_configs`, to keep claiming with `priority_aging_interval` alone. No schema change, and it is safe in any mix of 0.6 versions: runtimes before 0.6.20 do not escalate. See [priority aging](docs/configuration.md#escalation-while-a-lane-pins-the-queue-ring).
+
+### Added
+
+- `awa.dispatch.ring_pin_escalated_claims` counts the claims that returned jobs with a shortened aging interval, by `awa_job_queue`.
+- The warning `Queue ring prune is pinned by unclaimed ready rows` carries a `cause` field for its oldest lane: `paused`, `no_runtime` (no live runtime lists the queue), `advancing` (the lane's claim cursor moved since the previous read), `starved`, or `unknown`. No metric name or attribute changes.
+- `QueueStorage::queue_serving_states` reads whether queues are paused and whether a live runtime serves them, and `QueueStorage::queue_claims_lane` whether a queue's claims read a ready lane.
+
 ### Fixed
 
 - **Admin UI: the phone navigation drawer opens.** Below 768px, which includes a desktop browser at 200% zoom, the drawer closed in the same moment it opened, so no page could be reached from the navigation. It now opens, and closes once a page is chosen. At that width wide tables scroll inside their own frame instead of widening the page.

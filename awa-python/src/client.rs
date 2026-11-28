@@ -1802,6 +1802,9 @@ impl PyClient {
             if let Some(claim_batch_size) = config.claim_batch_size {
                 queue_config.claim_batch_size = claim_batch_size;
             }
+            if let Some(enabled) = config.ring_pin_aging_escalation {
+                queue_config.ring_pin_aging_escalation = enabled;
+            }
             builder = builder.queue(config.name.clone(), queue_config);
         }
         if let Some(global_max) = global_max_workers {
@@ -3522,6 +3525,10 @@ struct ParsedQueueConfig {
     /// Maximum jobs claimed per dispatcher round-trip. `None` keeps the
     /// Rust `QueueConfig` default.
     claim_batch_size: Option<usize>,
+    /// Whether the queue claims with a shorter aging interval while one of
+    /// its lanes keeps the queue ring from being reclaimed. `None` keeps the
+    /// Rust `QueueConfig` default (on).
+    ring_pin_aging_escalation: Option<bool>,
 }
 
 /// Parse queue configs from Python input (list of tuples or dicts).
@@ -3564,6 +3571,7 @@ fn parse_queue_configs(
                 deadline_duration_ms: None,
                 claimers: None,
                 claim_batch_size: None,
+                ring_pin_aging_escalation: None,
             });
             continue;
         }
@@ -3650,6 +3658,10 @@ fn parse_queue_configs(
             .get_item("claim_batch_size")?
             .map(|v| v.extract())
             .transpose()?;
+        let ring_pin_aging_escalation: Option<bool> = dict
+            .get_item("ring_pin_aging_escalation")?
+            .map(|v| v.extract())
+            .transpose()?;
         if claimers == Some(0) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "claimers must be > 0",
@@ -3671,6 +3683,7 @@ fn parse_queue_configs(
             deadline_duration_ms,
             claimers,
             claim_batch_size,
+            ring_pin_aging_escalation,
         });
     }
 
@@ -3701,6 +3714,7 @@ fn normalize_queue_configs(
                     deadline_duration_ms: None,
                     claimers: None,
                     claim_batch_size: None,
+                    ring_pin_aging_escalation: None,
                 });
             }
         }

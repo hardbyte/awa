@@ -5670,6 +5670,7 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_paused_queue() {
         .parse()
         .expect("age is a number");
     assert!((600..660).contains(&warned_age), "warned age {warned_age}");
+    assert_eq!(warning.fields["cause"], "paused");
 
     admin::resume_queue(&pool, queue)
         .await
@@ -6074,6 +6075,390 @@ async fn test_queue_ring_pin_gauge_refreshes_while_prune_backs_off() {
         attempts,
         "the gauge moved from {age} to {refreshed} without another prune attempt"
     );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// Claims made with a shortened aging interval for `queue` so far.
+fn ring_pin_escalated_claims_for(
+    exporter: &InMemoryMetricExporter,
+    meter_provider: &SdkMeterProvider,
+    queue: &str,
+) -> u64 {
+    meter_provider.force_flush().expect("flush metrics");
+    let metrics = exporter.get_finished_metrics().expect("read metrics");
+    let Some(latest) = metrics.last() else {
+        return 0;
+    };
+    sum_counter_metric_with_attribute(
+        std::slice::from_ref(latest),
+        "awa.dispatch.ring_pin_escalated_claims",
+        "awa.job.queue",
+        queue,
+    )
+}
+
+async fn queue_ring_generation(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT generation FROM {}.queue_ring_state WHERE singleton = TRUE",
+        store.schema()
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read queue ring generation")
+}
+
+/// Enqueue one `priority` job into `queue` every 30ms until the returned flag
+/// is set, so the lane stays backlogged for a worker that takes 40ms a job
+/// and the ring has rows to rotate over.
+fn spawn_lane_feeder(
+    pool: sqlx::PgPool,
+    store_config: QueueStorageConfig,
+    queue: &str,
+    priority: i16,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let queue = queue.to_string();
+    let handle = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let store = QueueStorage::new(store_config).expect("feeder store");
+            while !stop.load(Ordering::SeqCst) {
+                enqueue_lane(&pool, &store, &queue, priority, 1).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+    });
+    (stop, handle)
+}
+
+async fn wait_for_jobs_seen(seen: &Arc<std::sync::Mutex<Vec<i64>>>, jobs: &[i64], message: &str) {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(45));
+    loop {
+        let done: HashSet<i64> = seen.lock().unwrap().iter().copied().collect();
+        if jobs.iter().all(|job| done.contains(job)) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{message}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn strict_priority_queue_config(ring_pin_aging_escalation: bool) -> QueueConfig {
+    QueueConfig {
+        max_workers: 1,
+        poll_interval: Duration::from_millis(25),
+        priority_aging_interval: Duration::ZERO,
+        claim_batch_size: 1,
+        ring_pin_aging_escalation,
+        ..QueueConfig::default()
+    }
+}
+
+/// A queue with a starved priority-4 lane in the oldest sealed slot and a
+/// priority-1 lane that stays backlogged: returns the starved lane's job ids.
+async fn enqueue_starved_lane_under_a_saturating_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+) -> Vec<i64> {
+    let starved = enqueue_lane(pool, store, queue, 4, 2).await;
+    backdate_ready_lane(pool, store, queue, 4, Duration::from_secs(3600)).await;
+    assert_rotated_to(store, pool, 1).await;
+    enqueue_lane(pool, store, queue, 1, 20).await;
+    starved
+}
+
+/// #779: with strict priority, a lane that pins the queue ring is claimed
+/// ahead of a saturating higher-priority lane, so the ring unpins and wraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_pin_aging_escalation_claims_a_starved_lane_and_prune_proceeds() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_escalation";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_escalation");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let starved = enqueue_starved_lane_under_a_saturating_lane(&pool, &store, queue).await;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        strict_priority_queue_config(true),
+        store_config.clone(),
+        SlowRecordingWorker { seen: seen.clone() },
+    );
+    client.start().await.expect("start client");
+    let (stop, feeder) = spawn_lane_feeder(pool.clone(), store_config.clone(), queue, 1);
+
+    wait_for_jobs_seen(
+        &seen,
+        &starved,
+        "the starved lane is claimed while a higher lane stays backlogged",
+    )
+    .await;
+    assert!(
+        ring_pin_escalated_claims_for(&exporter, &meter_provider, queue) > 0,
+        "escalated claims are counted"
+    );
+
+    // The ring wraps into the slot the starved lane pinned.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(20));
+    while queue_ring_generation(&pool, &store).await < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "queue prune reclaims the slot once the starved lane is claimed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    feeder.await.expect("feeder");
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// #779: a queue that opts out claims in strict priority order while its
+/// starved lane pins the ring, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_pin_aging_escalation_opt_out_leaves_the_lane_starved() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_escalation_off";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_escalation_off");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let starved = enqueue_starved_lane_under_a_saturating_lane(&pool, &store, queue).await;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        strict_priority_queue_config(false),
+        store_config.clone(),
+        SlowRecordingWorker { seen: seen.clone() },
+    );
+    client.start().await.expect("start client");
+    let (stop, feeder) = spawn_lane_feeder(pool.clone(), store_config.clone(), queue, 1);
+
+    let warning = wait_for_ring_pin_warning(queue).await;
+    assert_eq!(warning.fields["priority"], "4");
+    assert_eq!(warning.fields["cause"], "starved");
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 4, 0),
+        |age| age > 0.0,
+        "the starved lane is reported as pinning the ring",
+    )
+    .await;
+
+    // Long enough for an escalated queue to have claimed the lane many times.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let done = seen.lock().unwrap().clone();
+    assert!(
+        done.len() >= 20,
+        "the higher lane is being claimed: {done:?}"
+    );
+    assert!(
+        done.iter().all(|job| !starved.contains(job)),
+        "strict priority never reaches the starved lane: {done:?}"
+    );
+    assert_eq!(
+        ring_pin_escalated_claims_for(&exporter, &meter_provider, queue),
+        0
+    );
+    assert!(
+        queue_ring_generation(&pool, &store).await < 4,
+        "the ring cannot wrap into the pinned slot"
+    );
+    assert!(lane_pins_slot(&pool, &store, 0, queue, 4).await);
+
+    stop.store(true, Ordering::SeqCst);
+    feeder.await.expect("feeder");
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// #779: when the lane above the starved one has the older head, escalation
+/// leaves the claim order as strict priority has it, and a lane claimed once
+/// is not claimed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_pin_aging_escalation_keeps_order_when_the_higher_head_is_older() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_escalation_older";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_escalation_older");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    let higher = enqueue_lane(&pool, &store, queue, 1, 6).await;
+    backdate_ready_lane(&pool, &store, queue, 1, Duration::from_secs(7200)).await;
+    let lower = enqueue_lane(&pool, &store, queue, 4, 2).await;
+    backdate_ready_lane(&pool, &store, queue, 4, Duration::from_secs(3600)).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        strict_priority_queue_config(true),
+        store_config,
+        SlowRecordingWorker { seen: seen.clone() },
+    );
+    client.start().await.expect("start client");
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 1, 0),
+        |age| age > 0.0,
+        "the leader has read the pin before the queue resumes",
+    )
+    .await;
+    admin::resume_queue(&pool, queue)
+        .await
+        .expect("resume queue");
+
+    wait_for_jobs_seen(&seen, &lower, "the lower lane is claimed after the higher").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let expected: Vec<i64> = higher.iter().chain(&lower).copied().collect();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        expected,
+        "the older higher lane is served first, then the lower lane, each job once"
+    );
+    assert!(ring_pin_escalated_claims_for(&exporter, &meter_provider, queue) > 0);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// #779: a runtime that is not the maintenance leader reads the pin itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_pin_aging_escalation_on_a_runtime_that_is_not_the_leader() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let queue = "qs_ring_pin_escalation_follower";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_escalation_follower");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let starved = enqueue_starved_lane_under_a_saturating_lane(&pool, &store, queue).await;
+
+    let leader = ring_pin_client(
+        &pool,
+        "qs_ring_pin_escalation_follower_other",
+        QueueConfig::default(),
+        store_config.clone(),
+        CompleteWorker,
+    );
+    leader.start().await.expect("start leader");
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let follower = Client::builder(pool.clone())
+        .queue(queue, strict_priority_queue_config(true))
+        .queue_storage(
+            store_config.clone(),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .register_worker(SlowRecordingWorker { seen: seen.clone() })
+        .maintenance_leader(false)
+        .build()
+        .expect("build follower");
+    follower.start().await.expect("start follower");
+    let (stop, feeder) = spawn_lane_feeder(pool.clone(), store_config.clone(), queue, 1);
+
+    wait_for_jobs_seen(
+        &seen,
+        &starved,
+        "the follower reads the pin and claims the starved lane",
+    )
+    .await;
+
+    stop.store(true, Ordering::SeqCst);
+    feeder.await.expect("feeder");
+    follower.shutdown(Duration::from_secs(5)).await;
+    leader.shutdown(Duration::from_secs(5)).await;
+}
+
+/// #779: the pin warning says why no runtime claims the lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_warning_names_an_unserved_queue() {
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_unserved";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_unserved");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    enqueue_lane(&pool, &store, queue, 2, 2).await;
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let client = ring_pin_client(
+        &pool,
+        "qs_ring_pin_unserved_other",
+        QueueConfig::default(),
+        store_config,
+        CompleteWorker,
+    );
+    client.start().await.expect("start client");
+
+    let warning = wait_for_ring_pin_warning(queue).await;
+    assert_eq!(warning.fields["cause"], "no_runtime");
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// #779: whether a queue is paused and whether a live runtime serves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_serving_states_report_paused_and_served() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_serving_states";
+    let store_config = ring_pin_store_config("awa_qs_serving_states");
+    let store = Arc::new(create_store_with_config(&pool, store_config.clone()).await);
+    let lanes = [queue.to_string()];
+
+    let read = |store: Arc<QueueStorage>, pool: sqlx::PgPool| {
+        let lanes = lanes.clone();
+        async move {
+            let state = store
+                .queue_serving_states(&pool, &lanes)
+                .await
+                .expect("read serving states")
+                .remove(queue)
+                .expect("the queue is reported");
+            (state.paused, state.served)
+        }
+    };
+    assert_eq!(read(store.clone(), pool.clone()).await, (false, false));
+
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_eq!(read(store.clone(), pool.clone()).await, (true, false));
+
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        QueueConfig::default(),
+        store_config,
+        CompleteWorker,
+    );
+    client.start().await.expect("start client");
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    loop {
+        let current = read(store.clone(), pool.clone()).await;
+        if current == (true, true) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime registers: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     client.shutdown(Duration::from_secs(5)).await;
 }

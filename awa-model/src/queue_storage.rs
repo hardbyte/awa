@@ -803,6 +803,15 @@ pub struct QueueRingPin {
     pub lanes: Vec<PendingReadyLane>,
 }
 
+/// Whether a queue is paused and whether a live runtime serves it. See
+/// [`QueueStorage::queue_serving_states`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QueueServingState {
+    pub paused: bool,
+    pub served: bool,
+}
+
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     if let sqlx::Error::Database(ref db_err) = err {
         if db_err.code().as_deref() == Some("23505") {
@@ -21557,6 +21566,76 @@ impl QueueStorage {
             generation,
             lanes,
         }))
+    }
+
+    /// Whether `lane_queue`, the queue of a ready lane, is one of the lanes
+    /// the claim path of `queue` reads: the same name, or one of its stripes.
+    pub fn queue_claims_lane(&self, queue: &str, lane_queue: &str) -> bool {
+        queue == lane_queue
+            || (self.uses_queue_striping()
+                && self
+                    .physical_queues_for_logical(queue)
+                    .iter()
+                    .any(|physical| physical == lane_queue))
+    }
+
+    /// Whether each of `lane_queues`, the queues of ready lanes such as those
+    /// in a [`QueueRingPin`], is paused and whether a live runtime serves it.
+    /// A stripe is read as its logical queue. One query.
+    #[tracing::instrument(
+        skip(self, pool, lane_queues),
+        name = "queue_storage.queue_serving_states"
+    )]
+    pub async fn queue_serving_states(
+        &self,
+        pool: &PgPool,
+        lane_queues: &[String],
+    ) -> Result<HashMap<String, QueueServingState>, AwaError> {
+        if lane_queues.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let logical: Vec<String> = lane_queues
+            .iter()
+            .map(|queue| self.logical_queue_name(queue).to_string())
+            .collect();
+        let rows: Vec<(String, bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT
+                wanted.queue,
+                EXISTS (
+                    SELECT 1
+                    FROM awa.queue_meta AS meta
+                    WHERE meta.queue = wanted.queue
+                      AND meta.paused = TRUE
+                ),
+                EXISTS (
+                    SELECT 1
+                    FROM awa.runtime_instances AS runtime
+                    WHERE NOT runtime.shutting_down
+                      AND runtime.last_seen_at + make_interval(
+                          secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+                      ) >= now()
+                      AND runtime.queues @> jsonb_build_array(jsonb_build_object('queue', wanted.queue))
+                )
+            FROM unnest($1::text[]) AS wanted(queue)
+            "#,
+        )
+        .bind(&logical)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        let by_logical: HashMap<String, QueueServingState> = rows
+            .into_iter()
+            .map(|(queue, paused, served)| (queue, QueueServingState { paused, served }))
+            .collect();
+        Ok(lane_queues
+            .iter()
+            .filter_map(|queue| {
+                by_logical
+                    .get(self.logical_queue_name(queue))
+                    .map(|state| (queue.clone(), *state))
+            })
+            .collect())
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_leases")]

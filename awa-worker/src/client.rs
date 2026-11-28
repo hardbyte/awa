@@ -1189,6 +1189,7 @@ impl ClientBuilder {
             rescue_pass_budget: self.rescue_pass_budget,
             rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
+            ring_pin_watch: Arc::new(crate::ring_pin::RingPinWatch::default()),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
             dispatcher_handles: RwLock::new(Vec::new()),
@@ -1291,6 +1292,8 @@ pub struct Client {
     rescue_pass_budget: Option<Duration>,
     rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
+    /// The lanes pinning the queue ring, shared by dispatchers for aging escalation.
+    ring_pin_watch: Arc<crate::ring_pin::RingPinWatch>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
     /// Cancellation token for heartbeat + maintenance — kept alive during drain.
@@ -1855,6 +1858,7 @@ impl Client {
             },
         )
         .runtime_control(self.runtime_control.clone(), self.runtime_instance_id)
+        .ring_pin_watch(self.ring_pin_watch.clone())
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);
@@ -2013,6 +2017,7 @@ impl Client {
                     claimer_owner_id,
                     effective_storage.clone(),
                 )
+                .ring_pin_watch(self.ring_pin_watch.clone())
                 .abandon_grace(
                     2 * self
                         .deadline_rescue_interval
@@ -2021,6 +2026,28 @@ impl Client {
                 dispatcher_handles.push(tokio::spawn(async move {
                     dispatcher.run().await;
                 }));
+            }
+        }
+
+        if let RuntimeStorage::QueueStorage(runtime) = &effective_storage {
+            if self
+                .queues
+                .iter()
+                .any(|(_, config)| config.ring_pin_aging_escalation)
+            {
+                // Spread runtimes across the refresh interval.
+                let start_offset = Duration::from_millis(
+                    (self.runtime_instance_id.as_u128()
+                        % crate::ring_pin::RING_PIN_REFRESH_INTERVAL.as_millis())
+                        as u64,
+                );
+                dispatcher_handles.push(tokio::spawn(crate::ring_pin::run_refresher(
+                    self.ring_pin_watch.clone(),
+                    runtime.clone(),
+                    self.pool.clone(),
+                    self.dispatch_cancel.clone(),
+                    start_offset,
+                )));
             }
         }
 
