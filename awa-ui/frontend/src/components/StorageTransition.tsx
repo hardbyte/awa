@@ -256,7 +256,7 @@ export function StorageTransitionCard({ report }: StorageTransitionCardProps) {
         {report.prepared_queue_storage_schema && !report.prepared_schema_ready && (
           <div
             role="alert"
-            className="flex items-start gap-2 rounded-lg border border-warning bg-warning/10 p-3 text-sm text-warning-fg"
+            className="flex items-start gap-2 rounded-lg border border-warning bg-warning/10 p-3 text-sm text-warning-subtle-fg"
           >
             <ExclamationTriangleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />
             <div className="space-y-1">
@@ -347,7 +347,7 @@ function RollbackBoundariesPanel({ boundary, report }: RollbackBoundariesPanelPr
     return (
       <div
         role="alert"
-        className="flex items-start gap-2 rounded-lg border border-danger bg-danger/10 p-3 text-sm text-danger-fg"
+        className="flex items-start gap-2 rounded-lg border border-danger bg-danger/10 p-3 text-sm text-danger-subtle-fg"
       >
         <LockClosedIcon className="mt-0.5 size-4 shrink-0 text-danger" aria-hidden />
         <div className="space-y-1">
