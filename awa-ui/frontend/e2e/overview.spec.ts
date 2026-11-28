@@ -223,7 +223,7 @@ test.describe("Overview", () => {
     expect(outcomeReads).toBe(1);
   });
 
-  test("outcomes give the failure rate of both hours and the dead letters added", async ({ page }) => {
+  test("a server reporting terminal coverage gets the failure rate of both hours", async ({ page }) => {
     await mockOverview(page, {
       ...BUSY,
       outcomes: outcomes({ completed: 99, failed: 1 }, { completed: 8, failed: 2, dead_lettered: 1 }),
@@ -261,23 +261,16 @@ test.describe("Overview", () => {
     await expect(page.getByTestId("failure-rate")).toHaveCount(0);
   });
 
-  test("dead letters keep their own coverage when ring prune shortens the terminal one", async ({ page }) => {
-    // Queue storage under load: terminal rows cover five minutes, dead letters the window.
-    await mockOverview(page, { ...BUSY, outcomes: outcomes({ dead_lettered: 1 }, { completed: 9, failed: 3, dead_lettered: 2 }, 5) });
-    await page.goto("/");
-    await expect(page.getByTestId("dead-letter-trend")).toHaveText("+120 in the last hour");
-    await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
-    await expect(page.getByTestId("failure-rate")).toHaveCount(0);
-  });
-
-  test("a canonical server reports no terminal coverage, so the Failed tile stays as it was", async ({ page }) => {
-    const canonical = { ...outcomes({}, {}, -60), covered_since: null };
-    await mockOverview(page, { ...BUSY, outcomes: canonical });
+  test("with no terminal coverage the Failed tile stays as it was and dead letters still trend", async ({ page }) => {
+    // What both engines report: terminal series null throughout, dead letters counted.
+    const reserved = { ...outcomes({ dead_lettered: 1 }, { dead_lettered: 2 }, -60), covered_since: null };
+    await mockOverview(page, { ...BUSY, outcomes: reserved });
     await page.goto("/");
     await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
     await expect(page.getByTestId("failure-rate")).toHaveCount(0);
     await expect(page.locator("[data-id='jobs:failure-rate']")).toHaveCount(0);
-    await expect(page.getByTestId("dead-letter-trend")).toHaveText("none added in the last hour");
+    await expect(page.getByTestId("dead-letter-trend")).toHaveText("+120 in the last hour");
+    await expect(page.getByTestId("tile-dead-letters")).toContainText("most in billing (2)");
   });
 
   test("a failed read shows a dash and the error, never zero", async ({ page }) => {

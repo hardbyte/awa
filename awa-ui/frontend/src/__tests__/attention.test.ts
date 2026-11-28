@@ -525,9 +525,9 @@ describe("outcomeTrends", () => {
     expect(trends.failureRate?.current).toEqual({ finished: 60, failed: 0, rate: 0 });
   });
 
-  it("has no failure rate without terminal coverage, as on the canonical engine", () => {
-    const canonical = { ...outcomes({}, {}, NOW + 3600_000), covered_since: null };
-    expect(outcomeTrends(canonical, 60)).toEqual({ failureRate: null, deadLetteredLastHour: 0 });
+  it("has no failure rate without terminal coverage, as either engine reports today", () => {
+    const reserved = { ...outcomes({}, { dead_lettered: 2 }, NOW + 3600_000), covered_since: null };
+    expect(outcomeTrends(reserved, 60)).toEqual({ failureRate: null, deadLetteredLastHour: 120 });
   });
 
   it("keeps dead letters out of the failure rate", () => {
@@ -588,10 +588,11 @@ describe("failure rate in the Overview", () => {
     });
   });
 
-  it("stays quiet for a steady rate, an uncovered hour or an older server", () => {
+  it("stays quiet for a steady rate, an uncovered hour, no terminal coverage or an older server", () => {
     const steady = outcomes({ completed: 8, failed: 2 }, { completed: 8, failed: 2 });
     const uncovered = outcomes({ completed: 99, failed: 1 }, { completed: 8, failed: 2 }, NOW - 60 * 60_000);
-    for (const value of [steady, uncovered, null]) {
+    const reserved = { ...outcomes({}, {}, NOW + 3600_000), covered_since: null };
+    for (const value of [steady, uncovered, reserved, null]) {
       expect(attentionItems({ ...input(), outcomes: value }).map((i) => i.id)).not.toContain("jobs:failure-rate");
     }
   });
