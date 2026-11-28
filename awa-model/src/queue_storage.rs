@@ -927,6 +927,13 @@ pub struct PendingReadyLane {
     pub head_age: Duration,
 }
 
+/// What bounds one spent-claim-head advance call.
+#[derive(Debug, Clone, Copy)]
+enum SpentClaimAdvanceLimit {
+    WindowsPerLane(usize),
+    Budget(Duration),
+}
+
 /// A lane whose claim cursor [`QueueStorage::advance_spent_claim_heads`]
 /// moved over spent rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -961,6 +968,13 @@ pub struct SpentClaimHeadFailure {
 pub struct SpentClaimHeadAdvances {
     pub advanced: Vec<SpentClaimHeadAdvance>,
     pub failed: Vec<SpentClaimHeadFailure>,
+    /// Windows of [`DRAIN_BATCH_SIZE`] positions the call ran, one
+    /// transaction each, including windows that moved nothing.
+    pub windows: usize,
+    /// The call stopped at its time budget while a lane still had spent
+    /// rows to step over. Always `false` for a call bounded by a window
+    /// count.
+    pub budget_exhausted: bool,
 }
 
 /// The oldest sealed queue ring slot and the lanes whose pending ready rows
@@ -13158,6 +13172,53 @@ impl QueueStorage {
         lanes: &[PendingReadyLane],
         max_windows: usize,
     ) -> Result<SpentClaimHeadAdvances, AwaError> {
+        self.advance_spent_claim_heads_limited(
+            pool,
+            lanes,
+            SpentClaimAdvanceLimit::WindowsPerLane(max_windows),
+        )
+        .await
+    }
+
+    /// Like [`Self::advance_spent_claim_heads`], bounded by time instead of a
+    /// window count: a lane keeps advancing, one transaction per window,
+    /// while each window moves a full [`DRAIN_BATCH_SIZE`] positions, until
+    /// `budget` has elapsed. Lanes are advanced in turn, in
+    /// (queue, priority, shard) order, and every call starts at the first
+    /// lane again, so a lane that exhausts the budget delays the lanes after
+    /// it until it reaches a claimable row. At least one
+    /// window runs whatever the budget, and the window in flight when the
+    /// budget elapses finishes, so a call can overrun it by one window.
+    /// [`SpentClaimHeadAdvances::budget_exhausted`] says whether spent rows
+    /// remain.
+    #[tracing::instrument(skip_all, name = "queue_storage.advance_spent_claim_heads_within")]
+    pub async fn advance_spent_claim_heads_within(
+        &self,
+        pool: &PgPool,
+        lanes: &[PendingReadyLane],
+        budget: Duration,
+    ) -> Result<SpentClaimHeadAdvances, AwaError> {
+        self.advance_spent_claim_heads_limited(pool, lanes, SpentClaimAdvanceLimit::Budget(budget))
+            .await
+    }
+
+    async fn advance_spent_claim_heads_limited(
+        &self,
+        pool: &PgPool,
+        lanes: &[PendingReadyLane],
+        limit: SpentClaimAdvanceLimit,
+    ) -> Result<SpentClaimHeadAdvances, AwaError> {
+        let started = std::time::Instant::now();
+        let max_windows = match limit {
+            SpentClaimAdvanceLimit::WindowsPerLane(max_windows) => max_windows,
+            SpentClaimAdvanceLimit::Budget(_) => usize::MAX,
+        };
+        let over_budget = |windows_run: usize| match limit {
+            SpentClaimAdvanceLimit::Budget(budget) => {
+                windows_run > 0 && started.elapsed() >= budget
+            }
+            SpentClaimAdvanceLimit::WindowsPerLane(_) => false,
+        };
         let mut outcome = SpentClaimHeadAdvances::default();
         if lanes.is_empty() || max_windows == 0 {
             return Ok(outcome);
@@ -13261,9 +13322,14 @@ impl QueueStorage {
         probe.commit().await.map_err(map_sqlx_error)?;
 
         let sql = self.spent_claim_prefix_advance_sql(&claimed);
-        for (queue, priority, enqueue_shard) in candidates {
+        'lanes: for (queue, priority, enqueue_shard) in candidates {
+            if over_budget(outcome.windows) {
+                outcome.budget_exhausted = true;
+                break;
+            }
             let mut moved: Option<SpentClaimHeadAdvance> = None;
             for _ in 0..max_windows {
+                outcome.windows += 1;
                 let step = self
                     .advance_spent_claim_head_window(
                         pool,
@@ -13317,6 +13383,11 @@ impl QueueStorage {
                 }
                 if !unfinished {
                     break;
+                }
+                if over_budget(outcome.windows) {
+                    outcome.budget_exhausted = true;
+                    outcome.advanced.extend(moved);
+                    break 'lanes;
                 }
             }
             outcome.advanced.extend(moved);
