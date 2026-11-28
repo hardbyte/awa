@@ -51,6 +51,7 @@ export function DlqDetailPage() {
     onSuccess: (revived) => {
       void queryClient.invalidateQueries({ queryKey: ["dlq"] });
       void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
+      void queryClient.invalidateQueries({ queryKey: ["dlq-reasons"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       if (revived) {
         toast.success(`Dead letter #${jobId} retried; job now ${jobStateMeta(revived.state).label.toLowerCase()}`);
@@ -67,6 +68,7 @@ export function DlqDetailPage() {
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: ["dlq"] });
       void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
+      void queryClient.invalidateQueries({ queryKey: ["dlq-reasons"] });
       toast.success(res.count > 0 ? `Dead letter #${jobId} purged` : `Dead letter #${jobId} was already purged`);
       void navigate({ to: "/dlq" });
     },

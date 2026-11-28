@@ -156,3 +156,50 @@ describe("toWireFilter", () => {
     });
   });
 });
+
+describe("cron: and reason: terms", () => {
+  it("parse into the schedule and DLQ reason and round-trip", () => {
+    expect(parseSearch("kind:report cron:nightly reason:heartbeat_stale")).toEqual({
+      kind: "report",
+      cron: "nightly",
+      reason: "heartbeat_stale",
+    });
+    const search = "kind:k tag:a cron:nightly reason:poison";
+    expect(buildSearch(parseSearch(search))).toBe(search);
+  });
+
+  it("keep a quoted value with spaces as one term", () => {
+    expect(parseSearch('cron:"nightly report" reason:"bad \\"input\\""')).toEqual({
+      cron: "nightly report",
+      reason: 'bad "input"',
+    });
+    const filters = { cron: "nightly report", reason: 'audit "q2"', tags: ["a b"] };
+    expect(buildSearch(filters)).toBe('tag:"a b" cron:"nightly report" reason:"audit \\"q2\\""');
+    expect(parseSearch(buildSearch(filters))).toEqual(filters);
+    expect(buildSearch({ reason: "back\\slash" })).toBe("reason:back\\slash");
+    expect(parseSearch("reason:back\\slash")).toEqual({ reason: "back\\slash" });
+  });
+
+  it("refuse an unclosed quote rather than drop the term", () => {
+    expect(termError('cron:"nightly report', "dlq")).toMatch(/unclosed quote/);
+    expect(termError('reason:"a"b', "dlq")).toMatch(/unclosed quote/);
+    expect(parseSearch('cron:"nightly report')).toEqual({});
+  });
+
+  it("take reason: only on dead-letter views", () => {
+    expect(termError("queue:q reason:poison")).toMatch(/Dead letters page/);
+    expect(termError("queue:q reason:poison", "dlq")).toBeUndefined();
+    expect(termError("queue:q cron:nightly")).toBeUndefined();
+    expect(termError("bogus")).not.toMatch(/reason:/);
+    expect(termError("bogus", "dlq")).toMatch(/reason:/);
+    expect(termError("cron:")).toMatch(/cron: needs a value/);
+  });
+
+  it("send cron and reason under their query parameter names", () => {
+    expect(toWireFilter({ queue: "q", cron_name: "nightly", dlq_reason: "poison" })).toEqual({
+      queue: "q",
+      cron_name: "nightly",
+      dlq_reason: "poison",
+    });
+  });
+});

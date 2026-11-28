@@ -261,7 +261,7 @@ test.describe("Bulk operations form", () => {
 
     await page.goto("/batch-ops?state=available");
     await expect(page.getByTestId("batch-narrowing")).toHaveText(
-      "Add a queue, kind, tag, ID or created bound."
+      "Add a queue, kind, tag, schedule, ID or created bound."
     );
     await expect(page.getByRole("button", { name: "Preview" })).toBeDisabled();
     await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();

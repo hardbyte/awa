@@ -4,6 +4,7 @@ import { dlqDepthQuery } from "@/lib/shared-queries";
 import { formatNumber } from "@/lib/number";
 import { buildSearch, parseSearch } from "@/components/SearchBar";
 import { DlqList } from "@/components/DlqList";
+import { DlqReasons } from "@/components/DlqReasons";
 import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 
@@ -51,6 +52,8 @@ export function DlqPage() {
           </div>
         )}
       />
+
+      <DlqReasons filters={filters} />
 
       <DlqList />
     </Page>

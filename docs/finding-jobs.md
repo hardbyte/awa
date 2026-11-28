@@ -23,19 +23,19 @@ nothing, and batch operations are still refused.
 | `dead_lettered` | `true` for only dead-lettered jobs, `false` for none of them. |
 | `ids` | Only these job ids (at most 1,000). |
 | `created_at_gte`, `created_at_lt` | The original insert time, unchanged by retries and moves. |
+| `cron_name` | The cron schedule that enqueued the job: the `cron_name` it writes into each job's metadata. |
+| `dlq_reason` | The reason the job was dead-lettered, matched exactly. It selects only dead-lettered jobs, as `dead_lettered: true` does. |
 
-A field that is not set does not narrow the population. Unknown fields are an
-error, so a typo cannot widen what a purge or batch operation acts on. The
-same holds for the query parameters of `GET /api/jobs`, `/api/jobs/count` and
-`/api/dlq`, where an empty value is an error too. In Rust the lists are the
-`states` and `tags` fields.
+A field that is not set does not narrow the population. Unknown fields are an error, so a typo cannot widen what a purge or batch operation acts on. The same holds for the query parameters of `GET /api/jobs`, `/api/jobs/count` and `/api/dlq`, where an empty value is an error too. In Rust the lists are the `states` and `tags` fields. The query parameters for `cron_name` and `dlq_reason` are `cron` and `reason`, and the CLI flags `--cron` and `--reason`.
+
+`cron_name` and `dlq_reason` have no index of their own. `dlq_reason` reads only the DLQ, and `cron_name` reads job metadata, which suits a filter that also names a kind or queue, as the admin UI's links do. Without one, a `cron_name` filter walks recent jobs until the page fills, within the request budget below. A filter with `dlq_reason` and `dead_lettered: false`, or with states that leave out `failed`, matches nothing, as `dead_lettered: true` with those states does.
 
 Listing and counting share one 30-second budget per request, across every
 pass over candidates and every load of their rows. A filter that needs longer
 fails with an error asking to narrow it. Batch operations scan without that
 budget, since a failed scan fails the operation.
 
-A DLQ purge or bulk retry, and a batch operation, needs a field that picks out particular jobs (kind, queue, tag, ids or a created bound), or `allow_all`. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes to `POST /api/dlq/retry-matching` or `/api/dlq/purge-matching`: `{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`, or `{"filter": {}, "all": true}` for the whole DLQ. Each submits a `retry_from_dlq` or `purge_dlq` batch operation with that filter and answers `202 Accepted` with it, as `GET /api/batch-ops/{id}` returns it.
+A DLQ purge or bulk retry, and a batch operation, needs a field that picks out particular jobs (kind, queue, tag, cron schedule, DLQ reason, ids or a created bound), or `allow_all`. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes to `POST /api/dlq/retry-matching` or `/api/dlq/purge-matching`: `{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`, or `{"filter": {}, "all": true}` for the whole DLQ. Each submits a `retry_from_dlq` or `purge_dlq` batch operation with that filter and answers `202 Accepted` with it, as `GET /api/batch-ops/{id}` returns it.
 
 Each job appears once, in its current state. Listing is newest first; page by
 passing the last id you saw as `before_id`. A job whose claim is in flight
@@ -111,10 +111,7 @@ admin UI fetches it when the filter changes rather than on every poll.
 
 On the jobs page, a filter that can match available or scheduled jobs offers **Change priority or queue of matching jobs**, which opens the batch operations form with the same filter. `set_priority` and `move_queue` act only on available and scheduled jobs, so the preview counts those; running, waiting and finished jobs in the same filter are left alone. The other operation kinds (`retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq`, `purge_dlq`) each act on their own set of states, listed in [ADR-030](adr/030-batch-operations.md#bulk-action-operations), and the preview counts only those.
 
-A batch operation whose filter uses several tags, several states or
-`dead_lettered` is refused while a runtime older than 0.7.0-alpha.2 is live:
-an older runner can't read them. A 0.6 server or runner refuses a list under
-`tag` or `state` rather than acting on more jobs.
+A batch operation whose filter uses several tags, several states, `dead_lettered`, `cron_name` or `dlq_reason` is refused while a runtime older than 0.7.0-alpha.2 is live: an older runner can't read them, or ignores them and acts on more jobs. A 0.6 server or runner refuses a list under `tag` or `state` rather than acting on more jobs. Only `retry_from_dlq` and `purge_dlq` take a `dlq_reason`; every other kind refuses it, since it acts on no dead-lettered job.
 
 ## Building the tag indexes
 

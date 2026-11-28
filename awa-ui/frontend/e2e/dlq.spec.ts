@@ -139,6 +139,75 @@ test.describe("DLQ page", () => {
   });
 });
 
+test.describe("Dead-letter reasons", () => {
+  const GATE = "this filter uses several tags or states, dead_lettered, cron_name or dlq_reason, which runtimes older than 0.7.0-alpha.2 cannot run; 1 live runtime(s) are older: w1 (0.6.9)";
+
+  test("the commonest reasons head the list and each filters it", async ({ page }) => {
+    await page.goto("/dlq");
+    const reasons = page.getByTestId("dlq-reasons");
+    const link = reasons.getByTestId("dlq-reason-link").filter({ hasText: "manual_test" });
+    await expect(link).toBeVisible();
+    await expect(reasons.getByRole("listitem").filter({ hasText: "manual_test" }).getByTestId("dlq-reason-count")).toHaveText("1");
+    await Promise.all([
+      page.waitForResponse((r) => new URL(r.url()).pathname === "/api/dlq" && r.url().includes("reason=manual_test") && r.ok()),
+      link.click(),
+    ]);
+    expect(new URL(page.url()).searchParams.get("q")).toBe("kind:dlq_job queue:e2e_dlq reason:manual_test");
+    await expect(page.getByText("reason:manual_test", { exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "600001", exact: true })).toBeVisible();
+    await expect(link).toHaveAttribute("aria-current", "page");
+  });
+
+  test("a server without the reasons endpoint hides the header", async ({ page }) => {
+    let reads = 0;
+    // An older server routes /api/dlq/reasons to /api/dlq/{id} and refuses "reasons" as an id.
+    await page.route("**/api/dlq/reasons*", (route) => {
+      reads++;
+      return route.fulfill({ status: 400, json: { error: "Invalid URL: Cannot parse `reasons` to a `i64`" } });
+    });
+    await page.goto(DLQ_PAGE);
+    await expect(page.getByRole("link", { name: "600001", exact: true })).toBeVisible();
+    await expect(page.getByTestId("dlq-reasons")).toHaveCount(0);
+    expect(reads).toBe(1);
+  });
+
+  test("reason: suggests the DLQ's reasons", async ({ page }) => {
+    await page.goto(DLQ_PAGE);
+    const input = page.getByLabel("Search jobs");
+    await input.fill("reason:");
+    await expect(page.getByRole("listbox").getByText("reason:manual_test")).toBeVisible();
+    await page.getByRole("listbox").getByText("reason:manual_test").click();
+    await expect(page).toHaveURL(/reason%3Amanual_test/);
+  });
+
+  test("a reason flows into the bulk action, and the fleet gate's refusal shows in the dialog", async ({ page }) => {
+    let previewed: unknown = null;
+    let submitted: unknown = null;
+    await page.route("**/api/batch-ops/preview", (route) => {
+      previewed = route.request().postDataJSON();
+      return route.fallback();
+    });
+    await page.route(
+      (url) => url.pathname === "/api/batch-ops",
+      (route) => {
+        if (route.request().method() !== "POST") return route.fallback();
+        submitted = route.request().postDataJSON();
+        return route.fulfill({ status: 400, json: { error: GATE } });
+      }
+    );
+    await page.goto("/dlq?q=queue%3Ae2e_dlq%20reason%3Amanual_test");
+    await bulk(page, "Retry…").click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog).toContainText('dead-lettered for "manual_test"');
+    await dialog.getByRole("button", { name: "Retry 1 dead letter" }).click();
+    await expect(dialog.getByTestId("confirm-error")).toHaveText(GATE);
+    await expect(dialog).toBeVisible();
+    const filter = { queue: "e2e_dlq", dlq_reason: "manual_test" };
+    expect(previewed).toMatchObject({ op_kind: "retry_from_dlq", filter });
+    expect(submitted).toMatchObject({ op_kind: "retry_from_dlq", filter });
+  });
+});
+
 test.describe("Dead letters on a phone", () => {
   test("cards list the reason and open a dead letter with the keyboard", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });

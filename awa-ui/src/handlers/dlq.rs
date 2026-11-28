@@ -4,7 +4,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use awa_model::batch_operations::{self, BatchOperation, BatchOperationSpec, SubmitBatchOperation};
-use awa_model::dlq::{self, DlqRow, RetryFromDlqOpts};
+use awa_model::dlq::{self, DlqReasonGroup, DlqRow, RetryFromDlqOpts};
 use awa_model::queue_storage::QueueStorage;
 use awa_model::{AwaError, DlqPage, JobFilter};
 
@@ -73,6 +73,50 @@ pub async fn dlq_depth(State(state): State<AppState>) -> Result<Json<DlqDepthRes
         .map(|(queue, count)| DlqDepthByQueue { queue, count })
         .collect();
     Ok(Json(DlqDepthResponse { total, by_queue }))
+}
+
+/// Groups `GET /api/dlq/reasons` returns when no `limit` is given.
+const DEFAULT_DLQ_REASON_GROUPS: i64 = 20;
+
+/// `GET /api/dlq/reasons`: the DLQ grouped by reason, queue and kind,
+/// largest first. `queue` and `kind` narrow it; `limit` caps the groups.
+/// Unknown and empty parameters are refused, as on the listing endpoints.
+pub async fn dlq_reasons(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Vec<DlqReasonGroup>>, ApiError> {
+    let mut queue = None;
+    let mut kind = None;
+    let mut limit = DEFAULT_DLQ_REASON_GROUPS;
+    for (name, value) in url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes()) {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(validation(format!("`{name}` needs a value")));
+        }
+        match name.as_ref() {
+            "queue" => queue = Some(value.to_string()),
+            "kind" => kind = Some(value.to_string()),
+            "limit" => {
+                limit = value
+                    .parse()
+                    .map_err(|_| validation(format!("invalid value for `limit`: {value:?}")))?
+            }
+            other => {
+                return Err(validation(format!(
+                    "unknown parameter `{other}`; DLQ reasons take queue, kind and limit"
+                )))
+            }
+        }
+    }
+    if !dlq_storage_exists(&state).await? {
+        return Ok(Json(Vec::new()));
+    }
+    let groups = dlq::dlq_reasons(&state.pool, queue.as_deref(), kind.as_deref(), limit).await?;
+    Ok(Json(groups))
+}
+
+fn validation(message: String) -> ApiError {
+    ApiError::Awa(AwaError::Validation(message))
 }
 
 #[derive(Debug, Deserialize)]

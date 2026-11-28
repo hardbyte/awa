@@ -11,6 +11,7 @@ import {
 import { BulkActionDialog } from "@/components/BulkActionDialog";
 import { AdminButton } from "@/components/AdminAction";
 import {
+  actsOnDlq,
   buildPayload,
   filterError,
   formatCount,
@@ -134,6 +135,16 @@ export function BatchOpNewPage() {
             </select>
           </label>
           <label className="space-y-1 text-sm">
+            <span className="font-medium">Schedule filter</span>
+            <Input value={form.cronName} onChange={(event) => setForm((current) => ({ ...current, cronName: event.target.value }))} placeholder="nightly-report" />
+          </label>
+          {(actsOnDlq(form.opKind) || form.dlqReason) && (
+            <label className="space-y-1 text-sm">
+              <span className="font-medium">Dead-letter reason filter</span>
+              <Input value={form.dlqReason} onChange={(event) => setForm((current) => ({ ...current, dlqReason: event.target.value }))} placeholder="max_attempts_exhausted" />
+            </label>
+          )}
+          <label className="space-y-1 text-sm">
             <span className="font-medium">Created from</span>
             <Input value={form.createdGte} onChange={(event) => setForm((current) => ({ ...current, createdGte: event.target.value }))} placeholder="2026-10-01" />
           </label>
@@ -171,7 +182,7 @@ export function BatchOpNewPage() {
         )}
         {!formFilterError && !narrowing && (
           <p className="mt-2 text-sm text-muted-fg" data-testid="batch-narrowing">
-            Add a queue, kind, tag, ID or created bound.
+            Add a queue, kind, tag, schedule, ID or created bound.
           </p>
         )}
         {currentCount && (

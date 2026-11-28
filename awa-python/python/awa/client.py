@@ -64,8 +64,10 @@ class JobFilter(TypedDict, total=False):
     """Which jobs (ADR-049): every key set narrows the population.
 
     ``tag`` takes one tag or a list, all of which a job must carry;
-    ``state`` takes one state or a list, any of which matches. An unknown
-    key is an error.
+    ``state`` takes one state or a list, any of which matches.
+    ``cron_name`` is the cron schedule that enqueued the job, and
+    ``dlq_reason`` the reason it was dead-lettered, which implies
+    ``dead_lettered``. An unknown key is an error.
     """
 
     kind: str
@@ -76,6 +78,8 @@ class JobFilter(TypedDict, total=False):
     dead_lettered: bool
     created_at_gte: dt.datetime | str
     created_at_lt: dt.datetime | str
+    cron_name: str
+    dlq_reason: str
 
 
 #: Batch operations take the shared job filter.

@@ -56,9 +56,11 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 GET  /api/stats                         Job counts by state
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
-GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&limit=&before_id=
+GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&cron=&reason=&limit=&before_id=
                                         The shared job filter (ADR-049): `state` and `tag` repeat
-                                        (any of the states, all of the tags), `ids` is comma-separated.
+                                        (any of the states, all of the tags), `ids` is comma-separated,
+                                        `cron` is the schedule that enqueued the job and `reason` its
+                                        DLQ reason (dead-lettered jobs only).
                                         Rows omit output. Unknown or empty parameters are a 400; a 0.6
                                         server ignores unknown parameters and returns a wider list.
 GET  /api/jobs/count?<same filter>      { kind: "exact" | "at_least", value }; capped at 10,000
@@ -96,6 +98,7 @@ POST /api/cron/:name/resume
 GET  /api/dlq?<job filter>&limit=&before_id=&before_dlq_at=
 GET  /api/dlq/:id
 GET  /api/dlq/depth
+GET  /api/dlq/reasons?queue=&kind=&limit=   [{ reason, queue, kind, count, oldest, newest }], largest first
 POST   /api/dlq/:id/retry
 DELETE /api/dlq/:id
 POST   /api/dlq/retry-matching          { filter, all? }   all only with an empty filter; 202 with a retry_from_dlq batch operation
@@ -128,7 +131,7 @@ Failure rate against a baseline and a dead-letter trend need outcome counts buck
 
 ### Jobs (`/jobs`)
 
-Filterable, paginated job list with state filter pills (showing counts), a search bar and a bulk-action bar. The search takes `kind:`, `queue:`, `tag:`, `id:`, `created>=` and `created<` terms. The bar acts on the selected rows (Retry and Cancel, at once) or on all the jobs the filter matches (Retry, Cancel, Discard and Move to DLQ as bulk operations, plus Set priority and Move queue through the new-operation form); an action that can't apply to the filter is disabled and says why. The jobs list includes dead-lettered rows, but job actions never change them, so the "all matching" scope counts only live jobs ("All 18 matching live jobs") and agrees with the count the action's preview shows.
+Filterable, paginated job list with state filter pills (showing counts), a search bar and a bulk-action bar. The search takes `kind:`, `queue:`, `tag:`, `cron:`, `id:`, `created>=` and `created<` terms; a value with spaces goes in double quotes (`cron:"nightly report"`). `reason:` filters dead letters, so the jobs list refuses it and points to the Dead letters page rather than listing only dead letters, which its job actions would never change. The bar acts on the selected rows (Retry and Cancel, at once) or on all the jobs the filter matches (Retry, Cancel, Discard and Move to DLQ as bulk operations, plus Set priority and Move queue through the new-operation form); an action that can't apply to the filter is disabled and says why. The jobs list includes dead-lettered rows, but job actions never change them, so the "all matching" scope counts only live jobs ("All 18 matching live jobs") and agrees with the count the action's preview shows.
 
 Kind and queue cells show declared display names, with the raw name as a tooltip. A "why" column gives a failed, retryable or cancelled job's last error, when a retryable or scheduled job runs next and when a waiting job's callback times out; its header follows the state filter (Last error, Next attempt, Runs, Callback or Detail). Priority shows only when it isn't the default or was aged. Badges mark exceptions only.
 
@@ -156,7 +159,7 @@ Cluster overview: instance count, liveness, leader status, and an attention pane
 
 ### Schedules (`/cron`, `/cron/:name`)
 
-Table of registered schedules: the schedule in words and as a cron expression, next fire, last enqueue, target kind and queue, and badges for Paused, Retired, Queue paused and Overdue. Each row has Pause or Resume, Trigger now and Retire or Restore. "Trigger now" fires the job immediately without affecting the next scheduled run, and is allowed on a paused schedule after a confirmation, because pause stops automatic fires only. Pausing leaves `last_enqueued_at` untouched, so resume respects the schedule's existing missed-fire policy. A schedule's page shows its definition, its recent runs and its ownership.
+Table of registered schedules: the schedule in words and as a cron expression, next fire, last enqueue, target kind and queue, and badges for Paused, Retired, Queue paused and Overdue. Each row has Pause or Resume, Trigger now and Retire or Restore. "Trigger now" fires the job immediately without affecting the next scheduled run, and is allowed on a paused schedule after a confirmation, because pause stops automatic fires only. Pausing leaves `last_enqueued_at` untouched, so resume respects the schedule's existing missed-fire policy. A schedule's page shows its definition, its recent runs and its ownership, and links to the jobs it enqueued (`/jobs?q=kind:<kind> cron:<name>`); a job a schedule enqueued links back to the schedule and to its other jobs.
 
 When the target queue is itself paused, the row shows a "Queue paused" badge: fires continue to enqueue jobs into the paused queue, and those jobs dispatch only after the queue is resumed. Cron pause and queue pause are independent — one is "stop scheduling," the other is "stop dispatching."
 
@@ -166,13 +169,14 @@ Operator surface for durable async mutations recorded in `awa.batch_operations`.
 
 - **History** lists recent operations with kind, state, progress, processed, skipped and errored counts, the last error and submitted age. An operation that skipped every row says it changed nothing.
 - **An operation's page** shows its filter with a link to the matching jobs, its spec, progress, last error, submitter and runner. Active operations offer Cancel, which requests cooperative cancellation at chunk boundaries.
-- **New operation** (`/batch-ops/new`) chooses `set_priority`, `move_queue`, `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` or `purge_dlq`, filters by queue, kind, tags, ids, state or created time, and previews the exact count and sample rows before submitting. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation. The Jobs and Dead letters lists open this form with their filter for Set priority and Move queue.
+- **New operation** (`/batch-ops/new`) chooses `set_priority`, `move_queue`, `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` or `purge_dlq`, filters by queue, kind, tags, schedule, ids, state or created time (and DLQ reason for `retry_from_dlq` and `purge_dlq`), and previews the exact count and sample rows before submitting. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation. The Jobs and Dead letters lists open this form with their filter for Set priority and Move queue.
 
 ### Dead Letter Queue (`/dlq`, `/dlq/:id`)
 
 Operator surface for queue-storage `dlq_entries`.
 
-- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, last error, attempts and age; phones get cards.
+- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, last error, attempts and age; phones get cards. Its search also takes `reason:`, suggesting the DLQ's reasons.
+- **Top reasons** — above the list, the commonest reason, kind and queue groups among the dead letters matching the search's queue and kind, from `GET /api/dlq/reasons`, each with its count and latest time and linking to the list filtered to it. A server without the endpoint answers 404, or 400 where `/api/dlq/{id}` reads `reasons` as an id; the page then hides the header and stops asking.
 - **Bulk actions** — Retry and Purge on all the rows a filter matches, each previewed and then submitted as a `retry_from_dlq` or `purge_dlq` bulk operation, whose page then opens. Empty-filter actions require explicit `all=true` confirmation through the API.
 - **Detail (`/dlq/:id`)** — single-row inspection with retry and purge actions.
 - **Queue counts** — `/queues` links each queue's non-zero dead-letter count to its Dead letters tab.
@@ -187,7 +191,7 @@ The shared `/jobs/:id` detail page also carries DLQ metadata when a job has alre
 
 **Confirming actions:** Confirmation scales with what an action can break. Pausing or resuming a queue or schedule takes one click and its toast offers Undo. An action on one job with side effects (Retry, Cancel, retrying or purging a dead letter, triggering a paused schedule, cancelling a bulk operation) opens a dialog that names the object and the risk. Acting on several selected jobs lists them in the dialog. An action on everything a filter matches previews it first: the dialog shows the exact count, the filter in words and some of the matching jobs, and submitting opens the bulk operation's page. Discarding failed jobs, purging dead letters, and cancelling or retrying 1,000 or more jobs or dead letters (or a count the server could only bound from below) also ask you to type the count, since a retry runs handlers again and repeats their side effects, and draining a queue asks for its name after showing how many jobs it cancels. A dialog's confirm button names the action ("Cancel job #918"), its dismiss button is "Keep", it stays open until the server answers and shows the server's error in place, and it says "This can't be undone" only when that is true.
 
-**Jump to:** ⌘K (Ctrl+K elsewhere) or the header's "Jump to…" button opens a palette that goes to a job by id (a dead-lettered one opens its DLQ row), a queue, job kind or schedule by name or display name, a bulk operation by id or its first eight characters, a jobs search (`kind:send_email`, or `tenant:acme` as a tag), or any page. It loads names when it opens and doesn't poll.
+**Jump to:** ⌘K (Ctrl+K elsewhere) or the header's "Jump to…" button opens a palette that goes to a job by id (a dead-lettered one opens its DLQ row), a queue, job kind or schedule by name or display name, a bulk operation by id or its first eight characters, a jobs search (`kind:send_email`, or `tenant:acme` as a tag), a dead-letter search (any search with `reason:`), or any page. It loads names when it opens and doesn't poll.
 
 **Dark mode:** Three modes — Light, Dark, System (follows OS). Persisted in localStorage. Theme toggle cycles through all three.
 

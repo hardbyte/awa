@@ -5,11 +5,12 @@ visible tab combines initial reads, periodic polling, independent reconciliation
 mutation invalidations, focus/resume and explicit refresh. There is no streaming
 endpoint, database notification listener or worker execution-path change.
 
-Managed views cover jobs and detail, filtered counts, DLQ and depth, queues and
-queue runtime, workers/runtime, cron/reconciliation, batch operations, storage and
+Managed views cover jobs and detail, filtered counts, DLQ, its depth and its
+reason groups, queues and queue runtime, workers/runtime, cron/reconciliation, batch operations, storage and
 statistics. Catalog/kinds and search suggestions retain their existing policies.
 Backend origin, trusted-admin scope, full query/filter and page identify a key.
 Duplicate observers share admission; excess keys fail visibly without eviction.
+The DLQ reason groups read as absent on a server without `/api/dlq/reasons`, and stop polling there, as storage status does.
 
 The experimental client policy permits 16 active exact keys and two concurrent
 managed reads. Cached reads respect the advertised interval (at least five

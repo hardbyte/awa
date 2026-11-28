@@ -45,6 +45,11 @@ pub struct JobFilter {
     /// queue moves.
     pub created_at_gte: Option<DateTime<Utc>>,
     pub created_at_lt: Option<DateTime<Utc>>,
+    /// The cron schedule that enqueued the job: its `cron_name` metadata.
+    pub cron_name: Option<String>,
+    /// The reason the job was dead-lettered. Setting it keeps only
+    /// dead-lettered jobs, as `dead_lettered: Some(true)` does.
+    pub dlq_reason: Option<String>,
 }
 
 impl JobFilter {
@@ -117,6 +122,16 @@ impl JobFilter {
         self
     }
 
+    pub fn cron_name(mut self, name: impl Into<String>) -> Self {
+        self.cron_name = Some(name.into());
+        self
+    }
+
+    pub fn dlq_reason(mut self, reason: impl Into<String>) -> Self {
+        self.dlq_reason = Some(reason.into());
+        self
+    }
+
     // Methods that read every field destructure `Self` without `..`, so a
     // field added later fails to compile until each one decides what it
     // means. That matters most where a filter bounds a DELETE or UPDATE.
@@ -132,6 +147,8 @@ impl JobFilter {
             ids,
             created_at_gte,
             created_at_lt,
+            cron_name,
+            dlq_reason,
         } = self;
         kind.is_none()
             && queue.is_none()
@@ -141,12 +158,15 @@ impl JobFilter {
             && ids.is_none()
             && created_at_gte.is_none()
             && created_at_lt.is_none()
+            && cron_name.is_none()
+            && dlq_reason.is_none()
     }
 
-    /// True when a field picks out particular jobs: kind, queue, tags, ids or
-    /// a created bound. `states` and `dead_lettered` only choose part of the
-    /// lifecycle, so a filter of those alone still names every job in it.
-    /// Bulk changes need a scoped filter unless the caller opts into all.
+    /// True when a field picks out particular jobs: kind, queue, tags, ids, a
+    /// created bound, a cron schedule or a DLQ reason. `states` and
+    /// `dead_lettered` only choose part of the lifecycle, so a filter of
+    /// those alone still names every job in it. Bulk changes need a scoped
+    /// filter unless the caller opts into all.
     pub fn is_scoped(&self) -> bool {
         let JobFilter {
             kind,
@@ -157,6 +177,8 @@ impl JobFilter {
             ids,
             created_at_gte,
             created_at_lt,
+            cron_name,
+            dlq_reason,
         } = self;
         kind.is_some()
             || queue.is_some()
@@ -164,10 +186,13 @@ impl JobFilter {
             || ids.is_some()
             || created_at_gte.is_some()
             || created_at_lt.is_some()
+            || cron_name.is_some()
+            || dlq_reason.is_some()
     }
 
     /// True when the filter needs more than ADR-030's shape: a runner from
-    /// before ADR-049 cannot read it, or ignores `dead_lettered`.
+    /// before ADR-049 cannot read it, or ignores `dead_lettered`,
+    /// `cron_name` or `dlq_reason` and so acts on more jobs.
     pub fn uses_extended_fields(&self) -> bool {
         let JobFilter {
             kind: _,
@@ -178,8 +203,29 @@ impl JobFilter {
             ids: _,
             created_at_gte: _,
             created_at_lt: _,
+            cron_name,
+            dlq_reason,
         } = self;
-        tags.len() > 1 || states.len() > 1 || dead_lettered.is_some()
+        tags.len() > 1
+            || states.len() > 1
+            || dead_lettered.is_some()
+            || cron_name.is_some()
+            || dlq_reason.is_some()
+    }
+
+    /// `Some(true)` when only dead-lettered jobs can match, which a DLQ
+    /// reason implies, `Some(false)` when none can, and `None` for either.
+    pub(crate) fn dead_lettered_scope(&self) -> Option<bool> {
+        match (self.dead_lettered, &self.dlq_reason) {
+            (None, Some(_)) => Some(true),
+            (scope, _) => scope,
+        }
+    }
+
+    /// True when the filter contradicts itself about dead-lettered jobs: a
+    /// DLQ reason with `dead_lettered: Some(false)`.
+    fn excludes_its_dlq_reason(&self) -> bool {
+        self.dlq_reason.is_some() && self.dead_lettered == Some(false)
     }
 
     /// Bounds a submitted filter must respect. Stored filters are not
@@ -228,26 +274,44 @@ impl JobFilter {
     }
 
     /// Whether a loaded job, in its current state, belongs to the population.
-    /// `dead_lettered` says whether the row came from the DLQ.
+    /// `dead_lettered` says whether the row came from the DLQ. A job row
+    /// carries no DLQ reason, so `dlq_reason` only requires a dead-lettered
+    /// row here; [`JobFilter::matches_dlq_reason`] checks the reason itself.
     pub fn matches(&self, job: &JobRow, dead_lettered: bool) -> bool {
         let JobFilter {
             kind,
             queue,
             states,
             tags,
-            dead_lettered: wanted_dead_lettered,
+            dead_lettered: _,
             ids,
             created_at_gte,
             created_at_lt,
+            cron_name,
+            dlq_reason: _,
         } = self;
         kind.as_ref().is_none_or(|kind| &job.kind == kind)
             && queue.as_ref().is_none_or(|queue| &job.queue == queue)
             && (states.is_empty() || states.contains(&job.state))
             && tags.iter().all(|tag| job.tags.contains(tag))
-            && wanted_dead_lettered.is_none_or(|wanted| wanted == dead_lettered)
+            && !self.excludes_its_dlq_reason()
+            && self
+                .dead_lettered_scope()
+                .is_none_or(|wanted| wanted == dead_lettered)
             && ids.as_ref().is_none_or(|ids| ids.contains(&job.id))
             && created_at_gte.is_none_or(|gte| job.created_at >= gte)
             && created_at_lt.is_none_or(|lt| job.created_at < lt)
+            && cron_name
+                .as_ref()
+                .is_none_or(|name| job_cron_name(job) == Some(name.as_str()))
+    }
+
+    /// Whether a job's DLQ reason, `None` when it is not dead-lettered,
+    /// satisfies `dlq_reason`.
+    pub fn matches_dlq_reason(&self, reason: Option<&str>) -> bool {
+        self.dlq_reason
+            .as_deref()
+            .is_none_or(|wanted| reason == Some(wanted))
     }
 
     /// The states this filter can select once a consumer's eligible states
@@ -259,10 +323,17 @@ impl JobFilter {
             .filter(|state| self.states.is_empty() || self.states.contains(state))
             .filter(|state| {
                 // Dead-lettered rows are reported as failed.
-                self.dead_lettered != Some(true) || *state == JobState::Failed
+                self.dead_lettered_scope() != Some(true) || *state == JobState::Failed
             })
+            .filter(|_| !self.excludes_its_dlq_reason())
             .collect()
     }
+}
+
+/// The `cron_name` a cron schedule writes into the metadata of each job it
+/// enqueues.
+fn job_cron_name(job: &JobRow) -> Option<&str> {
+    job.metadata.get("cron_name").and_then(|name| name.as_str())
 }
 
 /// One value, or a list of them.
@@ -305,6 +376,10 @@ struct WireIn {
     created_at_gte: Option<DateTime<Utc>>,
     #[serde(default)]
     created_at_lt: Option<DateTime<Utc>>,
+    #[serde(default)]
+    cron_name: Option<String>,
+    #[serde(default)]
+    dlq_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -340,6 +415,10 @@ struct WireOut<'a> {
     created_at_gte: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at_lt: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cron_name: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dlq_reason: Option<&'a String>,
 }
 
 impl Serialize for JobFilter {
@@ -353,6 +432,8 @@ impl Serialize for JobFilter {
             dead_lettered: self.dead_lettered,
             created_at_gte: self.created_at_gte,
             created_at_lt: self.created_at_lt,
+            cron_name: self.cron_name.as_ref(),
+            dlq_reason: self.dlq_reason.as_ref(),
         }
         .serialize(serializer)
     }
@@ -368,6 +449,8 @@ impl<'de> Deserialize<'de> for JobFilter {
             dead_lettered: wire.dead_lettered,
             created_at_gte: wire.created_at_gte,
             created_at_lt: wire.created_at_lt,
+            cron_name: wire.cron_name,
+            dlq_reason: wire.dlq_reason,
             ..Default::default()
         };
         Ok(filter
@@ -378,7 +461,8 @@ impl<'de> Deserialize<'de> for JobFilter {
 
 /// The first version whose batch-operation runner reads every
 /// [`JobFilter`] field. An older runner fails to load a filter with several
-/// tags or states, and ignores `dead_lettered`.
+/// tags or states, and ignores `dead_lettered`, `cron_name` and
+/// `dlq_reason`.
 pub const EXTENDED_FILTER_MIN_RUNTIME: &str = "0.7.0-alpha.2";
 
 /// Refuse a filter that needs ADR-049's fields while a live runtime is older
@@ -390,7 +474,7 @@ pub(crate) async fn require_fleet_for_extended_filters(
     require_live_runtimes_at_least(
         pool,
         EXTENDED_FILTER_MIN_RUNTIME,
-        "this filter uses several tags or states, or dead_lettered",
+        "this filter uses several tags or states, dead_lettered, cron_name or dlq_reason",
     )
     .await
 }
@@ -586,6 +670,61 @@ mod tests {
         assert!(
             serde_json::from_value::<Adr030Filter>(serde_json::to_value(narrow).unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn cron_name_and_dlq_reason_round_trip_under_their_own_keys() {
+        let filter = JobFilter::new()
+            .kind("report")
+            .cron_name("nightly")
+            .dlq_reason("bad input");
+        let json = serde_json::to_value(&filter).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "report", "cron_name": "nightly", "dlq_reason": "bad input"
+            })
+        );
+        assert_eq!(serde_json::from_value::<JobFilter>(json).unwrap(), filter);
+        assert_eq!(
+            serde_json::to_value(JobFilter::new().queue("q")).unwrap(),
+            serde_json::json!({ "queue": "q" }),
+            "unset, they stay off the wire"
+        );
+        assert!(serde_json::from_value::<JobFilter>(serde_json::json!({ "cron": "x" })).is_err());
+        assert!(serde_json::from_value::<JobFilter>(serde_json::json!({ "reason": "x" })).is_err());
+    }
+
+    #[test]
+    fn cron_name_and_dlq_reason_are_extended_and_scoped() {
+        for filter in [
+            JobFilter::new().cron_name("nightly"),
+            JobFilter::new().dlq_reason("bad input"),
+        ] {
+            assert!(filter.uses_extended_fields(), "{filter:?}");
+            assert!(filter.is_scoped(), "{filter:?}");
+            assert!(!filter.is_empty(), "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn a_dlq_reason_selects_only_dead_lettered_jobs() {
+        let reason = JobFilter::new().dlq_reason("bad input");
+        assert_eq!(reason.dead_lettered_scope(), Some(true));
+        assert_eq!(
+            reason.effective_states(&[JobState::Failed, JobState::Available]),
+            vec![JobState::Failed]
+        );
+        assert!(reason.matches_dlq_reason(Some("bad input")));
+        assert!(!reason.matches_dlq_reason(Some("other")));
+        assert!(!reason.matches_dlq_reason(None));
+        assert!(JobFilter::new().matches_dlq_reason(None));
+        let contradictory = JobFilter::new()
+            .dlq_reason("bad input")
+            .dead_lettered(false);
+        assert!(contradictory
+            .effective_states(&[JobState::Failed])
+            .is_empty());
     }
 
     #[test]

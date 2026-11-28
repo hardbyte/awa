@@ -6,12 +6,12 @@ import { CapacityError } from "@/lib/observation/scheduler";
 
 function policy(key: QueryKey) {
   const name = String(key[0]);
-  if (!["jobs", "jobs-count", "job", "dlq", "dlq-job", "dlq-depth", "queues", "queue", "queue-runtime", "runtime", "cron", "cron-reconciliation", "batch-ops", "batch-op", "storage", "stats"].includes(name)) {
+  if (!["jobs", "jobs-count", "job", "dlq", "dlq-job", "dlq-depth", "dlq-reasons", "queues", "queue", "queue-runtime", "runtime", "cron", "cron-reconciliation", "batch-ops", "batch-op", "storage", "stats"].includes(name)) {
     throw new Error(`Unmapped managed query: ${name}`);
   }
   return {
     cached: ["queues", "queue-runtime", "runtime", "storage", "stats"].includes(name) && key[1] !== "timeseries",
-    manualOnly: name === "jobs-count", stalesCounts: ["jobs", "job", "dlq", "dlq-job"].includes(name), stopAfterNull: name === "storage",
+    manualOnly: name === "jobs-count", stalesCounts: ["jobs", "job", "dlq", "dlq-job"].includes(name), stopAfterNull: name === "storage" || name === "dlq-reasons",
     intervalMs: ["job", "batch-op"].includes(name) ? 2000 : name === "dlq-job" ? 10_000 : undefined,
   };
 }

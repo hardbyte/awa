@@ -437,6 +437,64 @@ pub async fn dlq_depth_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>, Awa
     .map_err(Into::into)
 }
 
+/// Most groups [`dlq_reasons`] returns.
+pub const MAX_DLQ_REASON_GROUPS: i64 = 100;
+
+/// Dead-lettered jobs sharing a reason, queue and kind.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::FromRow)]
+pub struct DlqReasonGroup {
+    pub reason: String,
+    pub queue: String,
+    pub kind: String,
+    pub count: i64,
+    /// When the group's earliest row was dead-lettered.
+    pub oldest: DateTime<Utc>,
+    /// When the group's latest row was dead-lettered.
+    pub newest: DateTime<Utc>,
+}
+
+/// The DLQ grouped by reason, queue and kind, largest groups first, at most
+/// `limit` of them (clamped to `1..=MAX_DLQ_REASON_GROUPS`). `queue` and
+/// `kind` narrow the rows grouped. Reads every matching DLQ row, through the
+/// `(queue, dlq_at)` index when `queue` is given, under the same read budget
+/// as listing.
+pub async fn dlq_reasons(
+    pool: &PgPool,
+    queue: Option<&str>,
+    kind: Option<&str>,
+    limit: i64,
+) -> Result<Vec<DlqReasonGroup>, AwaError> {
+    let store = active_queue_storage(pool).await?;
+    let sql = format!(
+        r#"
+        SELECT dlq_reason AS reason, queue, kind, count(*)::bigint AS count,
+               min(dlq_at) AS oldest, max(dlq_at) AS newest
+        FROM {schema}.dlq_entries
+        WHERE ($1::text IS NULL OR queue = $1)
+          AND ($2::text IS NULL OR kind = $2)
+        GROUP BY dlq_reason, queue, kind
+        ORDER BY count(*) DESC, max(dlq_at) DESC, dlq_reason, queue, kind
+        LIMIT $3
+        "#,
+        schema = store.schema(),
+    );
+    let limit = limit.clamp(1, MAX_DLQ_REASON_GROUPS);
+    let budget = ReadBudget::start();
+    budget
+        .run(async {
+            let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+            set_statement_timeout(&mut tx, budget.remaining()?).await?;
+            sqlx::query_as::<_, DlqReasonGroup>(audited_sql(sql))
+                .bind(queue)
+                .bind(kind)
+                .bind(limit)
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)
+        })
+        .await
+}
+
 /// Retry a single DLQ row back into live queue storage.
 ///
 /// Atomic: deletes the DLQ row and inserts a fresh ready/deferred row in one
@@ -463,7 +521,8 @@ fn require_dlq_scope(filter: &JobFilter, allow_all: bool, action: &str) -> Resul
         return Ok(());
     }
     Err(AwaError::Validation(format!(
-        "{action} needs a kind, queue, tag, ids or created_at bound (or allow_all=true)"
+        "{action} needs a kind, queue, tag, cron_name, dlq_reason, ids or created_at bound \
+         (or allow_all=true)"
     )))
 }
 

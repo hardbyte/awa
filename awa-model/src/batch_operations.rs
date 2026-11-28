@@ -388,8 +388,8 @@ pub async fn submit_batch_operation(
     // as an empty filter does.
     if !request.filter.is_scoped() && !request.allow_all {
         return Err(AwaError::Validation(
-            "batch operation needs a kind, queue, tag, ids or created_at bound \
-             (or allow_all=true)"
+            "batch operation needs a kind, queue, tag, cron_name, dlq_reason, ids or \
+             created_at bound (or allow_all=true)"
                 .to_string(),
         ));
     }
@@ -976,6 +976,13 @@ fn validate_filter_for_spec(
             "{} only supports {} state filters",
             kind.as_str(),
             state_list(eligible)
+        )));
+    }
+    if filter.dlq_reason.is_some() && kind.dlq_scope() == DlqScope::Excluded {
+        return Err(AwaError::Validation(format!(
+            "{} does not act on dead-lettered jobs, so a dlq_reason filter cannot match; \
+             use retry_from_dlq or purge_dlq",
+            kind.as_str()
         )));
     }
     if !dlq_ok {

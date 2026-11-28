@@ -113,7 +113,7 @@ checks it:
   `test_dlq_bulk_bodies_never_mean_more_on_an_older_server`). No rehearsal
   runs a released 0.6 runner against list-valued filters.
 - **Extended batch filters wait for the fleet.** A batch operation with
-  several tags or states, or `dead_lettered`, is refused while any live
+  several tags or states, `dead_lettered`, `cron_name` or `dlq_reason`, is refused while any live
   runtime reports a version older than 0.7.0-alpha.2
   (`extended_filters_wait_for_the_fleet` in `awa/tests/job_filter_test.rs`,
   using a recorded runtime row rather than a running 0.6 binary).

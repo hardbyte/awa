@@ -4,8 +4,10 @@ import {
   bulkActionReason,
   bulkConfirmLabel,
   bulkConfirmText,
+  buildFilter,
   describeFilter,
   describeSpec,
+  filterError,
   filterToSearch,
   formatCount,
   formFromSearch,
@@ -40,6 +42,11 @@ describe("isNarrowing", () => {
     expect(isNarrowing({ ids: [1] })).toBe(true);
     expect(isNarrowing({ created_at_gte: "2026-10-01T00:00:00.000Z" })).toBe(true);
     expect(isNarrowing({ created_at_lt: "2026-10-01T00:00:00.000Z" })).toBe(true);
+  });
+
+  it("is true for a cron schedule or a DLQ reason", () => {
+    expect(isNarrowing({ cron_name: "nightly" })).toBe(true);
+    expect(isNarrowing({ dlq_reason: "poison", dead_lettered: true })).toBe(true);
   });
 
   it("ignores empty values", () => {
@@ -132,6 +139,17 @@ describe("the new-operation form in the URL", () => {
     expect(formFromSearch(searchFromForm(form))).toEqual(form);
   });
 
+  it("carries a schedule and a DLQ reason into the filter, and refuses a reason outside the DLQ kinds", () => {
+    const form = formFromSearch({ op: "purge_dlq", queue: "q", cron_name: "nightly", dlq_reason: "poison" });
+    expect(buildFilter(form)).toEqual({ queue: "q", cron_name: "nightly", dlq_reason: "poison" });
+    expect(formFromSearch(searchFromForm(form))).toEqual(form);
+    expect(filterError(form)).toBeNull();
+    expect(filterError({ ...form, opKind: "retry" })).toMatch(/DLQ reason/);
+    expect(describeFilter(buildFilter(form), "dead-lettered")).toBe(
+      'dead-lettered jobs with queue q, from schedule nightly, dead-lettered for "poison"'
+    );
+  });
+
   it("leaves defaults and blanks out of the URL", () => {
     expect(searchFromForm(formFromSearch({ queue: "q" }))).toEqual({ queue: "q" });
   });
@@ -144,6 +162,14 @@ describe("the new-operation form in the URL", () => {
 });
 
 describe("operation details", () => {
+  it("turns a wire filter with a schedule and reason into a dead-letter search", () => {
+    expect(filterToSearch({ queue: "q", cron_name: "nightly", dlq_reason: "poison" }, "purge_dlq").filter).toEqual({
+      queue: "q",
+      cron: "nightly",
+      reason: "poison",
+    });
+  });
+
   it("turns a wire filter into a jobs search", () => {
     expect(filterToSearch({ kind: "k", tag: ["a", "b"], state: "failed" })).toEqual({
       filter: { kind: "k", tags: ["a", "b"] },

@@ -1,4 +1,4 @@
-import { filterPrefix, invalidTerms, isJobId, parseSearch } from "@/components/SearchBar";
+import { filterPrefix, invalidTerms, isJobId, parseSearch, type SearchView } from "@/components/SearchBar";
 import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
 
 /** Where a palette entry goes, in the shape the router's `navigate` takes. */
@@ -66,7 +66,13 @@ function label(key: string, displayName?: string | null): { label: string; detai
  * `id:abc` or `kind:`) that doesn't validate; undefined otherwise.
  */
 export function paletteSearchProblem(rawInput: string): string | undefined {
-  return invalidTerms(rawInput.trim()).find(({ term }) => filterPrefix(term))?.error;
+  const input = rawInput.trim();
+  return invalidTerms(input, searchView(input)).find(({ term }) => filterPrefix(term))?.error;
+}
+
+/** The list a search belongs on: a `reason:` term filters dead letters. */
+function searchView(input: string): SearchView {
+  return parseSearch(input).reason ? "dlq" : "jobs";
 }
 
 /** The palette's entries for what has been typed, in display order. */
@@ -101,8 +107,11 @@ export function paletteItems(rawInput: string, data: PaletteData): PaletteItem[]
   }
 
   if (input.includes(":") || filterPrefix(input)) {
-    const valid = invalidTerms(input).length === 0 && Object.keys(parseSearch(input)).length > 0;
-    if (valid) {
+    const view = searchView(input);
+    const valid = invalidTerms(input, view).length === 0 && Object.keys(parseSearch(input)).length > 0;
+    if (valid && view === "dlq") {
+      items.push({ id: "dlq-search", section: "Jobs", label: `Dead letters matching ${input}`, target: { to: "/dlq", search: { q: input } } });
+    } else if (valid) {
       items.push({ id: "jobs-search", section: "Jobs", label: `Jobs matching ${input}`, target: { to: "/jobs", search: { q: input } } });
     } else if (!/\s/.test(input) && !filterPrefix(input)) {
       items.push({ id: "jobs-tag", section: "Jobs", label: `Jobs tagged ${input}`, target: { to: "/jobs", search: { q: `tag:${input}` } } });

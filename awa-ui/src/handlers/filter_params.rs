@@ -1,6 +1,7 @@
 //! Query-string form of a [`JobFilter`] (ADR-049), shared by the jobs and
 //! DLQ endpoints. `tag` and `state` may repeat (all of the tags, any of the
-//! states); `ids` is comma-separated.
+//! states); `ids` is comma-separated. `cron` and `reason` are the filter's
+//! `cron_name` and `dlq_reason`.
 
 use awa_model::filter::{MAX_FILTER_IDS, MAX_FILTER_TAGS};
 use awa_model::{AwaError, JobFilter, JobState};
@@ -92,6 +93,8 @@ pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
             }
             "created_at_gte" => filter.created_at_gte = Some(parse_time("created_at_gte", value)?),
             "created_at_lt" => filter.created_at_lt = Some(parse_time("created_at_lt", value)?),
+            "cron" => filter.cron_name = Some(value.to_string()),
+            "reason" => filter.dlq_reason = Some(value.to_string()),
             "before_id" => {
                 query.before_id = Some(value.parse().map_err(|_| invalid("before_id", value))?)
             }
@@ -100,7 +103,7 @@ pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
             other => {
                 return Err(ApiError::Awa(AwaError::Validation(format!(
                     "unknown parameter `{other}`; filters take kind, queue, tag, state, \
-                     ids, dead_lettered, created_at_gte and created_at_lt"
+                     ids, dead_lettered, created_at_gte, created_at_lt, cron and reason"
                 ))))
             }
         }
@@ -148,6 +151,23 @@ mod tests {
         assert_eq!(parse(Some(&repeated)).unwrap().filter.tags, vec!["t"]);
         let ids: Vec<String> = (0..=MAX_FILTER_IDS).map(|i| i.to_string()).collect();
         assert!(parse(Some(&format!("ids={}", ids.join(",")))).is_err());
+    }
+
+    #[test]
+    fn cron_and_reason_set_their_fields() {
+        let parsed = parse(Some("kind=k&cron=nightly%20report&reason=bad%20input")).unwrap();
+        assert_eq!(
+            parsed.filter,
+            JobFilter::new()
+                .kind("k")
+                .cron_name("nightly report")
+                .dlq_reason("bad input")
+        );
+        assert!(parse(Some("cron=")).is_err());
+        assert!(
+            parse(Some("cron_name=x")).is_err(),
+            "the query key is `cron`"
+        );
     }
 
     #[test]

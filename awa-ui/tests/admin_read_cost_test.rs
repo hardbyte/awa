@@ -43,6 +43,7 @@ const POLLED_ENDPOINTS: &[&str] = &[
     "/api/capabilities",
     "/api/dlq?limit=50",
     "/api/dlq/depth",
+    "/api/dlq/reasons",
     "/api/cron",
 ];
 

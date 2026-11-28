@@ -704,6 +704,12 @@ struct FilterArgs {
     /// RFC 3339 time; jobs created before it.
     #[arg(long)]
     created_at_lt: Option<DateTime<Utc>>,
+    /// Jobs enqueued by this cron schedule.
+    #[arg(long = "cron")]
+    cron_name: Option<String>,
+    /// Dead-lettered jobs with this DLQ reason; implies dead-lettered.
+    #[arg(long = "reason")]
+    dlq_reason: Option<String>,
 }
 
 impl FilterArgs {
@@ -718,6 +724,8 @@ impl FilterArgs {
             ids: (!self.ids.is_empty()).then(|| self.ids.clone()),
             created_at_gte: self.created_at_gte,
             created_at_lt: self.created_at_lt,
+            cron_name: self.cron_name.clone(),
+            dlq_reason: self.dlq_reason.clone(),
             ..Default::default()
         }
         .tags(self.tags.clone())
@@ -2419,6 +2427,52 @@ mod tests {
             ])
             .is_err(),
             "retry-failed must reject ambiguous filters"
+        );
+    }
+
+    #[test]
+    fn filter_flags_take_a_cron_schedule_and_a_dlq_reason() {
+        let cli = Cli::try_parse_from([
+            "awa", "job", "list", "--kind", "report", "--cron", "nightly",
+        ])
+        .expect("job list should take --cron");
+        let Commands::Job {
+            command: JobCommands::List { filter, .. },
+        } = cli.command
+        else {
+            panic!("expected job list");
+        };
+        assert_eq!(
+            filter.job_filter().unwrap(),
+            awa_model::JobFilter::new()
+                .kind("report")
+                .cron_name("nightly")
+        );
+        let cli = Cli::try_parse_from([
+            "awa",
+            "dlq",
+            "purge",
+            "--queue",
+            "billing",
+            "--reason",
+            "bad input",
+        ])
+        .expect("dlq purge should take --reason");
+        let Commands::Dlq {
+            command: DlqCommands::Purge { filter, .. },
+        } = cli.command
+        else {
+            panic!("expected dlq purge");
+        };
+        assert_eq!(
+            filter.job_filter().unwrap(),
+            awa_model::JobFilter::new()
+                .queue("billing")
+                .dlq_reason("bad input")
+        );
+        assert!(
+            Cli::try_parse_from(["awa", "dlq", "move", "--reason", "triage", "--all"]).is_ok(),
+            "dlq move keeps --reason for the reason it records"
         );
     }
 
