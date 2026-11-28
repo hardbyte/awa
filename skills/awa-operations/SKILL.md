@@ -534,6 +534,18 @@ stops repeated dashboard polls from piling up slow queries. When embedding
 The release hook recovers connections whose request was dropped mid-query;
 without it, a cancelled query can leak the pool slot over TLS.
 
+`GET /api/stats/outcomes?minutes=&bucket=[&queue=][&kind=]` counts jobs that
+completed, failed, were cancelled or were dead-lettered per bucket, by when
+they reached that outcome; retries are not counted. It counts only retained
+rows, so each series carries its own coverage and is null, not zero, before
+it: `covered_since` for completed, failed and cancelled, and
+`dead_lettered_covered_since` for dead letters. On queue storage the terminal
+series covers only what the queue ring still retains (often minutes under
+load); dead letters are not ring-pruned and usually cover the whole window. The
+canonical engine reports no terminal coverage (`covered_since` is null), since
+its retention is not recorded in the database. `GET /api/stats/timeseries` is
+deprecated; the UI no longer reads it.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.
