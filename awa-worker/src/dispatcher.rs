@@ -337,6 +337,15 @@ pub struct Dispatcher {
     ring_pin_watch: Option<Arc<crate::ring_pin::RingPinWatch>>,
 }
 
+/// Whether `err` is the database's `numeric_value_out_of_range`.
+fn is_numeric_overflow(err: &awa_model::AwaError) -> bool {
+    matches!(
+        err,
+        awa_model::AwaError::Database(sqlx::Error::Database(db_err))
+            if db_err.code().as_deref() == Some("22003")
+    )
+}
+
 /// Two default deadline-rescue scans.
 const DEFAULT_ABANDON_GRACE: Duration =
     crate::maintenance::DEFAULT_DEADLINE_RESCUE_INTERVAL.saturating_mul(2);
@@ -743,10 +752,9 @@ impl Dispatcher {
                         }
                     }
                 }
-                let (aging_interval, aging_escalated) = self.claim_aging_interval();
-                let claimed = runtime
-                    .store
-                    .claim_runtime_batch_with_aging_for_instance(
+                let (aging_interval, mut aging_escalated) = self.claim_aging_interval();
+                let claim_with = |aging_interval: Duration| {
+                    runtime.store.claim_runtime_batch_with_aging_for_instance(
                         &self.pool,
                         &self.queue,
                         batch_size as i64,
@@ -757,7 +765,25 @@ impl Dispatcher {
                         CLAIMER_LEASE_TTL,
                         CLAIMER_IDLE_THRESHOLD,
                     )
-                    .await;
+                };
+                let mut claimed = claim_with(aging_interval).await;
+                if aging_escalated && claimed.as_ref().is_err_and(is_numeric_overflow) {
+                    // A row of the claimed batch is older than the escalated
+                    // interval allows (the claim computes its priority as a
+                    // smallint), and the failed claim moved no cursor. Claim
+                    // with the configured interval instead, and leave the
+                    // queue unescalated until the pin is read again.
+                    if let Some(watch) = &self.ring_pin_watch {
+                        watch.suppress(&self.queue);
+                    }
+                    warn!(
+                        queue = %self.queue,
+                        escalated_interval_secs = aging_interval.as_secs_f64(),
+                        "A claim with the escalated aging interval overflowed on an old row; claiming with the configured interval until the queue ring pin is read again"
+                    );
+                    aging_escalated = false;
+                    claimed = claim_with(self.config.priority_aging_interval).await;
+                }
                 drop(claim_slot);
                 match claimed {
                     Ok(jobs) => {

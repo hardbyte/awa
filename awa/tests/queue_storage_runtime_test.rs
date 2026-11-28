@@ -3922,20 +3922,32 @@ async fn assert_queue_prune_reclaims(store: &QueueStorage, pool: &sqlx::PgPool, 
     );
 }
 
-/// `queue_ring_pin` reports how long ago each lane's first pending row and its
-/// last row in the slot became ready.
+/// `queue_ring_pin` reports how long ago each lane's first pending row became
+/// ready and its last ready segment in the slot was written. The write time,
+/// not the last row's `run_at`, is what no row of the lane is younger than: a
+/// promoted row keeps the `run_at` it had while deferred.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_queue_ring_pin_reports_the_age_of_a_lanes_newest_row_in_the_slot() {
+async fn test_queue_ring_pin_reports_how_long_ago_a_lane_was_last_written() {
     let (_db_guard, pool) = setup_pool(6).await;
-    let queue = "qs_ring_pin_newest_age";
-    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_newest_age").await;
+    let queue = "qs_ring_pin_last_write_age";
+    let schema = "awa_qs_ring_pin_last_write_age";
+    let store = create_ring_pin_store(&pool, schema).await;
 
     let jobs = enqueue_lane(&pool, &store, queue, 4, 3).await;
     for (job_id, age_secs) in jobs.iter().zip([3600, 3560, 3500]) {
         backdate_ready_row(&pool, &store, *job_id, Duration::from_secs(age_secs)).await;
     }
+    sqlx::query(&format!(
+        "UPDATE {schema}.ready_segments
+         SET created_at = created_at - make_interval(secs => 120)
+         WHERE queue = $1"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("backdate segment writes");
     assert_rotated_to(&store, &pool, 1).await;
-    // A later slot's rows are not the slot's newest.
+    // A later slot's segments are not the slot's last write.
     enqueue_lane(&pool, &store, queue, 4, 1).await;
 
     let pin = store
@@ -3949,12 +3961,12 @@ async fn test_queue_ring_pin_reports_the_age_of_a_lanes_newest_row_in_the_slot()
     };
     assert!(within(lane.head_age, 3600), "head age {:?}", lane.head_age);
     assert!(
-        within(lane.newest_age, 3500),
-        "newest age {:?}",
-        lane.newest_age
+        within(lane.last_write_age, 120),
+        "last write age {:?}",
+        lane.last_write_age
     );
 
-    // Claiming the first row moves the head, not the newest row.
+    // Claiming the first row moves the head, not the last write.
     claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
     let pin = store
         .queue_ring_pin(&pool)
@@ -3962,7 +3974,7 @@ async fn test_queue_ring_pin_reports_the_age_of_a_lanes_newest_row_in_the_slot()
         .expect("read queue ring pin")
         .expect("the ring is still pinned");
     assert!(within(pin.lanes[0].head_age, 3560));
-    assert!(within(pin.lanes[0].newest_age, 3500));
+    assert!(within(pin.lanes[0].last_write_age, 120));
 }
 
 async fn oldest_pending_age(
@@ -6314,8 +6326,26 @@ fn strict_priority_client<W: Worker + 'static>(
     worker: W,
     escalation: bool,
 ) -> Client {
+    strict_priority_client_with(
+        pool,
+        queue,
+        strict_priority_queue_config(),
+        store_config,
+        worker,
+        escalation,
+    )
+}
+
+fn strict_priority_client_with<W: Worker + 'static>(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    queue_config: QueueConfig,
+    store_config: QueueStorageConfig,
+    worker: W,
+    escalation: bool,
+) -> Client {
     Client::builder(pool.clone())
-        .queue(queue, strict_priority_queue_config())
+        .queue(queue, queue_config)
         .queue_ring_pin_aging_escalation(queue, escalation)
         .queue_storage(
             store_config,
@@ -6337,16 +6367,29 @@ async fn enqueue_starved_lane_under_a_saturating_lane(
     store: &QueueStorage,
     queue: &str,
 ) -> Vec<i64> {
-    let starved = enqueue_lane(pool, store, queue, 4, STARVED_LANE_ROW_AGES.len()).await;
+    let starved = enqueue_lane(pool, store, queue, 4, STARVED_LANE_ROW_AGES.len() + 1).await;
     for (job_id, age_secs) in starved.iter().zip(STARVED_LANE_ROW_AGES) {
         backdate_ready_row(pool, store, *job_id, Duration::from_secs(age_secs)).await;
     }
+    // The last row of the lane is a retry promoted late: it is the last by
+    // lane order but keeps the `run_at` it had while deferred, far older than
+    // the rows before it.
+    backdate_ready_row(
+        pool,
+        store,
+        *starved.last().expect("the last row"),
+        LATE_PROMOTED_ROW_AGE,
+    )
+    .await;
     assert_rotated_to(store, pool, 1).await;
     enqueue_lane(pool, store, queue, 1, 100).await;
     starved
 }
 
-/// How long each row of the starved lane has been ready, oldest first: tens of
+/// How long the late-promoted last row of the starved lane has been ready.
+const LATE_PROMOTED_ROW_AGE: Duration = Duration::from_secs(10 * 3600);
+
+/// How long each of the starved lane's other rows has been ready, oldest first: tens of
 /// seconds apart, so that a head that reaches priority 1 does not take the
 /// rows behind it with it.
 const STARVED_LANE_ROW_AGES: [u64; 12] = [
@@ -6553,6 +6596,64 @@ async fn test_ring_pin_aging_escalation_keeps_order_when_the_higher_head_is_olde
 /// Long enough for a lane held by a blocked worker to be read as starved at
 /// the leader's and the refresher's cadences.
 const ESCALATION_HOLD: Duration = Duration::from_secs(25);
+
+/// #779: a row far older than the escalated interval allows, behind younger
+/// rows of its lane where no reading of the lane's head sees it, fails the
+/// claim that reaches it. The claim is made again with the configured
+/// interval, so the queue keeps being claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_pin_aging_escalation_falls_back_when_a_claim_overflows_on_an_old_row() {
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(12).await;
+    let queue = "qs_ring_pin_escalation_fallback";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_escalation_fallback");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    // Eight priority-1 jobs occupy every worker while the lane below is read
+    // as starved.
+    let occupying = enqueue_lane(&pool, &store, queue, 1, 8).await;
+    let starved = enqueue_lane(&pool, &store, queue, 4, 6).await;
+    for job_id in &starved[..5] {
+        backdate_ready_row(&pool, &store, *job_id, Duration::from_secs(3600)).await;
+    }
+    // About 1,000 hours: older than 32,767 times any interval escalation
+    // picks here, and last in the lane, so the head the readings see is young.
+    backdate_ready_row(&pool, &store, starved[5], Duration::from_secs(1000 * 3600)).await;
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let worker = GatedRecordingWorker::new(seen.clone());
+    let client = strict_priority_client_with(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 8,
+            claim_batch_size: 8,
+            ..strict_priority_queue_config()
+        },
+        store_config,
+        worker.clone(),
+        true,
+    );
+    client.start().await.expect("start client");
+    wait_for_ring_pin_warning(queue).await;
+    tokio::time::sleep(ESCALATION_HOLD).await;
+    worker.release();
+
+    let expected: Vec<i64> = occupying.iter().chain(&starved).copied().collect();
+    wait_for_jobs_seen(&seen, &expected, "every job of the queue is claimed").await;
+    let failures = claim_failures_for(queue);
+    assert!(
+        failures.is_empty(),
+        "no claim of the queue fails: {failures:?}"
+    );
+    assert!(
+        escalated_claim_fallbacks_for(queue) > 0,
+        "the old row overflowed an escalated claim, which was made again"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
 
 /// #779: a queue whose lane is being claimed, however slowly, is never
 /// escalated: the ordinary backlog of a healthy queue pins the ring for a
@@ -12189,6 +12290,24 @@ impl tracing::field::Visit for RingPinVisitor {
 /// events.
 const CLAIM_FAILURE_MESSAGE: &str = "Failed to claim queue storage jobs";
 
+/// The dispatcher's warning for a claim with an escalated aging interval that
+/// overflowed and was made again with the configured one.
+const ESCALATED_CLAIM_OVERFLOW_MESSAGE: &str =
+    "A claim with the escalated aging interval overflowed";
+
+/// How many escalated claims of `queue` overflowed and fell back so far.
+fn escalated_claim_fallbacks_for(queue: &str) -> usize {
+    ring_pin_events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event.message.starts_with(ESCALATED_CLAIM_OVERFLOW_MESSAGE)
+                && event.fields.get("queue").map(String::as_str) == Some(queue)
+        })
+        .count()
+}
+
 /// The errors of the failed claims logged for `queue` so far.
 fn claim_failures_for(queue: &str) -> Vec<String> {
     ring_pin_events()
@@ -12214,7 +12333,10 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingPinLayer {
         let mut visitor = RingPinVisitor::default();
         event.record(&mut visitor);
         let message = visitor.0.remove("message").unwrap_or_default();
-        if message.starts_with("Queue ring prune is") || message == CLAIM_FAILURE_MESSAGE {
+        if message.starts_with("Queue ring prune is")
+            || message == CLAIM_FAILURE_MESSAGE
+            || message.starts_with(ESCALATED_CLAIM_OVERFLOW_MESSAGE)
+        {
             self.0.lock().unwrap().push(RingPinEvent {
                 message,
                 fields: visitor.0,

@@ -754,8 +754,11 @@ pub struct PendingReadyLane {
     pub head_run_at: DateTime<Utc>,
     /// How long that row has been ready, by the database clock.
     pub head_age: Duration,
-    /// How long the lane's last row in the slot has been ready.
-    pub newest_age: Duration,
+    /// How long ago the lane's last ready segment in the slot was written, by
+    /// the database clock. Every row of the lane in the slot has `run_at` at
+    /// or before then: ready rows are due when written, and a promoted row
+    /// keeps the older `run_at` it had while deferred.
+    pub last_write_age: Duration,
 }
 
 /// A lane whose claim cursor [`QueueStorage::advance_spent_claim_heads`]
@@ -816,7 +819,7 @@ pub struct QueueServingState {
 
 /// One row of the [`QueueStorage::queue_ring_pin`] read: queue, priority,
 /// enqueue shard, head `lane_seq` and `run_at`, and the ages in seconds of the
-/// head and of the newest row in the slot.
+/// head and of the lane's last ready segment write in the slot.
 type PendingReadyLaneRow = (String, i16, i16, i64, DateTime<Utc>, f64, f64);
 
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
@@ -21515,6 +21518,7 @@ impl QueueStorage {
         };
 
         let ready_child = ready_child_name(schema, slot as usize);
+        let segment_child = ready_segment_child_name(schema, slot as usize);
         let rows: Vec<PendingReadyLaneRow> = sqlx::query_as(&format!(
             r#"
             WITH claim_cursors AS MATERIALIZED (
@@ -21532,7 +21536,7 @@ impl QueueStorage {
                 head.lane_seq,
                 head.run_at,
                 GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - head.run_at)), 0)::float8,
-                GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - newest.run_at)), 0)::float8
+                GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - written.created_at)), 0)::float8
             FROM claim_cursors AS claims
             CROSS JOIN LATERAL (
                 SELECT ready.lane_seq, ready.run_at
@@ -21545,14 +21549,14 @@ impl QueueStorage {
                 LIMIT 1
             ) AS head
             CROSS JOIN LATERAL (
-                SELECT ready.run_at
-                FROM {ready_child} AS ready
-                WHERE ready.queue = claims.queue
-                  AND ready.priority = claims.priority
-                  AND ready.enqueue_shard = claims.enqueue_shard
-                ORDER BY ready.lane_seq DESC
+                SELECT segment.created_at
+                FROM {segment_child} AS segment
+                WHERE segment.queue = claims.queue
+                  AND segment.priority = claims.priority
+                  AND segment.enqueue_shard = claims.enqueue_shard
+                ORDER BY segment.next_lane_seq DESC
                 LIMIT 1
-            ) AS newest
+            ) AS written
             ORDER BY head.run_at ASC, claims.queue, claims.priority, claims.enqueue_shard
             "#
         ))
@@ -21574,7 +21578,7 @@ impl QueueStorage {
                     head_lane_seq,
                     head_run_at,
                     head_age_secs,
-                    newest_age_secs,
+                    last_write_age_secs,
                 )| {
                     PendingReadyLane {
                         queue,
@@ -21583,7 +21587,7 @@ impl QueueStorage {
                         head_lane_seq,
                         head_run_at,
                         head_age: Duration::try_from_secs_f64(head_age_secs).unwrap_or_default(),
-                        newest_age: Duration::try_from_secs_f64(newest_age_secs)
+                        last_write_age: Duration::try_from_secs_f64(last_write_age_secs)
                             .unwrap_or_default(),
                     }
                 },

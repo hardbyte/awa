@@ -95,8 +95,9 @@ pub(crate) struct LaneReading {
     pub logical_queue: String,
     /// The lane's first pending row; it moves when the lane is claimed.
     pub head_lane_seq: i64,
-    /// How long the lane's newest row in the pinned slot has been ready.
-    pub newest_age: Duration,
+    /// How long ago the lane's last ready segment in the pinned slot was
+    /// written; every row of the lane in the slot is at least that old.
+    pub last_write_age: Duration,
 }
 
 /// What one read of the queue ring pin found.
@@ -128,7 +129,7 @@ pub(crate) async fn read_pin(
             key: (lane.queue.clone(), lane.priority, lane.enqueue_shard),
             logical_queue: store.logical_queue_name(&lane.queue).to_string(),
             head_lane_seq: lane.head_lane_seq,
-            newest_age: lane.newest_age,
+            last_write_age: lane.last_write_age,
         })
         .collect();
 
@@ -176,16 +177,19 @@ pub(crate) async fn read_pin(
 }
 
 /// The aging interval that brings every pending row of a lane of priority
-/// `priority` in the pinned slot to priority 1, given the age of the lane's
-/// newest row there. `None` for priority 1.
+/// `priority` in the pinned slot to priority 1, given how long ago the lane's
+/// last ready segment there was written. No row of the lane in the slot is
+/// younger, because a ready row is due when written and a promoted row keeps
+/// the older `run_at` it had while deferred, so anchoring on a row's own
+/// `run_at` could leave a younger row short. `None` for priority 1.
 ///
 /// The claim orders lanes by `GREATEST(1, priority - floor(age / interval))`,
 /// so a row `age` old reaches priority 1 at `age / (priority - 1)`. The
 /// interval is rounded down to a millisecond so that floating point error
 /// cannot leave a row one level short, and is never below one second.
-fn lane_wanted_interval(priority: i16, newest_age: Duration) -> Option<Duration> {
+fn lane_wanted_interval(priority: i16, last_write_age: Duration) -> Option<Duration> {
     (priority > 1).then(|| {
-        let millis = (newest_age.as_secs_f64() * 1000.0 / f64::from(priority - 1)).floor();
+        let millis = (last_write_age.as_secs_f64() * 1000.0 / f64::from(priority - 1)).floor();
         Duration::from_millis(millis as u64).max(MIN_ESCALATED_AGING_INTERVAL)
     })
 }
@@ -313,7 +317,7 @@ impl RingPinWatch {
                 continue;
             }
             let (Some(wanted), Some(oldest_pending)) = (
-                lane_wanted_interval(lane.key.1, lane.newest_age),
+                lane_wanted_interval(lane.key.1, lane.last_write_age),
                 reading.oldest_pending.get(&lane.logical_queue).copied(),
             ) else {
                 continue;
@@ -328,6 +332,12 @@ impl RingPinWatch {
         }
         observation.queues = queues;
         causes
+    }
+
+    /// Stops escalating `queue` until the next reading: a claim made with its
+    /// escalated interval failed on a row older than the interval allows.
+    pub(crate) fn suppress(&self, queue: &str) {
+        self.lock().queues.remove(queue);
     }
 
     /// Records that no lane pins the queue ring.
@@ -415,12 +425,12 @@ mod tests {
         (queue.to_string(), priority, 0)
     }
 
-    fn lane(queue: &str, priority: i16, head_lane_seq: i64, newest_age: u64) -> LaneReading {
+    fn lane(queue: &str, priority: i16, head_lane_seq: i64, last_write_age: u64) -> LaneReading {
         LaneReading {
             key: lane_key(queue, priority),
             logical_queue: queue.to_string(),
             head_lane_seq,
-            newest_age: secs(newest_age),
+            last_write_age: secs(last_write_age),
         }
     }
 
@@ -474,7 +484,7 @@ mod tests {
     #[test]
     fn every_row_of_a_lane_in_the_slot_reaches_priority_one() {
         let row_ages = [3600_u64, 3570, 3540, 3500];
-        let newest = *row_ages.last().expect("rows");
+        let newest = *row_ages.last().expect("rows"); // the last write is no older than the youngest row
         let wanted = lane_wanted_interval(4, secs(newest)).expect("priority 4");
         for age in row_ages {
             let aged = (age as f64 / wanted.as_secs_f64()).floor() as i64;
@@ -611,7 +621,7 @@ mod tests {
         assert_eq!(
             interval(&watch, "emails", start + secs(10)),
             Some(secs(200)),
-            "the newest row's age over priority minus one"
+            "the last write's age over priority minus one"
         );
         assert_eq!(interval(&watch, "reports", start + secs(10)), None);
     }
@@ -768,6 +778,24 @@ mod tests {
             None,
             "not shorter than the configured interval"
         );
+    }
+
+    #[test]
+    fn a_suppressed_queue_escalates_again_at_the_next_reading() {
+        let watch = RingPinWatch::default();
+        let start = Instant::now();
+        let lanes = || vec![lane("emails", 4, 7, 600), lane("reports", 4, 7, 600)];
+        publish_starved(&watch, lanes, start);
+        let at = start + secs(10);
+        assert!(interval(&watch, "emails", at).is_some());
+        watch.suppress("emails");
+        assert_eq!(interval(&watch, "emails", at), None);
+        assert!(
+            interval(&watch, "reports", at).is_some(),
+            "only the queue whose claim failed"
+        );
+        watch.publish(reading(0, lanes(), 600), start + secs(20));
+        assert!(interval(&watch, "emails", start + secs(20)).is_some());
     }
 
     #[test]
