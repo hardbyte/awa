@@ -8,7 +8,6 @@ import {
   DescriptionTerm,
 } from "@/components/ui/description-list";
 import {
-  dlqPolicyIntent,
   dlqPolicyLabel,
   queueCapacityLabel,
   rateLimitLabel,
@@ -129,9 +128,7 @@ export function QueueConfigTab() {
 
                   <DescriptionTerm>DLQ policy</DescriptionTerm>
                   <DescriptionDetails>
-                    <Badge intent={dlqPolicyIntent(runtime.config)}>
-                      {dlqPolicyLabel(runtime.config)}
-                    </Badge>
+                    <span>{dlqPolicyLabel(runtime.config)}</span>
                   </DescriptionDetails>
                 </>
               )}

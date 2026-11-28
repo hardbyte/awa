@@ -1,4 +1,5 @@
 import { formatDuration } from "@/lib/time";
+import { errorSummary, latestError } from "@/lib/errors";
 
 export interface SummaryFact {
   key: string;
@@ -143,4 +144,32 @@ export function jobSummary(job: SummaryJob, nowMs: number): SummaryFact[] {
     }
   }
   return facts;
+}
+
+/** A list row's "why": its last error, when it runs next, or when its callback times out. */
+export interface RowReason {
+  /** When the job next runs or times out, e.g. "next in 2m". */
+  next?: string;
+  /** The latest error's first line, with its class. */
+  error?: string;
+}
+
+export function jobRowReason(
+  job: SummaryJob & { errors?: unknown[] | null },
+  nowMs: number
+): RowReason {
+  const reason: RowReason = {};
+  const runMs = ms(job.run_at);
+  if ((job.state === "retryable" || job.state === "scheduled") && runMs !== null) {
+    reason.next = `${job.state === "retryable" ? "next" : "runs"} ${relative(runMs, nowMs)}`;
+  }
+  const timeoutMs = ms(job.callback_timeout_at);
+  if (job.state === "waiting_external" && timeoutMs !== null) {
+    reason.next = timeoutMs >= nowMs ? `times out in ${span(nowMs, timeoutMs)}` : `timed out ${span(timeoutMs, nowMs)} ago`;
+  }
+  if (["failed", "retryable", "cancelled"].includes(job.state)) {
+    const error = latestError(job.errors);
+    if (error) reason.error = errorSummary(error) || undefined;
+  }
+  return reason;
 }

@@ -386,3 +386,15 @@ If you want to use the typography plugin (prose), uncomment the line below.
   outline: 1px solid var(--primary);
   transform: translateZ(0);
 }
+
+/* Motion stops for people who ask for less of it: spinners, pulses and transitions settle at once. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

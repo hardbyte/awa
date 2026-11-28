@@ -141,8 +141,8 @@ export function KindDetailPage() {
               <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{kind.kind}</code>
             )}
             {!kind.descriptor_last_seen_at && <Badge intent="secondary">Not declared</Badge>}
-            {kind.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
-            {kind.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
+            {kind.descriptor_stale && <Badge intent="secondary">Descriptor stale</Badge>}
+            {kind.descriptor_mismatch && <Badge intent="warning">Descriptor drift</Badge>}
           </>
         }
         description={kind.description || undefined}

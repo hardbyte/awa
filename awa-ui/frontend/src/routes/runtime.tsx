@@ -34,7 +34,6 @@ import {
   instanceLabel,
   LoopStatus,
   PostgresBadge,
-  dlqPolicyIntent,
   dlqPolicyLabel,
   queueCapacityLabel,
   queueConfigDetails,
@@ -559,11 +558,9 @@ export function RuntimePage() {
                       {queue.queue}
                     </Link>
                     {queue.config ? (
-                      <Badge intent={queue.config.mode === "weighted" ? "secondary" : "outline"}>
-                        {queue.config.mode === "weighted" ? "Weighted" : "Reserved"}
-                      </Badge>
+                      <span className="text-sm">{queue.config.mode === "weighted" ? "Weighted" : "Reserved"}</span>
                     ) : (
-                      <Badge intent="outline">Unknown</Badge>
+                      <span className="text-sm text-muted-fg">Unknown mode</span>
                     )}
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
@@ -576,9 +573,7 @@ export function RuntimePage() {
                     <span className="text-muted-fg">DLQ</span>
                     <span>
                       {queue.config ? (
-                        <Badge intent={dlqPolicyIntent(queue.config)}>
-                          {dlqPolicyLabel(queue.config)}
-                        </Badge>
+                        <span>{dlqPolicyLabel(queue.config)}</span>
                       ) : (
                         "—"
                       )}
@@ -645,9 +640,7 @@ export function RuntimePage() {
                     </TableCell>
                     <TableCell>
                       {queue.config ? (
-                        <Badge intent={queue.config.mode === "weighted" ? "secondary" : "outline"}>
-                          {queue.config.mode === "weighted" ? "Weighted" : "Reserved"}
-                        </Badge>
+                        <span className="text-sm">{queue.config.mode === "weighted" ? "Weighted" : "Reserved"}</span>
                       ) : (
                         "—"
                       )}
@@ -664,9 +657,7 @@ export function RuntimePage() {
                     </TableCell>
                     <TableCell>
                       {queue.config ? (
-                        <Badge intent={dlqPolicyIntent(queue.config)}>
-                          {dlqPolicyLabel(queue.config)}
-                        </Badge>
+                        <span>{dlqPolicyLabel(queue.config)}</span>
                       ) : (
                         "—"
                       )}

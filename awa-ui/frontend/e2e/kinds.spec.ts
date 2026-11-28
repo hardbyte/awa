@@ -17,7 +17,7 @@ test.describe("Kinds page", () => {
 
     // Descriptor-backed kind renders its display name + description.
     await expect(kindsTable.getByText("E2E Job")).toBeVisible();
-    await expect(kindsTable.getByText("e2e_job")).toBeVisible();
+    await expect(kindsTable.getByRole("link", { name: "E2E Job" })).toHaveAttribute("title", "e2e_job");
     await expect(
       kindsTable.getByText("End-to-end job kind used for UI coverage")
     ).toBeVisible();

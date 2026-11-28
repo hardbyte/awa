@@ -177,7 +177,8 @@ test.describe("Runtime page", () => {
     await expect(instancesGrid.getByRole("rowheader", { name: /worker-b/ })).toBeVisible();
     await expect(instancesGrid.getByText("instance 11111111")).toBeVisible();
     await expect(instancesGrid.getByText("Leader", { exact: true })).toBeVisible();
-    await expect(instancesGrid.getByText("Degraded", { exact: true })).toBeVisible();
+    await expect(instancesGrid.getByText("Unhealthy", { exact: true })).toBeVisible();
+    await expect(instancesGrid.getByText("Healthy", { exact: true })).toHaveCount(0);
     const queueGrid = page.getByRole("grid", { name: "Queue runtime summary" });
     await expect(queueGrid).toBeVisible();
     await expect(queueGrid.getByRole("rowheader", { name: "email" })).toBeVisible();

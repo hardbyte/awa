@@ -149,7 +149,7 @@ export function JobTimeline({ job }: { job: JobRow }) {
       })}
 
       {/* Transparency note */}
-      <p className="pt-2 text-xs text-muted-fg/60">
+      <p className="pt-2 text-xs text-muted-fg">
         Timeline reconstructed from job timestamps and error history.
       </p>
     </div>

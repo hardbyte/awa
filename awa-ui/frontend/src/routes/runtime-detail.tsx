@@ -191,22 +191,19 @@ export function RuntimeInstancePage() {
             <div className="rounded-lg border p-4">
               <div className="text-xs uppercase tracking-wide text-muted-fg">Poll</div>
               <div className="mt-2">
-                <LoopBadge label="poll" healthy={instance.poll_loop_alive} />
+                <LoopBadge healthy={instance.poll_loop_alive} />
               </div>
             </div>
             <div className="rounded-lg border p-4">
               <div className="text-xs uppercase tracking-wide text-muted-fg">Heartbeat</div>
               <div className="mt-2">
-                <LoopBadge label="heartbeat" healthy={instance.heartbeat_alive} />
+                <LoopBadge healthy={instance.heartbeat_alive} />
               </div>
             </div>
             <div className="rounded-lg border p-4">
               <div className="text-xs uppercase tracking-wide text-muted-fg">Maintenance</div>
               <div className="mt-2">
-                <LoopBadge
-                  label="maintenance"
-                  healthy={instance.maintenance_alive}
-                />
+                <LoopBadge healthy={instance.maintenance_alive} />
               </div>
             </div>
           </div>

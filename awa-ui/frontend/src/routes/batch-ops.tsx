@@ -21,6 +21,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { formatNumber } from "@/lib/number";
+import { RowCards } from "@/components/RowCards";
 
 export function BatchOpsPage() {
   const navigate = useNavigate();
@@ -42,7 +43,47 @@ export function BatchOpsPage() {
         }
       />
 
-      <Table aria-label="Batch operations">
+      {operations.length === 0 && (
+        <ListState
+          isLoading={operationsQuery.isLoading}
+          error={operationsQuery.isError ? operationsQuery.error : null}
+          onRetry={() => void operationsQuery.refetch()}
+          noun="batch operations"
+          empty="No batch operations yet."
+        />
+      )}
+
+      <RowCards
+        label="Bulk operations"
+        items={operations.map((operation) => ({
+          key: operation.id,
+          title: operationLabel(operation.op_kind),
+          titleSuffix: operation.id.slice(0, 8),
+          link: { to: "/batch-ops/$id", params: { id: operation.id } },
+          status: (
+            <BatchStateBadge state={operation.state} tone={changedNothing(operation) ? "retryable" : undefined} />
+          ),
+          why: operation.last_error ? (
+            <span className="text-danger-subtle-fg">{operation.last_error}</span>
+          ) : changedNothing(operation) ? (
+            "No jobs changed"
+          ) : undefined,
+          meta: (
+            <>
+              <span>{progressText(operation)}</span>
+              <Time value={operation.submitted_at} />
+            </>
+          ),
+          actions: isCancellable(operation.state) ? (
+            <AdminButton size="xs" intent="outline" onPress={() => setCancelling(operation)}>
+              Cancel…
+            </AdminButton>
+          ) : undefined,
+        }))}
+      />
+
+      {operations.length > 0 && (
+      <Table aria-label="Batch operations" className="hidden sm:block">
         <TableHeader>
           <TableColumn>ID</TableColumn>
           <TableColumn>Kind</TableColumn>
@@ -54,17 +95,7 @@ export function BatchOpsPage() {
           <TableColumn>Submitted</TableColumn>
           <TableColumn>Action</TableColumn>
         </TableHeader>
-        <TableBody
-          renderEmptyState={() => (
-            <ListState
-              isLoading={operationsQuery.isLoading}
-              error={operationsQuery.isError ? operationsQuery.error : null}
-              onRetry={() => void operationsQuery.refetch()}
-              noun="batch operations"
-              empty="No batch operations yet."
-            />
-          )}
-        >
+        <TableBody>
           {operations.map((operation) => (
             <TableRow
               key={operation.id}
@@ -105,6 +136,7 @@ export function BatchOpsPage() {
           ))}
         </TableBody>
       </Table>
+      )}
       {operations.length >= BATCH_OPS_LIST_LIMIT && (
         <p className="text-sm text-muted-fg">
           Showing the {BATCH_OPS_LIST_LIMIT} most recent operations.

@@ -21,6 +21,9 @@ import { jobStateMeta, TONE_TEXT } from "@/lib/states";
 import { CheckIcon } from "@heroicons/react/16/solid";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Badge } from "@/components/ui/badge";
+import { RowCards } from "@/components/RowCards";
+import { jobRowReason } from "@/lib/job-summary";
+import { useNow } from "@/hooks/use-now";
 import { Button } from "@/components/ui/button";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { AdminButton } from "@/components/AdminAction";
@@ -73,6 +76,42 @@ function timeColumnLabel(state: string): string {
   return "Created";
 }
 
+/** Header of the "why" column for the state the list shows. */
+function reasonColumnLabel(state: string): string {
+  if (state === "failed" || state === "cancelled") return "Last error";
+  if (state === "retryable") return "Next attempt";
+  if (state === "scheduled") return "Runs";
+  if (state === "waiting_external") return "Callback";
+  return "Detail";
+}
+
+/** The "why" cell: when the job runs next, and its last error. */
+function ReasonCell({ job, nowMs }: { job: JobRow; nowMs: number }) {
+  const reason = jobRowReason(job, nowMs);
+  if (!reason.next && !reason.error) return <span className="text-muted-fg">—</span>;
+  return (
+    <div className="min-w-0 max-w-[28rem]">
+      {reason.next && <div className="text-sm text-muted-fg">{reason.next}</div>}
+      {reason.error && (
+        <div className="truncate text-sm" title={reason.error} data-testid="job-last-error">
+          {reason.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A neutral priority badge, only when the priority isn't the default or was aged. */
+function PriorityBadge({ job }: { job: JobRow }) {
+  if (job.priority === 2 && job.original_priority === 2) return null;
+  return (
+    <Badge intent="secondary" className="text-[10px]" aria-label={`Priority ${job.priority}`}>
+      P{job.priority}
+      {job.original_priority !== job.priority ? ` (was ${job.original_priority})` : ""}
+    </Badge>
+  );
+}
+
 // Treat empty display_name as missing — `??` alone would let
 // `display_name: ""` render a blank label.
 function jobKindLabel(job: JobRow): string {
@@ -123,6 +162,7 @@ export interface JobsListProps {
  * `state`, `q`, `before_id` and `limit`. */
 export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
   const navigate = useNavigate();
+  const nowMs = useNow();
   const filters = useJobFilters();
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const queryClient = useQueryClient();
@@ -345,7 +385,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
       <SearchBar value={filters.search} onChange={setSearch} locked={lockedTerms(lockedFilter)} />
 
       {searchError && (
-        <p className="text-sm text-danger" role="alert">
+        <p className="text-sm text-danger-subtle-fg" role="alert">
           {searchError}. No jobs are listed until the search is fixed.
         </p>
       )}
@@ -361,7 +401,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
             </span>
           )}
           {countQuery.isError && (
-            <span className="text-danger" data-testid="match-count-error">
+            <span className="text-danger-subtle-fg" data-testid="match-count-error">
               Count failed: {countQuery.error.message}
             </span>
           )}
@@ -413,96 +453,54 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
         />
       )}
 
-      {/* Mobile card layout */}
-      <div className="space-y-2 sm:hidden">
-        {jobsQuery.isLoading && (
-          <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
-        )}
-        {!jobsQuery.isLoading && jobsQuery.isError && (
-          <p className="py-8 text-center text-sm text-danger-subtle-fg">
-            Failed to load jobs: {jobsQuery.error.message}
-          </p>
-        )}
-        {!jobsQuery.isLoading && !jobsQuery.isError && !searchError && jobs.length === 0 && (
-          <p className="py-8 text-center text-sm text-muted-fg">No jobs found.</p>
-        )}
-        {jobs.map((job) => (
-          <div
-            key={job.id}
-            className={[
-              "rounded-lg border p-3 transition-colors",
-              selected.has(job.id) ? "border-primary bg-primary-subtle/30" : "",
-            ].join(" ")}
-          >
-            <div className="flex items-start gap-3">
-              <input
-                type="checkbox"
-                disabled={jobsQuery.isPlaceholderData}
-                checked={selected.has(job.id)}
-                onChange={() => {
-                  setSelected((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(job.id)) next.delete(job.id);
-                    else next.add(job.id);
-                    return next;
-                  });
-                }}
-                className="mt-1 shrink-0"
-              />
-              <div
-                className="min-w-0 flex-1 cursor-pointer"
-                onClick={() =>
-                  void navigate({
-                    to: "/jobs/$id",
-                    params: { id: String(job.id) },
-                  })
-                }
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-medium">
-                    {jobKindLabel(job)}
-                    <span className="ml-1.5 text-xs text-muted-fg">#{job.id}</span>
-                  </span>
-                  <StateBadge state={job.state} />
-                  {(job.priority !== 2 || job.original_priority !== job.priority) && (
-                    <Badge
-                      intent={job.priority === 1 ? "danger" : "secondary"}
-                      className="text-[10px]"
-                    >
-                      P{job.priority}{job.original_priority !== job.priority ? ` (was ${job.original_priority})` : ""}
-                    </Badge>
-                  )}
-                </div>
-                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-fg">
-                  <span>{queueLabel(job)}</span>
-                  {job.queue_descriptor?.display_name && <span>{job.queue}</span>}
-                  <span>{job.attempt}/{job.max_attempts}</span>
-                  <Time value={contextualTime(job)} />
-                </div>
-                {job.kind_descriptor?.description && (
-                  <p className="mt-1 text-xs text-muted-fg">
-                    {job.kind_descriptor.description}
-                  </p>
-                )}
-                {job.tags.length > 0 && (
-                  <div className="mt-1.5 flex flex-wrap gap-1">
-                    {job.tags.slice(0, 3).map((t) => (
-                      <Badge key={t} intent="secondary" className="text-[10px]">
-                        {t}
-                      </Badge>
-                    ))}
-                    {job.tags.length > 3 && (
-                      <span className="text-[10px] text-muted-fg">
-                        +{job.tags.length - 3}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
+      <RowCards
+        label="Jobs"
+        placeholder={
+          jobsQuery.isLoading ? (
+            "Loading…"
+          ) : jobsQuery.isError ? (
+            <span className="text-danger-subtle-fg">Failed to load jobs: {jobsQuery.error.message}</span>
+          ) : searchError ? undefined : (
+            "No jobs found."
+          )
+        }
+        items={jobs.map((job) => {
+          const reason = jobRowReason(job, nowMs);
+          return {
+            key: job.id,
+            title: jobKindLabel(job),
+            titleSuffix: `#${job.id}`,
+            link: { to: "/jobs/$id", params: { id: String(job.id) } },
+            status: (
+              <>
+                <PriorityBadge job={job} />
+                <StateBadge state={job.state} />
+              </>
+            ),
+            why: reason.error ?? reason.next,
+            meta: (
+              <>
+                <span>{queueLabel(job)}</span>
+                <span>attempt {job.attempt}/{job.max_attempts}</span>
+                {reason.error && reason.next && <span>{reason.next}</span>}
+                <Time value={contextualTime(job)} />
+              </>
+            ),
+            selection: {
+              checked: selected.has(job.id),
+              disabled: jobsQuery.isPlaceholderData,
+              label: `Select job #${job.id}`,
+              onChange: (checked: boolean) =>
+                setSelected((prev) => {
+                  const next = new Set(prev);
+                  if (checked) next.add(job.id);
+                  else next.delete(job.id);
+                  return next;
+                }),
+            },
+          };
+        })}
+      />
 
       {/* Desktop table */}
       <Table
@@ -523,6 +521,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn>State</TableColumn>
           <TableColumn>Queue</TableColumn>
+          <TableColumn>{reasonColumnLabel(filters.state)}</TableColumn>
           <TableColumn className="text-right">Pri</TableColumn>
           <TableColumn className="text-right">Attempt</TableColumn>
           <TableColumn>Tags</TableColumn>
@@ -566,38 +565,20 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
               className="cursor-pointer"
             >
               <TableCell className="font-medium">
-                <div>
-                  <div>{jobKindLabel(job)}
-                <span className="ml-1.5 text-xs text-muted-fg">#{job.id}</span>
-                  </div>
-                  {job.kind_descriptor?.display_name && (
-                    <div className="text-xs font-normal text-muted-fg">{job.kind}</div>
-                  )}
-                </div>
+                <span title={job.kind_descriptor?.display_name?.trim() ? job.kind : undefined}>{jobKindLabel(job)}</span>
+                <span className="ml-1.5 text-xs font-normal text-muted-fg">#{job.id}</span>
               </TableCell>
               <TableCell>
                 <StateBadge state={job.state} />
               </TableCell>
-              <TableCell className="text-muted-fg">
-                <div>
-                  <div>{queueLabel(job)}</div>
-                  {job.queue_descriptor?.display_name && (
-                    <div className="text-xs">{job.queue}</div>
-                  )}
-                </div>
+              <TableCell>
+                <span title={job.queue_descriptor?.display_name?.trim() ? job.queue : undefined}>{queueLabel(job)}</span>
+              </TableCell>
+              <TableCell>
+                <ReasonCell job={job} nowMs={nowMs} />
               </TableCell>
               <TableCell className="text-right tabular-nums">
-                {job.priority !== 2 ? (
-                  <Badge intent={job.priority === 1 ? "danger" : "secondary"} className="text-[10px]">
-                    {job.original_priority !== job.priority
-                      ? `${job.priority} (was ${job.original_priority})`
-                      : String(job.priority)}
-                  </Badge>
-                ) : job.original_priority !== 2 ? (
-                  <span className="text-muted-fg">2 <span className="text-[10px]">(was {job.original_priority})</span></span>
-                ) : (
-                  <span className="text-muted-fg">2</span>
-                )}
+                <PriorityBadge job={job} />
               </TableCell>
               <TableCell className="text-right tabular-nums">
                 {job.attempt}/{job.max_attempts}

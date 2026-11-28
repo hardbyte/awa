@@ -25,14 +25,17 @@ test.describe("Queues page", () => {
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
-    // Columns were consolidated: Scheduled/Available fold into Queued;
-    // Mode/RateLimit fold into Capacity; Waiting is a subline under Queue.
+    // Ready work is split from work that isn't due yet; mode and rate limit
+    // fold into Capacity.
     for (const header of [
       "Queue",
-      "Queued",
+      "Ready",
+      "Oldest ready",
       "Running",
-      "Retry",
+      "Retrying",
       "Failed",
+      "Dead letters",
+      "Not yet due",
       "Completed/hr",
       "Capacity",
       "Status",
@@ -43,9 +46,8 @@ test.describe("Queues page", () => {
       ).toBeVisible();
     }
 
-    // Descriptor-backed queue shows display name and raw key
-    await expect(queueTable.getByText("E2E Queue")).toBeVisible();
-    await expect(queueTable.getByText("e2e_test")).toBeVisible();
+    // A descriptor-backed queue shows its display name, with the key as its tooltip.
+    await expect(queueTable.getByRole("link", { name: "E2E Queue" })).toHaveAttribute("title", "e2e_test");
     await expect(
       queueTable.getByRole("link", { name: "legacy_queue", exact: true })
     ).toBeVisible();
@@ -74,7 +76,7 @@ test.describe("Queues page", () => {
     }
   });
 
-  test("queue table surfaces DLQ policy from runtime config", async ({ page }) => {
+  test("queue table shows badges only for exceptions", async ({ page }) => {
     await page.route("**/api/queues", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -138,7 +140,9 @@ test.describe("Queues page", () => {
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable.getByRole("rowheader", { name: /DLQ Off Queue/ })).toBeVisible();
-    await expect(queueTable.getByText("DLQ off", { exact: true })).toBeVisible();
+    await expect(queueTable.getByText("DLQ off", { exact: true })).toHaveCount(0);
+    await expect(queueTable.getByText("Active", { exact: true })).toHaveCount(0);
+    await expect(queueTable.getByText("Paused", { exact: true })).toHaveCount(0);
   });
 
   test("click queue navigates to queue detail", async ({ page }) => {
@@ -306,7 +310,9 @@ test.describe("Queues page", () => {
 
   async function openActionsMenu(page: Page, queueName: string) {
     const queueTable = page.getByRole("grid", { name: "Queues" });
-    const row = queueTable.getByRole("row", { name: new RegExp(queueName) });
+    const row = queueTable.getByRole("row").filter({
+      has: page.getByRole("button", { name: `Actions for ${queueName}`, exact: true }),
+    });
     await expect(row).toBeVisible();
     await row
       .getByRole("button", { name: new RegExp(`Actions for ${queueName}`) })

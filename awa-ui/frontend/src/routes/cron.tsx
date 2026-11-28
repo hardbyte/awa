@@ -27,6 +27,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { RowCards } from "@/components/RowCards";
 
 /** Badges for the states that need a look; a healthy schedule shows none. */
 export function CronStatusBadges({
@@ -40,10 +41,10 @@ export function CronStatusBadges({
 }) {
   return (
     <div className="flex flex-wrap gap-1">
-      {cron.retired_at && <Badge intent="warning" data-testid="cron-retired">Retired</Badge>}
+      {cron.retired_at && <Badge intent="secondary" data-testid="cron-retired">Retired</Badge>}
       {cron.paused_at && <Badge intent="warning" data-testid="cron-paused">Paused</Badge>}
       {queuePaused && <Badge intent="warning" data-testid="cron-queue-paused">Queue paused</Badge>}
-      {isOverdue(cron, nowMs) && <Badge intent="danger" data-testid="cron-overdue">Overdue</Badge>}
+      {isOverdue(cron, nowMs) && <Badge intent="warning" data-testid="cron-overdue">Overdue</Badge>}
     </div>
   );
 }
@@ -127,7 +128,45 @@ export function CronPage() {
         />
       )}
 
-      <Table aria-label="Schedules">
+      {cronJobs.length === 0 && (
+        <ListState
+          isLoading={cronQuery.isLoading}
+          error={cronQuery.isError ? cronQuery.error : null}
+          onRetry={() => void cronQuery.refetch()}
+          noun="cron schedules"
+          empty="No cron schedules found."
+        />
+      )}
+
+      <RowCards
+        label="Schedules"
+        items={cronJobs.map((cron) => ({
+          key: cron.name,
+          title: cron.name,
+          link: { to: "/cron/$name", params: { name: cron.name } },
+          status: <CronStatusBadges cron={cron} queuePaused={pausedQueues.has(cron.queue)} nowMs={nowMs} />,
+          why: describeCron(cron.cron_expr),
+          meta: (
+            <>
+              {!cron.retired_at && (
+                <span>
+                  next <Time value={cron.next_fire_at} format="relative" />
+                </span>
+              )}
+              <span>
+                last <Time value={cron.last_enqueued_at} fallback="never" />
+              </span>
+              <span>
+                {cron.kind} → {cron.queue}
+              </span>
+            </>
+          ),
+          actions: <CronControls cron={cron} actions={actions} size="xs" />,
+        }))}
+      />
+
+      {cronJobs.length > 0 && (
+      <Table aria-label="Schedules" className="hidden sm:block">
         <TableHeader>
           <TableColumn isRowHeader>Name</TableColumn>
           <TableColumn>Schedule</TableColumn>
@@ -137,17 +176,7 @@ export function CronPage() {
           <TableColumn>Status</TableColumn>
           <TableColumn>Actions</TableColumn>
         </TableHeader>
-        <TableBody
-          renderEmptyState={() => (
-            <ListState
-              isLoading={cronQuery.isLoading}
-              error={cronQuery.isError ? cronQuery.error : null}
-              onRetry={() => void cronQuery.refetch()}
-              noun="cron schedules"
-              empty="No cron schedules found."
-            />
-          )}
-        >
+        <TableBody>
           {cronJobs.map((cron) => {
             const isPaused = cron.paused_at != null;
             const isRetired = cron.retired_at != null;
@@ -195,6 +224,7 @@ export function CronPage() {
           })}
         </TableBody>
       </Table>
+      )}
     </Page>
   );
 }

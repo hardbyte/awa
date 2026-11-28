@@ -139,6 +139,18 @@ test.describe("DLQ page", () => {
   });
 });
 
+test.describe("Dead letters on a phone", () => {
+  test("cards list the reason and open a dead letter with the keyboard", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(DLQ_PAGE);
+    const cards = page.getByRole("list", { name: "Dead letters" });
+    await expect(cards.getByTestId("row-card").first()).toBeVisible();
+    await cards.getByRole("link").first().focus();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/dlq\/\d+$/);
+  });
+});
+
 test.describe("Dead letter page", () => {
   test("Retry quotes the dead-letter reason and Purge says it can't be undone", async ({ page }) => {
     const posts: string[] = [];

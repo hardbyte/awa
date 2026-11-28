@@ -195,10 +195,7 @@ function RefreshControl() {
       </svg>
       {/* Live indicator dot */}
       {fetching && (
-        <span className="absolute -right-0.5 -top-0.5 flex size-2">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-50" />
-          <span className="relative inline-flex size-2 rounded-full bg-primary" />
-        </span>
+        <span className="absolute -right-0.5 -top-0.5 inline-flex size-2 rounded-full bg-primary" />
       )}
     </Button>
   );
@@ -302,10 +299,7 @@ function ClusterStatusChip({
   const workerLabel = `${summary.liveCount} live ${summary.liveCount === 1 ? "worker" : "workers"}`;
   return (
     <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs">
-      <span className="relative flex size-2">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
-        <span className="relative inline-flex size-2 rounded-full bg-primary" />
-      </span>
+      <span className="inline-flex size-2 shrink-0 rounded-full bg-primary" aria-hidden="true" />
       <span className="flex flex-col">
         <span className="font-medium text-fg">{workerLabel}</span>
         {summary.engineLabel && (

@@ -17,6 +17,14 @@ import {
 } from "@/components/ui/table";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
 import { DlqLink, KindLink, QueueLink } from "@/components/links";
+import { RowCards } from "@/components/RowCards";
+import { errorSummary, latestError } from "@/lib/errors";
+
+/** A dead letter's latest error, first line with its class. */
+function lastErrorText(row: DlqRow): string | null {
+  const error = latestError(row.errors);
+  return error ? errorSummary(error) || null : null;
+}
 import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
@@ -156,26 +164,58 @@ export function DlqList({ lockedFilter }: DlqListProps) {
       )}
 
       {searchError && (
-        <p className="text-sm text-danger" role="alert">
+        <p className="text-sm text-danger-subtle-fg" role="alert">
           {searchError}. Nothing is listed and bulk actions are off until the
           search is fixed.
         </p>
       )}
 
-      <Table>
+      <RowCards
+        label="Dead letters"
+        placeholder={
+          dlqQuery.isLoading ? (
+            "Loading…"
+          ) : dlqQuery.isError ? (
+            <span className="text-danger-subtle-fg">Failed to load the DLQ: {dlqQuery.error.message}</span>
+          ) : searchError ? undefined : (
+            `DLQ is empty${hasActiveFilter ? " (matching this filter)" : ""}.`
+          )
+        }
+        items={rows.map((row) => {
+          const error = lastErrorText(row);
+          return {
+            key: row.id,
+            title: row.kind_descriptor?.display_name?.trim() ? row.kind_descriptor.display_name : row.kind,
+            titleSuffix: `#${row.id}`,
+            link: { to: "/dlq/$id", params: { id: String(row.id) } },
+            why: error ?? row.dlq_reason,
+            meta: (
+              <>
+                <span>{row.queue_descriptor?.display_name?.trim() ? row.queue_descriptor.display_name : row.queue}</span>
+                {error && <span>{row.dlq_reason}</span>}
+                <span>attempt {row.attempt}/{row.max_attempts}</span>
+                <Time value={row.dlq_at} />
+              </>
+            ),
+          };
+        })}
+      />
+
+      <Table aria-label="Dead letters" className="hidden sm:block">
         <TableHeader>
-          <TableColumn>ID</TableColumn>
+          <TableColumn isRowHeader>ID</TableColumn>
           <TableColumn>Kind</TableColumn>
           <TableColumn>Queue</TableColumn>
           <TableColumn>Reason</TableColumn>
+          <TableColumn>Last error</TableColumn>
           <TableColumn>Attempts</TableColumn>
           <TableColumn>DLQ'd</TableColumn>
         </TableHeader>
         <TableBody>
           {dlqQuery.isError && (
             <TableRow>
-              <TableCell colSpan={6}>
-                <div className="text-danger py-6" role="alert">
+              <TableCell colSpan={7}>
+                <div className="py-6 text-danger-subtle-fg" role="alert">
                   Failed to load the DLQ: {dlqQuery.error.message}
                 </div>
               </TableCell>
@@ -183,7 +223,7 @@ export function DlqList({ lockedFilter }: DlqListProps) {
           )}
           {rows.length === 0 && !dlqQuery.isLoading && !dlqQuery.isError && !searchError && (
             <TableRow>
-              <TableCell colSpan={6}>
+              <TableCell colSpan={7}>
                 <div className="text-muted-fg py-6">
                   DLQ is empty{hasActiveFilter ? " (matching this filter)" : ""}. Terminal failures appear here only for queues with DLQ on.
                 </div>
@@ -202,6 +242,15 @@ export function DlqList({ lockedFilter }: DlqListProps) {
                 <QueueLink queue={row.queue} descriptor={row.queue_descriptor} />
               </TableCell>
               <TableCell>{row.dlq_reason}</TableCell>
+              <TableCell>
+                {lastErrorText(row) ? (
+                  <div className="max-w-[28rem] truncate" title={lastErrorText(row)!}>
+                    {lastErrorText(row)}
+                  </div>
+                ) : (
+                  <span className="text-muted-fg">—</span>
+                )}
+              </TableCell>
               <TableCell>
                 {row.attempt} / {row.max_attempts}
               </TableCell>

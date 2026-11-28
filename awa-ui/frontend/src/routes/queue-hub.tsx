@@ -71,8 +71,8 @@ export function QueueHubLayout() {
             )}
             {queue.paused && <Badge intent="warning" data-testid="queue-paused">Paused</Badge>}
             {runtime?.config?.dlq_enabled === true && <Badge intent="secondary">DLQ on</Badge>}
-            {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
-            {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
+            {queue.descriptor_stale && <Badge intent="secondary">Descriptor stale</Badge>}
+            {queue.descriptor_mismatch && <Badge intent="warning">Descriptor drift</Badge>}
             {runtime?.config_mismatch && <Badge intent="warning">Config mismatch</Badge>}
           </>
         }

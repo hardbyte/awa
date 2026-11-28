@@ -34,7 +34,7 @@ test.describe("Jobs page", () => {
     await expect(jobTable).toBeVisible();
 
     // Kind is now the primary column (no ID column)
-    for (const header of ["Kind", "State", "Queue", "Attempt", "Created"]) {
+    for (const header of ["Kind", "State", "Queue", "Detail", "Attempt", "Created"]) {
       await expect(
         jobTable.getByRole("columnheader", { name: header })
       ).toBeVisible();
@@ -45,6 +45,25 @@ test.describe("Jobs page", () => {
     await expect(rows).not.toHaveCount(1);
   });
 
+  test("a failed list says why each job failed", async ({ page }) => {
+    await page.goto("/jobs?state=failed&q=kind%3Ae2e_job");
+    const jobTable = page.getByRole("grid", { name: "Jobs" });
+    await expect(jobTable.getByRole("columnheader", { name: "Last error" })).toBeVisible();
+    await expect(jobTable.getByRole("row").nth(1)).toBeVisible();
+  });
+
+  test("phone cards open a job with the keyboard", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/jobs");
+    const cards = page.getByRole("list", { name: "Jobs" });
+    await expect(cards).toBeVisible();
+    await expect(cards.getByRole("checkbox").first()).toHaveAccessibleName(/^Select job #\d+$/);
+    const title = cards.getByRole("link").first();
+    await title.focus();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+  });
+
   test("descriptor-backed and legacy labels both render in jobs table", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
@@ -53,9 +72,9 @@ test.describe("Jobs page", () => {
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await expect(jobTable.getByText("E2E Job").first()).toBeVisible();
-    await expect(jobTable.getByText("e2e_job").first()).toBeVisible();
+    await expect(jobTable.getByText("E2E Job").first()).toHaveAttribute("title", "e2e_job");
     await expect(jobTable.getByText("E2E Queue").first()).toBeVisible();
-    await expect(jobTable.getByText("e2e_test").first()).toBeVisible();
+    await expect(jobTable.getByText("E2E Queue").first()).toHaveAttribute("title", "e2e_test");
     await expect(jobTable.getByText("legacy_job").first()).toBeVisible();
     await expect(jobTable.getByText("legacy_queue").first()).toBeVisible();
   });
@@ -326,7 +345,7 @@ test.describe("Search bar filters", () => {
       page.waitForResponse((r) => r.url().includes("/api/jobs?") && r.ok()),
       page.goto("/jobs?q=queue%3Ae2e_test"),
     ]);
-    const rows = page.getByRole("row").filter({ hasText: "e2e_test" });
+    const rows = page.getByRole("row").filter({ hasText: "E2E Queue" });
     await expect(rows.first()).toBeVisible();
     // An in-app navigation keeps the query cache, whose entry for the wider
     // search shares a key with this one.

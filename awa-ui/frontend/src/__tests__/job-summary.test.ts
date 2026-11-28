@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { jobSummary, type SummaryJob } from "@/lib/job-summary";
+import { jobRowReason, jobSummary, type SummaryJob } from "@/lib/job-summary";
 
 const NOW = Date.parse("2026-11-28T12:00:00Z");
 const ago = (seconds: number) => new Date(NOW - seconds * 1000).toISOString();
@@ -96,5 +96,36 @@ describe("jobSummary", () => {
     expect(texts(jobSummary(job({ state: "dead_lettered", attempt: 1, dlq_at: ago(180) }), NOW))).toEqual([
       "Dead-lettered 3m ago after 1 attempt",
     ]);
+  });
+});
+
+describe("jobRowReason", () => {
+  const errors = [{ error: "TimeoutError: read timed out\nTraceback...", attempt: 1 }];
+
+  it("gives a failed or cancelled job its last error", () => {
+    expect(jobRowReason({ ...job({ state: "failed" }), errors }, NOW)).toEqual({ error: "TimeoutError: read timed out" });
+    expect(jobRowReason({ ...job({ state: "cancelled" }), errors: [] }, NOW)).toEqual({});
+  });
+
+  it("gives a retryable job its next attempt and last error", () => {
+    expect(jobRowReason({ ...job({ state: "retryable", run_at: later(120) }), errors }, NOW)).toEqual({
+      next: "next in 2m",
+      error: "TimeoutError: read timed out",
+    });
+  });
+
+  it("gives a scheduled job its run time and a waiting job its callback timeout", () => {
+    expect(jobRowReason(job({ state: "scheduled", run_at: later(7200) }), NOW)).toEqual({ next: "runs in 2h" });
+    expect(jobRowReason(job({ state: "waiting_external", callback_timeout_at: later(90) }), NOW)).toEqual({
+      next: "times out in 1m 30s",
+    });
+    expect(jobRowReason(job({ state: "waiting_external", callback_timeout_at: ago(30) }), NOW)).toEqual({
+      next: "timed out 30s ago",
+    });
+  });
+
+  it("says nothing for other states", () => {
+    expect(jobRowReason({ ...job({ state: "completed" }), errors }, NOW)).toEqual({});
+    expect(jobRowReason(job({ state: "running" }), NOW)).toEqual({});
   });
 });
