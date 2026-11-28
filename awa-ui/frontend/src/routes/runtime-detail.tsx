@@ -267,7 +267,7 @@ export function RuntimeInstancePage() {
             </div>
           )}
 
-          <Table bleed aria-label="Runtime queue assignments" className="hidden sm:table">
+          <Table bleed aria-label="Runtime queue assignments" className="hidden sm:block">
             <TableHeader>
               <TableColumn isRowHeader>Queue</TableColumn>
               <TableColumn>Mode</TableColumn>

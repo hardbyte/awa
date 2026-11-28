@@ -266,7 +266,7 @@ export function QueuesPage() {
       <BulkRunProgress state={bulk.state} onStop={bulk.requestStop} />
 
       {/* Desktop table layout */}
-      <Table aria-label="Queues" className="hidden sm:table">
+      <Table aria-label="Queues" className="hidden sm:block">
         <TableHeader>
           <TableColumn isRowHeader>Queue</TableColumn>
           <TableColumn className="text-right">Queued</TableColumn>
