@@ -10,7 +10,7 @@ use sqlx::types::Json;
 use sqlx::Acquire;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
-use std::cmp::{max, min};
+use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -4436,14 +4436,18 @@ impl OutcomeQuery {
 }
 
 /// Jobs that reached each terminal outcome within one bucket, by the time
-/// they reached it. A count is `None` in a bucket that starts before its
-/// series' coverage: unknown, not zero.
+/// they reached it. A count is `None` where it is not known: unknown, not
+/// zero.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutcomeBucket {
     /// The start of the bucket.
     pub bucket: DateTime<Utc>,
+    /// Reserved; `None` until terminal coverage can be reported (see
+    /// [`job_outcomes`]).
     pub completed: Option<i64>,
+    /// Reserved, as `completed`.
     pub failed: Option<i64>,
+    /// Reserved, as `completed`.
     pub cancelled: Option<i64>,
     pub dead_lettered: Option<i64>,
 }
@@ -4452,296 +4456,93 @@ pub struct OutcomeBucket {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobOutcomes {
     /// The earliest time the completed, failed and cancelled counts are
-    /// complete from, or `None` where they are complete for no time at all:
-    /// on the canonical engine, whose cleanup removes terminal rows past a
-    /// retention the database does not record.
+    /// complete from. Reserved: `None` on both engines, which record no time
+    /// at which terminal rows leave, so no retained count can be told
+    /// complete.
     pub covered_since: Option<DateTime<Utc>>,
-    /// The earliest time the dead-lettered counts are complete from.
+    /// The earliest time the dead-lettered counts are complete from: the
+    /// window start.
     pub dead_lettered_covered_since: DateTime<Utc>,
-    /// Oldest first, from the first bucket that starts at or after the
-    /// earlier coverage time; the last holds the current time. A covered
-    /// bucket with no outcomes has zero counts.
+    /// Every bucket of the window, oldest first; the last holds the current
+    /// time. A bucket with no dead letters has a zero count.
     pub buckets: Vec<OutcomeBucket>,
 }
 
-/// Bind numbering for the optional queue and kind terms, after the window
-/// start (`$1`) and bucket width in seconds (`$2`).
-struct OutcomeFilter<'a> {
-    queue: Option<&'a str>,
-    kind: Option<&'a str>,
-}
-
-impl<'a> OutcomeFilter<'a> {
-    fn new(query: &'a OutcomeQuery) -> Self {
-        Self {
-            queue: query.queue.as_deref(),
-            kind: query.kind.as_deref(),
-        }
-    }
-
-    fn queue_param(&self) -> Option<&'static str> {
-        self.queue.map(|_| "$3")
-    }
-
-    fn kind_param(&self) -> Option<&'static str> {
-        self.kind
-            .map(|_| if self.queue.is_some() { "$4" } else { "$3" })
-    }
-
-    /// `AND` terms for the filters present, on `alias.queue` and
-    /// `alias.kind`.
-    fn terms(&self, alias: &str, queue: bool, kind: bool) -> String {
-        let mut terms = String::new();
-        if let (true, Some(param)) = (queue, self.queue_param()) {
-            terms.push_str(&format!(" AND {alias}.queue = {param}"));
-        }
-        if let (true, Some(param)) = (kind, self.kind_param()) {
-            terms.push_str(&format!(" AND {alias}.kind = {param}"));
-        }
-        terms
-    }
-
-    fn bind<'q, O>(
-        &self,
-        query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
-    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>
-    where
-        'a: 'q,
-    {
-        let mut query = query;
-        if let Some(queue) = self.queue {
-            query = query.bind(queue);
-        }
-        if let Some(kind) = self.kind {
-            query = query.bind(kind);
-        }
-        query
-    }
-}
-
-/// The bucket of `column`, aligned to whole multiples of the width since the
-/// Unix epoch.
-fn outcome_bucket_sql(column: &str) -> String {
-    format!("date_bin($2::bigint * interval '1 second', {column}, TIMESTAMPTZ '1970-01-01 00:00:00+00')")
-}
-
-/// Each distinct `queue` of `table`, one index probe per queue along an
-/// index that leads with `queue`.
-fn distinct_queues_sql(table: &str) -> String {
-    format!(
-        r#"
-        queues AS (
-            (SELECT queue FROM {table} ORDER BY queue LIMIT 1)
-            UNION ALL
-            SELECT (
-                SELECT next.queue FROM {table} AS next
-                WHERE next.queue > queues.queue
-                ORDER BY next.queue
-                LIMIT 1
-            )
-            FROM queues
-            WHERE queues.queue IS NOT NULL
-        )
-        "#
-    )
-}
-
-/// Statements counting `(bucket, outcome, count)` on queue storage, one per
-/// source, each reading only its own relations so its partition locks can be
-/// released before the next.
-fn queue_storage_outcome_sources(schema: &str, filter: &OutcomeFilter<'_>) -> Vec<String> {
-    let done_bucket = outcome_bucket_sql("done.finalized_at");
-    let done_terms = filter.terms("done", true, true);
-    let done = format!(
-        r#"
-        SELECT {done_bucket} AS bucket, done.state::text, count(*)::bigint
-        FROM {schema}.done_entries AS done
-        WHERE done.finalized_at >= $1{done_terms}
-        GROUP BY 1, 2
-        "#
-    );
-
-    let batch_bucket = outcome_bucket_sql("batch.finalized_at");
-    let batch_queue = filter.terms("batch", true, false);
-    let receipts = if let Some(kind) = filter.kind_param() {
-        // A completion batch does not carry its members' kind; each member's
-        // ready row does.
+/// Dead letters per bucket of `$2` seconds from `$1`, optionally for the
+/// queue and kind bound after them.
+fn queue_storage_dead_letter_sql(schema: &str, query: &OutcomeQuery) -> String {
+    let bucket = "date_bin($2::bigint * interval '1 second', dlq.dlq_at, \
+                  TIMESTAMPTZ '1970-01-01 00:00:00+00')";
+    let kind = match (&query.queue, &query.kind) {
+        (_, None) => "",
+        (Some(_), Some(_)) => " AND dlq.kind = $4",
+        (None, Some(_)) => " AND dlq.kind = $3",
+    };
+    if query.queue.is_some() {
         format!(
             r#"
-            SELECT {batch_bucket} AS bucket, 'completed', count(*)::bigint
-            FROM {schema}.receipt_completion_batches AS batch
-            CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases, batch.lane_seqs)
-                AS item(job_id, run_lease, lane_seq)
-            CROSS JOIN LATERAL (
-                SELECT ready.kind
-                FROM {schema}.ready_entries AS ready
-                WHERE ready.ready_slot = batch.ready_slot
-                  AND ready.ready_generation = batch.ready_generation
-                  AND ready.queue = batch.queue
-                  AND ready.priority = batch.priority
-                  AND ready.enqueue_shard = batch.enqueue_shard
-                  AND ready.lane_seq = item.lane_seq
-                  AND ready.job_id = item.job_id
-                OFFSET 0
-            ) AS ready
-            WHERE batch.finalized_at >= $1{batch_queue}
-              AND ready.kind = {kind}
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
-                  WHERE tomb.ready_slot = batch.ready_slot
-                    AND tomb.ready_generation = batch.ready_generation
-                    AND tomb.job_id = item.job_id
-                    AND tomb.run_lease = item.run_lease
-              )
+            SELECT {bucket} AS bucket, count(*)::bigint
+            FROM {schema}.dlq_entries AS dlq
+            WHERE dlq.queue = $3 AND dlq.dlq_at >= $1{kind}
             GROUP BY 1
             "#
         )
     } else {
-        let tomb_queue = filter.terms("tomb", true, false);
-        // As `completed_last_hour` counts them: each batch by its size, less
-        // its members deleted or retried since. A tombstone on a member
-        // finalised inside the window is itself newer than the window start,
-        // and only batches in the window with such a tombstone are expanded.
+        // Dead letters are kept for weeks: read each queue's window along its
+        // `(queue, dlq_at)` index, one probe per queue, rather than scanning
+        // them all.
+        let table = format!("{schema}.dlq_entries");
         format!(
             r#"
-            WITH recent_tombstones AS MATERIALIZED (
-                SELECT tomb.ready_slot, tomb.ready_generation, tomb.queue, tomb.priority,
-                       tomb.enqueue_shard, tomb.job_id, tomb.run_lease
-                FROM {schema}.receipt_completion_tombstones AS tomb
-                WHERE tomb.deleted_at >= $1{tomb_queue}
-            ),
-            tombstoned_batches AS MATERIALIZED (
-                SELECT batch.finalized_at, batch.ready_slot, batch.job_ids, batch.run_leases
-                FROM {schema}.receipt_completion_batches AS batch
-                WHERE batch.finalized_at >= $1{batch_queue}
-                  AND EXISTS (
-                      SELECT 1 FROM recent_tombstones AS tomb
-                      WHERE tomb.ready_slot = batch.ready_slot
-                        AND tomb.ready_generation = batch.ready_generation
-                        AND tomb.queue = batch.queue
-                        AND tomb.priority = batch.priority
-                        AND tomb.enqueue_shard = batch.enqueue_shard
-                  )
-            )
-            SELECT {batch_bucket} AS bucket, 'completed', sum(completed)::bigint
-            FROM (
-                SELECT batch.finalized_at, batch.completed_count::bigint AS completed
-                FROM {schema}.receipt_completion_batches AS batch
-                WHERE batch.finalized_at >= $1{batch_queue}
+            WITH RECURSIVE queues AS (
+                (SELECT queue FROM {table} ORDER BY queue LIMIT 1)
                 UNION ALL
-                SELECT batch.finalized_at, -1::bigint
-                FROM tombstoned_batches AS batch
-                CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases)
-                    AS member(job_id, run_lease)
-                JOIN recent_tombstones AS tomb
-                  ON tomb.ready_slot = batch.ready_slot
-                 AND tomb.job_id = member.job_id
-                 AND tomb.run_lease = member.run_lease
-            ) AS batch
-            GROUP BY 1
-            "#
-        )
-    };
-
-    let dlq_bucket = outcome_bucket_sql("dlq.dlq_at");
-    let dlq_kind = filter.terms("dlq", false, true);
-    let dlq = match filter.queue_param() {
-        Some(queue) => format!(
-            r#"
-            SELECT {dlq_bucket} AS bucket, 'dead_lettered', count(*)::bigint
-            FROM {schema}.dlq_entries AS dlq
-            WHERE dlq.queue = {queue} AND dlq.dlq_at >= $1{dlq_kind}
-            GROUP BY 1
-            "#
-        ),
-        // Dead letters are kept for weeks: read each queue's window along
-        // its `(queue, dlq_at)` index rather than scanning them all.
-        None => format!(
-            r#"
-            WITH RECURSIVE {queues}
-            SELECT {dlq_bucket} AS bucket, 'dead_lettered', count(*)::bigint
+                SELECT (
+                    SELECT next.queue FROM {table} AS next
+                    WHERE next.queue > queues.queue
+                    ORDER BY next.queue
+                    LIMIT 1
+                )
+                FROM queues
+                WHERE queues.queue IS NOT NULL
+            )
+            SELECT {bucket} AS bucket, count(*)::bigint
             FROM queues
             CROSS JOIN LATERAL (
                 SELECT dlq.dlq_at
-                FROM {schema}.dlq_entries AS dlq
-                WHERE dlq.queue = queues.queue AND dlq.dlq_at >= $1{dlq_kind}
+                FROM {table} AS dlq
+                WHERE dlq.queue = queues.queue AND dlq.dlq_at >= $1{kind}
             ) AS dlq
             WHERE queues.queue IS NOT NULL
             GROUP BY 1
-            "#,
-            queues = distinct_queues_sql(&format!("{schema}.dlq_entries")),
-        ),
-    };
-
-    vec![done, receipts, dlq]
-}
-
-/// The oldest dead letter retained on the queue bound as `$1`, or on any
-/// queue when `queue` is false. Dead-letter retention is applied per queue,
-/// not per kind, so a kind filter does not narrow it.
-fn queue_storage_oldest_dead_letter_sql(schema: &str, queue: bool) -> String {
-    if queue {
-        format!(
-            r#"
-            SELECT dlq.dlq_at
-            FROM {schema}.dlq_entries AS dlq
-            WHERE dlq.queue = $1
-            ORDER BY dlq.dlq_at
-            LIMIT 1
             "#
-        )
-    } else {
-        format!(
-            r#"
-            WITH RECURSIVE {queues}
-            SELECT oldest.dlq_at
-            FROM queues
-            CROSS JOIN LATERAL (
-                SELECT dlq.dlq_at
-                FROM {schema}.dlq_entries AS dlq
-                WHERE dlq.queue = queues.queue
-                ORDER BY dlq.dlq_at
-                LIMIT 1
-            ) AS oldest
-            WHERE queues.queue IS NOT NULL
-            ORDER BY 1
-            LIMIT 1
-            "#,
-            queues = distinct_queues_sql(&format!("{schema}.dlq_entries")),
         )
     }
 }
 
-/// Jobs that completed, failed, were cancelled or were dead-lettered, per
-/// bucket over the last `query.minutes`, by the time each reached that
-/// outcome.
+/// Jobs dead-lettered per bucket over the last `query.minutes`, by `dlq_at`,
+/// with the completed, failed and cancelled series reserved.
 ///
-/// The counts come from the terminal rows the database still holds. On
-/// queue storage those are `done_entries` and completion batches, which
-/// queue-ring prune reclaims a generation at a time, and dead letters by
-/// `dlq_at`. [`JobOutcomes::covered_since`] is then the ring's
-/// [`QueueStorage::terminal_retention_horizon`], or the window start if that
-/// is later. Ring prune does not touch dead letters, which DLQ cleanup
-/// removes past a retention the database does not record (30 days by
-/// default), so [`JobOutcomes::dead_lettered_covered_since`] is the later of
-/// the window start and the oldest dead letter retained on the queue (or on
-/// any queue): a retention shorter than the window shows there, at the cost
-/// of reading a queue's first dead letter as the start of its coverage.
+/// Terminal counts are not reported on either engine: every count is
+/// `None` and [`JobOutcomes::covered_since`] is `None`. Queue-ring prune
+/// truncates a generation's terminal rows whenever their jobs finished, and
+/// canonical cleanup removes them past `completed_retention` and
+/// `failed_retention` (worker settings with per-queue overrides); neither
+/// records when rows leave, so no retained count can be told complete, and a
+/// missing completion would read as a higher failure rate. The fields stay
+/// in the response for when prune or a rollup records that time.
 ///
-/// On the canonical engine nothing is read. Its cleanup removes terminal
-/// rows past `completed_retention` and `failed_retention`, worker settings
-/// with per-queue overrides that the database does not record, so no
-/// retained count can be told complete: `covered_since` is `None` and every
-/// completed, failed and cancelled count is `None`. No dead letter can exist
-/// there, so that series is zero across the window.
-///
-/// Retries are not counted: a retry leaves no terminal row.
-///
-/// Each source is read in its own savepoint, released before the next, so
-/// the read never holds locks across every ring partition at once.
+/// Dead letters are counted on queue storage from `dlq_entries`, which ring
+/// prune does not touch. DLQ cleanup removes them past a retention (30 days
+/// by default, configurable per queue) that the database does not record;
+/// it is taken to be longer than the window, at most 24 hours, so
+/// [`JobOutcomes::dead_lettered_covered_since`] is the window start. A
+/// shorter retention undercounts. No dead letter exists on the canonical
+/// engine, so the series is zero there and nothing is read.
 pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutcomes, AwaError> {
     query.validate()?;
     let width = i64::from(query.bucket_seconds);
+    let count = query.bucket_count();
     // The window ends with the bucket holding the database's current time.
     let last: DateTime<Utc> = sqlx::query_scalar(
         "SELECT date_bin($1::bigint * interval '1 second', clock_timestamp(), \
@@ -4750,135 +4551,49 @@ pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutc
     .bind(width)
     .fetch_one(pool)
     .await?;
-    let since = last - Duration::seconds(width * (query.bucket_count() - 1));
+    let since = last - Duration::seconds(width * (count - 1));
 
-    let Some(store) = active_queue_storage(pool).await? else {
-        // Nothing is read: no terminal count is known, and no dead letter
-        // exists on the canonical engine.
-        return Ok(JobOutcomes {
-            covered_since: None,
-            dead_lettered_covered_since: since,
-            buckets: fill_outcome_buckets(
-                since,
-                width,
-                query.bucket_count(),
-                (None, since),
-                Vec::new(),
-            ),
-        });
-    };
-    let filter = OutcomeFilter::new(query);
-    let sources = queue_storage_outcome_sources(store.schema(), &filter);
-
-    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-    let mut tx = sqlx::Connection::begin_with(
-        &mut *begin_guard.connection,
-        "BEGIN ISOLATION LEVEL READ COMMITTED, READ ONLY",
-    )
-    .await?;
-    begin_guard.begin_pending = false;
-    sqlx::query("SET LOCAL jit = off")
-        .execute(tx.as_mut())
-        .await?;
-
-    let mut rows: Vec<(DateTime<Utc>, String, i64)> = Vec::new();
-    for sql in sources {
-        sqlx::query("SAVEPOINT awa_outcome_source")
-            .execute(tx.as_mut())
-            .await?;
-        let statement = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(audited_sql(sql))
+    let rows: Vec<(DateTime<Utc>, i64)> = match active_queue_storage(pool).await? {
+        Some(store) => {
+            let mut statement = sqlx::query_as::<_, (DateTime<Utc>, i64)>(audited_sql(
+                queue_storage_dead_letter_sql(store.schema(), query),
+            ))
             .bind(since)
             .bind(width);
-        rows.extend(filter.bind(statement).fetch_all(tx.as_mut()).await?);
-        sqlx::query("ROLLBACK TO SAVEPOINT awa_outcome_source")
-            .execute(tx.as_mut())
-            .await?;
-        sqlx::query("RELEASE SAVEPOINT awa_outcome_source")
-            .execute(tx.as_mut())
-            .await?;
-    }
-    sqlx::query("SAVEPOINT awa_outcome_source")
-        .execute(tx.as_mut())
-        .await?;
-    let sql = queue_storage_oldest_dead_letter_sql(store.schema(), query.queue.is_some());
-    let mut statement = sqlx::query_scalar(audited_sql(sql));
-    if let Some(queue) = &query.queue {
-        statement = statement.bind(queue);
-    }
-    let oldest_dead_letter: Option<DateTime<Utc>> = statement.fetch_optional(tx.as_mut()).await?;
-    sqlx::query("ROLLBACK TO SAVEPOINT awa_outcome_source")
-        .execute(tx.as_mut())
-        .await?;
-    sqlx::query("RELEASE SAVEPOINT awa_outcome_source")
-        .execute(tx.as_mut())
-        .await?;
-    // Read after the rows, each statement on a fresh snapshot: a rotation
-    // that let prune reclaim rows read above moves the horizon past them.
-    let horizon = store.terminal_retention_horizon(&mut tx).await?;
-    tx.commit().await?;
-    drop(begin_guard);
-
-    let covered_since = Some(horizon.map_or(since, |horizon| max(horizon, since)));
-    let dead_lettered_covered_since = oldest_dead_letter.map_or(since, |at| max(at, since));
-    Ok(JobOutcomes {
-        covered_since,
-        dead_lettered_covered_since,
-        buckets: fill_outcome_buckets(
-            since,
-            width,
-            query.bucket_count(),
-            (covered_since, dead_lettered_covered_since),
-            rows,
-        ),
-    })
-}
-
-/// Every bucket from `since` that starts at or after the earlier of the
-/// terminal and dead-letter coverage times (the dead-letter one when the
-/// terminal series has none), with the counted rows added in, zeros where a
-/// covered series has none, and `None` where a series is not covered.
-fn fill_outcome_buckets(
-    since: DateTime<Utc>,
-    width: i64,
-    count: i64,
-    (terminal_since, dead_lettered_since): (Option<DateTime<Utc>>, DateTime<Utc>),
-    rows: Vec<(DateTime<Utc>, String, i64)>,
-) -> Vec<OutcomeBucket> {
-    let mut buckets: Vec<OutcomeBucket> = (0..count)
-        .map(|n| since + Duration::seconds(width * n))
-        .map(|bucket| {
-            let terminal = terminal_since
-                .is_some_and(|since| bucket >= since)
-                .then_some(0);
-            OutcomeBucket {
-                bucket,
-                completed: terminal,
-                failed: terminal,
-                cancelled: terminal,
-                dead_lettered: (bucket >= dead_lettered_since).then_some(0),
+            if let Some(queue) = &query.queue {
+                statement = statement.bind(queue);
             }
+            if let Some(kind) = &query.kind {
+                statement = statement.bind(kind);
+            }
+            statement.fetch_all(pool).await?
+        }
+        None => Vec::new(),
+    };
+
+    let mut buckets: Vec<OutcomeBucket> = (0..count)
+        .map(|n| OutcomeBucket {
+            bucket: since + Duration::seconds(width * n),
+            completed: None,
+            failed: None,
+            cancelled: None,
+            dead_lettered: Some(0),
         })
         .collect();
-    for (bucket, outcome, n) in rows {
+    for (bucket, n) in rows {
         let offset = (bucket - since).num_seconds();
         if offset < 0 || offset % width != 0 || offset / width >= count {
             continue;
         }
-        let entry = &mut buckets[(offset / width) as usize];
-        let series = match outcome.as_str() {
-            "completed" => &mut entry.completed,
-            "failed" => &mut entry.failed,
-            "cancelled" => &mut entry.cancelled,
-            "dead_lettered" => &mut entry.dead_lettered,
-            _ => continue,
-        };
-        if let Some(total) = series {
+        if let Some(total) = &mut buckets[(offset / width) as usize].dead_lettered {
             *total += n;
         }
     }
-    let first = terminal_since.map_or(dead_lettered_since, |since| min(since, dead_lettered_since));
-    buckets.retain(|bucket| bucket.bucket >= first);
-    buckets
+    Ok(JobOutcomes {
+        covered_since: None,
+        dead_lettered_covered_since: since,
+        buckets,
+    })
 }
 
 /// Register a callback for a running job, writing the callback_id and timeout

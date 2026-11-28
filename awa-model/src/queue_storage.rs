@@ -23787,53 +23787,6 @@ impl QueueStorage {
         Ok(outcome)
     }
 
-    /// The earliest finalisation time from which the queue ring still holds
-    /// the terminal rows (`done_entries` and completion batches) it was
-    /// given, or `None` when no generation can have been pruned yet.
-    ///
-    /// A terminal row lives in the slot of the generation its job was
-    /// enqueued in. Prune reclaims only the oldest sealed generation, and
-    /// rotation reuses a slot only once its generation is pruned, so every
-    /// generation older than the oldest sealed one is gone and the oldest
-    /// sealed one may be. The horizon is when the generation after it opened:
-    /// a job enqueued and finished since then is still counted. A job
-    /// enqueued before it and finished after it belonged to a generation
-    /// prune may since have reclaimed; prune waits for every job of a
-    /// generation to finish, so such a row is one that held its generation
-    /// back from prune.
-    ///
-    /// Reads only the ring's cursor and rotation ledger. In compat cursor
-    /// authority the ledger can lag the cursor; without a ledger row newer
-    /// than the oldest sealed generation the horizon is the current time.
-    pub async fn terminal_retention_horizon(
-        &self,
-        tx: &mut sqlx::Transaction<'_, Postgres>,
-    ) -> Result<Option<DateTime<Utc>>, AwaError> {
-        let schema = self.schema();
-        let authority = self.ring_authority_tx(tx).await?;
-        let (current_slot, current_generation) = self
-            .ring_cursor_tx(tx, RingFamily::Queue, authority)
-            .await?;
-        let slot_count = self.ring_slot_count_tx(tx, RingFamily::Queue).await?;
-        let Some((_, oldest_generation)) =
-            oldest_initialized_ring_slot(current_slot, current_generation, slot_count)
-        else {
-            return Ok(None);
-        };
-        let ledger = RingFamily::Queue.ledger_relname();
-        let horizon: DateTime<Utc> = sqlx::query_scalar(audited_sql(format!(
-            "SELECT COALESCE( \
-                 (SELECT rotated_at FROM {schema}.{ledger} \
-                  WHERE generation > $1 ORDER BY generation LIMIT 1), \
-                 clock_timestamp())"
-        )))
-        .bind(oldest_generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        Ok(Some(horizon))
-    }
-
     /// The lanes keeping queue prune from reclaiming the oldest sealed queue
     /// ring slot because they hold ready rows at or past their claim cursor:
     /// the rows behind [`SkipReason::QueuePendingReady`]. `None` when there is
