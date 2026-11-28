@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Keyboard } from "@/components/ui/keyboard";
 import { fetchCronJobs, fetchKinds, fetchQueues, type BatchOperation } from "@/lib/api";
 import { batchOpsQuery } from "@/lib/shared-queries";
-import { paletteItems, type PaletteItem } from "@/lib/palette";
+import { paletteItems, paletteSearchProblem, type PaletteItem } from "@/lib/palette";
 
 const PALETTE_STALE_MS = 60_000;
 
@@ -70,6 +70,7 @@ export function CommandPalette() {
     return [...grouped].map(([label, entries]) => ({ id: label, label, entries }));
   }, [items]);
   const failed = [queues, kinds, schedules].some((query) => query.isError);
+  const searchProblem = paletteSearchProblem(input);
 
   function go(key: React.Key) {
     const item = items.find((entry) => entry.id === key);
@@ -119,6 +120,11 @@ export function CommandPalette() {
             </CommandMenuSection>
           )}
         </CommandMenuList>
+        {searchProblem && (
+          <CommandMenuFooter role="status" data-testid="palette-search-problem">
+            Not a jobs search: {searchProblem}
+          </CommandMenuFooter>
+        )}
         {failed && (
           <CommandMenuFooter role="status">Some names couldn't be loaded; job ids and pages still work.</CommandMenuFooter>
         )}

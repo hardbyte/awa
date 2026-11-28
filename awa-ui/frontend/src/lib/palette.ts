@@ -1,4 +1,4 @@
-import { invalidTerms, isJobId, parseSearch } from "@/components/SearchBar";
+import { filterPrefix, invalidTerms, isJobId, parseSearch } from "@/components/SearchBar";
 import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
 
 /** Where a palette entry goes, in the shape the router's `navigate` takes. */
@@ -61,6 +61,14 @@ function label(key: string, displayName?: string | null): { label: string; detai
   return name && name !== key ? { label: name, detail: key } : { label: key };
 }
 
+/**
+ * Why the input can't be a jobs search, when it uses a filter prefix (e.g.
+ * `id:abc` or `kind:`) that doesn't validate; undefined otherwise.
+ */
+export function paletteSearchProblem(rawInput: string): string | undefined {
+  return invalidTerms(rawInput.trim()).find(({ term }) => filterPrefix(term))?.error;
+}
+
 /** The palette's entries for what has been typed, in display order. */
 export function paletteItems(rawInput: string, data: PaletteData): PaletteItem[] {
   const input = rawInput.trim();
@@ -92,11 +100,11 @@ export function paletteItems(rawInput: string, data: PaletteData): PaletteItem[]
     }
   }
 
-  if (input.includes(":")) {
+  if (input.includes(":") || filterPrefix(input)) {
     const valid = invalidTerms(input).length === 0 && Object.keys(parseSearch(input)).length > 0;
     if (valid) {
       items.push({ id: "jobs-search", section: "Jobs", label: `Jobs matching ${input}`, target: { to: "/jobs", search: { q: input } } });
-    } else if (!/\s/.test(input)) {
+    } else if (!/\s/.test(input) && !filterPrefix(input)) {
       items.push({ id: "jobs-tag", section: "Jobs", label: `Jobs tagged ${input}`, target: { to: "/jobs", search: { q: `tag:${input}` } } });
     }
   }

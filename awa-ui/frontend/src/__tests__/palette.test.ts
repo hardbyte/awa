@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PALETTE_SECTION_LIMIT, paletteItems } from "@/lib/palette";
+import { PALETTE_SECTION_LIMIT, paletteItems, paletteSearchProblem } from "@/lib/palette";
 
 const data = {
   queues: [
@@ -81,5 +81,15 @@ describe("paletteItems", () => {
       target: { to: "/jobs", search: { q: "tag:tenant:acme" } },
     });
     expect(paletteItems("bad: term", data).some((i) => i.section === "Jobs")).toBe(false);
+  });
+
+  it("offers no tag search for a filter term that doesn't validate, and says why", () => {
+    for (const input of ["id:abc", "kind:", "created>=someday", "kind:send_email id:x"]) {
+      expect(paletteItems(input, data).some((i) => i.section === "Jobs"), input).toBe(false);
+    }
+    expect(paletteSearchProblem("id:abc")).toBe("id: takes whole job ids, e.g. id:123 or id:123,456");
+    expect(paletteSearchProblem("kind:")).toBe("kind: needs a value");
+    expect(paletteSearchProblem("tenant:acme")).toBeUndefined();
+    expect(paletteSearchProblem("kind:send_email")).toBeUndefined();
   });
 });

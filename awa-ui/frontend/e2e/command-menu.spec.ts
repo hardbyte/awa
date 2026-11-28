@@ -36,6 +36,17 @@ test.describe("Jump to (command palette)", () => {
     await expect(page).toHaveURL(/\/batch-ops$/);
   });
 
+  test("a filter term that doesn't validate says why instead of offering a tag search", async ({ page }) => {
+    await page.goto("/");
+    await page.keyboard.press(shortcut);
+    const dialog = page.getByRole("dialog", { name: "Jump to" });
+    await dialog.getByRole("searchbox").fill("id:abc");
+    await expect(dialog.getByTestId("palette-search-problem")).toHaveText(
+      "Not a jobs search: id: takes whole job ids, e.g. id:123 or id:123,456"
+    );
+    await expect(dialog.getByRole("menuitem", { name: /Jobs tagged/ })).toHaveCount(0);
+  });
+
   test("Escape closes it and returns focus to the button that opened it", async ({ page }) => {
     await page.goto("/");
     const trigger = page.getByTestId("command-palette-trigger");

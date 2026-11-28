@@ -81,6 +81,14 @@ export interface InvalidTerm {
   error: string;
 }
 
+/** The prefixes a search term can start with. */
+export const FILTER_PREFIXES = ["kind:", "queue:", "tag:", "id:", "created>=", "created<"] as const;
+
+/** The filter prefix `term` starts with, if any. */
+export function filterPrefix(term: string): (typeof FILTER_PREFIXES)[number] | undefined {
+  return FILTER_PREFIXES.find((p) => term.startsWith(p));
+}
+
 /**
  * The terms of a search, typed or from the URL, that `parseSearch` would
  * drop. Dropping one leaves a wider filter than the one written, so a page
@@ -89,9 +97,7 @@ export interface InvalidTerm {
 export function invalidTerms(search: string): InvalidTerm[] {
   const out: InvalidTerm[] = [];
   for (const term of search.trim().split(/\s+/).filter(Boolean)) {
-    const prefix = ["kind:", "queue:", "tag:", "id:", "created>=", "created<"].find((p) =>
-      term.startsWith(p)
-    );
+    const prefix = filterPrefix(term);
     const value = prefix ? term.slice(prefix.length) : "";
     let error: string | undefined;
     if (!prefix) {
