@@ -16,6 +16,7 @@ import {
 } from "@/lib/api";
 import { isJobId, toRfc3339 } from "@/components/SearchBar";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ListState } from "@/components/ListState";
 import { describeFilter, formatCount, isNarrowing, previewCount, sameFilter } from "@/lib/batch";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
@@ -435,7 +436,17 @@ export function BatchOpsPage() {
           <TableColumn>Submitted</TableColumn>
           <TableColumn>Action</TableColumn>
         </TableHeader>
-        <TableBody>
+        <TableBody
+          renderEmptyState={() => (
+            <ListState
+              isLoading={operationsQuery.isLoading}
+              error={operationsQuery.isError ? operationsQuery.error : null}
+              onRetry={() => void operationsQuery.refetch()}
+              noun="batch operations"
+              empty="No batch operations yet."
+            />
+          )}
+        >
           {operations.map((operation) => (
             <TableRow key={operation.id}>
               <TableCell className="font-mono text-xs">{operation.id.slice(0, 8)}</TableCell>

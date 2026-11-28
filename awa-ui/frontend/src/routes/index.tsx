@@ -151,8 +151,10 @@ export function DashboardPage() {
                   <div className="text-3xl font-bold tabular-nums">
                     {statsQuery.isLoading ? (
                       <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
-                    ) : (
+                    ) : statsQuery.data ? (
                       (count ?? 0).toLocaleString()
+                    ) : (
+                      <span className="text-muted-fg" aria-label="Count unavailable">—</span>
                     )}
                   </div>
                   <div className="mt-1.5 flex items-center justify-center gap-2">
@@ -179,7 +181,7 @@ export function DashboardPage() {
                 ) : completedPerHour != null ? (
                   completedPerHour.toLocaleString()
                 ) : (
-                  "—"
+                  <span className="text-muted-fg" aria-label="Count unavailable">—</span>
                 )}
               </div>
               <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
@@ -187,6 +189,12 @@ export function DashboardPage() {
           </Card>
         </Link>
       </div>
+
+      {statsQuery.isError && (
+        <p className="text-sm text-danger-subtle-fg" role="alert" data-testid="stats-error">
+          Failed to load job counts: {statsQuery.error.message}
+        </p>
+      )}
 
       {/* Total jobs count */}
       {totalJobs != null && (
