@@ -3,7 +3,7 @@
 # Finding jobs
 
 One filter describes "which jobs" everywhere Awa answers the question: the
-admin UI's jobs page and DLQ page, `awa job list` and `awa dlq list`, Python's
+admin UI's Jobs and Dead letters pages, `awa job list` and `awa dlq list`, Python's
 `find_jobs`, and batch operations' preview and execution
 ([ADR-049](../adr/049-job-filter-and-indexed-tags/index.md)). The same filter selects
 the same jobs on every one of them.

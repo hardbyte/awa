@@ -4492,7 +4492,7 @@ the participation path for SQL-native producers.</p>
 <h3 id="operator-workflow">Operator workflow<a class="headerlink" href="#operator-workflow" title="Permanent link">&para;</a></h3>
 <p>Once DLQ is on, operators interact with it through:</p>
 <ul>
-<li><strong>Web UI</strong> — DLQ tab with retry, purge, and per-row failure detail.</li>
+<li><strong>Web UI</strong> — Dead letters page (and a Dead letters tab on each queue) with retry, purge, and per-row failure detail.</li>
 <li><strong>CLI</strong> — <code>awa dlq list</code>, <code>awa dlq retry &lt;id&gt;</code>, <code>awa dlq purge</code>.</li>
 <li><strong>REST</strong> — <code>/api/dlq/*</code> endpoints (same actions as the UI).</li>
 <li><strong>Python / Rust</strong> — <code>client.dlq_*</code> admin methods for programmatic retry / purge.</li>
@@ -4564,7 +4564,7 @@ the participation path for SQL-native producers.</p>
 <p>The cache deduplicates repeated poll requests — multiple browser tabs or rapid refresh cycles within the TTL window hit memory rather than the database. The frontend polling interval is derived from the cache TTL (minimum 5s) and served via <code>/api/capabilities</code>, so clients automatically back off to match the server's refresh rate.</p>
 <p>If you're connecting to a read replica, increase <code>--cache-ttl</code> to reduce load. The dashboard will feel slightly less real-time but won't overwhelm the replica.</p>
 <h3 id="read-only-mode">Read-only mode<a class="headerlink" href="#read-only-mode" title="Permanent link">&para;</a></h3>
-<p><code>awa serve</code> disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. <code>/api/capabilities</code> reports <code>read_only: true</code> and the frontend hides the corresponding buttons. Mutation requests against a read-only server return <code>503 Service Unavailable</code> with a clear error body.</p>
+<p><code>awa serve</code> disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. <code>/api/capabilities</code> reports <code>read_only: true</code> and the frontend shows the corresponding actions disabled, with the reason. Mutation requests against a read-only server return <code>503 Service Unavailable</code> with a clear error body.</p>
 <p>There are two ways to opt in:</p>
 <table>
 <thead>
