@@ -1025,9 +1025,11 @@ const QUEUE_RING_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// advances past per pin read.
 const QUEUE_RING_PIN_ADVANCE_LANES: usize = 32;
 
-/// The most windows of a lane's positions the leader advances past per pin
-/// read; each window is at most 1,000 positions.
-const QUEUE_RING_PIN_ADVANCE_WINDOWS: usize = 4;
+/// How long one pin read keeps advancing lanes' claim cursors, in windows of
+/// at most 1,000 positions, each its own short transaction. A read that uses
+/// it all and moved a cursor is followed by another on the next tick, not
+/// after [`QUEUE_RING_PIN_REFRESH_INTERVAL`].
+const QUEUE_RING_PIN_ADVANCE_BUDGET: Duration = Duration::from_millis(400);
 
 /// A `(queue, priority, enqueue_shard)` ready lane.
 type ReadyLaneKey = (String, i16, i16);
@@ -1039,6 +1041,9 @@ struct QueueRingPinReport {
     lanes: HashSet<ReadyLaneKey>,
     last_warned_at: Option<Instant>,
     last_observed_at: Option<Instant>,
+    /// The last advance used its whole budget and moved a cursor, so spent
+    /// rows remain at lane heads and the next read is due.
+    advance_pending: bool,
 }
 
 impl QueueRingPinReport {
@@ -1076,18 +1081,21 @@ impl QueueRingPinReport {
         warn
     }
 
-    /// Whether lanes were pinning the ring when last read and that read is
+    /// Whether lanes were pinning the ring when last read and either the
+    /// advance left spent rows behind or that read is
     /// [`QUEUE_RING_PIN_REFRESH_INTERVAL`] old.
     fn refresh_due(&self, now: Instant) -> bool {
         !self.lanes.is_empty()
-            && self
-                .last_observed_at
-                .is_none_or(|at| now.duration_since(at) >= QUEUE_RING_PIN_REFRESH_INTERVAL)
+            && (self.advance_pending
+                || self
+                    .last_observed_at
+                    .is_none_or(|at| now.duration_since(at) >= QUEUE_RING_PIN_REFRESH_INTERVAL))
     }
 
     /// Zeroes the gauges of the lanes last reported. Returns whether any were.
     fn clear(&mut self, metrics: &AwaMetrics) -> bool {
         self.last_observed_at = None;
+        self.advance_pending = false;
         for (queue, priority, enqueue_shard) in self.lanes.drain() {
             metrics.record_queue_ring_pinned_ready_age(
                 &queue,
@@ -4404,10 +4412,10 @@ impl MaintenanceService {
                 return;
             }
         };
-        let (pin, released) = if self.control.allowed() {
+        let (pin, released, advance_pending) = if self.control.allowed() {
             self.release_spent_pinning_lanes(store, pin).await
         } else {
-            (Some(pin), false)
+            (Some(pin), false, false)
         };
         if released {
             prune_tracker.reset(PRUNE_BRANCH_QUEUE);
@@ -4426,11 +4434,15 @@ impl MaintenanceService {
                 )
             })
             .collect();
-        let warn = self
-            .queue_ring_pin
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .observe(&pinning, &self.metrics, Instant::now());
+        let warn = {
+            let mut report = self
+                .queue_ring_pin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let warn = report.observe(&pinning, &self.metrics, Instant::now());
+            report.advance_pending = advance_pending;
+            warn
+        };
         if warn {
             let oldest = &pin.lanes[0];
             warn!(
@@ -4447,16 +4459,17 @@ impl MaintenanceService {
 
     /// Advances the claim cursors of `pin`'s lanes over spent head rows.
     /// Returns the pin as it stands afterwards, `None` once no lane pins the
-    /// oldest sealed slot, and whether an advanced lane stopped pinning the
-    /// slot `pin` names, which it logs.
+    /// oldest sealed slot, whether an advanced lane stopped pinning the
+    /// slot `pin` names, which it logs, and whether the advance used its
+    /// whole budget and moved a cursor, so the next read should not wait.
     async fn release_spent_pinning_lanes(
         &self,
         store: &QueueStorage,
         pin: QueueRingPin,
-    ) -> (Option<QueueRingPin>, bool) {
+    ) -> (Option<QueueRingPin>, bool, bool) {
         let lanes = &pin.lanes[..pin.lanes.len().min(QUEUE_RING_PIN_ADVANCE_LANES)];
         let outcome = match store
-            .advance_spent_claim_heads(&self.pool, lanes, QUEUE_RING_PIN_ADVANCE_WINDOWS)
+            .advance_spent_claim_heads_within(&self.pool, lanes, QUEUE_RING_PIN_ADVANCE_BUDGET)
             .await
         {
             Ok(outcome) => outcome,
@@ -4470,7 +4483,7 @@ impl MaintenanceService {
                         "Failed to advance the claim cursors of lanes pinning the queue ring",
                     );
                 }
-                return (Some(pin), false);
+                return (Some(pin), false, false);
             }
         };
         for lane in &outcome.failed {
@@ -4494,9 +4507,10 @@ impl MaintenanceService {
                 );
             }
         }
+        let advance_pending = outcome.budget_exhausted && !outcome.advanced.is_empty();
         let advanced = outcome.advanced;
         if advanced.is_empty() {
-            return (Some(pin), false);
+            return (Some(pin), false, false);
         }
         for lane in &advanced {
             self.metrics.record_queue_ring_claim_cursor_advance(
@@ -4510,7 +4524,7 @@ impl MaintenanceService {
             Ok(after) => after,
             Err(err) => {
                 debug!(error = %err, "Failed to read the lanes pinning the queue ring");
-                return (Some(pin), false);
+                return (Some(pin), false, false);
             }
         };
         let still_pinning = |lane: &SpentClaimHeadAdvance| {
@@ -4536,7 +4550,7 @@ impl MaintenanceService {
                 "Queue ring prune is no longer pinned by this lane: its claim cursor moved over cancelled, moved or claimed rows",
             );
         }
-        (after, released)
+        (after, released, advance_pending)
     }
 
     /// Whether to warn about a failed claim-cursor advance: the first time,
@@ -7574,6 +7588,13 @@ mod tests {
         let observed = start + Duration::from_secs(2) + QUEUE_RING_PIN_WARN_INTERVAL;
         assert!(!report.refresh_due(observed + Duration::from_secs(1)));
         assert!(report.refresh_due(observed + QUEUE_RING_PIN_REFRESH_INTERVAL));
+
+        report.advance_pending = true;
+        assert!(
+            report.refresh_due(observed + Duration::from_secs(1)),
+            "an advance that used its budget is followed by a read on the next tick"
+        );
+        report.advance_pending = false;
 
         assert!(report.clear(&metrics), "clearing a reported pin says so");
         assert!(!report.refresh_due(start + QUEUE_RING_PIN_WARN_INTERVAL));
