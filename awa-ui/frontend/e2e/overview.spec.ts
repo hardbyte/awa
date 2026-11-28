@@ -220,6 +220,21 @@ test.describe("Overview", () => {
     await expect(page.getByTestId("attention-empty")).toContainText("Nothing needs attention · checked");
     await expect(page.getByTestId("queues-attention-empty")).toBeVisible();
     await expect(page.getByTestId("attention-item")).toHaveCount(0);
+    await expect(page.getByTestId("attention-stuck-sample")).toHaveCount(0);
+  });
+
+  test("says stuck jobs were looked for among the newest running jobs only", async ({ page }) => {
+    await mockOverview(page, {
+      stats: { available: 0, running: 250, failed: 0, retryable: 0, scheduled: 0, waiting_external: 0 },
+      queues: [queue({ running: 250 })],
+      dlq: { total: 0, by_queue: [] },
+      failed: [],
+      running: Array.from({ length: 100 }, (_, i) => job({ id: 1000 + i, state: "running", heartbeat_at: now() })),
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("attention-stuck-sample")).toHaveText(
+      "Stuck jobs were looked for among the 100 newest running jobs only."
+    );
   });
 
   test("live data loads every check", async ({ page }) => {

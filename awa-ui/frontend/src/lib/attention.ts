@@ -19,6 +19,8 @@ import {
   ATTENTION_FAILURE_GROUPS,
   BATCH_FAILURE_WINDOW_MS,
   LAG_ATTENTION_SECONDS,
+  OVERVIEW_FAILED_SAMPLE,
+  OVERVIEW_RUNNING_SAMPLE,
   STUCK_HEARTBEAT_MS,
 } from "@/lib/constants";
 import { formatDuration } from "@/lib/time";
@@ -56,9 +58,11 @@ export interface AttentionInput {
   dlqDepth?: DlqDepthResponse;
   batchOps?: BatchOperation[];
   cron?: CronJobRow[];
-  /** The newest failed jobs. */
+  /** The newest failed jobs, at most `OVERVIEW_FAILED_SAMPLE`. */
   failedJobs?: JobRow[];
-  /** The newest running jobs. */
+  /** The newest running jobs, at most `OVERVIEW_RUNNING_SAMPLE`. The jobs
+   * API lists newest first only, so older running jobs go unchecked when
+   * there are more. */
   runningJobs?: JobRow[];
 }
 
@@ -153,18 +157,24 @@ export function attentionItems(input: AttentionInput): AttentionItem[] {
         id: "jobs:stuck",
         severity: "action",
         title: `${plural(stuck.length, "running job")} past deadline or without a recent heartbeat`,
-        detail: `Among the ${formatNumber(runningJobs.length)} newest running jobs`,
+        detail:
+          runningJobs.length >= OVERVIEW_RUNNING_SAMPLE
+            ? `Only the ${formatNumber(runningJobs.length)} newest running jobs were checked; older ones may be stuck too`
+            : `Of ${plural(runningJobs.length, "running job")}`,
         target: { to: "/jobs", search: { state: "running" } },
       });
     }
   }
 
   if (failedJobs) {
+    const sampled = failedJobs.length >= OVERVIEW_FAILED_SAMPLE;
     for (const group of groupFailures(failedJobs).slice(0, ATTENTION_FAILURE_GROUPS)) {
       push(3, group.count, {
         id: `failures:${group.kind}:${group.key}`,
         severity: "action",
-        title: `${formatNumber(group.count)}× ${group.key} in ${kindName(failedJobs, group.kind)}`,
+        title:
+          `${formatNumber(group.count)}× ${group.key} in ${kindName(failedJobs, group.kind)}` +
+          (sampled ? ` among the newest ${formatNumber(failedJobs.length)} failed jobs` : ""),
         detail: group.summary,
         target: { to: "/jobs", search: { state: "failed", q: `kind:${group.kind}` } },
       });

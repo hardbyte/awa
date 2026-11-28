@@ -7,6 +7,7 @@ import {
   queuesNeedingAttention,
   type AttentionInput,
 } from "@/lib/attention";
+import { OVERVIEW_FAILED_SAMPLE, OVERVIEW_RUNNING_SAMPLE } from "@/lib/constants";
 import type {
   BatchOperation,
   CronJobRow,
@@ -263,7 +264,30 @@ describe("attentionItems", () => {
     ];
     const items = attentionItems({ now: NOW, runningJobs: running });
     expect(items).toHaveLength(1);
-    expect(items[0]).toMatchObject({ id: "jobs:stuck", title: "2 running jobs past deadline or without a recent heartbeat" });
+    expect(items[0]).toMatchObject({
+      id: "jobs:stuck",
+      title: "2 running jobs past deadline or without a recent heartbeat",
+      detail: "Of 4 running jobs",
+    });
+  });
+
+  it("says when the running jobs checked for stuck ones are only the newest", () => {
+    const running = Array.from({ length: OVERVIEW_RUNNING_SAMPLE }, (_, i) =>
+      job({ id: i + 1, state: "running", heartbeat_at: i === 0 ? ago(5 * 60_000) : ago(1000) })
+    );
+    const [item] = attentionItems({ now: NOW, runningJobs: running });
+    expect(item!.detail).toBe(
+      `Only the ${OVERVIEW_RUNNING_SAMPLE} newest running jobs were checked; older ones may be stuck too`
+    );
+  });
+
+  it("says a failure count comes from the newest failed jobs when the sample is full", () => {
+    const failed = Array.from({ length: OVERVIEW_FAILED_SAMPLE }, (_, i) =>
+      job({ id: i + 1, kind: "charge", errors: [{ error: "GatewayTimeout: slow", attempt: 4 }] })
+    );
+    expect(attentionItems({ now: NOW, failedJobs: failed }).map((i) => i.title)).toEqual([
+      `${OVERVIEW_FAILED_SAMPLE}× GatewayTimeout in charge among the newest ${OVERVIEW_FAILED_SAMPLE} failed jobs`,
+    ]);
   });
 
   it("shows recent failed bulk operations as actions and running ones as notices", () => {

@@ -332,6 +332,11 @@ export function DashboardPage() {
                     {" "}· checked <Time value={new Date(checkedAt).toISOString()} />
                   </>
                 )}
+                {figures.stuck && figures.stuck.sampled >= OVERVIEW_RUNNING_SAMPLE && (
+                  <span className="block" data-testid="attention-stuck-sample">
+                    Stuck jobs were looked for among the {formatNumber(figures.stuck.sampled)} newest running jobs only.
+                  </span>
+                )}
               </span>
             </p>
           )}
