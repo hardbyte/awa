@@ -33,10 +33,33 @@ pub enum Persona {
     ClaimAbandon,
     /// Producers that enqueue inside their own REPEATABLE READ and SERIALIZABLE transactions.
     Txn,
+    /// One queue under strict priority whose priority-1 lane never runs dry, with a
+    /// trickle of priority-4 jobs (#779). Not in the default set.
+    Starve,
 }
 
 impl Persona {
-    pub const ALL: [Persona; 15] = [
+    pub const ALL: [Persona; 16] = [
+        Persona::Mia,
+        Persona::Tom,
+        Persona::Priya,
+        Persona::Sam,
+        Persona::Alex,
+        Persona::Chaos,
+        Persona::Watchers,
+        Persona::Support,
+        Persona::UiOps,
+        Persona::Impatient,
+        Persona::Python,
+        Persona::Fanout,
+        Persona::ShardOps,
+        Persona::ClaimAbandon,
+        Persona::Txn,
+        Persona::Starve,
+    ];
+
+    /// The personas a run starts when `AWA_SOAK_PERSONAS` is unset.
+    pub const DEFAULT: [Persona; 15] = [
         Persona::Mia,
         Persona::Tom,
         Persona::Priya,
@@ -71,6 +94,7 @@ impl Persona {
             Persona::ShardOps => "shardops",
             Persona::ClaimAbandon => "abandon",
             Persona::Txn => "txn",
+            Persona::Starve => "starve",
         }
     }
 
@@ -91,7 +115,7 @@ impl FromStr for Persona {
             .into_iter()
             .find(|persona| persona.name() == value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops,abandon,txn")
+                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops,abandon,txn,starve")
             })
     }
 }
@@ -191,6 +215,16 @@ pub struct SoakConfig {
     pub txn_producers: u64,
     pub txn_serializable_percent: u64,
     pub txn_hold: Duration,
+    /// The starve persona: workers on its queue, the priority-1 backlog its producer
+    /// keeps, each job's handler time, the interval between priority-4 jobs, whether
+    /// ring-pin aging escalation is on, and the longest priority-4 wait it accepts
+    /// with escalation on.
+    pub starve_workers: u32,
+    pub starve_depth: u64,
+    pub starve_handler: Duration,
+    pub starve_trickle: Duration,
+    pub starve_escalation: bool,
+    pub starve_max_wait: Duration,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -250,7 +284,7 @@ impl SoakConfig {
                 .split(',')
                 .map(str::parse)
                 .collect::<Result<Vec<Persona>, _>>()?,
-            None => Persona::ALL.to_vec(),
+            None => Persona::DEFAULT.to_vec(),
         };
         let seed = env_parse("AWA_SOAK_SEED").unwrap_or_else(|| {
             std::time::SystemTime::now()
@@ -363,6 +397,18 @@ impl SoakConfig {
                 .unwrap_or(50)
                 .min(100),
             txn_hold: Duration::from_millis(env_parse("AWA_SOAK_TXN_HOLD_MS").unwrap_or(40)),
+            starve_workers: env_parse("AWA_SOAK_STARVE_WORKERS").unwrap_or(16),
+            starve_depth: env_parse("AWA_SOAK_STARVE_DEPTH").unwrap_or(2_000),
+            starve_handler: Duration::from_millis(
+                env_parse("AWA_SOAK_STARVE_HANDLER_MS").unwrap_or(5),
+            ),
+            starve_trickle: Duration::from_millis(
+                env_parse("AWA_SOAK_STARVE_TRICKLE_MS").unwrap_or(1_000),
+            ),
+            starve_escalation: env_parse::<u8>("AWA_SOAK_STARVE_ESCALATION").unwrap_or(1) != 0,
+            starve_max_wait: Duration::from_secs(
+                env_parse("AWA_SOAK_STARVE_MAX_WAIT_S").unwrap_or(300),
+            ),
         })
     }
 

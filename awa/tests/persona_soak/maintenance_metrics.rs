@@ -11,7 +11,11 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const PREFIXES: [&str; 2] = ["awa.maintenance.", "awa.queue.due."];
+const PREFIXES: [&str; 3] = [
+    "awa.maintenance.",
+    "awa.queue.due.",
+    "awa.dispatch.ring_pin",
+];
 const EXPORT_EVERY: Duration = Duration::from_secs(10);
 
 pub struct Capture {

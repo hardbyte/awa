@@ -11,7 +11,8 @@
 # Environment:
 #   AWA_SOAK_SECONDS          load phase length per engine (default 900)
 #   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos,
-#                             watchers,support,uiops,impatient,python,fanout,shardops,abandon,txn
+#                             watchers,support,uiops,impatient,python,fanout,shardops,abandon,txn;
+#                             starve runs only when named
 #   AWA_SOAK_SEED             fixes the workload mix and chaos schedule
 #   AWA_SOAK_SCALE            multiplies rates and queue counts (default 1)
 #   AWA_SOAK_SHARDOPS_SCALE   multiplies the shardops persona's rates on its own (default 1)
@@ -32,6 +33,12 @@
 #                             transactions that are SERIALIZABLE rather than REPEATABLE READ
 #                             (default 50) and the longest pause between a transaction's first
 #                             read and its enqueue (default 40)
+#   AWA_SOAK_STARVE_WORKERS, AWA_SOAK_STARVE_DEPTH, AWA_SOAK_STARVE_HANDLER_MS,
+#   AWA_SOAK_STARVE_TRICKLE_MS, AWA_SOAK_STARVE_ESCALATION, AWA_SOAK_STARVE_MAX_WAIT_S
+#                             the starve persona's workers (default 16), priority-1 backlog
+#                             (2000), handler time (5), interval between priority-4 jobs (1000),
+#                             ring-pin aging escalation (1, on) and the longest priority-4 wait
+#                             accepted with escalation on (300)
 #   AWA_SOAK_RESCUE_INTERVAL_SECONDS
 #                             heartbeat and deadline rescue interval of every runtime (default: the
 #                             harness's 3 s and 2 s; the library default for heartbeat rescue is 30 s)
