@@ -66,7 +66,7 @@ export function KindsPage() {
 
   return (
     <Page className="space-y-4">
-      <PageHeader title="Job Kinds" />
+      <PageHeader title="Job kinds" />
 
       {kinds.length === 0 ? (
         <div

@@ -106,7 +106,7 @@ export function CronPage() {
 
   return (
     <Page className="space-y-4">
-      <PageHeader title="Cron Schedules" />
+      <PageHeader title="Schedules" />
       {(reconciliation.data ?? []).map((plan) => (
         <details key={plan.owner_id} className="rounded-lg border p-3">
           <summary className="cursor-pointer font-medium">

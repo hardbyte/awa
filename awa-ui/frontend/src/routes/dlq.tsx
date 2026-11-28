@@ -8,7 +8,6 @@ import { useState, useCallback } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import {
   fetchDlq,
-  fetchDlqDepth,
   bulkRetryDlq,
   bulkPurgeDlq,
 } from "@/lib/api";
@@ -29,6 +28,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
+import { dlqDepthQuery } from "@/lib/shared-queries";
 import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
@@ -83,10 +83,7 @@ export function DlqPage() {
     enabled: !searchError,
   });
 
-  const depthQuery = useManagedQuery({
-    queryKey: ["dlq-depth"],
-    queryFn: fetchDlqDepth,
-  });
+  const depthQuery = useManagedQuery(dlqDepthQuery);
 
   // The bulk actions submit a batch operation, which the maintenance leader
   // applies a chunk at a time after the request returns.
@@ -163,7 +160,7 @@ export function DlqPage() {
     <Page className="space-y-4">
       {dlqQuery.isPlaceholderData && <p role="status">Previous filter results are shown while the new read finishes.</p>}
       <PageHeader
-        title="Dead Letter Queue"
+        title="Dead letters"
         status={depthQuery.data && (
           <div className="flex flex-wrap gap-2 items-center">
             <Badge intent="danger">

@@ -78,7 +78,7 @@ export function DashboardPage() {
 
   return (
     <Page>
-      <PageHeader title="Dashboard" />
+      <PageHeader title="Overview" />
 
       {/* Headline counter cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

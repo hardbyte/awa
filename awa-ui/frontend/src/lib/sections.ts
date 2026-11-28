@@ -5,8 +5,8 @@ export const SECTION_LABELS: Record<ListRoute, string> = {
   "/jobs": "Jobs",
   "/queues": "Queues",
   "/dlq": "Dead letters",
-  "/runtime": "Runtime",
+  "/runtime": "Fleet",
   "/kinds": "Job kinds",
-  "/cron": "Cron",
-  "/batch-ops": "Batch operations",
+  "/cron": "Schedules",
+  "/batch-ops": "Bulk operations",
 };

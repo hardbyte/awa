@@ -155,7 +155,7 @@ export function RuntimePage() {
 
   return (
     <Page>
-      <PageHeader title="Runtime" />
+      <PageHeader title="Fleet" />
 
       {hasAttention && (
         <Card>

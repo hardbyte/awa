@@ -34,7 +34,7 @@ test.describe("Cron page", () => {
   test("navigate to /cron, heading visible", async ({ page }) => {
     await page.goto("/cron");
     await expect(
-      page.getByRole("heading", { name: "Cron Schedules" })
+      page.getByRole("heading", { name: "Schedules", exact: true })
     ).toBeVisible();
   });
 

@@ -23,6 +23,8 @@ import {
   normalizeInstanceColor,
 } from "@/lib/instance";
 import { Button } from "@/components/ui/button";
+import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
+import { ACTIVE_BATCH_STATES, batchOpsQuery, dlqDepthQuery } from "@/lib/shared-queries";
 import {
   Sidebar,
   SidebarContent,
@@ -367,16 +369,42 @@ const IconBatchOps = () => (
   </svg>
 );
 
-const NAV_ITEMS = [
-  { to: "/", label: "Dashboard", Icon: IconDashboard },
-  { to: "/jobs", label: "Jobs", Icon: IconJobs },
-  { to: "/dlq", label: "Dead letters", Icon: IconDeadLetters },
-  { to: "/kinds", label: "Kinds", Icon: IconKinds },
-  { to: "/queues", label: "Queues", Icon: IconQueues },
-  { to: "/runtime", label: "Runtime", Icon: IconRuntime },
-  { to: "/cron", label: "Cron", Icon: IconCron },
-  { to: "/batch-ops", label: "Batch Ops", Icon: IconBatchOps },
-] as const;
+interface NavItem {
+  to: "/" | ListRoute;
+  label: string;
+  Icon: () => React.JSX.Element;
+}
+
+const NAV_GROUPS: { label?: string; items: NavItem[] }[] = [
+  { items: [{ to: "/", label: "Overview", Icon: IconDashboard }] },
+  {
+    label: "Investigate",
+    items: [
+      { to: "/jobs", label: SECTION_LABELS["/jobs"], Icon: IconJobs },
+      { to: "/dlq", label: SECTION_LABELS["/dlq"], Icon: IconDeadLetters },
+    ],
+  },
+  {
+    label: "Configure",
+    items: [
+      { to: "/queues", label: SECTION_LABELS["/queues"], Icon: IconQueues },
+      { to: "/kinds", label: SECTION_LABELS["/kinds"], Icon: IconKinds },
+      { to: "/cron", label: SECTION_LABELS["/cron"], Icon: IconCron },
+    ],
+  },
+  {
+    label: "Operate",
+    items: [
+      { to: "/runtime", label: SECTION_LABELS["/runtime"], Icon: IconRuntime },
+      { to: "/batch-ops", label: SECTION_LABELS["/batch-ops"], Icon: IconBatchOps },
+    ],
+  },
+];
+
+/** A count for a nav badge, or undefined to show none (zero or unknown). */
+function badgeCount(value: number | undefined): string | undefined {
+  return value !== undefined && value > 0 ? value.toLocaleString() : undefined;
+}
 
 export function Shell() {
   const router = useRouter();
@@ -434,6 +462,18 @@ export function Shell() {
     retry: false,
   });
 
+  // Nav badges. Each shares its key with the page that lists the same data,
+  // and shows nothing on error or zero rather than a misleading count.
+  const dlqDepth = useManagedQuery(dlqDepthQuery);
+  const batchOps = useManagedQuery(batchOpsQuery);
+  const navBadges: Partial<Record<NavItem["to"], string>> = {
+    "/dlq": dlqDepth.isError ? undefined : badgeCount(dlqDepth.data?.total),
+    "/runtime": runtimeQuery.isError ? undefined : badgeCount(runtimeQuery.data?.stale_instances),
+    "/batch-ops": batchOps.isError
+      ? undefined
+      : badgeCount(batchOps.data?.filter((op) => ACTIVE_BATCH_STATES.has(op.state)).length),
+  };
+
   function isActive(to: string): boolean {
     if (to === "/") return currentPath === "/";
     return currentPath.startsWith(to);
@@ -476,19 +516,23 @@ export function Shell() {
         </SidebarHeader>
         <SidebarContent>
           <nav aria-label="Primary">
-          <SidebarSection title="Navigation">
-            {NAV_ITEMS.map((item) => (
-              <SidebarItem
-                key={item.to}
-                href={item.to}
-                isCurrent={isActive(item.to)}
-                tooltip={item.label}
-              >
-                <item.Icon />
-                <SidebarLabel>{item.label}</SidebarLabel>
-              </SidebarItem>
+            {NAV_GROUPS.map((group, index) => (
+              <SidebarSection key={group.label ?? index} {...(group.label ? { label: group.label } : {})}>
+                {group.items.map((item) => (
+                  <SidebarItem
+                    key={item.to}
+                    href={item.to}
+                    isCurrent={isActive(item.to)}
+                    tooltip={item.label}
+                    badge={navBadges[item.to]}
+                    data-testid={`nav-${item.to === "/" ? "overview" : item.to.slice(1)}`}
+                  >
+                    <item.Icon />
+                    <SidebarLabel>{item.label}</SidebarLabel>
+                  </SidebarItem>
+                ))}
+              </SidebarSection>
             ))}
-          </SidebarSection>
           </nav>
         </SidebarContent>
         <SidebarFooter>

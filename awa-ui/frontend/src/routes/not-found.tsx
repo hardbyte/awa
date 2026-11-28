@@ -15,7 +15,7 @@ export function NotFoundPage() {
         to="/"
         className="mt-6 inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-fg transition-colors hover:opacity-80"
       >
-        Go to Dashboard
+        Go to Overview
       </Link>
     </div>
   );

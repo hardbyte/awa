@@ -101,10 +101,10 @@ test.describe("Phone navigation", () => {
 test.describe("Navigation", () => {
   test("Dead letters is in the sidebar and opens the DLQ", async ({ page }) => {
     await page.goto("/");
-    const nav = page.locator('[data-slot="sidebar-section"]').first();
+    const nav = page.getByRole("navigation", { name: "Primary" });
     await nav.getByRole("link", { name: "Dead letters" }).click();
     await expect(page).toHaveURL(/\/dlq$/);
-    await expect(page.getByRole("heading", { name: "Dead Letter Queue" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Dead letters", exact: true })).toBeVisible();
     await expect(nav.getByRole("link", { name: "Dead letters" })).toHaveAttribute("aria-current", "page");
   });
 
@@ -114,7 +114,7 @@ test.describe("Navigation", () => {
     await page.goto("/dlq");
     await expect(page).toHaveTitle(/^Dead letters · /);
     await page.goto("/");
-    await expect(page).toHaveTitle(/^Dashboard · /);
+    await expect(page).toHaveTitle(/^Overview · /);
   });
 });
 
@@ -214,8 +214,8 @@ test.describe("Not-found detail pages", () => {
   for (const { path, title, back } of [
     { path: "/jobs/999999999", title: "Job #999999999 not found", back: "Back to jobs" },
     { path: "/queues/no-such-queue", title: 'Queue "no-such-queue" not found', back: "Back to queues" },
-    { path: "/dlq/999999999", title: "DLQ row #999999999 not found", back: "Back to DLQ" },
-    { path: "/runtime/no-such-instance", title: "Runtime instance not found", back: "Back to runtime" },
+    { path: "/dlq/999999999", title: "Dead letter #999999999 not found", back: "Back to dead letters" },
+    { path: "/runtime/no-such-instance", title: "Fleet instance not found", back: "Back to fleet" },
   ]) {
     test(`${path} explains and links back`, async ({ page }) => {
       await page.goto(path);

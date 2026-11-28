@@ -29,7 +29,7 @@ export function pageTitle(pathname: string): string {
   switch (section) {
     case "":
     case undefined:
-      return "Dashboard";
+      return "Overview";
     case "jobs":
       return detail ? `Job #${detail}` : "Jobs";
     case "dlq":
@@ -37,13 +37,13 @@ export function pageTitle(pathname: string): string {
     case "queues":
       return detail ? `Queue ${detail}` : "Queues";
     case "kinds":
-      return "Kinds";
+      return "Job kinds";
     case "runtime":
-      return detail ? "Runtime instance" : "Runtime";
+      return detail ? "Fleet instance" : "Fleet";
     case "cron":
-      return "Cron";
+      return "Schedules";
     case "batch-ops":
-      return "Batch Ops";
+      return "Bulk operations";
     default:
       return "Not found";
   }

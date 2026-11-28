@@ -73,11 +73,11 @@ export function DlqDetailPage() {
   if (rowQuery.data === undefined && rowQuery.error && !isNotFoundError(rowQuery.error)) {
     return (
       <ResourceLoadError
-        noun={`DLQ row #${jobId}`}
+        noun={`dead letter #${jobId}`}
         error={rowQuery.error}
         onRetry={() => void rowQuery.refetch()}
         backTo="/dlq"
-        backLabel="Back to DLQ"
+        backLabel="Back to dead letters"
       />
     );
   }
@@ -85,10 +85,10 @@ export function DlqDetailPage() {
   if (!row) {
     return (
       <ResourceNotFound
-        title={`DLQ row #${jobId} not found`}
+        title={`Dead letter #${jobId} not found`}
         reason="This row may have been retried or purged."
         backTo="/dlq"
-        backLabel="Back to DLQ"
+        backLabel="Back to dead letters"
       />
     );
   }

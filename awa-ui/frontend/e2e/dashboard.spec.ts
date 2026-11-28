@@ -6,10 +6,10 @@ function isQueuesListResponse(response: Response): boolean {
 }
 
 test.describe("Dashboard page", () => {
-  test("page loads and shows Dashboard heading", async ({ page }) => {
+  test("page loads and shows the Overview heading", async ({ page }) => {
     await page.goto("/");
     await expect(
-      page.getByRole("heading", { name: "Dashboard" })
+      page.getByRole("heading", { name: "Overview" })
     ).toBeVisible();
   });
 

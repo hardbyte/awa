@@ -12,7 +12,7 @@ function policy(key: QueryKey) {
   return {
     cached: ["queues", "queue-runtime", "runtime", "storage", "stats"].includes(name) && key[1] !== "timeseries",
     manualOnly: name === "jobs-count", stalesCounts: ["jobs", "job", "dlq", "dlq-job"].includes(name), stopAfterNull: name === "storage",
-    intervalMs: ["job", "batch-ops"].includes(name) ? 2000 : name === "dlq-job" ? 10_000 : undefined,
+    intervalMs: name === "job" ? 2000 : name === "dlq-job" ? 10_000 : undefined,
   };
 }
 interface Options<T> { queryKey: QueryKey; queryFn: () => Promise<T>; enabled?: boolean; paused?: boolean; staleTime?: number; retry?: boolean }

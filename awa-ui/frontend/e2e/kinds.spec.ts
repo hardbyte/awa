@@ -3,7 +3,7 @@ import { test, expect } from "@playwright/test";
 test.describe("Kinds page", () => {
   test("navigate to /kinds, heading visible", async ({ page }) => {
     await page.goto("/kinds");
-    await expect(page.getByRole("heading", { name: "Job Kinds" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Job kinds" })).toBeVisible();
   });
 
   test("kinds table renders descriptor-backed and legacy kinds", async ({ page }) => {

@@ -69,7 +69,7 @@ test.describe("Batch operations page", () => {
     });
 
     await page.goto("/batch-ops");
-    await expect(page.getByRole("heading", { name: "Batch Operations" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Bulk operations" })).toBeVisible();
     await page.getByLabel("Queue filter").fill("e2e_test");
     await page.getByRole("textbox", { name: "Priority" }).fill("1");
     await page.getByRole("button", { name: "Preview" }).click();

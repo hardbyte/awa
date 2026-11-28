@@ -24,17 +24,17 @@ describe("instanceTitle", () => {
 
 describe("documentTitle", () => {
   it("names the page for each route", () => {
-    expect(documentTitle("/", null)).toBe("Dashboard · AWA");
+    expect(documentTitle("/", null)).toBe("Overview · AWA");
     expect(documentTitle("/jobs", null)).toBe("Jobs · AWA");
     expect(documentTitle("/jobs/42", null)).toBe("Job #42 · AWA");
     expect(documentTitle("/dlq", null)).toBe("Dead letters · AWA");
     expect(documentTitle("/queues/email%20out", null)).toBe("Queue email out · AWA");
-    expect(documentTitle("/batch-ops/", null)).toBe("Batch Ops · AWA");
+    expect(documentTitle("/batch-ops/", null)).toBe("Bulk operations · AWA");
     expect(documentTitle("/nope", null)).toBe("Not found · AWA");
   });
 
   it("keeps the instance name", () => {
-    expect(documentTitle("/cron", "cloudsql-prod")).toBe("Cron · cloudsql-prod — AWA");
+    expect(documentTitle("/cron", "cloudsql-prod")).toBe("Schedules · cloudsql-prod — AWA");
   });
 });
 

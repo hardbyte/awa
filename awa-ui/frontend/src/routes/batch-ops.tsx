@@ -5,7 +5,6 @@ import { useSearch } from "@tanstack/react-router";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   cancelBatchOperation,
-  fetchBatchOperations,
   previewBatchOperation,
   submitBatchOperation,
   toWireFilter,
@@ -18,6 +17,7 @@ import {
 import { isJobId, toRfc3339 } from "@/components/SearchBar";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListState } from "@/components/ListState";
+import { batchOpsQuery } from "@/lib/shared-queries";
 import { BatchStateBadge } from "@/components/StateBadge";
 import { describeFilter, formatCount, isNarrowing, previewCount, sameFilter } from "@/lib/batch";
 import { useReadOnly } from "@/hooks/use-read-only";
@@ -258,10 +258,7 @@ export function BatchOpsPage() {
       ? "Operation or filter changed; preview again"
       : "Preview first";
 
-  const operationsQuery = useManagedQuery({
-    queryKey: ["batch-ops"],
-    queryFn: () => fetchBatchOperations({ limit: 50 }),
-  });
+  const operationsQuery = useManagedQuery(batchOpsQuery);
 
   const previewMutation = useMutation({
     mutationFn: (previewed: BatchOperationPayload) => {
@@ -302,7 +299,7 @@ export function BatchOpsPage() {
   return (
     <Page>
       <PageHeader
-        title="Batch Operations"
+        title="Bulk operations"
         description="Preview, submit, and monitor durable bulk mutations, applied a chunk at a time."
       />
 

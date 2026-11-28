@@ -69,7 +69,7 @@ export function RuntimeInstancePage() {
         error={runtimeQuery.error}
         onRetry={() => void runtimeQuery.refetch()}
         backTo="/runtime"
-        backLabel="Back to runtime"
+        backLabel="Back to fleet"
       />
     );
   }
@@ -81,10 +81,10 @@ export function RuntimeInstancePage() {
   if (!instance) {
     return (
       <ResourceNotFound
-        title="Runtime instance not found"
+        title="Fleet instance not found"
         reason="The snapshot may have expired or this URL is stale."
         backTo="/runtime"
-        backLabel="Back to runtime"
+        backLabel="Back to fleet"
       />
     );
   }
