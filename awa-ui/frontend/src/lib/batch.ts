@@ -324,11 +324,23 @@ export function actsOnDlq(kind: string): boolean {
   return kind === "retry_from_dlq" || kind === "purge_dlq";
 }
 
-/** A wire filter as a Jobs or Dead letters search, with the one state the
- * Jobs page can show when the filter names exactly one. */
-export function filterToSearch(filter: BatchOperationFilter): { filter: SearchFilters; state?: string } {
+/**
+ * A wire filter as a Jobs or Dead letters search. The Jobs page shows one
+ * state at a time, so `state` is set when the filter, or else the operation
+ * kind, names exactly one; `wider` names the states, in words, when there are
+ * several and the list will show every state. `liveOnly` is set when the list
+ * could show dead letters, which only the DLQ kinds act on.
+ */
+export function filterToSearch(
+  filter: BatchOperationFilter,
+  kind?: string
+): { filter: SearchFilters; state?: string; wider?: string; liveOnly: boolean } {
   const tags = filter.tag === undefined ? [] : [filter.tag].flat();
-  const states = filter.state === undefined ? [] : [filter.state].flat();
+  const filterStates = filter.state === undefined ? [] : [filter.state].flat();
+  const option = KIND_OPTIONS.find((candidate) => candidate.kind === kind);
+  const states = filterStates.length > 0 ? filterStates : option?.states ?? [];
+  const words = (list: string[]) =>
+    `${list.slice(0, -1).join(", ")} or ${list[list.length - 1]}`.replace(/_/g, " ");
   const search: SearchFilters = {};
   if (filter.kind) search.kind = filter.kind;
   if (filter.queue) search.queue = filter.queue;
@@ -336,7 +348,12 @@ export function filterToSearch(filter: BatchOperationFilter): { filter: SearchFi
   if (filter.ids && filter.ids.length > 0) search.ids = filter.ids;
   if (filter.created_at_gte) search.createdGte = filter.created_at_gte;
   if (filter.created_at_lt) search.createdLt = filter.created_at_lt;
-  return { filter: search, state: states.length === 1 ? states[0] : undefined };
+  return {
+    filter: search,
+    state: states.length === 1 ? states[0] : undefined,
+    wider: states.length < 2 ? undefined : filterStates.length > 0 || !option ? words(states) : option.scope,
+    liveOnly: kind !== undefined && !actsOnDlq(kind) && (states.length === 0 || states.includes("failed")),
+  };
 }
 
 /** What an operation sets, in words, or null when its kind takes nothing. */

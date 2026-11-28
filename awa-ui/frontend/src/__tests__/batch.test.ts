@@ -148,8 +148,34 @@ describe("operation details", () => {
     expect(filterToSearch({ kind: "k", tag: ["a", "b"], state: "failed" })).toEqual({
       filter: { kind: "k", tags: ["a", "b"] },
       state: "failed",
+      liveOnly: false,
     });
-    expect(filterToSearch({ queue: "q", state: ["available", "scheduled"] }).state).toBeUndefined();
+    expect(filterToSearch({ queue: "q", state: ["available", "scheduled"] })).toMatchObject({
+      state: undefined,
+      wider: "available or scheduled",
+    });
+  });
+
+  it("narrows to the states the operation kind acts on, or says the list is wider", () => {
+    expect(filterToSearch({ queue: "q" }, "discard")).toMatchObject({ state: "failed", liveOnly: true });
+    expect(filterToSearch({ queue: "q" }, "retry")).toMatchObject({
+      state: undefined,
+      wider: "failed or cancelled",
+      liveOnly: true,
+    });
+    expect(filterToSearch({ queue: "q" }, "cancel")).toMatchObject({
+      wider: "available, scheduled, retryable, running or waiting",
+      liveOnly: false,
+    });
+    expect(filterToSearch({ queue: "q", state: ["running", "waiting_external", "retryable"] }, "cancel").wider).toBe(
+      "running, waiting external or retryable"
+    );
+    expect(filterToSearch({ queue: "q", state: "cancelled" }, "retry")).toMatchObject({
+      state: "cancelled",
+      wider: undefined,
+      liveOnly: false,
+    });
+    expect(filterToSearch({ queue: "q" }, "purge_dlq")).toMatchObject({ state: undefined, wider: undefined, liveOnly: false });
   });
 
   it("reports changed and skipped separately", () => {

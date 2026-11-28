@@ -63,6 +63,25 @@ test.describe("Bulk operation page", () => {
     const url = new URL(page.url());
     expect(url.searchParams.get("state")).toBe("failed");
     expect(url.searchParams.get("q")).toBe("kind:e2e_job");
+    expect(url.searchParams.get("dead_lettered")).toBe("false");
+  });
+
+  test("without a state the link narrows to the kind's one state, or says the list is wider", async ({ page }) => {
+    let op = operation({ op_kind: "discard", filter: { kind: "e2e_job" } });
+    await page.route(`**/api/batch-ops/${ID}`, (route) =>
+      route.request().method() === "GET" ? route.fulfill({ json: op }) : route.fallback()
+    );
+    await page.goto(`/batch-ops/${ID}`);
+    await expect(page.getByRole("link", { name: "Open matching jobs" })).toHaveAttribute(
+      "href",
+      /\/jobs\?state=failed&q=kind%3Ae2e_job&dead_lettered=false$/
+    );
+
+    op = operation({ op_kind: "retry", filter: { kind: "e2e_job" } });
+    await page.reload();
+    const wider = page.getByRole("link", { name: "Open matching jobs in every state, not only failed or cancelled" });
+    await expect(wider).toBeVisible();
+    await expect(wider).not.toHaveAttribute("href", /state=/);
   });
 
   test("a DLQ operation links to the matching dead letters", async ({ page }) => {

@@ -147,7 +147,7 @@ export function BatchOpDetailPage() {
     operation.total_matched === null
       ? filterWords.charAt(0).toUpperCase() + filterWords.slice(1)
       : `${formatNumber(operation.total_matched)} ${filterWords}`;
-  const matching = filterToSearch(operation.filter);
+  const matching = filterToSearch(operation.filter, operation.op_kind);
   const spec = describeSpec(operation.op_kind, operation.spec);
   const active = !operation.finalized_at;
 
@@ -184,9 +184,14 @@ export function BatchOpDetailPage() {
             to={actsOnDlq(operation.op_kind) ? "/dlq" : "/jobs"}
             filter={matching.filter}
             state={matching.state}
+            liveOnly={matching.liveOnly}
             className="text-sm"
           >
-            {actsOnDlq(operation.op_kind) ? "Open matching dead letters" : "Open matching jobs"}
+            {actsOnDlq(operation.op_kind)
+              ? "Open matching dead letters"
+              : matching.wider
+                ? `Open matching jobs in every state, not only ${matching.wider}`
+                : "Open matching jobs"}
           </FilterLink>
         </CardContent>
       </Card>

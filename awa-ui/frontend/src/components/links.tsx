@@ -137,13 +137,22 @@ export function FilterLink({
   to = "/jobs",
   filter,
   state,
+  liveOnly = false,
   className = "",
   children,
   "aria-label": ariaLabel,
-}: EntityLinkProps & { to?: "/jobs" | "/dlq"; filter: SearchFilters; state?: string; "aria-label"?: string }) {
+}: EntityLinkProps & {
+  to?: "/jobs" | "/dlq";
+  filter: SearchFilters;
+  state?: string;
+  /** Leave dead letters out of the Jobs list. */
+  liveOnly?: boolean;
+  "aria-label"?: string;
+}) {
   const q = buildSearch(filter);
-  const search: Record<string, string> = {};
+  const search: Record<string, string | boolean> = {};
   if (state && to === "/jobs") search.state = state;
+  if (liveOnly && to === "/jobs") search.dead_lettered = false;
   if (q) search.q = q;
   return (
     <Link to={to} search={search} className={`${entityLinkClass} ${className}`} aria-label={ariaLabel}>
