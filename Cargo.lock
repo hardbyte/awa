@@ -463,6 +463,7 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
