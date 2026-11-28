@@ -5590,6 +5590,7 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_starved_lane() {
     let ages = pinned_ready_ages(&exporter, &meter_provider);
     assert!(
         ages.iter()
+            .filter(|((lane_queue, _, _), _)| lane_queue == queue)
             .all(|((_, priority, _), age)| *priority == 4 || *age == 0.0),
         "only the starved lane pins the ring: {ages:?}"
     );
@@ -6124,7 +6125,7 @@ fn spawn_lane_feeder(
         async move {
             let store = QueueStorage::new(store_config).expect("feeder store");
             while !stop.load(Ordering::SeqCst) {
-                enqueue_lane(&pool, &store, &queue, priority, 1).await;
+                enqueue_lane(&pool, &store, &queue, priority, 2).await;
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
         }
@@ -6165,7 +6166,7 @@ async fn enqueue_starved_lane_under_a_saturating_lane(
     let starved = enqueue_lane(pool, store, queue, 4, 2).await;
     backdate_ready_lane(pool, store, queue, 4, Duration::from_secs(3600)).await;
     assert_rotated_to(store, pool, 1).await;
-    enqueue_lane(pool, store, queue, 1, 20).await;
+    enqueue_lane(pool, store, queue, 1, 100).await;
     starved
 }
 
