@@ -274,8 +274,7 @@ test.describe("Runtime page", () => {
 
     await page.goto("/runtime");
     const instancesGrid = page.getByRole("grid", { name: "Runtime instances" });
-    // Whole row is clickable (design refresh: affordance fix)
-    await instancesGrid.getByRole("rowheader", { name: /worker-a/ }).click();
+    await instancesGrid.getByRole("link", { name: "worker-a" }).click();
 
     await expect(page).toHaveURL(/\/runtime\/11111111-1111-4111-8111-111111111111$/);
     await expect(page.getByRole("heading", { name: "worker-a" })).toBeVisible();

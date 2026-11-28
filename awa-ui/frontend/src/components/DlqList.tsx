@@ -5,7 +5,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useState, useCallback } from "react";
-import { useNavigate, useSearch, Link } from "@tanstack/react-router";
+import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchDlq,
   bulkRetryDlq,
@@ -26,7 +26,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
-import { BatchOpLink } from "@/components/links";
+import { BatchOpLink, DlqLink, KindLink, QueueLink } from "@/components/links";
 import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
@@ -243,23 +243,13 @@ export function DlqList({ lockedFilter }: DlqListProps) {
           {rows.map((row) => (
             <TableRow key={row.id}>
               <TableCell>
-                <Link
-                  to="/dlq/$id"
-                  params={{ id: String(row.id) }}
-                  className="font-mono underline"
-                >
-                  {row.id}
-                </Link>
+                <DlqLink id={row.id}>{row.id}</DlqLink>
               </TableCell>
-              <TableCell className="font-mono">{row.kind}</TableCell>
               <TableCell>
-                <Link
-                  to="/queues/$name"
-                  params={{ name: row.queue }}
-                  className="underline"
-                >
-                  {row.queue}
-                </Link>
+                <KindLink kind={row.kind} descriptor={row.kind_descriptor} />
+              </TableCell>
+              <TableCell>
+                <QueueLink queue={row.queue} descriptor={row.queue_descriptor} />
               </TableCell>
               <TableCell>{row.dlq_reason}</TableCell>
               <TableCell>

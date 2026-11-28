@@ -27,6 +27,7 @@ import { BatchOpsPage } from "./routes/batch-ops";
 import { BatchOpNewPage } from "./routes/batch-op-new";
 import { BatchOpDetailPage } from "./routes/batch-op-detail";
 import { BATCH_PREFILL_KEYS } from "./lib/batch";
+import { foldLegacyFilter } from "./lib/legacy-url";
 import { RuntimePage } from "./routes/runtime";
 import { RuntimeInstancePage } from "./routes/runtime-detail";
 import { NotFoundPage } from "./routes/not-found";
@@ -43,9 +44,18 @@ const dashboardRoute = createRoute({
   component: DashboardPage,
 });
 
+/** Older links filter with kind=, queue= and tag=; fold them into q. */
+function normaliseLegacyFilter(to: "/jobs" | "/dlq") {
+  return ({ search }: { search: unknown }) => {
+    const folded = foldLegacyFilter(search as Record<string, unknown>);
+    if (folded) throw redirect({ to, search: folded, replace: true });
+  };
+}
+
 const jobsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/jobs",
+  beforeLoad: normaliseLegacyFilter("/jobs"),
   component: JobsPage,
 });
 
@@ -118,6 +128,7 @@ const cronDetailRoute = createRoute({
 const dlqRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/dlq",
+  beforeLoad: normaliseLegacyFilter("/dlq"),
   component: DlqPage,
 });
 

@@ -5,13 +5,14 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useParams, Link, useNavigate } from "@tanstack/react-router";
+import { useParams, useNavigate } from "@tanstack/react-router";
 import { fetchJob, retryJob, cancelJob } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Page, PageHeader } from "@/components/Page";
+import { KindLink, QueueLink, ScheduleLink, TagChip } from "@/components/links";
 import { SECTION_LABELS } from "@/lib/sections";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
@@ -48,12 +49,16 @@ function descriptorLabel(
   return displayName?.trim() ? displayName : fallback;
 }
 
-function jobKindLabel(job: JobRow): string {
-  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
+/** The schedule that enqueued a job, from the metadata cron fires record. */
+function scheduleOrigin(metadata: unknown): { name: string; manual: boolean } | null {
+  if (!metadata || typeof metadata !== "object") return null;
+  const fields = metadata as Record<string, unknown>;
+  if (typeof fields.cron_name !== "string" || !fields.cron_name) return null;
+  return { name: fields.cron_name, manual: fields.triggered_manually === true };
 }
 
-function queueLabel(job: JobRow): string {
-  return descriptorLabel(job.queue_descriptor?.display_name, job.queue);
+function jobKindLabel(job: JobRow): string {
+  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
 }
 
 export function JobDetailPage() {
@@ -137,6 +142,7 @@ export function JobDetailPage() {
     job.state
   );
   const canCancel = !["completed", "failed", "cancelled"].includes(job.state);
+  const cronOrigin = scheduleOrigin(job.metadata);
 
   return (
     <Page width="readable">
@@ -206,13 +212,7 @@ export function JobDetailPage() {
       <DescriptionList>
         <DescriptionTerm>Queue</DescriptionTerm>
         <DescriptionDetails>
-          <Link
-            to="/queues/$name"
-            params={{ name: job.queue }}
-            className="text-primary no-underline hover:underline"
-          >
-            {queueLabel(job)}
-          </Link>
+          <QueueLink queue={job.queue} descriptor={job.queue_descriptor} />
           {job.queue_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.queue}</span>
           )}
@@ -220,11 +220,21 @@ export function JobDetailPage() {
 
         <DescriptionTerm>Kind</DescriptionTerm>
         <DescriptionDetails>
-          {jobKindLabel(job)}
+          <KindLink kind={job.kind} descriptor={job.kind_descriptor} />
           {job.kind_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.kind}</span>
           )}
         </DescriptionDetails>
+
+        {cronOrigin && (
+          <>
+            <DescriptionTerm>Created by</DescriptionTerm>
+            <DescriptionDetails data-testid="job-cron-origin">
+              Schedule <ScheduleLink name={cronOrigin.name} />
+              {cronOrigin.manual && <span className="text-muted-fg"> (manual trigger)</span>}
+            </DescriptionDetails>
+          </>
+        )}
 
         <DescriptionTerm>Priority</DescriptionTerm>
         <DescriptionDetails>
@@ -268,9 +278,7 @@ export function JobDetailPage() {
             <DescriptionDetails>
               <div className="flex flex-wrap gap-1">
                 {job.tags.map((tag) => (
-                  <Badge key={tag} intent="secondary">
-                    {tag}
-                  </Badge>
+                  <TagChip key={tag} tag={tag} />
                 ))}
               </div>
             </DescriptionDetails>

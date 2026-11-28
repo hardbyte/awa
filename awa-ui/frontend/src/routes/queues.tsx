@@ -29,11 +29,30 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
+import { dlqDepthQuery } from "@/lib/shared-queries";
+import { formatNumber } from "@/lib/number";
 import { timeAgo } from "@/lib/time";
 import {
   dlqPolicyIntent,
   dlqPolicyLabel,
 } from "@/components/RuntimeDisplay";
+
+/** A queue's dead-letter count as a link to its Dead letters tab. */
+function DlqCount({ queue, counts }: { queue: string; counts: Map<string, number> | null }) {
+  if (!counts) return <span className="text-muted-fg">—</span>;
+  const count = counts.get(queue) ?? 0;
+  if (count === 0) return <span className="text-muted-fg/60">0</span>;
+  return (
+    <Link
+      to="/queues/$name/dlq"
+      params={{ name: queue }}
+      className="text-danger-subtle-fg no-underline hover:underline"
+      aria-label={`${count} dead letters in ${queue}`}
+    >
+      +{formatNumber(count)}
+    </Link>
+  );
+}
 
 export function QueuesPage() {
   const queryClient = useQueryClient();
@@ -83,6 +102,11 @@ export function QueuesPage() {
       toast.error("Failed to drain queue");
     },
   });
+
+  const depthQuery = useManagedQuery(dlqDepthQuery);
+  const dlqByQueue = depthQuery.isError
+    ? null
+    : new Map((depthQuery.data?.by_queue ?? []).map((entry) => [entry.queue, entry.count]));
 
   const queues = queuesQuery.data ?? [];
   const runtimeByQueue = new Map<string, QueueRuntimeSummary>(
@@ -201,6 +225,8 @@ export function QueuesPage() {
                     <span>{q.waiting_external.toLocaleString()}</span>
                   </>
                 )}
+                <span className="text-muted-fg">Dead letters</span>
+                <span><DlqCount queue={q.queue} counts={dlqByQueue} /></span>
                 <span className="text-muted-fg">Lag</span>
                 <span><LagValue seconds={q.lag_seconds} /></span>
                 <span className="text-muted-fg">Capacity</span>
@@ -262,6 +288,7 @@ export function QueuesPage() {
           <TableColumn className="text-right">Running</TableColumn>
           <TableColumn className="text-right">Retry</TableColumn>
           <TableColumn className="text-right">Failed</TableColumn>
+          <TableColumn className="text-right">Dead letters</TableColumn>
           <TableColumn className="text-right">Completed/hr</TableColumn>
           <TableColumn>Capacity</TableColumn>
           <TableColumn>Status</TableColumn>
@@ -346,6 +373,9 @@ export function QueuesPage() {
                     }`}
                   >
                     {q.failed.toLocaleString()}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    <DlqCount queue={q.queue} counts={dlqByQueue} />
                   </TableCell>
                   <TableCell className="text-right tabular-nums text-muted-fg">
                     {q.completed_last_hour.toLocaleString()}

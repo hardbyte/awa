@@ -12,6 +12,7 @@ import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/componen
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Page, PageHeader } from "@/components/Page";
+import { KindLink, QueueLink, TagChip } from "@/components/links";
 import { SECTION_LABELS } from "@/lib/sections";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -124,13 +125,29 @@ export function DlqDetailPage() {
       <Card>
         <CardHeader>
           <div className="flex gap-2">
-            <Badge intent="danger">dlq</Badge>
-            <Badge intent="secondary">{row.kind}</Badge>
-            <Badge intent="secondary">{row.queue}</Badge>
+            <Badge intent="danger">Dead-lettered</Badge>
           </div>
         </CardHeader>
         <CardContent>
           <DescriptionList>
+            <DescriptionTerm>Kind</DescriptionTerm>
+            <DescriptionDetails>
+              <KindLink kind={row.kind} descriptor={row.kind_descriptor} />
+            </DescriptionDetails>
+            <DescriptionTerm>Queue</DescriptionTerm>
+            <DescriptionDetails>
+              <QueueLink queue={row.queue} descriptor={row.queue_descriptor} />
+            </DescriptionDetails>
+            {row.tags.length > 0 && (
+              <>
+                <DescriptionTerm>Tags</DescriptionTerm>
+                <DescriptionDetails>
+                  <div className="flex flex-wrap gap-1">
+                    {row.tags.map((tag) => <TagChip key={tag} tag={tag} to="/dlq" />)}
+                  </div>
+                </DescriptionDetails>
+              </>
+            )}
             <DescriptionTerm>Reason</DescriptionTerm>
             <DescriptionDetails>{row.dlq_reason}</DescriptionDetails>
             <DescriptionTerm>DLQ'd</DescriptionTerm>

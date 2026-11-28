@@ -63,8 +63,9 @@ test.describe("Dashboard page", () => {
       })
     ).toBeVisible();
 
-    // Seeded failed e2e_job should appear
-    await expect(page.getByText("e2e_job").first()).toBeVisible();
+    // The seeded failed e2e_job appears, its kind linking to the kind's page.
+    const failures = page.getByRole("grid", { name: "Recent failures" });
+    await expect(failures.getByRole("link", { name: "E2E Job" }).first()).toHaveAttribute("href", /\/kinds\/e2e_job$/);
   });
 
   test("counter card click navigates to /jobs with state filter", async ({ page }) => {
@@ -175,10 +176,9 @@ test.describe("Dashboard page", () => {
     const failuresTable = page.getByRole("grid", { name: "Recent failures" });
     await expect(failuresTable).toBeVisible();
 
-    // Click the first failure row
     const firstRow = failuresTable.getByRole("row").nth(1);
     await expect(firstRow).toBeVisible();
-    await firstRow.click();
+    await firstRow.getByRole("link").first().click();
 
     await page.waitForURL(/\/jobs\/\d+/);
     await expect(

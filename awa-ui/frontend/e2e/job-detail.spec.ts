@@ -317,4 +317,30 @@ test.describe("Job detail page", () => {
     await expect(page.getByText("dead-lettered").first()).toBeVisible();
     await expect(page.getByRole("button", { name: "Copy output JSON" })).toBeVisible();
   });
+
+  test("the kind and tags link to their pages", async ({ page }) => {
+    await page.goto("/jobs/800002");
+    await page.getByRole("link", { name: "E2E Job", exact: true }).click();
+    await expect(page).toHaveURL(/\/kinds\/e2e_job$/);
+    await page.goBack();
+    await page.getByTestId("tag-chip").filter({ hasText: "e2e" }).first().click();
+    await page.waitForURL(/\/jobs\?/);
+    expect(new URL(page.url()).searchParams.get("q")).toBe("tag:e2e");
+  });
+
+  test("a job a schedule created links to the schedule", async ({ page }) => {
+    await page.route("**/api/jobs/800002", async (route) => {
+      const response = await route.fetch();
+      const job = await response.json();
+      await route.fulfill({
+        response,
+        json: { ...job, metadata: { cron_name: "e2e_cron_owner", triggered_manually: true } },
+      });
+    });
+    await page.goto("/jobs/800002");
+    const origin = page.getByTestId("job-cron-origin");
+    await expect(origin).toContainText("(manual trigger)");
+    await origin.getByRole("link", { name: "e2e_cron_owner" }).click();
+    await expect(page).toHaveURL(/\/cron\/e2e_cron_owner$/);
+  });
 });

@@ -14,6 +14,7 @@ import type {
   RuntimeOverview,
 } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
+import { JobLink, KindLink, QueueLink } from "@/components/links";
 import { jobStateMeta, TONE_SURFACE } from "@/lib/states";
 import { Page, PageHeader } from "@/components/Page";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
@@ -501,11 +502,15 @@ export function DashboardPage() {
                         })
                       }
                     >
-                      <TableCell className="font-mono text-primary">
-                        {job.id}
+                      <TableCell>
+                        <JobLink id={job.id}>{job.id}</JobLink>
                       </TableCell>
-                      <TableCell>{job.kind}</TableCell>
-                      <TableCell>{job.queue}</TableCell>
+                      <TableCell>
+                        <KindLink kind={job.kind} descriptor={job.kind_descriptor} />
+                      </TableCell>
+                      <TableCell>
+                        <QueueLink queue={job.queue} descriptor={job.queue_descriptor} />
+                      </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {job.attempt}/{job.max_attempts}
                       </TableCell>

@@ -18,6 +18,7 @@ import {
   StorageTransitionCard,
 } from "@/components/StorageTransition";
 import { Page, PageHeader } from "@/components/Page";
+import { InstanceLink } from "@/components/links";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -349,11 +350,11 @@ export function RuntimePage() {
           ) : (
             <div className="space-y-3 sm:hidden">
               {visibleInstances.map((instance) => (
-                <button
+                <Link
                   key={instance.instance_id}
-                  type="button"
-                  onClick={() => navigateToInstance(instance.instance_id)}
-                  className="block w-full rounded-lg border p-4 text-left transition hover:bg-secondary/40"
+                  to="/runtime/$instanceId"
+                  params={{ instanceId: instance.instance_id }}
+                  className="block w-full rounded-lg border p-4 text-left text-fg no-underline transition hover:bg-secondary/40"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -389,7 +390,7 @@ export function RuntimePage() {
                     <span className="text-muted-fg">Queues</span>
                     <span>{queueListLabel(instance)}</span>
                   </div>
-                </button>
+                </Link>
               ))}
             </div>
           )}
@@ -440,7 +441,7 @@ export function RuntimePage() {
                       className="cursor-pointer"
                     >
                       <TableCell className="font-medium">
-                        <div>{instanceLabel(instance)}</div>
+                        <InstanceLink instanceId={instance.instance_id}>{instanceLabel(instance)}</InstanceLink>
                         <div className="text-xs text-muted-fg">
                           {instance.version} · pid {instance.pid}
                         </div>

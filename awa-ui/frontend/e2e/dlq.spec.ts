@@ -96,4 +96,18 @@ test.describe("DLQ page", () => {
       await expect(page).toHaveURL(new RegExp(`/batch-ops/${id}$`));
     });
   }
+
+  test("a queue chip narrows the list and pressing it again widens it", async ({ page }) => {
+    await page.route("**/api/dlq/depth", (route) =>
+      route.fulfill({ json: { total: 3, by_queue: [{ queue: "e2e_dlq", count: 3 }] } })
+    );
+    await page.goto("/dlq");
+    const chip = page.getByTestId("dlq-queue-chip").filter({ hasText: "e2e_dlq" });
+    await expect(chip).toHaveAttribute("aria-pressed", "false");
+    await chip.click();
+    await expect(page).toHaveURL(/\/dlq\?q=queue%3Ae2e_dlq$/);
+    await expect(chip).toHaveAttribute("aria-pressed", "true");
+    await chip.click();
+    await expect(page).toHaveURL(/\/dlq$/);
+  });
 });
