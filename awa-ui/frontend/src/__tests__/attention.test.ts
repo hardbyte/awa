@@ -197,6 +197,14 @@ describe("attentionItems", () => {
     });
   });
 
+  it("says when and by whom a paused queue was paused, when the server reports it", () => {
+    const [item] = attentionItems({
+      now: NOW,
+      queues: [queue({ queue: "imports", paused: true, available: 2, lag_seconds: 60, paused_at: ago(25 * 60_000), paused_by: "ops" })],
+    });
+    expect(item!.detail).toBe("Paused 25m ago by ops · Oldest has waited 1m");
+  });
+
   it("flags lag only on unpaused queues past the threshold", () => {
     expect(
       ids({

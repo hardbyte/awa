@@ -194,6 +194,19 @@ test.describe("Overview", () => {
     expect(decodeURIComponent(page.url())).toContain("q=kind:e2e_job");
   });
 
+  test("a paused queue's attention item says when and by whom it was paused", async ({ page }) => {
+    const pausedAt = new Date(Date.now() - 25 * 60_000).toISOString();
+    await mockOverview(page, {
+      ...BUSY,
+      queues: [queue({ queue: "imports", display_name: "Contact imports", paused: true, paused_at: pausedAt, paused_by: "ops", available: 140, lag_seconds: 540 })],
+    });
+    await page.goto("/");
+    const item = page.locator('[data-testid="attention-item"][data-id="queue:paused:imports"]');
+    await expect(item).toContainText("Paused 25m ago by ops · Oldest has waited 9m");
+    const table = page.getByRole("grid", { name: "Queues needing attention" });
+    await expect(table.getByText("Paused 25m ago by ops", { exact: true })).toBeVisible();
+  });
+
   test("queues needing attention leave quiet queues out", async ({ page }) => {
     await mockOverview(page, BUSY);
     await page.goto("/");

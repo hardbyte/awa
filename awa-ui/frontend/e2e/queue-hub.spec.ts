@@ -67,6 +67,8 @@ test.describe("Queue hub", () => {
       header.getByRole("button", { name: "Pause" }).click(),
     ]);
     await expect(header.getByTestId("queue-paused")).toBeVisible();
+    // The UI pauses as "ui"; the server reports when and by whom.
+    await expect(header.getByTestId("queue-paused")).toHaveText(/^Paused (just now|\d+s ago) by ui$/);
     await Promise.all([
       page.waitForResponse((r) => r.url().endsWith("/api/queues/legacy_queue/resume") && r.ok()),
       header.getByRole("button", { name: "Resume" }).click(),

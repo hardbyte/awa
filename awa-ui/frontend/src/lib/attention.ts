@@ -24,6 +24,7 @@ import {
   STUCK_HEARTBEAT_MS,
 } from "@/lib/constants";
 import { formatDuration } from "@/lib/time";
+import { pausedLabel } from "@/lib/pause";
 import { formatNumber, plural } from "@/lib/number";
 
 /** "action" needs an operator now, "warning" soon; a "notice" is worth knowing. */
@@ -210,7 +211,10 @@ export function attentionItems(input: AttentionInput): AttentionItem[] {
           id: `queue:paused:${q.queue}`,
           severity: "warning",
           title: `${queueName(queues, q.queue)} is paused with ${plural(q.available, "ready job")}`,
-          detail: q.lag_seconds !== null ? `Oldest has waited ${formatDuration(q.lag_seconds)}` : undefined,
+          detail: [
+            (q.paused_at || q.paused_by) && pausedLabel(q, now),
+            q.lag_seconds !== null && `Oldest has waited ${formatDuration(q.lag_seconds)}`,
+          ].filter(Boolean).join(" · ") || undefined,
           target: { to: "/queues/$name", params: { name: q.queue } },
         });
       } else if (!q.paused && q.lag_seconds !== null && q.lag_seconds >= LAG_ATTENTION_SECONDS) {

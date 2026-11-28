@@ -86,6 +86,12 @@ export interface QueueOverview extends DescriptorFields {
   completed_last_hour: number;
   lag_seconds: number | null;
   paused: boolean;
+  /** When a paused queue was paused; null while it isn't paused. Absent
+   * from servers before 0.7. */
+  paused_at?: string | null;
+  /** Who paused it, as the pause gave it; null while it isn't paused or
+   * when the pause named no one. Absent from servers before 0.7. */
+  paused_by?: string | null;
 }
 
 export type QueueStats = QueueOverview;
@@ -99,6 +105,16 @@ export interface JobKindOverview extends DescriptorFields {
   job_count: number;
   queue_count: number;
   completed_last_hour: number;
+  /* The fields below are absent from servers before 0.7. */
+  /** The queues `queue_count` counts, sorted. */
+  queues?: string[];
+  available?: number;
+  retryable?: number;
+  /** Running jobs, not counting those waiting for a callback. */
+  running?: number;
+  /** Failed jobs, not counting dead letters. */
+  failed?: number;
+  dead_lettered?: number;
 }
 
 export interface RateLimitSnapshot {

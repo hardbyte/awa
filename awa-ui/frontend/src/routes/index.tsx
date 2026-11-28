@@ -47,7 +47,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
+import { PausedBadge } from "@/components/PausedBadge";
 import { QueueLink, entityLinkClass } from "@/components/links";
 import { Time } from "@/components/Time";
 
@@ -378,7 +378,7 @@ export function DashboardPage() {
                   <li key={q.queue} className="py-3">
                     <div className="flex items-center gap-2">
                       <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
-                      {q.paused && <Badge intent="warning">Paused</Badge>}
+                      {q.paused && <PausedBadge queue={q} />}
                     </div>
                     <div className="mt-1 text-sm text-muted-fg">
                       {[
@@ -408,7 +408,7 @@ export function DashboardPage() {
                       <TableCell>
                         <span className="inline-flex items-center gap-2">
                           <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
-                          {q.paused && <Badge intent="warning">Paused</Badge>}
+                          {q.paused && <PausedBadge queue={q} />}
                         </span>
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(q.available)}</TableCell>

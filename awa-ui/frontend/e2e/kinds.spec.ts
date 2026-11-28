@@ -96,4 +96,49 @@ test.describe("Kinds page", () => {
     const legacyRow = kindsTable.getByRole("row", { name: /legacy_job/ });
     await expect(legacyRow.getByText(/^Output/)).toHaveCount(0);
   });
+
+  function mockKind(overrides: Record<string, unknown> = {}) {
+    return {
+      kind: "mock_kind", display_name: null, description: null, owner: null, docs_url: null, tags: [], extra: {},
+      output: null, descriptor_last_seen_at: "2026-03-01T00:00:00Z", descriptor_stale: false, descriptor_mismatch: false,
+      job_count: 20, queue_count: 2, completed_last_hour: 0,
+      ...overrides,
+    };
+  }
+
+  test("Failed and Retryable columns show the server's per-kind counts", async ({ page }) => {
+    await page.route("**/api/kinds", (route) =>
+      route.fulfill({ json: [mockKind({ queues: ["a", "b"], available: 3, retryable: 4, running: 1, failed: 6, dead_lettered: 2 })] })
+    );
+    await page.goto("/kinds");
+    const table = page.getByRole("grid", { name: "Job kinds" });
+    await expect(table.getByRole("columnheader", { name: "Failed" })).toBeVisible();
+    await expect(table.getByRole("columnheader", { name: "Retryable" })).toBeVisible();
+    const row = table.getByRole("row", { name: /mock_kind/ });
+    await expect(row.getByRole("gridcell")).toHaveText(["20", "2", "6", "4", "0", "—", ""]);
+    await row.getByRole("link", { name: "Failed jobs of mock_kind: 6" }).click();
+    await page.waitForURL(/\/jobs\?/);
+    const url = new URL(page.url());
+    expect(url.searchParams.get("state")).toBe("failed");
+    expect(url.searchParams.get("dead_lettered")).toBe("false");
+    expect(url.searchParams.get("q")).toBe("kind:mock_kind");
+  });
+
+  test("an older server's kinds keep the columns they had", async ({ page }) => {
+    await page.route("**/api/kinds", (route) => route.fulfill({ json: [mockKind()] }));
+    await page.goto("/kinds");
+    const table = page.getByRole("grid", { name: "Job kinds" });
+    await expect(table.getByRole("row", { name: /mock_kind/ })).toBeVisible();
+    await expect(table.getByRole("columnheader", { name: "Failed" })).toHaveCount(0);
+    await expect(table.getByRole("columnheader", { name: "Retryable" })).toHaveCount(0);
+  });
+
+  test("phone cards show a kind's failed and retrying counts", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.route("**/api/kinds", (route) => route.fulfill({ json: [mockKind({ queues: ["a", "b"], retryable: 4, failed: 6 })] }));
+    await page.goto("/kinds");
+    const cards = page.getByRole("list", { name: "Job kinds" });
+    await expect(cards).toContainText("6 failed");
+    await expect(cards).toContainText("4 retrying");
+  });
 });

@@ -84,4 +84,18 @@ test.describe("Job kind page", () => {
     await expect(page.getByRole("heading", { level: 1, name: /not found/i })).toBeVisible();
     await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
   });
+
+  test("lists every queue the server reports for the kind", async ({ page }) => {
+    await page.route("**/api/kinds", async (route) => {
+      const response = await route.fetch();
+      const kinds = (await response.json()) as Array<Record<string, unknown>>;
+      await route.fulfill({
+        json: kinds.map((kind) => (kind.kind === "e2e_job" ? { ...kind, queues: ["e2e_test", "only_in_server_list"], queue_count: 2 } : kind)),
+      });
+    });
+    await page.goto("/kinds/e2e_job");
+    const queues = page.getByTestId("kind-queues");
+    await expect(queues.getByRole("link")).toHaveText(["e2e_test", "only_in_server_list"]);
+    await expect(page.getByText("Every queue holding jobs of this kind.")).toBeVisible();
+  });
 });

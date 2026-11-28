@@ -430,4 +430,31 @@ test.describe("Queues page", () => {
     await expect(trigger).toBeDisabled();
     await expect(trigger).toHaveAccessibleDescription("Read-only server — admin actions are off");
   });
+
+  function mockQueue(overrides: Record<string, unknown> = {}) {
+    return {
+      queue: "mock_queue", display_name: null, description: null, owner: null, docs_url: null, tags: [], extra: {},
+      descriptor_last_seen_at: null, descriptor_stale: false, descriptor_mismatch: false,
+      total_queued: 0, scheduled: 0, available: 0, retryable: 0, running: 0, failed: 0,
+      waiting_external: 0, completed_last_hour: 0, lag_seconds: null, paused: false,
+      ...overrides,
+    };
+  }
+
+  test("a paused queue's badge says when and by whom, and just Paused for an older server", async ({ page }) => {
+    await page.route("**/api/queues", (route) =>
+      route.fulfill({
+        json: [
+          mockQueue({ queue: "told", paused: true, paused_at: new Date(Date.now() - 25 * 60_000).toISOString(), paused_by: "ops" }),
+          // A server before 0.7 sends neither field.
+          mockQueue({ queue: "older", paused: true }),
+        ],
+      })
+    );
+    await page.route("**/api/queues/runtime", (route) => route.fulfill({ json: [] }));
+    await page.goto("/queues");
+    const table = page.getByRole("grid", { name: "Queues" });
+    await expect(table.getByRole("row", { name: /told/ }).getByText("Paused 25m ago by ops", { exact: true })).toBeVisible();
+    await expect(table.getByRole("row", { name: /older/ }).getByText("Paused", { exact: true })).toBeVisible();
+  });
 });

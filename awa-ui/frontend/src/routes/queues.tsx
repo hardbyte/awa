@@ -11,6 +11,7 @@ import { DrainDialog } from "@/components/DrainDialog";
 import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
+import { PausedBadge } from "@/components/PausedBadge";
 import { Menu, MenuContent, MenuItem, MenuTrigger } from "@/components/ui/menu";
 import {
   Table,
@@ -53,7 +54,7 @@ function QueueStatusBadges({ queue, runtime }: { queue: QueueStats; runtime: Que
   if (!any) return null;
   return (
     <div className="flex flex-wrap gap-1">
-      {queue.paused && <Badge intent="warning">Paused</Badge>}
+      {queue.paused && <PausedBadge queue={queue} />}
       <DlqOnBadge config={runtime?.config} />
       {queue.descriptor_stale && <Badge intent="secondary">Descriptor stale</Badge>}
       {queue.descriptor_mismatch && <Badge intent="warning">Descriptor drift</Badge>}

@@ -200,6 +200,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - **HTTP: `GET /api/queues` and `/api/queues/{name}` return `paused_at` and `paused_by`** for a paused queue, null while it isn't paused. **`GET /api/kinds` returns per-kind `available`, `retryable`, `running`, `failed` and `dead_lettered` counts and `queues`,** the sorted queues `queue_count` counts. A kind's `failed` leaves dead letters out, which `dead_lettered` counts, where a queue's `failed` includes them; `running` leaves out jobs waiting for a callback. On queue storage the counts come from the per-kind, per-queue pass `/api/kinds` already made. `QueueOverview` and `JobKindOverview` gain the same fields in Rust.
 
+- **Admin UI: queue pauses and per-kind failures at a glance.** A paused queue's badge, on the Queues list, its hub and the Overview, and the Overview's paused-queue attention item say when and by whom it was paused ("Paused 25m ago by ops"). Job kinds gain Failed (dead letters left out, linking to them) and Retryable columns and phone-card counts, and a kind's page lists every queue holding its jobs instead of those seen in its recent failures and schedules. Against an older server that doesn't send these fields the UI shows what it did before.
+
 ### Changed
 
 - **HTTP: `GET /api/batch-ops/{id}` answers an unknown id, or one that isn't a UUID, with 404** where it answered 400. The Rust `batch_operations::find_batch_operation` returns `None` for a missing operation; `get_batch_operation` still reports it as a validation error.
