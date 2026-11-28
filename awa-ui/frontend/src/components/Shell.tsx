@@ -14,6 +14,7 @@ import {
   type RuntimeOverview,
   type StorageStatusReport,
 } from "@/lib/api";
+import { documentTitle } from "@/lib/page-title";
 import { Button } from "@/components/ui/button";
 import {
   Sidebar,
@@ -305,6 +306,12 @@ const IconJobs = () => (
     <path d="M4 5h12M4 10h12M4 15h8" />
   </svg>
 );
+const IconDeadLetters = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 11.5 5 4.5h10l2 7" />
+    <path d="M3 11.5V15.5h14v-4h-4.5a2.5 2.5 0 0 1-5 0H3z" />
+  </svg>
+);
 const IconKinds = () => (
   <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
     <path d="M10.5 2.5h5a2 2 0 0 1 2 2v5a1 1 0 0 1-.3.7l-7 7a1 1 0 0 1-1.4 0L3 11.5a1 1 0 0 1 0-1.4l7-7a1 1 0 0 1 .5-.6z" />
@@ -342,6 +349,7 @@ const IconBatchOps = () => (
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", Icon: IconDashboard },
   { to: "/jobs", label: "Jobs", Icon: IconJobs },
+  { to: "/dlq", label: "Dead letters", Icon: IconDeadLetters },
   { to: "/kinds", label: "Kinds", Icon: IconKinds },
   { to: "/queues", label: "Queues", Icon: IconQueues },
   { to: "/runtime", label: "Runtime", Icon: IconRuntime },
@@ -370,6 +378,10 @@ export function Shell() {
     staleTime: 60_000,
   });
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
+
+  useEffect(() => {
+    document.title = documentTitle(currentPath);
+  }, [currentPath]);
 
   // Cluster status for the sidebar footer; poll-aligned with other pages.
   const runtimeQuery = useQuery({

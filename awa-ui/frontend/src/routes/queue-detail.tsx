@@ -309,7 +309,7 @@ export function QueueDetailPage() {
 
             <DescriptionTerm>Lag</DescriptionTerm>
             <DescriptionDetails>
-              <LagValue seconds={queue.lag_seconds} /> s
+              <LagValue seconds={queue.lag_seconds} />
             </DescriptionDetails>
           </DescriptionList>
         </CardContent>

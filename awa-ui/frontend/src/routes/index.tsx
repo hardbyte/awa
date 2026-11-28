@@ -368,7 +368,7 @@ export function DashboardPage() {
               <TableColumn className="text-right">Failed</TableColumn>
               <TableColumn className="text-right">Waiting</TableColumn>
               <TableColumn className="text-right">Completed/hr</TableColumn>
-              <TableColumn className="text-right">Lag (s)</TableColumn>
+              <TableColumn className="text-right">Lag</TableColumn>
               <TableColumn>Status</TableColumn>
             </TableHeader>
             <TableBody
