@@ -386,6 +386,12 @@ Binaries before v062 keep reading the cursor directly and behave as before, incl
 
 v063 widens the `op_kind` check constraint on `awa.batch_operations` to the new batch operation kinds `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` and `purge_dlq` ([ADR-030](adr/030-batch-operations.md#bulk-action-operations)). It drops and re-adds the constraint, which holds an `ACCESS EXCLUSIVE` lock on `awa.batch_operations` only, a small control table, while the new constraint checks its rows. No job or queue-storage table is touched. Binaries before v063 never write the new kinds, so they can run before or after it. A maintenance leader before this release cannot read an operation of a new kind and marks it failed, so submit them once every runtime runs this release. External migration runners apply `awa migrate --sql --from 62 --to 63`.
 
+## v064: retained enqueue shard
+
+v064 adds a nullable `enqueue_shard` column to `deferred_jobs` and `dlq_entries` in the default and every discovered custom queue-storage schema. A job that is retried, snoozed, rescued, dead-lettered or scheduled with an `ordering_key` keeps the shard of its lane, and goes back to it, taken modulo the destination queue's `enqueue_shards`, when it becomes ready again. NULL routes the job through the rotor, as every row written before v064 is. [ADR-033](adr/033-per-key-execution-control.md) builds per-key execution control on this.
+
+Adding the column takes an `ACCESS EXCLUSIVE` lock on `deferred_jobs` and `dlq_entries` until the migration commits, waiting at most 2 s for each when no `lock_timeout` is set. Neither table is scanned or rewritten, and a schema that already has the column is not locked. Binaries before v064 write these rows with explicit column lists, which leave the column NULL, so they can run before or after it. Binaries from this release check for the column and leave it out until it exists, so they can run before the migration too. `awa.insert_job_compat` and `awa.insert_jobs_compat_batch` are unchanged and leave it NULL on scheduled rows. External migration runners apply `awa migrate --sql --from 63 --to 64`.
+
 ## Tag indexes (ADR-049)
 
 Tags become the indexed way to find jobs on queue storage. There is no

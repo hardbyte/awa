@@ -171,6 +171,54 @@ fn stripe_hash(hash: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A retained enqueue shard placed in a queue `shards` wide. The shard is
+/// kept when it is in range and wrapped when the queue is narrower than the
+/// one the job was routed in, so jobs that shared a shard still share one.
+fn retained_shard_in_width(retained: i16, shards: i16) -> i16 {
+    if shards <= 1 {
+        return 0;
+    }
+    retained.rem_euclid(shards)
+}
+
+/// The `enqueue_shard` column and parameter a `deferred_jobs` or
+/// `dlq_entries` insert adds when the schema retains shards (migration
+/// v064), or nothing when it does not.
+struct RetainedShardInsert {
+    retained: bool,
+    column: &'static str,
+    param: String,
+}
+
+impl RetainedShardInsert {
+    fn new(retained: bool, param_index: usize) -> Self {
+        if retained {
+            Self {
+                retained,
+                column: ", enqueue_shard",
+                param: format!(", ${param_index}::smallint[]"),
+            }
+        } else {
+            Self {
+                retained,
+                column: "",
+                param: String::new(),
+            }
+        }
+    }
+}
+
+/// The `enqueue_shard` column a `deferred_jobs` or `dlq_entries` read adds
+/// when the schema retains shards. Without it the row's `enqueue_shard`
+/// defaults to `None`.
+fn retained_shard_column(retained: bool) -> &'static str {
+    if retained {
+        ", enqueue_shard"
+    } else {
+        ""
+    }
+}
+
 /// Deterministically map an ordering key to a shard in `[0, shards)`.
 ///
 /// Inputs sharing a key always produce the same shard, which is what
@@ -3129,7 +3177,7 @@ fn write_ready_copy_row(
     buf.push(b'\n');
 }
 
-fn write_deferred_copy_row(buf: &mut Vec<u8>, row: &DeferredJobRow) {
+fn write_deferred_copy_row(buf: &mut Vec<u8>, row: &DeferredJobRow, retains_shard: bool) {
     buf.extend_from_slice(row.job_id.to_string().as_bytes());
     buf.push(b',');
     write_copy_field(buf, &row.kind);
@@ -3161,6 +3209,13 @@ fn write_deferred_copy_row(buf: &mut Vec<u8>, row: &DeferredJobRow) {
     write_copy_optional_string(buf, row.unique_states.as_deref());
     buf.push(b',');
     write_copy_storage_payload(buf, &row.payload);
+    if retains_shard {
+        buf.push(b',');
+        match row.enqueue_shard {
+            Some(shard) => buf.extend_from_slice(shard.to_string().as_bytes()),
+            None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+        }
+    }
     buf.push(b'\n');
 }
 
@@ -3520,6 +3575,7 @@ impl ReadyTransitionRow {
             unique_key: self.unique_key,
             unique_states: self.unique_states,
             payload,
+            enqueue_shard: Some(self.enqueue_shard),
         }
     }
 
@@ -4098,6 +4154,7 @@ impl DoneJobRow {
     }
 
     fn into_dlq_row(self, dlq_reason: String, dlq_at: DateTime<Utc>) -> DlqJobRow {
+        let enqueue_shard = self.retained_enqueue_shard();
         DlqJobRow {
             job_id: self.job_id,
             kind: self.kind,
@@ -4118,7 +4175,15 @@ impl DoneJobRow {
             dlq_reason,
             dlq_at,
             original_run_lease: self.run_lease,
+            enqueue_shard,
         }
+    }
+
+    /// The shard of the lane this terminal row was claimed from. A row with a
+    /// negative `lane_seq` never had a lane position (a cancelled deferred
+    /// job, or a body recovered without one), so its shard means nothing.
+    fn retained_enqueue_shard(&self) -> Option<i16> {
+        (self.lane_seq >= 0).then_some(self.enqueue_shard)
     }
 }
 
@@ -4192,6 +4257,11 @@ struct DlqJobRow {
     dlq_reason: String,
     dlq_at: DateTime<Utc>,
     original_run_lease: i64,
+    /// The job's retained enqueue shard. `None` on rows written before
+    /// migration v064 or by a binary that does not retain it, and in
+    /// projections that leave the column out.
+    #[sqlx(default)]
+    enqueue_shard: Option<i16>,
 }
 
 impl DlqJobRow {
@@ -4251,6 +4321,7 @@ impl DlqJobRow {
             unique_key: self.unique_key,
             unique_states: self.unique_states,
             payload,
+            enqueue_shard: self.enqueue_shard,
         }
     }
 
@@ -4278,6 +4349,7 @@ impl DlqJobRow {
             unique_key: self.unique_key,
             unique_states: self.unique_states,
             payload,
+            enqueue_shard: self.enqueue_shard,
         }
     }
 }
@@ -4298,6 +4370,9 @@ struct ExistingReadyRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+    /// The enqueue shard the job was last routed to, taken modulo the
+    /// destination queue's current width. `None` takes the rotor.
+    enqueue_shard: Option<i16>,
 }
 
 /// What one lane's promotion transaction did.
@@ -4501,6 +4576,7 @@ impl LeaseTransitionRow {
             unique_key: self.unique_key,
             unique_states: self.unique_states,
             payload,
+            enqueue_shard: Some(self.enqueue_shard),
         }
     }
 
@@ -4520,6 +4596,7 @@ impl LeaseTransitionRow {
             unique_key: self.unique_key,
             unique_states: self.unique_states,
             payload,
+            enqueue_shard: Some(self.enqueue_shard),
         }
     }
 
@@ -4550,6 +4627,7 @@ impl LeaseTransitionRow {
             dlq_reason,
             dlq_at,
             original_run_lease: self.run_lease,
+            enqueue_shard: Some(self.enqueue_shard),
         }
     }
 }
@@ -4641,6 +4719,11 @@ struct DeferredJobRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+    /// The job's retained enqueue shard. `None` on rows written before
+    /// migration v064 or by a binary that does not retain it, and in
+    /// projections that leave the column out.
+    #[sqlx(default)]
+    enqueue_shard: Option<i16>,
 }
 
 impl DeferredJobRow {
@@ -4720,6 +4803,10 @@ pub struct QueueStorage {
     /// each enqueue checks again, so producers start using the floor with the
     /// first enqueue after v062 commits rather than some time later.
     enqueue_ring_cursor_present: AtomicBool,
+    /// Set once `deferred_jobs` and `dlq_entries` were found to have
+    /// migration v064's `enqueue_shard` column. A negative answer is not
+    /// kept, so the first write after v064 commits starts retaining shards.
+    retained_shard_columns_present: AtomicBool,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
     cancel_phase_hook: CancelPhaseHookSlot,
@@ -4808,6 +4895,7 @@ impl QueueStorage {
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
             enqueue_ring_cursor_present: AtomicBool::new(false),
+            retained_shard_columns_present: AtomicBool::new(false),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
             cancel_phase_hook: CancelPhaseHookSlot(None),
@@ -6354,6 +6442,17 @@ impl QueueStorage {
         queue: &str,
         ordering_key: Option<&[u8]>,
     ) -> Result<i16, AwaError> {
+        let shards = self.enqueue_shard_count(pool_executor, queue).await?;
+        Ok(self.pick_shard(shards, ordering_key))
+    }
+
+    /// `awa.queue_meta.enqueue_shards` for `queue`, at least 1, cached
+    /// in-process.
+    async fn enqueue_shard_count(
+        &self,
+        pool_executor: impl sqlx::PgExecutor<'_>,
+        queue: &str,
+    ) -> Result<i16, AwaError> {
         if let Some(cached) = self
             .enqueue_shards_cache
             .lock()
@@ -6361,7 +6460,7 @@ impl QueueStorage {
             .get(queue)
             .copied()
         {
-            return Ok(self.pick_shard(cached, ordering_key));
+            return Ok(cached);
         }
 
         let shards: i16 = sqlx::query_scalar(
@@ -6382,7 +6481,7 @@ impl QueueStorage {
             .expect("enqueue_shards_cache poisoned")
             .insert(queue.to_string(), shards);
 
-        Ok(self.pick_shard(shards, ordering_key))
+        Ok(shards)
     }
 
     /// Map a row (or a no-key sub-batch) to its shard.
@@ -6732,6 +6831,40 @@ impl QueueStorage {
         }
         let authority = self.ring_authority_tx(tx).await?;
         self.ring_cursor_tx(tx, RingFamily::Queue, authority).await
+    }
+
+    /// Whether `deferred_jobs` and `dlq_entries` have the `enqueue_shard`
+    /// column migration v064 adds. Before it, writers and readers leave the
+    /// column out, so a job routes through the rotor when it returns to
+    /// ready, as it did before shards were retained.
+    async fn retains_enqueue_shard<'e, E>(&self, executor: E) -> Result<bool, AwaError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        if self.retained_shard_columns_present.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let present: bool = sqlx::query_scalar(
+            r#"
+            SELECT count(*) = 2
+            FROM pg_attribute
+            WHERE NOT attisdropped
+              AND attname = 'enqueue_shard'
+              AND attrelid IN (
+                  to_regclass(format('%I.deferred_jobs', $1)),
+                  to_regclass(format('%I.dlq_entries', $1))
+              )
+            "#,
+        )
+        .bind(self.schema())
+        .fetch_one(executor)
+        .await
+        .map_err(map_sqlx_error)?;
+        if present {
+            self.retained_shard_columns_present
+                .store(true, Ordering::Relaxed);
+        }
+        Ok(present)
     }
 
     async fn enqueue_ring_cursor_callable<'e, E>(&self, executor: E) -> Result<bool, AwaError>
@@ -7523,10 +7656,33 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<ExistingReadyRow>,
     ) -> Result<usize, AwaError> {
-        let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
+        // A row that retains its shard goes back to that shard, taken modulo
+        // the destination queue's current width: a cross-queue move or a
+        // narrowed queue cannot leave it out of range. Rows without one share
+        // one rotor pick per (queue, priority), as before shards were
+        // retained. Lanes are then reserved in (queue, priority, shard) order,
+        // the order fresh enqueues take them in.
+        let mut rotor_shards: HashMap<(String, i16), i16> = HashMap::new();
+        let mut grouped: BTreeMap<(String, i16, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
         for row in rows {
+            let enqueue_shard = match row.enqueue_shard {
+                Some(retained) => {
+                    let shards = self.enqueue_shard_count(tx.as_mut(), &row.queue).await?;
+                    retained_shard_in_width(retained, shards)
+                }
+                None => match rotor_shards.get(&(row.queue.clone(), row.priority)) {
+                    Some(&shard) => shard,
+                    None => {
+                        let shard = self
+                            .shard_for_enqueue(tx.as_mut(), &row.queue, None)
+                            .await?;
+                        rotor_shards.insert((row.queue.clone(), row.priority), shard);
+                        shard
+                    }
+                },
+            };
             grouped
-                .entry((row.queue.clone(), row.priority))
+                .entry((row.queue.clone(), row.priority, enqueue_shard))
                 .or_default()
                 .push(row);
         }
@@ -7534,16 +7690,7 @@ impl QueueStorage {
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         let mut ready_rows = Vec::with_capacity(total_rows);
 
-        for ((queue, priority), lane_rows) in grouped {
-            // Re-enqueue paths (retry-after, age-waiting, DLQ retry,
-            // callback resume) do not carry the producer's original
-            // `ordering_key`: the row came back from terminal storage
-            // or from a deferred row, where the key was not retained.
-            // Fall back to the rotor so the retry batch picks a shard
-            // uniformly. Workloads that need ordering preserved across
-            // retries must re-enqueue with the original key from the
-            // application layer.
-            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue, None).await?;
+        for ((queue, priority, enqueue_shard), lane_rows) in grouped {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
                 .await?;
 
@@ -7677,15 +7824,17 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        sqlx::query(audited_sql(format!(
+        let shard = RetainedShardInsert::new(self.retains_enqueue_shard(tx.as_mut()).await?, 17);
+        let (shard_column, shard_param) = (shard.column, shard.param);
+        let query = sqlx::query(audited_sql(format!(
             r#"
-            INSERT INTO {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload)
-            SELECT job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload
+            INSERT INTO {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload{shard_column})
+            SELECT job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload{shard_column}
             FROM unnest(
                 $1::bigint[], $2::text[], $3::text[], $4::jsonb[], $5::text[], $6::smallint[],
                 $7::smallint[], $8::bigint[], $9::smallint[], $10::timestamptz[], $11::timestamptz[],
-                $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[], $16::jsonb[]
-            ) AS rows (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload)
+                $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[], $16::jsonb[]{shard_param}
+            ) AS rows (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload{shard_column})
             "#
         )))
         .bind(rows.iter().map(|row| row.job_id).collect::<Vec<_>>())
@@ -7703,10 +7852,13 @@ impl QueueStorage {
         .bind(rows.iter().map(|row| row.created_at).collect::<Vec<_>>())
         .bind(rows.iter().map(|row| row.unique_key.as_deref()).collect::<Vec<_>>())
         .bind(rows.iter().map(|row| row.unique_states.as_deref()).collect::<Vec<_>>())
-        .bind(rows.iter().map(|row| storage_payload(&row.payload)).collect::<Vec<_>>())
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        .bind(rows.iter().map(|row| storage_payload(&row.payload)).collect::<Vec<_>>());
+        let query = if shard.retained {
+            query.bind(rows.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+        } else {
+            query
+        };
+        query.execute(tx.as_mut()).await.map_err(map_sqlx_error)?;
 
         Ok(rows.len())
     }
@@ -7734,8 +7886,10 @@ impl QueueStorage {
         // invariant by hand: `schema` passed `validate_ident`, the sentinel
         // is a const, and every row value is CSV-encoded into the COPY
         // stream rather than into the statement.
+        let retains_shard = self.retains_enqueue_shard(tx.as_mut()).await?;
+        let shard_column = retained_shard_column(retains_shard);
         let copy_sql = format!(
-            "COPY {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
+            "COPY {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload{shard_column}) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
         let mut copy_in = tx
             .as_mut()
@@ -7746,7 +7900,7 @@ impl QueueStorage {
         // are bounded by chunked COPY sends below rather than by this reserve.
         let mut csv_buf = Vec::with_capacity(rows.len().min(1024) * 320);
         for row in &rows {
-            write_deferred_copy_row(&mut csv_buf, row);
+            write_deferred_copy_row(&mut csv_buf, row, retains_shard);
             if csv_buf.len() >= COPY_CHUNK_TARGET_BYTES {
                 let chunk =
                     std::mem::replace(&mut csv_buf, Vec::with_capacity(COPY_CHUNK_TARGET_BYTES));
@@ -8288,16 +8442,18 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        sqlx::query(audited_sql(format!(
+        let shard = RetainedShardInsert::new(self.retains_enqueue_shard(tx.as_mut()).await?, 20);
+        let (shard_column, shard_param) = (shard.column, shard.param);
+        let query = sqlx::query(audited_sql(format!(
             r#"
-            INSERT INTO {schema}.dlq_entries (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease)
-            SELECT job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease
+            INSERT INTO {schema}.dlq_entries (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease{shard_column})
+            SELECT job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease{shard_column}
             FROM unnest(
                 $1::bigint[], $2::text[], $3::text[], $4::jsonb[], $5::text[], $6::smallint[],
                 $7::smallint[], $8::bigint[], $9::smallint[], $10::timestamptz[], $11::timestamptz[],
                 $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[], $16::jsonb[],
-                $17::text[], $18::timestamptz[], $19::bigint[]
-            ) AS rows (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease)
+                $17::text[], $18::timestamptz[], $19::bigint[]{shard_param}
+            ) AS rows (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease{shard_column})
             "#
         )))
         .bind(rows.iter().map(|row| row.job_id).collect::<Vec<_>>())
@@ -8318,10 +8474,13 @@ impl QueueStorage {
         .bind(rows.iter().map(|row| storage_payload(&row.payload)).collect::<Vec<_>>())
         .bind(rows.iter().map(|row| row.dlq_reason.as_str()).collect::<Vec<_>>())
         .bind(rows.iter().map(|row| row.dlq_at).collect::<Vec<_>>())
-        .bind(rows.iter().map(|row| row.original_run_lease).collect::<Vec<_>>())
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        .bind(rows.iter().map(|row| row.original_run_lease).collect::<Vec<_>>());
+        let query = if shard.retained {
+            query.bind(rows.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+        } else {
+            query
+        };
+        query.execute(tx.as_mut()).await.map_err(map_sqlx_error)?;
 
         Ok(rows.len())
     }
@@ -8585,6 +8744,13 @@ impl QueueStorage {
             match prepared.state {
                 JobState::Available => ready_rows.push(ready_row),
                 JobState::Scheduled => deferred_rows.push(DeferredJobRow {
+                    // A keyed job keeps the shard its key selects now, so it
+                    // joins its key's lane when it becomes due. An unkeyed
+                    // job takes the rotor then.
+                    enqueue_shard: match ready_row.ordering_key.as_deref() {
+                        Some(key) => Some(self.shard_for_enqueue(pool, &queue, Some(key)).await?),
+                        None => None,
+                    },
                     job_id: 0,
                     kind: ready_row.kind,
                     queue,
@@ -8698,6 +8864,13 @@ impl QueueStorage {
             match prepared.state {
                 JobState::Available => ready_rows.push(ready_row),
                 JobState::Scheduled => deferred_rows.push(DeferredJobRow {
+                    // A keyed job keeps the shard its key selects now, so it
+                    // joins its key's lane when it becomes due. An unkeyed
+                    // job takes the rotor then.
+                    enqueue_shard: match ready_row.ordering_key.as_deref() {
+                        Some(key) => Some(self.shard_for_enqueue(pool, &queue, Some(key)).await?),
+                        None => None,
+                    },
                     job_id: 0,
                     kind: ready_row.kind,
                     queue,
@@ -11235,6 +11408,7 @@ impl QueueStorage {
                 &Self::done_rows_to_counter_keys(std::slice::from_ref(&terminal)),
             )
             .await?;
+            let enqueue_shard = terminal.retained_enqueue_shard();
             let ready_row = ExistingReadyRow {
                 job_id: terminal.job_id,
                 kind: terminal.kind,
@@ -11253,6 +11427,7 @@ impl QueueStorage {
                     terminal.unique_states,
                     &terminal.payload,
                 )?,
+                enqueue_shard,
                 unique_key: terminal.unique_key,
                 payload: terminal.payload,
             };
@@ -13524,6 +13699,7 @@ impl QueueStorage {
                 unique_key: row.unique_key,
                 unique_states: row.unique_states,
                 payload: payload.into_json(),
+                enqueue_shard: Some(row.enqueue_shard),
             });
         }
 
@@ -19435,6 +19611,7 @@ impl QueueStorage {
             unique_key: row.unique_key,
             unique_states,
             payload,
+            enqueue_shard: None,
         };
 
         {
@@ -20449,6 +20626,7 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        let shard_column = retained_shard_column(self.retains_enqueue_shard(tx.as_mut()).await?);
         let moved: Option<DlqJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -20472,7 +20650,7 @@ impl QueueStorage {
                 COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
-                original_run_lease
+                original_run_lease{shard_column}
             "#
         )))
         .bind(job_id)
@@ -20556,6 +20734,7 @@ impl QueueStorage {
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+        let shard_column = retained_shard_column(self.retains_enqueue_shard(tx.as_mut()).await?);
         let sql = format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -20579,7 +20758,7 @@ impl QueueStorage {
                 COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
-                original_run_lease
+                original_run_lease{shard_column}
             "#,
             where_clause = predicate.where_clause(),
         );
@@ -20615,6 +20794,7 @@ impl QueueStorage {
             return Ok(outcome);
         }
         let schema = self.schema();
+        let shard_column = retained_shard_column(self.retains_enqueue_shard(tx.as_mut()).await?);
         let moved: Vec<DlqJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
             DELETE FROM {schema}.dlq_entries
@@ -20638,7 +20818,7 @@ impl QueueStorage {
                 COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
-                original_run_lease
+                original_run_lease{shard_column}
             "#
         )))
         .bind(ids)
@@ -21856,6 +22036,7 @@ impl QueueStorage {
             DueLaneRows::Selected(_) => ("AND job_id = ANY($4)", ""),
             DueLaneRows::Oldest(_) => ("", "ORDER BY run_at ASC, job_id ASC LIMIT $4"),
         };
+        let shard_column = retained_shard_column(self.retains_enqueue_shard(tx.as_mut()).await?);
         let query = sqlx::query_as::<_, DeferredJobRow>(audited_sql(format!(
             r#"
             DELETE FROM {schema}.deferred_jobs
@@ -21890,7 +22071,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                COALESCE(payload, '{{}}'::jsonb) AS payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload{shard_column}
             "#
         )))
         .bind(state)
@@ -21928,6 +22109,7 @@ impl QueueStorage {
                     unique_key: row.unique_key,
                     unique_states: row.unique_states,
                     payload: row.payload,
+                    enqueue_shard: row.enqueue_shard,
                 };
                 (ready, Some(state))
             })
