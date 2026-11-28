@@ -3,6 +3,7 @@ import { Link, useParams } from "@tanstack/react-router";
 import { fetchRuntime } from "@/lib/api";
 import type { RuntimeInstance, RuntimeOverview } from "@/lib/api";
 import { Copyable } from "@/components/CopyButton";
+import { ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -62,7 +63,15 @@ export function RuntimeInstancePage() {
     return <p className="text-sm text-muted-fg">Loading runtime instance…</p>;
   }
   if (runtimeQuery.error && runtimeQuery.data === undefined) {
-    return <p className="text-sm text-danger">Error: {String(runtimeQuery.error)}</p>;
+    return (
+      <ResourceLoadError
+        noun="runtime instances"
+        error={runtimeQuery.error}
+        onRetry={() => void runtimeQuery.refetch()}
+        backTo="/runtime"
+        backLabel="Back to runtime"
+      />
+    );
   }
 
   const instance = runtimeQuery.data?.instances.find(
@@ -71,17 +80,12 @@ export function RuntimeInstancePage() {
 
   if (!instance) {
     return (
-      <div className="space-y-4">
-        <Link
-          to="/runtime"
-          className="text-sm text-muted-fg no-underline hover:text-fg"
-        >
-          &larr; Back to runtime
-        </Link>
-        <p className="text-sm text-muted-fg">
-          Runtime instance not found. The snapshot may have expired or this URL is stale.
-        </p>
-      </div>
+      <ResourceNotFound
+        title="Runtime instance not found"
+        reason="The snapshot may have expired or this URL is stale."
+        backTo="/runtime"
+        backLabel="Back to runtime"
+      />
     );
   }
 

@@ -25,6 +25,7 @@ import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
+import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 
 function hasMetadata(job: JobRow): boolean {
   return (
@@ -105,13 +106,26 @@ export function JobDetailPage() {
   if (jobQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading...</p>;
   }
-  if (jobQuery.error && jobQuery.data === undefined) {
+  if (jobQuery.data === undefined && jobQuery.error && !isNotFoundError(jobQuery.error)) {
     return (
-      <p className="text-sm text-danger">Error: {String(jobQuery.error)}</p>
+      <ResourceLoadError
+        noun={`job #${id}`}
+        error={jobQuery.error}
+        onRetry={() => void jobQuery.refetch()}
+        backTo="/jobs"
+        backLabel="Back to jobs"
+      />
     );
   }
   if (!jobQuery.data) {
-    return <p className="text-sm text-muted-fg">Job not found.</p>;
+    return (
+      <ResourceNotFound
+        title={`Job #${id} not found`}
+        reason="No job has this ID. It may have been deleted by retention after it finished, or the link is wrong."
+        backTo="/jobs"
+        backLabel="Back to jobs"
+      />
+    );
   }
 
   const job = jobQuery.data;
