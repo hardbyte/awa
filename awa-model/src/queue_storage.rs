@@ -67,6 +67,9 @@ const DRAIN_BATCH_SIZE: i64 = 1_000;
 const DRAIN_TRANSACTION_BEGIN: &str =
     crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
+/// How long a maintenance claim-cursor advance waits for any lock it does
+/// not take with `SKIP LOCKED` or `NOWAIT`.
+const CLAIM_CURSOR_ADVANCE_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
 // Rescue cursor scans are estimated far above their real cost, enough to
 // JIT-compile them, which takes seconds against about 100 ms of execution.
 const RESCUE_TRANSACTION_BEGIN: &str =
@@ -924,6 +927,42 @@ pub struct PendingReadyLane {
     pub head_age: Duration,
 }
 
+/// A lane whose claim cursor [`QueueStorage::advance_spent_claim_heads`]
+/// moved over spent rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpentClaimHeadAdvance {
+    pub queue: String,
+    pub priority: i16,
+    pub enqueue_shard: i16,
+    /// The lane's claim cursor before the advance.
+    pub from_seq: i64,
+    /// The lane's claim cursor after it: the lane's first unspent row, or
+    /// one past the last spent row the advance read.
+    pub to_seq: i64,
+}
+
+/// A lane [`QueueStorage::advance_spent_claim_heads`] could not advance
+/// because of an error other than lock contention or a failed connection;
+/// a failed connection fails the whole call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpentClaimHeadFailure {
+    pub queue: String,
+    pub priority: i16,
+    pub enqueue_shard: i16,
+    pub error: String,
+}
+
+/// What one [`QueueStorage::advance_spent_claim_heads`] call did, lane by
+/// lane. A lane skipped for lock contention appears in neither list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpentClaimHeadAdvances {
+    pub advanced: Vec<SpentClaimHeadAdvance>,
+    pub failed: Vec<SpentClaimHeadFailure>,
+}
+
 /// The oldest sealed queue ring slot and the lanes whose pending ready rows
 /// keep queue prune from reclaiming it. See [`QueueStorage::queue_ring_pin`].
 #[derive(Debug, Clone, PartialEq)]
@@ -948,6 +987,21 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
 
 fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     pg_session_lock::is_lock_not_available(err)
+}
+
+/// A failure of the connection itself, after which whether the statement
+/// took effect is unknown: an I/O, TLS or protocol error, or SQLSTATE class 08.
+fn is_connection_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(db_err) => db_err.code().is_some_and(|code| code.starts_with("08")),
+        _ => false,
+    }
+}
+
+/// A lock timeout, or a deadlock in which the advance was the victim.
+fn is_prune_contention_error(err: &sqlx::Error) -> bool {
+    pg_session_lock::is_lock_not_available(err) || pg_session_lock::is_deadlock(err)
 }
 
 async fn set_lock_timeout_tx(
@@ -3390,6 +3444,18 @@ struct ReadyTransitionRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+/// A lane whose claim cursor a spent-prefix advance moved.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SpentPrefixAdvance {
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    claim_seq: i64,
+    next_seq: i64,
+    /// Every row in the window was spent and the lane has rows past it.
+    unfinished: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -12032,19 +12098,7 @@ impl QueueStorage {
     /// callers build the store with default configuration.
     fn ready_row_claimed_sql(&self, alias: &str) -> String {
         let schema = self.schema();
-        let mut sql = format!(
-            "EXISTS (
-                SELECT 1 FROM {schema}.ready_claim_attempt_batches AS attempts
-                WHERE attempts.ready_slot = {alias}.ready_slot
-                  AND attempts.ready_generation = {alias}.ready_generation
-                  AND attempts.queue = {alias}.queue
-                  AND attempts.priority = {alias}.priority
-                  AND attempts.enqueue_shard = {alias}.enqueue_shard
-                  AND attempts.first_lane_seq <= {alias}.lane_seq
-                  AND attempts.next_lane_seq > {alias}.lane_seq
-                  AND attempts.lane_ranges @> int8range({alias}.lane_seq, {alias}.lane_seq + 1, '[)')
-            )"
-        );
+        let mut sql = self.ready_row_attempt_batch_sql(alias);
         for table in [
             "leases",
             "done_entries",
@@ -12061,6 +12115,37 @@ impl QueueStorage {
             ));
         }
         sql
+    }
+
+    /// SQL true when the ready row `alias` is covered by a claim-attempt
+    /// batch, the only claim evidence `claim_ready_runtime` trusts in
+    /// receipts mode.
+    fn ready_row_attempt_batch_sql(&self, alias: &str) -> String {
+        let schema = self.schema();
+        format!(
+            "EXISTS (
+                SELECT 1 FROM {schema}.ready_claim_attempt_batches AS attempts
+                WHERE attempts.ready_slot = {alias}.ready_slot
+                  AND attempts.ready_generation = {alias}.ready_generation
+                  AND attempts.queue = {alias}.queue
+                  AND attempts.priority = {alias}.priority
+                  AND attempts.enqueue_shard = {alias}.enqueue_shard
+                  AND attempts.first_lane_seq <= {alias}.lane_seq
+                  AND attempts.next_lane_seq > {alias}.lane_seq
+                  AND attempts.lane_ranges @> int8range({alias}.lane_seq, {alias}.lane_seq + 1, '[)')
+            )"
+        )
+    }
+
+    /// SQL true when the ready row `alias` was claimed, by the evidence the
+    /// schema's claim function trusts: claim-attempt batches with receipts,
+    /// [`Self::ready_row_claimed_sql`] without.
+    fn ready_row_claimed_for_mode_sql(&self, alias: &str, receipts: bool) -> String {
+        if receipts {
+            self.ready_row_attempt_batch_sql(alias)
+        } else {
+            self.ready_row_claimed_sql(alias)
+        }
     }
 
     async fn cancel_job_tx<'a>(
@@ -12832,8 +12917,8 @@ impl QueueStorage {
         pool: &PgPool,
         lanes: &[DrainLane],
     ) -> Result<(), AwaError> {
-        let schema = self.schema();
         let claimed = self.ready_row_claimed_sql("ready");
+        let sql = self.spent_claim_prefix_advance_sql(&claimed);
         let mut lanes = lanes.to_vec();
         while !lanes.is_empty() {
             let mut tx = pool
@@ -12841,18 +12926,44 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             self.lock_claim_heads_tx(&mut tx, &lanes).await?;
-            // Each window is a range of positions, so a live row inside it is
-            // always seen. Untombstoned rows are checked for a claim only from
-            // the first, a few at a time: claims past the cursor are the few
-            // whose claimer has not yet moved it. The tombstone check is a
-            // column behind OFFSET 0, so it is not pushed down as a NOT EXISTS,
-            // for the reason given in `cancel_available_chunk_tx`. A gap before a visible row
-            // is an enqueue that rolled back: enqueues on a lane commit in
-            // position order. So each window starts at the lane's first
-            // visible row at or after the cursor, however many rolled-back
-            // positions lie before it.
-            let unfinished: Vec<(String, i16, i16)> = sqlx::query_as(audited_sql(format!(
-                r#"
+            let advanced = Self::advance_spent_claim_prefixes_tx(&mut tx, &sql, &lanes).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            lanes.retain(|lane| {
+                advanced.iter().any(|advance| {
+                    advance.unfinished
+                        && lane.queue == advance.queue
+                        && lane.priority == advance.priority
+                        && lane.enqueue_shard == advance.enqueue_shard
+                })
+            });
+        }
+        Ok(())
+    }
+
+    /// The statement behind [`Self::skip_spent_claim_prefixes`] and
+    /// [`Self::advance_spent_claim_heads`], for lanes whose claim heads the
+    /// transaction holds. `claimed` is the SQL predicate, over the ready row
+    /// `ready`, that the row's attempt was already claimed.
+    ///
+    /// Each window is a range of positions, so a live row inside it is
+    /// always seen. Untombstoned rows are checked for a claim only from the
+    /// first, a few at a time: claims past the cursor are the few whose
+    /// claimer has not yet moved it. The tombstone check is a column behind
+    /// OFFSET 0, so it is not pushed down as a NOT EXISTS, for the reason
+    /// given in `cancel_available_chunk_tx`. A gap before a visible row is an
+    /// enqueue that rolled back: enqueues on a lane commit in position order.
+    /// So each window starts at the lane's first visible row at or after the
+    /// cursor, however many rolled-back positions lie before it, and a lane
+    /// with no visible row there does not move. A lane's segments cover
+    /// disjoint position ranges, so that row is the first one in the first
+    /// segment, by `next_lane_seq`, that has a row at or after the cursor.
+    /// The cursor moves to the first unclaimed checked row, else one past the
+    /// last checked row when the check limit was reached, else one past the
+    /// last visible row, and never moves back.
+    fn spent_claim_prefix_advance_sql(&self, claimed: &str) -> String {
+        let schema = self.schema();
+        format!(
+            r#"
                 WITH cursors AS (
                     SELECT
                         lanes.queue,
@@ -12984,31 +13095,369 @@ impl QueueStorage {
                     FROM scanned
                     WHERE scanned.next_seq > scanned.claim_seq
                 )
-                SELECT queue, priority, enqueue_shard
+                SELECT queue, priority, enqueue_shard, claim_seq, next_seq,
+                       first_live IS NULL AND next_seq < to_seq AS unfinished
                 FROM advanced
-                WHERE first_live IS NULL
-                  AND next_seq < to_seq
                 "#
-            )))
-            .bind(lanes.iter().map(|lane| lane.queue.as_str()).collect::<Vec<_>>())
+        )
+    }
+
+    /// Run [`Self::spent_claim_prefix_advance_sql`] for `lanes`, binding
+    /// [`DRAIN_BATCH_SIZE`] as the window and [`DRAIN_CLAIM_CHECK_ROWS`] as
+    /// the claim-check limit. Returns the lanes whose cursor moved.
+    async fn advance_spent_claim_prefixes_tx(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        sql: &str,
+        lanes: &[DrainLane],
+    ) -> Result<Vec<SpentPrefixAdvance>, AwaError> {
+        sqlx::query_as(audited_sql(sql))
+            .bind(
+                lanes
+                    .iter()
+                    .map(|lane| lane.queue.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
-            .bind(lanes.iter().map(|lane| lane.enqueue_shard).collect::<Vec<_>>())
+            .bind(
+                lanes
+                    .iter()
+                    .map(|lane| lane.enqueue_shard)
+                    .collect::<Vec<_>>(),
+            )
             .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
             .bind(DRAIN_BATCH_SIZE)
             .bind(DRAIN_CLAIM_CHECK_ROWS)
             .fetch_all(tx.as_mut())
             .await
-            .map_err(map_sqlx_error)?;
-            tx.commit().await.map_err(map_sqlx_error)?;
-            lanes.retain(|lane| {
-                unfinished.iter().any(|(queue, priority, enqueue_shard)| {
-                    &lane.queue == queue
-                        && lane.priority == *priority
-                        && lane.enqueue_shard == *enqueue_shard
-                })
-            });
+            .map_err(map_sqlx_error)
+    }
+
+    /// Move the claim cursors of `lanes` over the spent rows at their heads,
+    /// outside any claim, so a lane whose head rows were cancelled, moved,
+    /// reprioritised, or claimed without the cursor following, stops keeping
+    /// queue prune from reclaiming the slot that holds them (#779).
+    ///
+    /// Only a lane whose head row, read without a row lock, is tombstoned or
+    /// claimed is advanced, so a lane that is merely behind is left alone.
+    /// Each such lane is advanced in its own transactions, at most
+    /// `max_windows` windows of [`DRAIN_BATCH_SIZE`] positions per call. A
+    /// transaction takes the lane's claim head with `SKIP LOCKED` and the
+    /// queue-slot tables it reads with `NOWAIT`, in queue prune's lock order,
+    /// under a short lock timeout: a lane a claim, cancel or move holds, or a
+    /// table prune holds, is skipped for this call instead of waited for.
+    ///
+    /// The cursor moves only over committed tombstones and committed claim
+    /// evidence of the kind the claim path trusts in this store's mode, and
+    /// never past a row that is or may become claimable: see
+    /// `correctness/storage/AwaMaintenanceCursorAdvance.tla`. Returns the
+    /// lanes whose cursor moved.
+    #[tracing::instrument(skip_all, name = "queue_storage.advance_spent_claim_heads")]
+    pub async fn advance_spent_claim_heads(
+        &self,
+        pool: &PgPool,
+        lanes: &[PendingReadyLane],
+        max_windows: usize,
+    ) -> Result<SpentClaimHeadAdvances, AwaError> {
+        let mut outcome = SpentClaimHeadAdvances::default();
+        if lanes.is_empty() || max_windows == 0 {
+            return Ok(outcome);
         }
-        Ok(())
+        let schema = self.schema();
+        let mut probe = pool
+            .begin_with(DRAIN_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(&mut probe, CLAIM_CURSOR_ADVANCE_LOCK_TIMEOUT).await?;
+        let receipts = self.schema_uses_lease_claim_receipts_tx(&mut probe).await?;
+        let claimed = self.ready_row_claimed_for_mode_sql("ready", receipts);
+        let candidates: Result<Vec<(String, i16, i16)>, sqlx::Error> =
+            sqlx::query_as(audited_sql(format!(
+                r#"
+            WITH heads AS MATERIALIZED (
+                SELECT
+                    lanes.queue,
+                    lanes.priority,
+                    lanes.enqueue_shard,
+                    {schema}.sequence_next_value(claims.seq_name) AS claim_seq
+                FROM unnest($1::text[], $2::smallint[], $3::smallint[])
+                    AS lanes(queue, priority, enqueue_shard)
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = lanes.queue
+                 AND claims.priority = lanes.priority
+                 AND claims.enqueue_shard = lanes.enqueue_shard
+            )
+            SELECT heads.queue, heads.priority, heads.enqueue_shard
+            FROM heads
+            CROSS JOIN LATERAL (
+                SELECT head.*
+                FROM {schema}.ready_segments AS segment
+                CROSS JOIN LATERAL (
+                    SELECT
+                        entry.ready_slot,
+                        entry.ready_generation,
+                        entry.queue,
+                        entry.priority,
+                        entry.enqueue_shard,
+                        entry.lane_seq,
+                        entry.job_id,
+                        entry.run_lease
+                    FROM {schema}.ready_entries AS entry
+                    WHERE entry.ready_slot = segment.ready_slot
+                      AND entry.ready_generation = segment.ready_generation
+                      AND entry.queue = heads.queue
+                      AND entry.priority = heads.priority
+                      AND entry.enqueue_shard = heads.enqueue_shard
+                      AND entry.lane_seq >= GREATEST(segment.first_lane_seq, heads.claim_seq)
+                      AND entry.lane_seq < segment.next_lane_seq
+                    ORDER BY entry.lane_seq
+                    LIMIT 1
+                ) AS head
+                WHERE segment.queue = heads.queue
+                  AND segment.priority = heads.priority
+                  AND segment.enqueue_shard = heads.enqueue_shard
+                  AND segment.next_lane_seq > heads.claim_seq
+                ORDER BY segment.next_lane_seq
+                LIMIT 1
+            ) AS ready
+            WHERE EXISTS (
+                    SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                    WHERE tomb.ready_slot = ready.ready_slot
+                      AND tomb.ready_generation = ready.ready_generation
+                      AND tomb.queue = ready.queue
+                      AND tomb.priority = ready.priority
+                      AND tomb.enqueue_shard = ready.enqueue_shard
+                      AND tomb.lane_seq = ready.lane_seq
+                )
+               OR {claimed}
+            ORDER BY heads.queue COLLATE "C", heads.priority, heads.enqueue_shard
+            "#
+            )))
+            .bind(
+                lanes
+                    .iter()
+                    .map(|lane| lane.queue.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+            .bind(
+                lanes
+                    .iter()
+                    .map(|lane| lane.enqueue_shard)
+                    .collect::<Vec<_>>(),
+            )
+            .fetch_all(probe.as_mut())
+            .await;
+        let candidates = match candidates {
+            Ok(candidates) => candidates,
+            Err(err) if is_prune_contention_error(&err) => {
+                tracing::debug!(
+                    error = %err,
+                    "Skipped claim-cursor advances behind a locked queue-storage table"
+                );
+                return Ok(outcome);
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        };
+        probe.commit().await.map_err(map_sqlx_error)?;
+
+        let sql = self.spent_claim_prefix_advance_sql(&claimed);
+        for (queue, priority, enqueue_shard) in candidates {
+            let mut moved: Option<SpentClaimHeadAdvance> = None;
+            for _ in 0..max_windows {
+                let step = self
+                    .advance_spent_claim_head_window(
+                        pool,
+                        &sql,
+                        receipts,
+                        &queue,
+                        priority,
+                        enqueue_shard,
+                    )
+                    .await;
+                let step = match step {
+                    Ok(step) => step,
+                    Err(AwaError::Database(err)) if is_prune_contention_error(&err) => {
+                        tracing::debug!(
+                            queue = %queue,
+                            priority,
+                            enqueue_shard,
+                            error = %err,
+                            "Skipped a claim-cursor advance on a locked queue-storage table"
+                        );
+                        break;
+                    }
+                    Err(AwaError::Database(err)) if is_connection_error(&err) => {
+                        return Err(AwaError::Database(err));
+                    }
+                    Err(err) => {
+                        outcome.failed.push(SpentClaimHeadFailure {
+                            queue: queue.clone(),
+                            priority,
+                            enqueue_shard,
+                            error: err.to_string(),
+                        });
+                        break;
+                    }
+                };
+                let Some(step) = step else {
+                    break;
+                };
+                let unfinished = step.unfinished;
+                match moved.as_mut() {
+                    Some(lane) => lane.to_seq = step.next_seq,
+                    None => {
+                        moved = Some(SpentClaimHeadAdvance {
+                            queue: queue.clone(),
+                            priority,
+                            enqueue_shard,
+                            from_seq: step.claim_seq,
+                            to_seq: step.next_seq,
+                        })
+                    }
+                }
+                if !unfinished {
+                    break;
+                }
+            }
+            outcome.advanced.extend(moved);
+        }
+        Ok(outcome)
+    }
+
+    /// Whether this store's schema claims with lease-claim receipts, read from
+    /// its installed claim functions the way the schema migrations read it:
+    /// the claim allocator and its first per-slot function carry the mode
+    /// marker and the receipt inserts. Falls back to this store's
+    /// configuration when the allocator is missing.
+    async fn schema_uses_lease_claim_receipts_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+    ) -> Result<bool, AwaError> {
+        let receipts: Option<bool> = sqlx::query_scalar(
+            r#"
+            WITH definitions AS (
+                SELECT
+                    pg_get_functiondef(to_regprocedure(format(
+                        '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+                        $1::text
+                    ))) AS runtime,
+                    pg_get_functiondef(to_regprocedure(format(
+                        '%I.claim_ready_slot_0(text,int,bigint,smallint,smallint,bigint,bigint,double precision,timestamptz,timestamptz,double precision,bigint)',
+                        $1::text
+                    ))) AS slot
+            )
+            SELECT CASE
+                WHEN $1 = 'awa' THEN TRUE
+                WHEN runtime IS NULL THEN NULL
+                ELSE position(format('INSERT INTO %I.lease_claims', $1::text)
+                              IN runtime || COALESCE(slot, '')) > 0
+                  OR position(format('INSERT INTO %I.lease_claim_batches', $1::text)
+                              IN runtime || COALESCE(slot, '')) > 0
+            END
+            FROM definitions
+            "#,
+        )
+        .bind(self.schema())
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(receipts.unwrap_or_else(|| self.lease_claim_receipts()))
+    }
+
+    /// One window of [`Self::advance_spent_claim_heads`] for one lane, in its
+    /// own transaction. `None` when the lane's head is held by another
+    /// transaction or the cursor did not move.
+    async fn advance_spent_claim_head_window(
+        &self,
+        pool: &PgPool,
+        sql: &str,
+        receipts: bool,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+    ) -> Result<Option<SpentPrefixAdvance>, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool
+            .begin_with(DRAIN_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(&mut tx, CLAIM_CURSOR_ADVANCE_LOCK_TIMEOUT).await?;
+        let locked: Option<i32> = sqlx::query_scalar(audited_sql(format!(
+            r#"
+            SELECT 1
+            FROM {schema}.queue_claim_heads
+            WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            FOR UPDATE SKIP LOCKED
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if locked.is_none() {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            return Ok(None);
+        }
+        // The tables the advance statement reads in the schema's claim mode,
+        // locked up front without waiting: a table another transaction holds
+        // exclusively ends this window instead of queueing behind it.
+        let tables: &[&str] = if receipts {
+            &[
+                "ready_segments",
+                "ready_entries",
+                "ready_claim_attempt_batches",
+                "ready_tombstones",
+            ]
+        } else {
+            &[
+                "leases",
+                "ready_segments",
+                "done_entries",
+                "ready_entries",
+                "ready_claim_attempt_batches",
+                "ready_tombstones",
+            ]
+        };
+        let tables = tables
+            .iter()
+            .map(|table| format!("{schema}.{table}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sqlx::query(audited_sql(format!(
+            "LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT"
+        )))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let to_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+            r#"
+            SELECT {schema}.sequence_next_value(seq_name)
+            FROM {schema}.queue_enqueue_heads
+            WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let lane = DrainLane {
+            queue: queue.to_string(),
+            priority,
+            enqueue_shard,
+            from_seq: 0,
+            to_seq,
+        };
+        let advance =
+            Self::advance_spent_claim_prefixes_tx(&mut tx, sql, std::slice::from_ref(&lane))
+                .await?
+                .into_iter()
+                .next();
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(advance)
     }
 
     pub async fn set_priority(

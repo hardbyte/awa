@@ -43,6 +43,14 @@ AwaJobOutput.tla              ;; AwaJobOutputDrainOnSend.cfg             ;; Reso
 AwaJobOutput.tla              ;; AwaJobOutputBatchDrops.cfg              ;; ResolvedCompletionHasOutput is violated ;; batched completion drops the output
 AwaJobOutput.tla              ;; AwaJobOutputUnfenced.cfg                ;; NoOutputFromRescuedAttempt is violated ;; the output of a rescued attempt is published after its job is reclaimed
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
+AwaMaintenanceCursorAdvance.tla ;; -                                      ;; pass ;; maintenance advance over a spent lane prefix (#779)
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceWide.cfg     ;; pass ;; maintenance advance, uncapped window
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceUnlocked.cfg ;; pass ;; maintenance advance against writers that skip the head lock
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceCursorLoss.cfg ;; pass ;; cursor movement lost to a crash or failover
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceSkipInvisible.cfg ;; NoSkippedLive is violated ;; advance over an uncommitted enqueue witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceOutOfOrderEnqueue.cfg ;; NoSkippedLive is violated ;; enqueues committing out of lane order witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceProgress.cfg ;; MaintNeverPassesTombstone is violated ;; maintenance passes a tombstone witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceRepairStopsAtGap.cfg ;; ClaimNeverStalls is violated ;; claim repair stopping at a rolled-back reservation witness (#813)
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRacesSafe.cfg        ;; pass ;; safe commit

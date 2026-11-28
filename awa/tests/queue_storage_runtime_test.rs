@@ -12,7 +12,7 @@ use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
     BatchOperationSpec, PromotionLane, PruneOutcome, QueueStorage, QueueStorageConfig,
-    RingRotationCadence, RotateOutcome, SkipReason, SubmitBatchOperation,
+    RingRotationCadence, RotateOutcome, SkipReason, SpentClaimHeadAdvance, SubmitBatchOperation,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -5285,15 +5285,16 @@ async fn test_queue_ring_pinned_by_paused_queue_until_resumed() {
     );
 }
 
-/// #779: whether making an unclaimed lane's rows unavailable unpins the ring.
-/// Cancel, move and reprioritise tombstone the ready row, and the pending
-/// gate counts tombstoned rows. A cancel advances the lane's claim cursor
-/// only when the cancelled row is exactly at it, so cancelling a lane in lane
-/// order, in one bulk cancel or by draining the queue releases it, while
-/// cancelling it out of order, cancelling inside the
-/// caller's transaction, moving it or reprioritising it leaves the rows
-/// pinning the slot. Claiming from the lane then moves the cursor over the
-/// tombstones.
+/// #779: making an unclaimed lane's rows unavailable unpins the ring. Cancel,
+/// move and reprioritise tombstone the ready row, and the pending gate counts
+/// tombstoned rows. A cancel advances the lane's claim cursor only when the
+/// cancelled row is exactly at it, so cancelling a lane in lane order, in one
+/// bulk cancel or by draining the queue releases it at once. Cancelling it
+/// out of order, cancelling inside the caller's transaction, moving it or
+/// reprioritising it leaves the rows pinning the slot until one maintenance
+/// pass moves those lanes' cursors over their tombstones; prune then reclaims
+/// the slot, the ring wraps, and every job is counted and claimed once where
+/// it now lives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_ring_pin_after_cancelling_or_moving_unclaimed_rows() {
     let (_db_guard, pool) = setup_pool(6).await;
@@ -5319,6 +5320,11 @@ async fn test_queue_ring_pin_after_cancelling_or_moving_unclaimed_rows() {
         moved,
     ] {
         lanes.insert(queue, enqueue_lane(&pool, &store, queue, 4, 3).await);
+    }
+    let mut last_seqs = HashMap::new();
+    for (queue, job_ids) in &lanes {
+        let seqs = first_lane_seqs(&pool, &store, job_ids).await;
+        last_seqs.insert(*queue, *seqs.iter().max().unwrap());
     }
     assert_rotated_to(&store, &pool, 1).await;
 
@@ -5387,30 +5393,1216 @@ async fn test_queue_ring_pin_after_cancelling_or_moving_unclaimed_rows() {
         );
     }
     assert_queue_prune_pinned(&store, &pool, 0).await;
-    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
 
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    let mut advanced_queues: Vec<&str> = advanced.iter().map(|lane| lane.queue.as_str()).collect();
+    advanced_queues.sort_unstable();
+    let mut expected_queues = vec![reverse, in_tx, reprioritised, moved];
+    expected_queues.sort_unstable();
+    assert_eq!(
+        advanced_queues, expected_queues,
+        "one maintenance pass advances exactly the lanes held by tombstones: {advanced:?}"
+    );
+    for lane in &advanced {
+        assert_eq!(
+            lane.to_seq,
+            last_seqs[lane.queue.as_str()] + 1,
+            "{}: the cursor passes every tombstone of the lane",
+            lane.queue
+        );
+    }
     for queue in [reverse, in_tx, reprioritised, moved] {
-        let mut live = Vec::new();
+        assert!(
+            !lane_pins_slot(&pool, &store, 0, queue, 4).await,
+            "{queue}: the advance moves the cursor over the tombstones"
+        );
+    }
+    assert!(
+        advance_pinning_lanes(&store, &pool).await.is_empty(),
+        "nothing is left to advance"
+    );
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    assert_rotated_to(&store, &pool, 2).await;
+    assert_rotated_to(&store, &pool, 3).await;
+    assert_rotated_to(&store, &pool, 0).await;
+
+    for queue in [in_order, bulk, reverse, in_tx, drained] {
+        let counts = store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("queue counts");
+        assert_eq!(
+            (counts.available, counts.running, counts.terminal),
+            (0, 0, 3),
+            "{queue}: the cancelled jobs stay counted once their slot is pruned"
+        );
+    }
+    for (queue, expected) in [
+        (in_order, Vec::new()),
+        (bulk, Vec::new()),
+        (reverse, Vec::new()),
+        (in_tx, Vec::new()),
+        (drained, Vec::new()),
+        (moved, Vec::new()),
+        (reprioritised, lanes[reprioritised].clone()),
+        (moved_to, lanes[moved].clone()),
+    ] {
+        let mut claimed = Vec::new();
         for _ in 0..4 {
-            live.extend(
+            claimed.extend(
                 claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
                     .await
                     .into_iter()
                     .map(|job| job.job.id),
             );
         }
-        let expected: Vec<i64> = if queue == reprioritised {
-            lanes[reprioritised].clone()
-        } else {
-            Vec::new()
-        };
-        assert_eq!(live, expected, "{queue}: only live rows are claimed");
-        assert!(
-            !lane_pins_slot(&pool, &store, 0, queue, 4).await,
-            "{queue}: a claim on the lane moves its cursor over the tombstones"
+        assert_eq!(claimed, expected, "{queue}: each live job is claimed once");
+    }
+    for (queue, terminal) in [(reprioritised, 3), (moved, 0), (moved_to, 3)] {
+        let counts = store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("queue counts");
+        assert_eq!(
+            (counts.available, counts.running, counts.terminal),
+            (0, 0, terminal),
+            "{queue}: exact counts after the moved and reprioritised jobs complete"
         );
     }
+}
 
+/// One maintenance pass over the lanes pinning the queue ring, as the
+/// leader runs it: advance the claim cursors of those whose head rows are
+/// spent.
+async fn advance_pinning_lanes(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+) -> Vec<SpentClaimHeadAdvance> {
+    let Some(pin) = store
+        .queue_ring_pin(pool)
+        .await
+        .expect("read queue ring pin")
+    else {
+        return Vec::new();
+    };
+    let outcome = store
+        .advance_spent_claim_heads(pool, &pin.lanes, 4)
+        .await
+        .expect("advance spent claim heads");
+    assert!(outcome.failed.is_empty(), "no lane fails: {outcome:?}");
+    outcome.advanced
+}
+
+/// The lane's claim cursor: the next lane position a claim reads.
+async fn claim_cursor(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+) -> i64 {
+    let schema = store.schema();
+    sqlx::query_scalar(audited_sql(format!(
+        "SELECT {schema}.sequence_next_value(seq_name)
+         FROM {schema}.queue_claim_heads
+         WHERE queue = $1 AND priority = $2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .expect("read claim cursor")
+}
+
+/// Put the lane's claim cursor back to `next`, as a crash or failover that
+/// lost committed cursor movement would.
+async fn rewind_claim_cursor(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    next: i64,
+) {
+    let schema = store.schema();
+    sqlx::query(audited_sql(format!(
+        "SELECT setval(format('%I.%I', '{schema}', seq_name)::regclass, $3, false)
+         FROM {schema}.queue_claim_heads
+         WHERE queue = $1 AND priority = $2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .bind(priority)
+    .bind(next)
+    .execute(pool)
+    .await
+    .expect("rewind claim cursor");
+    assert_eq!(claim_cursor(pool, store, queue, priority).await, next);
+}
+
+/// The lane position of each job's first ready row.
+async fn first_lane_seqs(pool: &sqlx::PgPool, store: &QueueStorage, job_ids: &[i64]) -> Vec<i64> {
+    let schema = store.schema();
+    let mut seqs = Vec::with_capacity(job_ids.len());
+    for job_id in job_ids {
+        seqs.push(
+            sqlx::query_scalar(audited_sql(format!(
+                "SELECT lane_seq FROM {schema}.ready_entries
+                 WHERE job_id = $1 ORDER BY run_lease LIMIT 1"
+            )))
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read lane position"),
+        );
+    }
+    seqs
+}
+
+/// #779: the maintenance advance moves a lane's claim cursor over its
+/// tombstoned head rows and stops exactly at the first live row, which is
+/// then claimed normally. A lane whose head row is live is not advanced and
+/// keeps pinning the slot until it is claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_stops_at_the_first_live_row() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_live_row").await;
+    let queue = "qs_advance_live_row";
+    let moved_to = "qs_advance_live_row_dest";
+    let live_head = "qs_advance_live_head";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 4, 6).await;
+    let live_jobs = enqueue_lane(&pool, &store, live_head, 4, 2).await;
+    let seqs = first_lane_seqs(&pool, &store, &jobs).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let live_head_cursor = claim_cursor(&pool, &store, live_head, 4).await;
+
+    // Positions 0 and 1 moved, 2 live, 3 cancelled, 4 live, 5 cancelled.
+    for job_id in [jobs[1], jobs[0]] {
+        assert!(store
+            .move_queue(&pool, job_id, moved_to, None)
+            .await
+            .expect("move queue"));
+    }
+    let mut tx = pool.begin().await.expect("begin");
+    for job_id in [jobs[5], jobs[3]] {
+        admin::cancel_tx(&mut tx, job_id)
+            .await
+            .expect("cancel_tx")
+            .expect("available job cancels");
+    }
+    tx.commit().await.expect("commit cancels");
+    assert_eq!(claim_cursor(&pool, &store, queue, 4).await, seqs[0]);
+
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    assert_eq!(
+        advanced.len(),
+        1,
+        "only the tombstoned head moves: {advanced:?}"
+    );
+    assert_eq!(
+        (
+            advanced[0].queue.as_str(),
+            advanced[0].from_seq,
+            advanced[0].to_seq
+        ),
+        (queue, seqs[0], seqs[2]),
+        "the cursor stops exactly at the first live row"
+    );
+    assert_eq!(claim_cursor(&pool, &store, queue, 4).await, seqs[2]);
+    assert_eq!(
+        claim_cursor(&pool, &store, live_head, 4).await,
+        live_head_cursor,
+        "a lane with a live head row is left alone"
+    );
+    assert!(lane_pins_slot(&pool, &store, 0, queue, 4).await);
+    assert!(lane_pins_slot(&pool, &store, 0, live_head, 4).await);
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+    assert!(
+        advance_pinning_lanes(&store, &pool).await.is_empty(),
+        "a live head row is never passed"
+    );
+
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    assert_eq!(claimed, vec![jobs[2], jobs[4]]);
+    let live: Vec<i64> = claim_and_complete(&store, &pool, live_head, 10, Duration::ZERO)
+        .await
+        .into_iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert_eq!(live, live_jobs);
+    advance_pinning_lanes(&store, &pool).await;
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, 4)
+    );
+    let moved: Vec<i64> = claim_and_complete(&store, &pool, moved_to, 10, Duration::ZERO)
+        .await
+        .into_iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert_eq!(moved, vec![jobs[1], jobs[0]], "moved in that order");
+}
+
+/// #779: rows already claimed sit behind a claim cursor that a lost
+/// post-commit advance, or a failover, left behind them. The advance passes
+/// them on the claim evidence the claim path trusts in the store's mode, a
+/// cursor that then falls back again is tolerated, and no row is claimed
+/// twice.
+async fn assert_advance_passes_claimed_rows(schema: &str, lease_claim_receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_advance_claimed_prefix";
+    let moved_to = "qs_advance_claimed_prefix_dest";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 3, 4).await;
+    let seqs = first_lane_seqs(&pool, &store, &jobs).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let start = claim_cursor(&pool, &store, queue, 3).await;
+
+    let claimed: Vec<i64> = claim_and_complete(&store, &pool, queue, 2, Duration::ZERO)
+        .await
+        .into_iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert_eq!(claimed, jobs[..2]);
+    assert!(store
+        .move_queue(&pool, jobs[3], moved_to, None)
+        .await
+        .expect("move queue"));
+    rewind_claim_cursor(&pool, &store, queue, 3, start).await;
+    assert!(lane_pins_slot(&pool, &store, 0, queue, 3).await);
+
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    assert_eq!(advanced.len(), 1, "{advanced:?}");
+    assert_eq!(
+        (advanced[0].from_seq, advanced[0].to_seq),
+        (start, seqs[2]),
+        "the cursor passes the claimed rows and stops at the live one"
+    );
+
+    rewind_claim_cursor(&pool, &store, queue, 3, start).await;
+    let mut claimed = Vec::new();
+    for _ in 0..4 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    assert_eq!(
+        claimed,
+        vec![jobs[2]],
+        "a fallen-back cursor never claims a row twice"
+    );
+    advance_pinning_lanes(&store, &pool).await;
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 3).await);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, 3)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_passes_claimed_rows_with_receipts() {
+    assert_advance_passes_claimed_rows("awa_qs_advance_claimed_receipts", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_passes_claimed_rows_without_receipts() {
+    assert_advance_passes_claimed_rows("awa_qs_advance_claimed_legacy", false).await;
+}
+
+/// #779: a job whose claimed row the advance passes after the job was retried,
+/// rescued or moved runs exactly once more, from where it now lives; the
+/// passed row is never claimed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_does_not_resurrect_retried_rescued_or_moved_rows() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_retry").await;
+    let schema = store.schema().to_string();
+    let queue = "qs_advance_retry";
+    let moved_to = "qs_advance_retry_dest";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 4).await;
+    let seqs = first_lane_seqs(&pool, &store, &jobs).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+
+    // jobs[0]: claimed, then retried.
+    let first = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .expect("claim");
+    assert_eq!(first[0].job.id, jobs[0]);
+    store
+        .retry_after(&pool, jobs[0], first[0].job.run_lease, Duration::ZERO, None)
+        .await
+        .expect("retry after")
+        .expect("running job retries");
+    // jobs[1]: claimed, then rescued past its deadline.
+    let second = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .expect("claim");
+    assert_eq!(second[0].job.id, jobs[1]);
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.lease_claim_batches
+         SET deadline_at = clock_timestamp() - interval '1 millisecond'
+         WHERE batch_id = $1"
+    )))
+    .bind(second[0].claim.claim_batch_id)
+    .execute(&pool)
+    .await
+    .expect("expire deadline");
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue expired deadlines");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![jobs[1]]
+    );
+    // jobs[2]: moved.
+    assert!(store
+        .move_queue(&pool, jobs[2], moved_to, None)
+        .await
+        .expect("move queue"));
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.deferred_jobs SET run_at = clock_timestamp() WHERE job_id = ANY($1)"
+    )))
+    .bind(&jobs[..2])
+    .execute(&pool)
+    .await
+    .expect("make the retries due");
+    store
+        .promote_due(&pool, JobState::Retryable, 10)
+        .await
+        .expect("promote retryable");
+
+    rewind_claim_cursor(&pool, &store, queue, 2, start).await;
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    assert_eq!(advanced.len(), 1, "{advanced:?}");
+    assert_eq!(
+        (advanced[0].from_seq, advanced[0].to_seq),
+        (start, seqs[3]),
+        "the claimed and moved rows are passed, the live one is not"
+    );
+
+    let mut claimed = Vec::new();
+    for _ in 0..4 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| (job.job.id, job.job.attempt)),
+        );
+    }
+    claimed.sort_unstable();
+    let mut expected = vec![(jobs[0], 2), (jobs[1], 2), (jobs[3], 1)];
+    expected.sort_unstable();
+    assert_eq!(
+        claimed, expected,
+        "each job runs once more, at its next attempt"
+    );
+    let moved: Vec<(i64, i16)> = claim_and_complete(&store, &pool, moved_to, 10, Duration::ZERO)
+        .await
+        .into_iter()
+        .map(|job| (job.job.id, job.job.attempt))
+        .collect();
+    assert_eq!(moved, vec![(jobs[2], 1)]);
+    assert!(claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+        .await
+        .is_empty());
+}
+
+/// #779: a run of rolled-back reservations longer than one window, between
+/// the claim cursor and the lane's next committed rows, is crossed: the
+/// committed row behind it proves no earlier position can still commit. The
+/// maintenance advance then passes the moved row behind the gap and stops at
+/// the live one, and a drain moves its lane's cursor past the same shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_advance_crosses_rolled_back_reservations() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_gap").await;
+    let queue = "qs_advance_gap";
+    let drained = "qs_advance_gap_drained";
+
+    for lane in [queue, drained] {
+        let first = enqueue_lane(&pool, &store, lane, 2, 1).await;
+        let claimed = claim_and_complete(&store, &pool, lane, 1, Duration::ZERO).await;
+        assert_eq!(claimed[0].job.id, first[0]);
+        reserve_and_roll_back(&pool, &store, lane, 2, 2_500).await;
+    }
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 2).await;
+    let drained_jobs = enqueue_lane(&pool, &store, drained, 2, 3).await;
+    let seqs = first_lane_seqs(&pool, &store, &jobs).await;
+    let drained_seqs = first_lane_seqs(&pool, &store, &drained_jobs).await;
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+    assert!(seqs[0] - start >= 2_500, "the gap is wider than one window");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    assert!(store
+        .move_queue(&pool, jobs[0], "qs_advance_gap_dest", None)
+        .await
+        .expect("move queue"));
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    assert_eq!(advanced.len(), 1, "{advanced:?}");
+    assert_eq!(
+        (advanced[0].from_seq, advanced[0].to_seq),
+        (start, seqs[1]),
+        "the advance crosses the gap and the moved row, and stops at the live row"
+    );
+
+    assert_eq!(
+        admin::drain_queue(&pool, drained)
+            .await
+            .expect("drain queue"),
+        3
+    );
+    assert_eq!(
+        claim_cursor(&pool, &store, drained, 2).await,
+        drained_seqs[2] + 1,
+        "a drain moves its lane's cursor across the gap and its cancelled rows"
+    );
+
+    let claimed: Vec<i64> = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+        .await
+        .into_iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert_eq!(claimed, vec![jobs[1]]);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
+/// #779 cost check, run by hand: the advance's probe and window statements on
+/// a lane whose backlog is spread over many ready segments, and a claim on a
+/// lane whose claim head another transaction holds. Prints timings.
+/// `AWA_MEASURE_SEGMENTS` sets the backlog's segment count (default 5,000).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement: run by hand with --ignored --nocapture"]
+async fn measure_spent_claim_head_advance_with_a_segment_backlog() {
+    let segments_wanted: usize = std::env::var("AWA_MEASURE_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_measure").await;
+    let schema = store.schema().to_string();
+    let queue = "qs_advance_measure";
+
+    // One enqueue per job: each is its own ready segment.
+    let jobs = enqueue_lane(&pool, &store, queue, 2, segments_wanted).await;
+    let segments: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.ready_segments WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count segments");
+    assert_eq!(segments, segments_wanted as i64);
+    assert_rotated_to(&store, &pool, 1).await;
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("the backlog pins slot 0");
+
+    let mut probe_only = Vec::new();
+    for _ in 0..7 {
+        let started = Instant::now();
+        let advanced = store
+            .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+            .await
+            .expect("advance")
+            .advanced;
+        probe_only.push(started.elapsed());
+        assert!(advanced.is_empty(), "a live head is not advanced");
+    }
+    let mut advance = Vec::new();
+    for job_id in &jobs[..7] {
+        assert!(store
+            .move_queue(&pool, *job_id, "qs_advance_measure_dest", None)
+            .await
+            .expect("move queue"));
+        let started = Instant::now();
+        let advanced = store
+            .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+            .await
+            .expect("advance")
+            .advanced;
+        advance.push(started.elapsed());
+        assert_eq!(advanced.len(), 1);
+        assert_eq!(advanced[0].to_seq - advanced[0].from_seq, 1);
+    }
+    probe_only.sort();
+    advance.sort();
+    eprintln!(
+        "[advance-measure] segments={segments_wanted} probe_only_median={:?} probe_only_max={:?} advance_median={:?} advance_max={:?}",
+        probe_only[3], probe_only[6], advance[3], advance[6]
+    );
+
+    let mut holder = pool.begin().await.expect("begin");
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_claim_heads WHERE queue = $1 FOR UPDATE"
+    )))
+    .bind(queue)
+    .execute(&mut *holder)
+    .await
+    .expect("hold the claim head");
+    let started = Instant::now();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .expect("claim");
+    let held_claim = started.elapsed();
+    holder.rollback().await.expect("release");
+    assert!(
+        claimed.is_empty(),
+        "a claim skips a lane whose head is held"
+    );
+    eprintln!(
+        "[advance-measure] claim_with_head_held={held_claim:?} claimed={}",
+        claimed.len()
+    );
+}
+
+/// #779: a lane whose advance fails with an error other than lock
+/// contention is reported as failed, and the lanes after it are still
+/// advanced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_continues_past_a_failing_lane() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_failing_lane").await;
+    let schema = store.schema().to_string();
+    let failing = "qs_advance_a_failing";
+    let healthy = "qs_advance_b_healthy";
+
+    let mut lanes = HashMap::new();
+    for queue in [failing, healthy] {
+        lanes.insert(queue, enqueue_lane(&pool, &store, queue, 2, 2).await);
+    }
+    assert_rotated_to(&store, &pool, 1).await;
+    for queue in [failing, healthy] {
+        assert!(store
+            .move_queue(&pool, lanes[queue][0], "qs_advance_failing_dest", None)
+            .await
+            .expect("move queue"));
+    }
+    // A lane with no enqueue head fails its window read; the probe does not
+    // read enqueue heads, so the lane is still a candidate.
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.queue_enqueue_heads WHERE queue = $1"
+    )))
+    .bind(failing)
+    .execute(&pool)
+    .await
+    .expect("drop the failing lane's enqueue head");
+
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("both lanes pin slot 0");
+    let outcome = store
+        .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+        .await
+        .expect("a failing lane does not fail the call");
+    assert_eq!(
+        outcome
+            .failed
+            .iter()
+            .map(|lane| lane.queue.as_str())
+            .collect::<Vec<_>>(),
+        vec![failing]
+    );
+    assert_eq!(
+        outcome
+            .advanced
+            .iter()
+            .map(|lane| lane.queue.as_str())
+            .collect::<Vec<_>>(),
+        vec![healthy],
+        "the lane after the failing one is still advanced"
+    );
+    let seqs = first_lane_seqs(&pool, &store, &lanes[healthy]).await;
+    assert_eq!(claim_cursor(&pool, &store, healthy, 2).await, seqs[1]);
+}
+
+/// #779: the advance reads which claim evidence to trust from the schema's
+/// installed claim function, not from the store's configuration: a store
+/// configured without receipts, on a schema installed with them, reads only
+/// the receipt evidence and so does not touch `leases`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_uses_the_schema_claim_mode() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_advance_schema_mode";
+    let installed = create_ring_pin_store(&pool, schema).await;
+    let queue = "qs_advance_schema_mode";
+    let jobs = enqueue_lane(&pool, &installed, queue, 2, 2).await;
+    assert_rotated_to(&installed, &pool, 1).await;
+    assert!(installed
+        .move_queue(&pool, jobs[0], "qs_advance_schema_mode_dest", None)
+        .await
+        .expect("move queue"));
+    let pin = installed
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("the moved row pins slot 0");
+
+    let misconfigured = QueueStorage::new(QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    })
+    .expect("store");
+    let mut holder = pool.begin().await.expect("begin");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.leases IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("hold leases");
+    let outcome = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        misconfigured.advance_spent_claim_heads(&pool, &pin.lanes, 4),
+    )
+    .await
+    .expect("the advance does not wait")
+    .expect("advance");
+    holder.rollback().await.expect("release");
+    assert!(outcome.failed.is_empty(), "{outcome:?}");
+    assert_eq!(
+        outcome.advanced.len(),
+        1,
+        "the receipt-mode advance does not read leases, so it is not held back"
+    );
+    let seqs = first_lane_seqs(&pool, &installed, &jobs).await;
+    assert_eq!(claim_cursor(&pool, &installed, queue, 2).await, seqs[1]);
+}
+
+/// #779: `drain_queue` and the maintenance advance running at once on the
+/// same lane leave every drained job cancelled exactly once, never claimed,
+/// and the lane's cursor past them, so the next job enqueued is the next
+/// claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spent_claim_head_advance_racing_drain_queue() {
+    const JOBS: usize = 2_500;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store = Arc::new(create_ring_pin_store(&pool, "awa_qs_advance_drain_race").await);
+    let queue = "qs_advance_drain_race";
+
+    let params: Vec<_> = (0..JOBS)
+        .map(|n| {
+            insert::params_with(
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    priority: 2,
+                    ..Default::default()
+                },
+            )
+            .expect("insert params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &params)
+        .await
+        .expect("enqueue");
+    assert_rotated_to(&store, &pool, 1).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let head: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT 1",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read head");
+    admin::cancel_tx(&mut tx, head)
+        .await
+        .expect("cancel_tx")
+        .expect("available job cancels");
+    tx.commit().await.expect("commit");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let passes = Arc::new(AtomicUsize::new(0));
+    let advancer = {
+        let (store, pool, stop, passes) =
+            (store.clone(), pool.clone(), stop.clone(), passes.clone());
+        tokio::spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                advance_pinning_lanes(&store, &pool).await;
+                passes.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    while passes.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the advance loop runs");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let passes_before = passes.load(Ordering::SeqCst);
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    let passes_during = passes.load(Ordering::SeqCst) - passes_before;
+    stop.store(true, Ordering::SeqCst);
+    advancer.await.expect("advancer");
+    assert_eq!(
+        drained as usize,
+        JOBS - 1,
+        "every available job is drained once"
+    );
+    assert!(passes_during >= 1, "the advance ran while the drain did");
+
+    let next = enqueue_lane(&pool, &store, queue, 2, 1).await;
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    assert_eq!(claimed, next, "no drained job is claimed");
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 2).await);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, JOBS as i64 + 1)
+    );
+}
+
+/// #779: `awa.delete_job_compat`, which tombstones a ready row without
+/// taking the lane's claim head, racing the advance on the same lane: the
+/// deleted jobs are never claimed, the live job behind them is claimed once,
+/// and the lane stops pinning the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spent_claim_head_advance_racing_compat_delete() {
+    const JOBS: usize = 200;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store = Arc::new(create_ring_pin_store(&pool, "awa_qs_advance_compat_delete").await);
+    let queue = "qs_advance_compat_delete";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, JOBS + 1).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let first: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+        .bind(jobs[0])
+        .fetch_one(&pool)
+        .await
+        .expect("delete_job_compat");
+    assert!(first);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let advancer = {
+        let (store, pool, stop) = (store.clone(), pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut advances = 0;
+            while !stop.load(Ordering::SeqCst) {
+                advances += advance_pinning_lanes(&store, &pool).await.len();
+                tokio::task::yield_now().await;
+            }
+            advances
+        })
+    };
+    for job_id in jobs[1..JOBS].iter().rev() {
+        let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("delete_job_compat");
+        assert!(deleted);
+    }
+    // Let the advance catch up with the last deletes.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    let live_seq = first_lane_seqs(&pool, &store, &jobs[JOBS..]).await[0];
+    while claim_cursor(&pool, &store, queue, 2).await != live_seq {
+        assert!(
+            Instant::now() < deadline,
+            "the advance reaches the live job"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.store(true, Ordering::SeqCst);
+    let advances = advancer.await.expect("advancer");
+    assert!(advances >= 1);
+
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    assert_eq!(claimed, vec![jobs[JOBS]], "only the live job is claimed");
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 2).await);
+}
+
+/// #779: the advance races live claims and moves on the same lane. Every job
+/// is claimed exactly once, from the queue it is in when claimed, and the
+/// lane stops pinning the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spent_claim_head_advance_racing_claims_and_moves_claims_each_job_once() {
+    const JOBS: usize = 300;
+    let (_db_guard, pool) = setup_pool(12).await;
+    let store = Arc::new(create_ring_pin_store(&pool, "awa_qs_advance_race").await);
+    let queue = "qs_advance_race";
+    let moved_to = "qs_advance_race_dest";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, JOBS).await;
+    assert_rotated_to(&store, &pool, 1).await;
+
+    // Tombstone a head prefix, so the advance has work before claims start.
+    let mut moved = Vec::new();
+    for job_id in jobs[..20].iter().rev() {
+        assert!(store
+            .move_queue(&pool, *job_id, moved_to, None)
+            .await
+            .expect("move queue"));
+        moved.push(*job_id);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let advancer_done = Arc::new(AtomicBool::new(false));
+    let advances = Arc::new(AtomicUsize::new(0));
+    let advancer = {
+        let (store, pool, stop, advances, advancer_done) = (
+            store.clone(),
+            pool.clone(),
+            stop.clone(),
+            advances.clone(),
+            advancer_done.clone(),
+        );
+        tokio::spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                advances.fetch_add(
+                    advance_pinning_lanes(&store, &pool).await.len(),
+                    Ordering::SeqCst,
+                );
+                tokio::task::yield_now().await;
+            }
+            advancer_done.store(true, Ordering::SeqCst);
+        })
+    };
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    while advances.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the advance passes the moved prefix"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mover = {
+        let (store, pool) = (store.clone(), pool.clone());
+        let candidates: Vec<i64> = jobs[20..].iter().rev().step_by(3).copied().collect();
+        tokio::spawn(async move {
+            let mut moved = Vec::new();
+            for job_id in candidates {
+                if store
+                    .move_queue(&pool, job_id, moved_to, None)
+                    .await
+                    .expect("move queue")
+                {
+                    moved.push(job_id);
+                }
+            }
+            moved
+        })
+    };
+    let mut claimers = Vec::new();
+    for _ in 0..2 {
+        let (store, pool, advancer_done) = (store.clone(), pool.clone(), advancer_done.clone());
+        claimers.push(tokio::spawn(async move {
+            let mut claimed = Vec::new();
+            let mut idle = 0;
+            while idle < 20 || !advancer_done.load(Ordering::SeqCst) {
+                let batch = claim_and_complete(&store, &pool, queue, 5, Duration::ZERO).await;
+                if batch.is_empty() {
+                    idle += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                } else {
+                    idle = 0;
+                    claimed.extend(batch.into_iter().map(|job| job.job.id));
+                }
+            }
+            claimed
+        }));
+    }
+    moved.extend(mover.await.expect("mover"));
+    stop.store(true, Ordering::SeqCst);
+    let mut claimed = Vec::new();
+    for claimer in claimers {
+        claimed.extend(claimer.await.expect("claimer"));
+    }
+    advancer.await.expect("advancer");
+
+    let claimed_set: HashSet<i64> = claimed.iter().copied().collect();
+    assert_eq!(claimed_set.len(), claimed.len(), "no job is claimed twice");
+    let moved_set: HashSet<i64> = moved.iter().copied().collect();
+    assert!(
+        claimed_set.is_disjoint(&moved_set),
+        "no moved job is claimed from its old queue"
+    );
+    let all: HashSet<i64> = jobs.iter().copied().collect();
+    assert_eq!(
+        claimed_set
+            .union(&moved_set)
+            .copied()
+            .collect::<HashSet<_>>(),
+        all,
+        "no live job is skipped"
+    );
+    let mut from_dest = Vec::new();
+    for _ in 0..(moved.len() / 50 + 2) {
+        from_dest.extend(
+            claim_and_complete(&store, &pool, moved_to, 100, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    from_dest.sort_unstable();
+    moved.sort_unstable();
+    assert_eq!(
+        from_dest, moved,
+        "each moved job is claimed once where it now lives"
+    );
+
+    advance_pinning_lanes(&store, &pool).await;
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 2).await);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, claimed.len() as i64)
+    );
+}
+
+/// #779: a tombstoned prefix longer than one call's window budget converges
+/// over several calls, two of them racing as two leaders would, and the
+/// cursor stops at the live row behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spent_claim_head_advance_converges_over_a_long_prefix_with_two_leaders() {
+    const TOMBSTONED: usize = 4_100;
+    let (_db_guard, pool) = setup_pool(8).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_long").await;
+    let schema = store.schema().to_string();
+    let queue = "qs_advance_long";
+
+    let params: Vec<_> = (0..TOMBSTONED + 3)
+        .map(|n| {
+            insert::params_with(
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    priority: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("insert params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &params)
+        .await
+        .expect("enqueue");
+    let jobs: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT job_id, lane_seq FROM {schema}.ready_entries WHERE queue = $1 ORDER BY lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read lane");
+    assert_eq!(jobs.len(), TOMBSTONED + 3);
+    assert_rotated_to(&store, &pool, 1).await;
+    let start = claim_cursor(&pool, &store, queue, 3).await;
+    assert_eq!(start, jobs[0].1);
+
+    let mut tx = pool.begin().await.expect("begin");
+    for (job_id, _) in jobs[..TOMBSTONED].iter().rev() {
+        admin::cancel_tx(&mut tx, *job_id)
+            .await
+            .expect("cancel_tx")
+            .expect("available job cancels");
+    }
+    tx.commit().await.expect("commit cancels");
+    assert_eq!(claim_cursor(&pool, &store, queue, 3).await, start);
+
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    assert_eq!(advanced.len(), 1);
+    assert_eq!(
+        (advanced[0].from_seq, advanced[0].to_seq),
+        (start, start + 4_000),
+        "one call passes at most four windows of 1,000 positions"
+    );
+    assert!(lane_pins_slot(&pool, &store, 0, queue, 3).await);
+
+    let (a, b) = tokio::join!(
+        advance_pinning_lanes(&store, &pool),
+        advance_pinning_lanes(&store, &pool)
+    );
+    assert!(
+        a.len() + b.len() >= 1,
+        "one of two racing leaders finishes the prefix: {a:?} {b:?}"
+    );
+    for _ in 0..2 {
+        advance_pinning_lanes(&store, &pool).await;
+    }
+    assert_eq!(
+        claim_cursor(&pool, &store, queue, 3).await,
+        jobs[TOMBSTONED].1,
+        "the cursor stops exactly at the first live row"
+    );
+
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    let expected: Vec<i64> = jobs[TOMBSTONED..]
+        .iter()
+        .map(|(job_id, _)| *job_id)
+        .collect();
+    assert_eq!(claimed, expected);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, (TOMBSTONED + 3) as i64)
+    );
+}
+
+/// #779: the advance gives up quietly, leaving the cursor where it is, when a
+/// queue-slot table it reads is held ACCESS EXCLUSIVE or the lane's claim
+/// head is held by another transaction, and advances once they are released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_locked").await;
+    let schema = store.schema().to_string();
+    let queue = "qs_advance_locked";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 3).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    for job_id in jobs.iter().rev() {
+        assert!(store
+            .move_queue(&pool, *job_id, "qs_advance_locked_dest", None)
+            .await
+            .expect("move queue"));
+    }
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("the moved rows pin slot 0");
+
+    let mut holder = pool.begin().await.expect("begin");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.ready_tombstones_0 IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("hold the tombstone child");
+    let started = Instant::now();
+    let advanced = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        store.advance_spent_claim_heads(&pool, &pin.lanes, 4),
+    )
+    .await
+    .expect("the advance does not wait behind a locked table")
+    .expect("a locked table is not an error");
+    assert!(
+        advanced.failed.is_empty(),
+        "contention on a locked table is not a lane failure: {advanced:?}"
+    );
+    assert!(advanced.advanced.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the advance does not wait behind the lock"
+    );
+    holder.rollback().await.expect("release");
+    assert_eq!(claim_cursor(&pool, &store, queue, 2).await, start);
+
+    let mut holder = pool.begin().await.expect("begin");
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_claim_heads WHERE queue = $1 FOR UPDATE"
+    )))
+    .bind(queue)
+    .execute(&mut *holder)
+    .await
+    .expect("hold the claim head");
+    let advanced = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        store.advance_spent_claim_heads(&pool, &pin.lanes, 4),
+    )
+    .await
+    .expect("the advance does not wait behind a held claim head")
+    .expect("a held head is not an error");
+    assert!(
+        advanced.failed.is_empty(),
+        "contention on a held head is not a lane failure: {advanced:?}"
+    );
+    assert!(advanced.advanced.is_empty());
+    holder.rollback().await.expect("release");
+    assert_eq!(claim_cursor(&pool, &store, queue, 2).await, start);
+
+    let advanced = store
+        .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+        .await
+        .expect("advance")
+        .advanced;
+    assert_eq!(advanced.len(), 1);
+    assert_eq!(advanced[0].to_seq - advanced[0].from_seq, 3);
     assert_queue_prune_reclaims(&store, &pool, 0).await;
 }
 
@@ -5546,6 +6738,7 @@ fn ring_pin_client_rotating_every<W: Worker + 'static>(
             queue_rotate_interval,
             Duration::from_millis(100),
         )
+        .ring_rotation_cadence(RingRotationCadence::EAGER)
         .register_worker(worker)
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
@@ -5724,6 +6917,202 @@ fn pending_ready_prune_attempts(
         "awa.ring.reason",
         "queue.pending_ready",
     )
+}
+
+fn claim_cursor_advances_for(
+    exporter: &InMemoryMetricExporter,
+    meter_provider: &SdkMeterProvider,
+    queue: &str,
+) -> u64 {
+    meter_provider.force_flush().expect("flush metrics");
+    let metrics = exporter.get_finished_metrics().expect("read metrics");
+    let Some(latest) = metrics.last() else {
+        return 0;
+    };
+    sum_counter_metric_with_attribute(
+        std::slice::from_ref(latest),
+        "awa.maintenance.prune.claim_cursor_advances",
+        "awa.job.queue",
+        queue,
+    )
+}
+
+fn ring_pin_release_logged(queue: &str) -> bool {
+    ring_pin_events().lock().unwrap().iter().any(|event| {
+        event
+            .message
+            .starts_with("Queue ring prune is no longer pinned by this lane")
+            && event.fields.get("queue").map(String::as_str) == Some(queue)
+    })
+}
+
+/// #779: moving a paused queue's jobs releases the queue ring through the
+/// running maintenance leader alone: it advances the lane's claim cursor over
+/// the tombstones, counts and logs the release, zeroes the lane's gauge, and
+/// prune reclaims the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_released_by_maintenance_after_moving_the_jobs() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_release_moved";
+    let moved_to = "qs_ring_pin_release_moved_dest";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_release_moved");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let schema = store.schema().to_string();
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 3).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 2,
+            poll_interval: Duration::from_millis(25),
+            ..QueueConfig::default()
+        },
+        store_config,
+        CompleteWorker,
+    );
+    client.start().await.expect("start client");
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |age| age > 0.0,
+        "the paused lane is reported as pinning the ring",
+    )
+    .await;
+    assert!(!ring_pin_release_logged(queue));
+
+    for job_id in jobs.iter().rev() {
+        assert!(store
+            .move_queue(&pool, *job_id, moved_to, None)
+            .await
+            .expect("move queue"));
+    }
+
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    loop {
+        let remaining: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE ready_slot = 0"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("count slot 0 ready rows");
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader releases the lane and prune reclaims slot 0"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ring_pin_release_logged(queue), "the release is logged");
+    assert!(claim_cursor_advances_for(&exporter, &meter_provider, queue) >= 1);
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |age| age == 0.0,
+        "the gauge drops to zero once the lane is released",
+    )
+    .await;
+    let counts = store
+        .queue_counts(&pool, moved_to)
+        .await
+        .expect("queue counts");
+    assert_eq!((counts.available, counts.terminal), (3, 0));
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, 0)
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[derive(Clone)]
+struct SlowRecordingWorker {
+    seen: Arc<std::sync::Mutex<Vec<i64>>>,
+}
+
+#[async_trait::async_trait]
+impl Worker for SlowRecordingWorker {
+    fn kind(&self) -> &'static str {
+        "complete_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        self.seen.lock().unwrap().push(ctx.job.id);
+        Ok(JobResult::Completed)
+    }
+}
+
+/// #779: a lane that pins the oldest slot only because it is still draining
+/// is left to its claimers: maintenance does not release or log it, queue
+/// prune keeps backing off, and every job runs exactly once in lane order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_busy_lane_is_left_to_its_claimers() {
+    const JOBS: usize = 60;
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_busy_lane";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_busy_lane");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, JOBS).await;
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 1,
+            poll_interval: Duration::from_millis(25),
+            ..QueueConfig::default()
+        },
+        store_config,
+        SlowRecordingWorker { seen: seen.clone() },
+    );
+    client.start().await.expect("start client");
+    let started = Instant::now();
+    wait_for_queue_drained(&store, &pool, queue).await;
+    let drained_in = started.elapsed();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        jobs,
+        "each job runs once, in lane order"
+    );
+    assert!(
+        !ring_pin_release_logged(queue),
+        "a draining lane is never reported as released"
+    );
+    let attempts = pending_ready_prune_attempts(&exporter, &meter_provider);
+    // Prune runs on ticks 1, 4, 9, 18, 35 and 68 while the slot stays pinned;
+    // a backoff reset on every tick would make one attempt per tick.
+    let ticks = drained_in.as_millis() / 100 + 1;
+    assert!(
+        (attempts as u128) * 3 < ticks.max(30),
+        "{attempts} pending-ready prune attempts over about {ticks} ticks: prune kept backing off"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// #779: once prune backs off a pinned slot for up to 32 rotation ticks, the

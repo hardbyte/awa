@@ -617,6 +617,34 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
        Step(LaneResource(dstQ, dstP), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared) >>
 
+\* Maintenance claim-cursor advance over a pinning lane's spent prefix
+\* (#779; `AwaMaintenanceCursorAdvance.tla`)
+\*   SELECT ... FROM queue_claim_heads FOR UPDATE SKIP LOCKED (lane row)
+\*   LOCK TABLE leases, ready_segments, done_entries, ready_entries,
+\*     ready_claim_attempt_batches, ready_tombstones IN ACCESS SHARE MODE
+\*     NOWAIT, in that order, which is prune's child exclusive-lock order
+\*     (with lease-claim receipts it leaves out leases and done_entries,
+\*     which its scan does not read)
+\*   one statement over those tables that finds the lane's first unspent
+\*     row and raises the lane cursor with set_sequence_next
+\* The plan names one slot's children. The real LOCK TABLE covers every
+\* child of every slot; the statement also reads deferred_jobs,
+\* dlq_entries, queue_enqueue_heads and queue_claim_heads under a short
+\* transaction-local lock_timeout, and set_sequence_next takes a blocking
+\* session advisory lock on the lane cursor that is held only around its
+\* setval. Those omissions are safe because the advance never waits on a
+\* lock prune or rotation holds: the head is SKIP LOCKED, the queue-slot
+\* families are NOWAIT, and the remaining waits are bounded. Modelling
+\* the steps as blocking acquires over-approximates it.
+MaintenanceCursorAdvancePlan(q, p, readySlot) ==
+    << Step(LaneResource(q, p), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ReadySegmentChildResource(readySlot), ModeShared),
+       Step(DoneChildResource(readySlot), ModeShared),
+       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
+       Step(ReadyTombstoneChildResource(readySlot), ModeShared) >>
+
 \* rotate_leases (ledger authority; see BeginRingTx for the compat head)
 \*   pg_try_advisory_xact_lock on the lease-ring rotation lock
 \*   SELECT EXISTS FROM lease_child[next_slot] (AccessShare on child)
@@ -1045,6 +1073,17 @@ BeginRingTx(t, singletonRes, plan) ==
                 ![singletonRes] = heldLocks[singletonRes] \cup {<<t, ModeExclusive>>}]
     /\ UNCHANGED authority
 
+StartMaintenanceCursorAdvance(t, q, p, readySlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ readySlot \in ReadySlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = MaintenanceCursorAdvancePlan(q, p, readySlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
 StartRotateLeases(t, nextSlot) ==
     /\ t \in TxIds /\ nextSlot \in LeaseSlots
     /\ BeginRingTx(t, LeaseRingStateResource,
@@ -1292,6 +1331,8 @@ Next ==
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)
     \/ \E t \in TxIds : StartFlipAuthority(t)
     \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities, rs \in ReadySlots :
+          StartMaintenanceCursorAdvance(t, q, p, rs)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
