@@ -74,10 +74,10 @@ export function QueuesPage() {
 
   const drainMutation = useMutation({
     mutationFn: (queue: string) => drainQueue(queue),
-    onSuccess: () => {
+    onSuccess: (result, queue) => {
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue drained`);
+      toast.success(`Queue "${queue}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
     },
     onError: () => {
       toast.error("Failed to drain queue");
@@ -202,7 +202,7 @@ export function QueuesPage() {
                   </>
                 )}
                 <span className="text-muted-fg">Lag</span>
-                <span><LagValue seconds={q.lag_seconds} /> s</span>
+                <span><LagValue seconds={q.lag_seconds} /></span>
                 <span className="text-muted-fg">Capacity</span>
                 <span>{capacityLabel(runtime)}</span>
                 <span className="text-muted-fg">Rate limit</span>
@@ -309,7 +309,7 @@ export function QueuesPage() {
                       {q.waiting_external > 0 && (
                         <div className="mt-0.5 text-xs text-muted-fg">
                           {q.waiting_external.toLocaleString()} waiting · lag{" "}
-                          <LagValue seconds={q.lag_seconds} /> s
+                          <LagValue seconds={q.lag_seconds} />
                         </div>
                       )}
                       {descriptorSyncLabel(q) && (

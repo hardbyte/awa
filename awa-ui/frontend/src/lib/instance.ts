@@ -14,6 +14,38 @@ export function instanceTitle(name: string | null | undefined): string {
   return trimmed ? `${trimmed} — AWA` : "AWA";
 }
 
+/** Page name for a route path, used in the browser tab title. */
+export function pageTitle(pathname: string): string {
+  const [section, id] = pathname.replace(/^\/+|\/+$/g, "").split("/");
+  const detail = id ? decodeURIComponent(id) : null;
+  switch (section) {
+    case "":
+    case undefined:
+      return "Dashboard";
+    case "jobs":
+      return detail ? `Job #${detail}` : "Jobs";
+    case "dlq":
+      return detail ? `Dead letter #${detail}` : "Dead letters";
+    case "queues":
+      return detail ? `Queue ${detail}` : "Queues";
+    case "kinds":
+      return "Kinds";
+    case "runtime":
+      return detail ? "Runtime instance" : "Runtime";
+    case "cron":
+      return "Cron";
+    case "batch-ops":
+      return "Batch Ops";
+    default:
+      return "Not found";
+  }
+}
+
+/** Browser tab title for a page of an (optionally named) instance. */
+export function documentTitle(pathname: string, name: string | null | undefined): string {
+  return `${pageTitle(pathname)} · ${instanceTitle(name)}`;
+}
+
 /**
  * Accept only CSS hex colors ('#' + 3/4/6/8 hex digits). The server
  * validates too; this is defense in depth before the value reaches inline
@@ -54,9 +86,9 @@ export function faviconDataUri(color: string | null): string {
 }
 
 /**
- * Apply the instance identity to the document: tab title and tinted
- * favicon. No-op until the capabilities query reports a name or color, so
- * unconfigured instances keep the browser defaults.
+ * Apply the instance identity to the document's tinted favicon. No-op until
+ * the capabilities query reports a name or color, so unconfigured instances
+ * keep the browser default. The tab title is set per route by the shell.
  */
 export function applyInstanceIdentity(
   name: string | null,
@@ -64,8 +96,6 @@ export function applyInstanceIdentity(
 ): void {
   const normalizedColor = normalizeInstanceColor(color);
   if (!name?.trim() && !normalizedColor) return;
-
-  document.title = instanceTitle(name);
 
   let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
   if (!link) {

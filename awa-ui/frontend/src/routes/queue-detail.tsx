@@ -77,12 +77,12 @@ export function QueueDetailPage() {
 
   const drainMutation = useMutation({
     mutationFn: () => drainQueue(queueName),
-    onSuccess: () => {
+    onSuccess: (result) => {
       setShowDrainConfirm(false);
       void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${queueName}" drained`);
+      toast.success(`Queue "${queueName}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
     },
     onError: () => toast.error("Failed to drain queue"),
   });
@@ -301,7 +301,7 @@ export function QueueDetailPage() {
 
             <DescriptionTerm>Lag</DescriptionTerm>
             <DescriptionDetails>
-              <LagValue seconds={queue.lag_seconds} /> s
+              <LagValue seconds={queue.lag_seconds} />
             </DescriptionDetails>
           </DescriptionList>
         </CardContent>

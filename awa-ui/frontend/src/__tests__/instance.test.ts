@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_FAVICON_COLOR,
+  documentTitle,
   faviconDataUri,
   faviconSvg,
   instanceTitle,
@@ -17,6 +18,22 @@ describe("instanceTitle", () => {
   it("prefixes the instance name", () => {
     expect(instanceTitle("cloudsql-prod")).toBe("cloudsql-prod — AWA");
     expect(instanceTitle("  alloydb  ")).toBe("alloydb — AWA");
+  });
+});
+
+describe("documentTitle", () => {
+  it("names the page for each route", () => {
+    expect(documentTitle("/", null)).toBe("Dashboard · AWA");
+    expect(documentTitle("/jobs", null)).toBe("Jobs · AWA");
+    expect(documentTitle("/jobs/42", null)).toBe("Job #42 · AWA");
+    expect(documentTitle("/dlq", null)).toBe("Dead letters · AWA");
+    expect(documentTitle("/queues/email%20out", null)).toBe("Queue email out · AWA");
+    expect(documentTitle("/batch-ops/", null)).toBe("Batch Ops · AWA");
+    expect(documentTitle("/nope", null)).toBe("Not found · AWA");
+  });
+
+  it("keeps the instance name", () => {
+    expect(documentTitle("/cron", "cloudsql-prod")).toBe("Cron · cloudsql-prod — AWA");
   });
 });
 

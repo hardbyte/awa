@@ -238,10 +238,10 @@ export function JobsPage() {
   });
   const drainQueueMutation = useMutation({
     mutationFn: () => drainQueue(activeQueue!),
-    onSuccess: () => {
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${activeQueue}" drained`);
+      toast.success(`Queue "${activeQueue}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
     },
     onError: () => toast.error("Failed to drain queue"),
   });

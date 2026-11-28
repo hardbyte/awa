@@ -99,6 +99,26 @@ test.describe("Phone navigation", () => {
   });
 });
 
+test.describe("Navigation", () => {
+  test("Dead letters is in the sidebar and opens the DLQ", async ({ page }) => {
+    await page.goto("/");
+    const nav = page.locator('[data-slot="sidebar-section"]').first();
+    await nav.getByRole("link", { name: "Dead letters" }).click();
+    await expect(page).toHaveURL(/\/dlq$/);
+    await expect(page.getByRole("heading", { name: "Dead Letter Queue" })).toBeVisible();
+    await expect(nav.getByRole("link", { name: "Dead letters" })).toHaveAttribute("aria-current", "page");
+  });
+
+  test("each route sets its own document title", async ({ page }) => {
+    await page.goto("/jobs");
+    await expect(page).toHaveTitle(/^Jobs · /);
+    await page.goto("/dlq");
+    await expect(page).toHaveTitle(/^Dead letters · /);
+    await page.goto("/");
+    await expect(page).toHaveTitle(/^Dashboard · /);
+  });
+});
+
 test.describe("Failed reads are not shown as empty", () => {
   test("dashboard tiles show no count when stats fail", async ({ page }) => {
     await failApi(page, "**/api/stats");
