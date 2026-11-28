@@ -1592,6 +1592,7 @@ impl PyClient {
                 &ListBatchOperationsFilter {
                     state,
                     limit: Some(limit),
+                    ..Default::default()
                 },
             )
             .await
@@ -3251,6 +3252,7 @@ impl PyClient {
                     &ListBatchOperationsFilter {
                         state,
                         limit: Some(limit),
+                        ..Default::default()
                     },
                 )
                 .await

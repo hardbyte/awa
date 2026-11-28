@@ -356,6 +356,9 @@ pub struct BatchOperationRunOutcome {
 pub struct ListBatchOperationsFilter {
     pub state: Option<BatchOperationState>,
     pub limit: Option<i64>,
+    /// Keyset cursor: list only operations strictly older than this
+    /// `(submitted_at, id)` pair in the newest-first order.
+    pub before: Option<(DateTime<Utc>, Uuid)>,
 }
 
 pub async fn submit_batch_operation(
@@ -416,28 +419,43 @@ pub async fn list_batch_operations(
     filter: &ListBatchOperationsFilter,
 ) -> Result<Vec<BatchOperation>, AwaError> {
     let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
+    let (before_at, before_id) = filter.before.unzip();
     sqlx::query_as::<_, BatchOperation>(
         r#"
         SELECT *
         FROM awa.batch_operations
         WHERE ($1::text IS NULL OR state = $1)
-        ORDER BY submitted_at DESC
+          AND ($3::timestamptz IS NULL OR (submitted_at, id) < ($3, $4::uuid))
+        ORDER BY submitted_at DESC, id DESC
         LIMIT $2
         "#,
     )
     .bind(filter.state.map(BatchOperationState::as_str))
     .bind(limit)
+    .bind(before_at)
+    .bind(before_id)
     .fetch_all(pool)
     .await
     .map_err(map_sqlx_error)
 }
 
-pub async fn get_batch_operation(pool: &PgPool, id: Uuid) -> Result<BatchOperation, AwaError> {
+/// The operation with this id, or `None` when there is none (never
+/// submitted, or removed by retention).
+pub async fn find_batch_operation(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<BatchOperation>, AwaError> {
     sqlx::query_as::<_, BatchOperation>("SELECT * FROM awa.batch_operations WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
         .await
-        .map_err(map_sqlx_error)?
+        .map_err(map_sqlx_error)
+}
+
+/// As [`find_batch_operation`], with a missing operation as a validation error.
+pub async fn get_batch_operation(pool: &PgPool, id: Uuid) -> Result<BatchOperation, AwaError> {
+    find_batch_operation(pool, id)
+        .await?
         .ok_or_else(|| AwaError::Validation(format!("batch operation not found: {id}")))
 }
 

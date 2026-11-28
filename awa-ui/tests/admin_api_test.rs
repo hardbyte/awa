@@ -1132,6 +1132,112 @@ async fn test_batch_ops_api_preview_submit_and_cancel() {
     assert_eq!(patch_response.status(), StatusCode::OK);
 }
 
+async fn get_status(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn test_batch_op_detail_is_404_for_unknown_and_malformed_ids() {
+    let db = queue_storage_db().await;
+    let app = awa_ui::router(db.pool().clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    for path in [
+        format!("/api/batch-ops/{}", Uuid::new_v4()),
+        "/api/batch-ops/not-a-uuid".to_string(),
+    ] {
+        let (status, body) = get_status(&app, &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not found")),
+            "{path}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_batch_ops_list_pages_by_submitted_at_and_id() {
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    // Five operations, three of them submitted at the same instant, so the
+    // cursor has to break ties on id.
+    let tied: chrono::DateTime<chrono::Utc> = "2026-01-02T03:04:05.123456Z".parse().unwrap();
+    let mut expected: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = vec![
+        ("2026-01-01T00:00:00Z".parse().unwrap(), Uuid::new_v4()),
+        (tied, Uuid::new_v4()),
+        (tied, Uuid::new_v4()),
+        (tied, Uuid::new_v4()),
+        ("2026-01-03T00:00:00Z".parse().unwrap(), Uuid::new_v4()),
+    ];
+    for (submitted_at, id) in &expected {
+        sqlx::query(
+            "INSERT INTO awa.batch_operations (id, op_kind, filter, spec, state, submitted_at) \
+             VALUES ($1, 'set_priority', '{}'::jsonb, '{\"op_kind\": \"set_priority\", \"priority\": 1}'::jsonb, 'completed', $2)",
+        )
+        .bind(id)
+        .bind(submitted_at)
+        .execute(&pool)
+        .await
+        .expect("fixture operation should insert");
+    }
+    expected.sort_by(|a, b| b.cmp(a));
+    let expected: Vec<String> = expected.iter().map(|(_, id)| id.to_string()).collect();
+
+    let mut seen = Vec::new();
+    let mut path = "/api/batch-ops?limit=2".to_string();
+    loop {
+        let page = get_json(&app, &path).await;
+        let page = page.as_array().expect("list should be an array").clone();
+        assert!(page.len() <= 2);
+        seen.extend(page.iter().map(|op| op["id"].as_str().unwrap().to_string()));
+        let Some(last) = page.last().filter(|_| page.len() == 2) else {
+            break;
+        };
+        let at = last["submitted_at"].as_str().unwrap();
+        let id = last["id"].as_str().unwrap();
+        path = format!(
+            "/api/batch-ops?limit=2&before_submitted_at={}&before_id={id}",
+            url::form_urlencoded::byte_serialize(at.as_bytes()).collect::<String>()
+        );
+    }
+    assert_eq!(
+        seen, expected,
+        "pages walk the whole list once, newest first"
+    );
+
+    for bad in [
+        "/api/batch-ops?before_submitted_at=yesterday&before_id=00000000-0000-0000-0000-000000000000",
+        "/api/batch-ops?before_submitted_at=2026-01-01T00:00:00Z&before_id=nope",
+        "/api/batch-ops?before_submitted_at=2026-01-01T00:00:00Z",
+        "/api/batch-ops?before_id=00000000-0000-0000-0000-000000000000",
+    ] {
+        let (status, body) = get_status(&app, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert!(body["error"].is_string(), "{bad}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn test_batch_ops_api_accepts_bulk_action_kinds() {
     let db = queue_storage_db().await;

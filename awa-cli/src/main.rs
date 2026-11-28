@@ -1747,6 +1747,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             &awa_model::batch_operations::ListBatchOperationsFilter {
                                 state,
                                 limit: Some(limit),
+                                ..Default::default()
                             },
                         )
                         .await?;

@@ -70,8 +70,11 @@ POST /api/jobs/bulk-cancel              { ids: [...] }
 
 POST /api/batch-ops/preview             { op_kind, filter, spec }
 POST /api/batch-ops                     { op_kind, filter, spec, all?, submitted_by? }
-GET  /api/batch-ops?state=&limit=
-GET  /api/batch-ops/:id
+GET  /api/batch-ops?state=&limit=&before_submitted_at=&before_id=
+                                        Newest first by (submitted_at, id); the last row's submitted_at
+                                        and id, given together, read the page after it. A malformed or
+                                        lone cursor parameter is a 400.
+GET  /api/batch-ops/:id                 404 for an unknown id or one that isn't a UUID
 PATCH /api/batch-ops/:id                { state: "cancelling" }
 
 GET  /api/queues
