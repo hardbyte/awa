@@ -76,7 +76,6 @@ test.describe("Phone navigation", () => {
     await page.locator('button[data-slot="sidebar-trigger"]').first().click();
     const drawer = page.getByRole("dialog", { name: "Sidebar" });
     await expect(drawer).toBeVisible();
-    // The drawer used to close itself in the same tick it opened.
     await page.waitForTimeout(500);
     await expect(drawer).toBeVisible();
 

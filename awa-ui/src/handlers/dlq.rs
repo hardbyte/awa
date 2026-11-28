@@ -31,10 +31,7 @@ pub async fn list_dlq(
     Ok(Json(rows))
 }
 
-/// The DLQ lives in the queue_storage schema. Before any queue_storage
-/// backend has been activated (a never-used install) it cannot hold rows, so
-/// the read endpoints answer empty rather than with the model's validation
-/// error. Writes still report that error.
+/// Whether a queue_storage backend is active; the DLQ cannot hold rows without one.
 async fn dlq_storage_exists(state: &AppState) -> Result<bool, ApiError> {
     Ok(QueueStorage::active_schema(&state.pool).await?.is_some())
 }
