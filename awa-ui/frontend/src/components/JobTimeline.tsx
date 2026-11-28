@@ -30,18 +30,32 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
     label: "Created",
   });
 
-  // Error history: one line per entry; the Errors card has the full text.
+  // Consecutive identical errors share one line; the Errors card has each one.
+  let run: { first: number | null; last: number | null; summary: string; event: TimelineEvent } | null = null;
   for (const entry of job.errors ?? []) {
     const error = parseErrorEntry(entry);
-    if (error.at) {
-      events.push({
-        timestamp: error.at,
-        label: error.attempt !== null ? `Attempt ${error.attempt} failed` : "Error",
-        state: "failed",
-        detail: errorSummary(error) || undefined,
-        isError: true,
-      });
+    if (!error.at) continue;
+    const summary = errorSummary(error);
+    const continues =
+      run !== null &&
+      run.summary === summary &&
+      error.attempt !== null &&
+      run.last !== null &&
+      error.attempt === run.last + 1;
+    if (continues && run) {
+      run.last = error.attempt;
+      run.event.label = `Attempts ${run.first}–${run.last} failed`;
+      continue;
     }
+    const event: TimelineEvent = {
+      timestamp: error.at,
+      label: error.attempt !== null ? `Attempt ${error.attempt} failed` : "Error",
+      state: "failed",
+      detail: summary || undefined,
+      isError: true,
+    };
+    events.push(event);
+    run = { first: error.attempt, last: error.attempt, summary, event };
   }
 
   // Attempt started — shown whenever attempted_at exists

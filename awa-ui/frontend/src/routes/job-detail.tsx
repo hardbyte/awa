@@ -325,6 +325,16 @@ export function JobDetailPage() {
         </DescriptionList>
       </details>
 
+      <ErrorBlock
+        errors={job.errors}
+        jobState={job.state}
+        lastAttempt={
+          job.state === "failed" || job.state === "cancelled"
+            ? { startedAt: job.attempted_at, finishedAt: job.finalized_at }
+            : undefined
+        }
+      />
+
       {/* Timeline */}
       <Card>
         <CardHeader title="Timeline" />
@@ -485,15 +495,6 @@ export function JobDetailPage() {
         </Card>
       )}
 
-      <ErrorBlock
-        errors={job.errors}
-        jobState={job.state}
-        lastAttempt={
-          job.state === "failed" || job.state === "cancelled"
-            ? { startedAt: job.attempted_at, finishedAt: job.finalized_at }
-            : undefined
-        }
-      />
     </Page>
   );
 }
