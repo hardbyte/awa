@@ -196,6 +196,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `pruned`, `noop`, `blocked`, `skipped_active` and `already_pruned`. See
   [Configuration](docs/configuration.md#what-the-knobs-mean).
 
+- **Job outcomes over time: `GET /api/stats/outcomes` and `admin::job_outcomes`.** Jobs that completed, failed, were cancelled or were dead-lettered, per bucket (60s, 300s, 900s or 3600s) over up to 24 hours, by when they reached that outcome, optionally for one queue or kind. The response carries `covered_since`, the earliest time the counts are complete from: on queue storage, queue-ring prune reclaims terminal rows a generation at a time, and no bucket before it is returned. Retries are not counted, since a retry leaves no terminal row. Unknown or empty parameters are a 400, as on `GET /api/jobs`. The read follows indexes on the canonical engine, scans the retained terminal rows at most once on queue storage, releases each source's partition locks before the next, and is cached for the dashboard cache TTL. See [the UI design notes](docs/ui-design.md#api-endpoints).
+
 ### Changed
 
 - **Every function awa installs that sets a `search_path` now lists `pg_temp` last and leaves `public` out**, in `awa` and in every queue-storage schema. With `pg_temp` left out, PostgreSQL searches the session's temporary schema first for tables, so a function running with its owner's privileges below a `SECURITY DEFINER` function could have read a caller's temporary table in place of its own. No function did so in a release. Migrations and schema preparation rewrite the paths in place; a migration role that can neither act as a function's owner nor `SET ROLE` to it leaves that function as it was, with a warning naming the call to run as the owner.
@@ -210,6 +212,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   milliseconds instead of more than two minutes.
 - **Automatic retries spread wider (#733, migration v059).** `awa.backoff_duration` drew the delay before a retry from `2^attempt` seconds plus 0 to 25%, so jobs that failed together retried close together and hit a recovering dependency at once. The delay is now `2^attempt` seconds times a random factor in [0.5, 1.5), capped at 24 hours as before: the mean is the base delay (previously 12.5% above it), the shortest possible delay halves, and in a simulation of 10,000 jobs failing together the peak retry rate for each attempt falls by about 3.5×. v059 is one function replacement with no table locks, and binaries before it use the new delays as soon as it commits. See [v059](docs/upgrade-0.6-to-0.7.md#v059-wider-retry-jitter).
 - **Dashboard refreshes share one bounded polling scheduler.** Managed views coalesce mutation/focus/manual demand, reconcile independently, pause in hidden tabs and retain stale data on failures. Selected jobs and manually refreshed counts keep their refresh exceptions. Aggregate caches fence obsolete fills after local mutations and return source-observation/cache-age headers. See [admin observation](docs/admin-observation.md) for scope and validation limits.
+
+### Deprecated
+
+- **`GET /api/stats/timeseries` is deprecated.** It counts jobs by the minute they were created and their current state, and the admin UI no longer reads it. It keeps working; use `GET /api/stats/outcomes` for outcomes over time.
 
 ### Fixed
 

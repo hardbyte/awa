@@ -146,6 +146,7 @@ pub async fn router_with_identity(
         // Stats
         .route("/stats", get(handlers::stats::get_stats))
         .route("/stats/timeseries", get(handlers::stats::get_timeseries))
+        .route("/stats/outcomes", get(handlers::stats::get_outcomes))
         .route("/stats/kinds", get(handlers::stats::get_distinct_kinds))
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
         .route("/capabilities", get(handlers::stats::get_capabilities))

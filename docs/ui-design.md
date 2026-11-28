@@ -54,7 +54,18 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 
 ```
 GET  /api/stats                         Job counts by state
-GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
+GET  /api/stats/outcomes?minutes=60&bucket=60s&queue=&kind=
+                                        { covered_since, buckets: [{ bucket, completed, failed,
+                                        cancelled, dead_lettered }] }: jobs reaching each terminal
+                                        outcome per bucket, by when they reached it. `minutes` is
+                                        1 to 1440 and a whole number of buckets; `bucket` is 60s,
+                                        300s, 900s or 3600s. Buckets are aligned to the Unix epoch,
+                                        oldest first, the last holding the current time; empty ones
+                                        are zeros. Counts come from retained terminal rows, so no
+                                        bucket before `covered_since` is returned (see below).
+                                        Retries are not counted. Unknown or empty parameters are a 400.
+GET  /api/stats/timeseries?minutes=60   Deprecated: jobs by creation minute and current state.
+                                        Unused by the UI; use /api/stats/outcomes.
 
 GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&limit=&before_id=
                                         The shared job filter (ADR-049): `state` and `tag` repeat
@@ -110,6 +121,8 @@ POST /api/callbacks/:callback_id/heartbeat
 
 GET  /api/capabilities                  Feature flags / read-only detection
 ```
+
+`GET /api/stats/outcomes` counts the terminal rows the database still holds. On queue storage those are `done_entries` and completion batches, bucketed by `finalized_at`, and dead letters by `dlq_at`. Queue-ring prune reclaims terminal rows a generation at a time, so `covered_since` is the time the generation after the oldest sealed one opened (from the queue ring's rotation ledger), or the window start if that is later: every job enqueued and finished since then is counted. A job enqueued before it and finished after it can be missing, since it belonged to a generation prune may have reclaimed. On the canonical engine the counts come from `awa.jobs_hot`, which cleanup trims only past its retention (24 hours for completed jobs by default), and `covered_since` is the window start; dead letters exist only on queue storage. The response is cached server-side for the dashboard cache TTL, per parameter set. A server without the endpoint answers 404.
 
 ## Pages
 

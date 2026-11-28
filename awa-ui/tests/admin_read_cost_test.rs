@@ -35,7 +35,7 @@ use tower::util::ServiceExt;
 /// UI sends. Keep in step with `refetchInterval` queries in `frontend/src`.
 const POLLED_ENDPOINTS: &[&str] = &[
     "/api/stats",
-    "/api/stats/timeseries?minutes=60",
+    "/api/stats/outcomes?minutes=120&bucket=60s",
     "/api/queues",
     "/api/queues/runtime",
     "/api/runtime",

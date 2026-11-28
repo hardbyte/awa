@@ -1,7 +1,9 @@
 //! Query-string form of a [`JobFilter`] (ADR-049), shared by the jobs and
 //! DLQ endpoints. `tag` and `state` may repeat (all of the tags, any of the
-//! states); `ids` is comma-separated.
+//! states); `ids` is comma-separated. The outcomes endpoint's parameters are
+//! parsed here too, by the same rules.
 
+use awa_model::admin::OutcomeQuery;
 use awa_model::filter::{MAX_FILTER_IDS, MAX_FILTER_TAGS};
 use awa_model::{AwaError, JobFilter, JobState};
 use chrono::{DateTime, Utc};
@@ -109,9 +111,73 @@ pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
     Ok(query)
 }
 
+/// Parse the query string of `GET /api/stats/outcomes`: `minutes`, `bucket`
+/// (a width such as `60s`), `queue` and `kind`, with the same refusals as
+/// [`parse`] for unknown parameters and empty values.
+pub fn parse_outcomes(raw: Option<&str>) -> Result<OutcomeQuery, ApiError> {
+    let mut query = OutcomeQuery::default();
+    let Some(raw) = raw else {
+        return Ok(query);
+    };
+    for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ApiError::Awa(AwaError::Validation(format!(
+                "`{name}` needs a value"
+            ))));
+        }
+        match name.as_ref() {
+            "minutes" => query.minutes = value.parse().map_err(|_| invalid("minutes", value))?,
+            "bucket" => {
+                query.bucket_seconds = value
+                    .strip_suffix('s')
+                    .and_then(|seconds| seconds.parse().ok())
+                    .ok_or_else(|| invalid("bucket", value))?
+            }
+            "queue" => query.queue = Some(value.to_string()),
+            "kind" => query.kind = Some(value.to_string()),
+            other => {
+                return Err(ApiError::Awa(AwaError::Validation(format!(
+                    "unknown parameter `{other}`; outcomes take minutes, bucket, queue and kind"
+                ))))
+            }
+        }
+    }
+    query.validate()?;
+    Ok(query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_parameters_are_bounded_and_unknown_ones_refused() {
+        let parsed = parse_outcomes(Some("minutes=120&bucket=300s&queue=email&kind=send")).unwrap();
+        assert_eq!(
+            parsed,
+            OutcomeQuery {
+                minutes: 120,
+                bucket_seconds: 300,
+                queue: Some("email".into()),
+                kind: Some("send".into()),
+            }
+        );
+        assert_eq!(parse_outcomes(None).unwrap(), OutcomeQuery::default());
+        for refused in [
+            "minutes=0",
+            "minutes=1441",
+            "minutes=-5",
+            "minutes=90&bucket=3600s",
+            "bucket=60",
+            "bucket=61s",
+            "bucket=1m",
+            "queue=",
+            "state=failed",
+        ] {
+            assert!(parse_outcomes(Some(refused)).is_err(), "{refused}");
+        }
+    }
 
     #[test]
     fn repeated_tags_and_states_accumulate() {

@@ -33,10 +33,10 @@ pub use wakeup::flush_wakeups;
 pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
 pub use admin::{
     CallbackConfig, DefaultAction, ExternalCompletion, JobKindDescriptor, JobKindOverview,
-    ListJobsFilter, QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
-    QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome,
-    RetryFailedOutcome, RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput,
-    StateTimeseriesBucket, StorageCapability,
+    JobOutcomes, ListJobsFilter, OutcomeBucket, OutcomeQuery, QueueDescriptor, QueueOverview,
+    QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, QueueRuntimeSummary,
+    RateLimitSnapshot, ResolveOutcome, RetryFailedOutcome, RuntimeInstance, RuntimeOverview,
+    RuntimeSnapshotInput, StateTimeseriesBucket, StorageCapability,
 };
 pub use batch_operations::{
     BatchOperation, BatchOperationFilter, BatchOperationKind, BatchOperationPreview,
