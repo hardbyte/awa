@@ -216,16 +216,18 @@ fn assert_every_row_claimed_once(claimed: &[i64], expected: &[i64], what: &str) 
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn interleaved_lane_claims_every_row(pool: PgPool) -> TestResult {
-    let schema = "bound_interleaved";
-    let store = install(&pool, schema).await?;
-    let queue = "interleaved";
-    store.enqueue_batch(&pool, queue, PRIORITY, 30).await?;
-    merge_segments(&pool, schema, queue).await?;
-    let all = lane_seqs(&pool, schema, queue).await?;
-    let source = only_slot(&pool, schema, queue).await?;
-    let (first, middle, last) = (all[0], all[10], all[20]);
+/// Enqueues 30 rows and leaves positions 11-20 in another slot, between two
+/// runs in the first.
+async fn build_interleaved_lane(
+    pool: &PgPool,
+    store: &QueueStorage,
+    queue: &str,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let schema = store.schema();
+    store.enqueue_batch(pool, queue, PRIORITY, 30).await?;
+    merge_segments(pool, schema, queue).await?;
+    let all = lane_seqs(pool, schema, queue).await?;
+    let source = only_slot(pool, schema, queue).await?;
     let mut tx = pool.begin().await?;
     move_range(
         &mut tx,
@@ -233,12 +235,20 @@ async fn interleaved_lane_claims_every_row(pool: PgPool) -> TestResult {
         queue,
         source,
         (source.0 + 1) % SLOTS,
-        middle,
-        last,
+        all[10],
+        all[20],
     )
     .await?;
     tx.commit().await?;
-    assert!(first < middle && middle < last);
+    Ok(all)
+}
+
+#[sqlx::test(migrations = false)]
+async fn interleaved_lane_claims_every_row(pool: PgPool) -> TestResult {
+    let schema = "bound_interleaved";
+    let store = install(&pool, schema).await?;
+    let queue = "interleaved";
+    let all = build_interleaved_lane(&pool, &store, queue).await?;
 
     // A batch of 15 reaches from the first run in the source slot into the
     // run after the other slot's rows.
@@ -368,5 +378,102 @@ async fn a_lane_with_one_segment_per_row_still_claims_a_full_batch(pool: PgPool)
     let mut claimed = first;
     claimed.extend(drain(&pool, schema, queue, 10).await?);
     assert_every_row_claimed_once(&claimed, &all, "one segment per row");
+    Ok(())
+}
+
+async fn claim_functions(
+    pool: &PgPool,
+    schema: &str,
+) -> Result<Vec<(String, i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT p.proname::text, p.oid::bigint, pg_get_functiondef(p.oid)
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = $1 AND p.proname ~ '^claim_ready_(runtime|slot_[0-9]+)$'
+         ORDER BY p.proname",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+}
+
+/// Removes the text from the first `start` after `from` up to and including
+/// the first `end` after it.
+fn cut(text: &mut String, start: &str, end: &str) {
+    let begin = text.find(start).expect("start marker");
+    let finish = begin + text[begin..].find(end).expect("end marker") + end.len();
+    text.replace_range(begin..finish, "");
+}
+
+/// The claim functions as released before v064: no re-resolve after the head
+/// lock and no bound on the reads.
+fn without_the_bound(definition: &str, is_runtime: bool) -> String {
+    let mut old = definition.to_string();
+    if is_runtime {
+        cut(
+            &mut old,
+            "\n\n            -- The head lock can be granted",
+            "LIMIT 1;",
+        );
+        cut(
+            &mut old,
+            "\n              -- Rows of this slot at or after",
+            "9223372036854775807)",
+        );
+    } else {
+        cut(
+            &mut old,
+            "\n                  -- Stop below the next segment of another slot",
+            "9223372036854775807)",
+        );
+    }
+    old
+}
+
+#[sqlx::test(migrations = false)]
+async fn v064_bounds_the_released_claim_functions_in_place(pool: PgPool) -> TestResult {
+    let schema = "bound_migration";
+    let store = install(&pool, schema).await?;
+    let installed = claim_functions(&pool, schema).await?;
+    assert_eq!(installed.len(), 1 + SLOTS as usize);
+    for (name, _, definition) in &installed {
+        assert!(
+            definition.contains("GREATEST(p_max_batch, 0) + 1")
+                || definition.contains("GREATEST(p_claim_limit, 0) + 1"),
+            "{name}: the installer carries the bound"
+        );
+    }
+
+    for (name, _, definition) in &installed {
+        let old = without_the_bound(definition, name == "claim_ready_runtime");
+        assert_ne!(&old, definition);
+        sqlx::raw_sql(audited_sql(old)).execute(&pool).await?;
+    }
+    let unbounded = build_interleaved_lane(&pool, &store, "before").await?;
+    let claimed = drain(&pool, schema, "before", 15).await?;
+    assert!(
+        unbounded.iter().any(|seq| !claimed.contains(seq)),
+        "the released functions skip rows of an interleaved lane"
+    );
+
+    for (_, _, sql) in migrations::migration_sql_range(63, 64) {
+        sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
+    }
+    assert_eq!(
+        claim_functions(&pool, schema).await?,
+        installed,
+        "v064 rewrites each function in place to the installer's text"
+    );
+    for (_, _, sql) in migrations::migration_sql_range(63, 64) {
+        sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
+    }
+    assert_eq!(
+        claim_functions(&pool, schema).await?,
+        installed,
+        "replaying v064 leaves the functions alone"
+    );
+
+    let all = build_interleaved_lane(&pool, &store, "after").await?;
+    let claimed = drain(&pool, schema, "after", 15).await?;
+    assert_every_row_claimed_once(&claimed, &all, "migrated claim functions");
     Ok(())
 }
