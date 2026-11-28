@@ -104,13 +104,21 @@ export function JobDetailPage() {
     mutationFn: () => retryJob(jobId),
     onSuccess: (job) => {
       invalidateJob();
+      if (job === null) {
+        toast.info(`Job #${jobId} can no longer be retried; nothing changed`);
+        return;
+      }
       toast.success(`Job #${jobId} retried; now ${jobStateMeta(job.state).label.toLowerCase()}`);
     },
   });
   const cancelMutation = useMutation({
     mutationFn: () => cancelJob(jobId),
-    onSuccess: () => {
+    onSuccess: (job) => {
       invalidateJob();
+      if (job === null) {
+        toast.info(`Job #${jobId} can no longer be cancelled; nothing changed`);
+        return;
+      }
       toast.success(`Job #${jobId} cancelled`);
     },
   });

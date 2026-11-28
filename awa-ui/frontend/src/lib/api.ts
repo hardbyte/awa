@@ -435,11 +435,13 @@ export function fetchJob(id: number): Promise<JobRow> {
   return apiRead(`/jobs/${id}`);
 }
 
-export function retryJob(id: number): Promise<JobRow> {
+/** Resolves to null when the job was no longer eligible and nothing changed. */
+export function retryJob(id: number): Promise<JobRow | null> {
   return apiFetch(`/jobs/${id}/retry`, { method: "POST" });
 }
 
-export function cancelJob(id: number): Promise<JobRow> {
+/** Resolves to null when the job was no longer eligible and nothing changed. */
+export function cancelJob(id: number): Promise<JobRow | null> {
   return apiFetch(`/jobs/${id}/cancel`, { method: "POST" });
 }
 
