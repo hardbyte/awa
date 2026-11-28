@@ -90,6 +90,30 @@ test.describe("Shell navigation", () => {
     await page.goto("/jobs");
     await expect(page.getByTestId("nav-batch-ops").locator('[data-slot="sidebar-badge"]')).toHaveText("2");
   });
+  test("Fleet badge counts unhealthy live instances, not stale ones", async ({ page }) => {
+    const instance = (id: string, stale: boolean, healthy: boolean) => ({
+      instance_id: id, hostname: "host", pid: 1, version: "0.7.0", storage_capability: "queue_storage",
+      started_at: new Date().toISOString(), last_seen_at: new Date().toISOString(), snapshot_interval_ms: 10000,
+      stale, healthy, postgres_connected: true, poll_loop_alive: healthy, heartbeat_alive: true,
+      maintenance_alive: true, shutting_down: false, leader: false, global_max_workers: null,
+      queues: [], queue_descriptor_hashes: {}, job_kind_descriptor_hashes: {},
+    });
+    await page.route("**/api/runtime", (route) =>
+      route.fulfill({
+        json: {
+          total_instances: 4, live_instances: 3, stale_instances: 1, healthy_instances: 2, leader_instances: 1,
+          instances: [
+            instance("a", false, true),
+            instance("b", false, true),
+            instance("c", false, false),
+            instance("d", true, false),
+          ],
+        },
+      })
+    );
+    await page.goto("/jobs");
+    await expect(page.getByTestId("nav-runtime").locator('[data-slot="sidebar-badge"]')).toHaveText("1");
+  });
 });
 
 test.describe("Theme toggle", () => {

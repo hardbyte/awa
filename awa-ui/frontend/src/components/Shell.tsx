@@ -468,7 +468,9 @@ export function Shell() {
   const batchOps = useManagedQuery(batchOpsQuery);
   const navBadges: Partial<Record<NavItem["to"], string>> = {
     "/dlq": dlqDepth.isError ? undefined : badgeCount(dlqDepth.data?.total),
-    "/runtime": runtimeQuery.isError ? undefined : badgeCount(runtimeQuery.data?.stale_instances),
+    "/runtime": runtimeQuery.isError
+      ? undefined
+      : badgeCount(runtimeQuery.data && runtimeQuery.data.live_instances - runtimeQuery.data.healthy_instances),
     "/batch-ops": batchOps.isError
       ? undefined
       : badgeCount(batchOps.data?.filter((op) => ACTIVE_BATCH_STATES.has(op.state)).length),
