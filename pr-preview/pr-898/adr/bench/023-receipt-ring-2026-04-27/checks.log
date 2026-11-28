@@ -1,0 +1,41 @@
+T+00:01 RUN STARTED pid=1569271 profile=7-phase-12h log=long-horizon-2026-04-27.log
+T+02:31 phase=clean_1 pid=alive closures_max=0 claims_max=0 rss_max=17540kB free=131G — schema=awa_exp (run started before the awa_exp→awa fold; harmless), straggler zsh PID 3301267 spinning in wait-for-replicas-to-die loop (not affecting run; will tear down docker after replicas exit naturally)
+T+04:31 phase=idle_1 pid=alive closures_max=0 claims_max=0 rss_max=17404kB free=141G — invariant holds; warm singletons spiking as expected for vacuum-blocked idle (lease_ring_state=26376, queue_claim_heads=131313, queue_ring_state=633, claim_ring_state=1470). Watch queue_claim_heads in recovery_1 to confirm drop — historical 12h validation logged 0 there but on a different commit, so the comparison isn't apples-to-apples.
+T+06:31 phase=clean_2 pid=alive closures_max=0 claims_max=0 rss_max=17540kB free=135G — Warm reclaim shape confirmed: idle_1 spike (lease_ring_state 26376, queue_claim_heads 131313) fully drained through recovery_1 (now 81 / 106 respectively). 474 WARN lines in log, all sqlx slow-statement on queue_counts query under sustained backlog (expected; not a fault). RSS stable across all 3 checkpoints (17404-17540 kB).
+T+08:31 phase=clean_2 pid=alive closures_max=0 claims_max=0 rss_max=17552kB free=136G — clean steady state, warm singletons holding (claim_ring_state=59, lease_ring_state=88, queue_ring_state=9, queue_claim_heads=237). 0 ERROR/FATAL/panic. RSS spread across 4 checkpoints: 17404-17552 kB (148 kB drift over 6h, no leak).
+T+10:31 phase=clean_3 pid=alive closures_max=0 claims_max=8 rss_max=17528kB free=132G — final clean phase (~26m in of 90m). idle_2/recovery_2 cleared cleanly: claim_ring_state=30, lease_ring_state=479 (still settling from spike), queue_ring_state=9, queue_claim_heads=212. lease_claims_5=8 (one partition saw a small dead-tuple residue, well under 200 threshold). 0 ERROR/FATAL/panic. RSS spread now 17184-17552 kB across 5 checkpoints over 8h.
+T+11:35 RUN COMPLETE — clean exit, no errors. Wall time matches planned profile.
+
+Validation results (aggregate of 4 replicas, awa_exp schema, commit a45dca6):
+
+  Receipt-plane invariant (ADR-023 headline):
+    lease_claim_closures_0..7  peak n_dead_tup = 0  across ALL 8 phases ✓
+    lease_claims_0..7          peak n_dead_tup = 24 (well under 200 threshold) ✓
+
+  Warm singletons (idle_1 / idle_2 / clean_3 peaks):
+    lease_ring_state           28563 / 26686 / —     (prior 12h: 28541 / 23563 / 2505 — comparable)
+    claim_ring_state            1616 /   323 /  76   (prior 12h: 1635 /  186 /   76 — comparable)
+    queue_ring_state             633 /     9 /  —     (prior 12h:  668 /   44 /   44 — comparable)
+
+  Throughput per replica (avg completion / enqueue rate jobs/s):
+    warmup       198.5  198.5     idle_1       118.1  164.9
+    clean_1      190.2  190.2     recovery_1   184.5  183.4
+    clean_2       95.7  174.0     idle_2        42.8  158.3
+    recovery_2    52.0  175.4     clean_3       31.5  175.8
+
+  Throughput regression in clean_2/clean_3 matches the previously-documented
+  post-idle backlog-growth shape (out of scope for ADR-023). Receipt-plane
+  stayed at peak 24 dead tuples / closures = 0 throughout, confirming the
+  architectural property holds even when the dispatch path is starved by
+  the queue_counts slow-statement loop.
+
+  Memory: per-replica RSS held at 17184-17552 kB across 5 sampled checkpoints
+  spanning the full 11.6h run. No leak.
+
+  Errors: 0 ERROR/FATAL/panic in the run log. 474 sqlx WARN slow-statement
+  events, all on the queue_counts query during high-backlog phases (expected).
+
+  Results dir: /home/brian/dev/awa/benchmarks/portable/results/custom-20260427T081444Z-2471c6
+  raw.csv: 529 MB  index.html: 35 MB  summary.json: 647 kB
+
+  Cron 7b5af94a stopped.
