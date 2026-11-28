@@ -90,7 +90,7 @@ function ReasonCell({ job, nowMs }: { job: JobRow; nowMs: number }) {
   const reason = jobRowReason(job, nowMs);
   if (!reason.next && !reason.error) return <span className="text-muted-fg">—</span>;
   return (
-    <div className="min-w-0 max-w-[28rem]">
+    <div className="min-w-0 max-w-[22rem]">
       {reason.next && <div className="text-sm text-muted-fg">{reason.next}</div>}
       {reason.error && (
         <div className="truncate text-sm" title={reason.error} data-testid="job-last-error">

@@ -25,7 +25,7 @@ export function DlqPage() {
         title="Dead letters"
         status={depthQuery.data && (
           <div className="flex flex-wrap gap-2 items-center">
-            <Badge intent="danger">
+            <Badge intent="warning">
               {formatNumber(depthQuery.data.total)} total
             </Badge>
             {depthQuery.data.by_queue.slice(0, 5).map((q) => {

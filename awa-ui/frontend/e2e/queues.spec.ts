@@ -30,15 +30,13 @@ test.describe("Queues page", () => {
     for (const header of [
       "Queue",
       "Ready",
-      "Oldest ready",
       "Running",
       "Retrying",
       "Failed",
       "Dead letters",
-      "Not yet due",
+      "Deferred",
       "Completed/hr",
       "Capacity",
-      "Status",
       "Actions",
     ]) {
       await expect(
@@ -69,7 +67,7 @@ test.describe("Queues page", () => {
     await expect(queueTable).toBeVisible();
 
     // Mode / rate limit / waiting folded into the Capacity and Queue cells.
-    for (const header of ["Capacity", "Status", "Actions"]) {
+    for (const header of ["Capacity", "Actions"]) {
       await expect(
         queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();

@@ -47,6 +47,9 @@ function DlqCount({ queue, counts }: { queue: string; counts: Map<string, number
 
 /** Badges for the exceptions only: paused, DLQ on, descriptor trouble and config drift. */
 function QueueStatusBadges({ queue, runtime }: { queue: QueueStats; runtime: QueueRuntimeSummary | undefined }) {
+  const any =
+    queue.paused || runtime?.config?.dlq_enabled === true || queue.descriptor_stale || queue.descriptor_mismatch || runtime?.config_mismatch;
+  if (!any) return null;
   return (
     <div className="flex flex-wrap gap-1">
       {queue.paused && <Badge intent="warning">Paused</Badge>}
@@ -194,15 +197,13 @@ export function QueuesPage() {
         <TableHeader>
           <TableColumn isRowHeader>Queue</TableColumn>
           <TableColumn className="text-right">Ready</TableColumn>
-          <TableColumn className="text-right">Oldest ready</TableColumn>
           <TableColumn className="text-right">Running</TableColumn>
           <TableColumn className="text-right">Retrying</TableColumn>
           <TableColumn className="text-right">Failed</TableColumn>
           <TableColumn className="text-right">Dead letters</TableColumn>
-          <TableColumn className="text-right">Not yet due</TableColumn>
+          <TableColumn className="text-right">Deferred</TableColumn>
           <TableColumn className="text-right">Completed/hr</TableColumn>
           <TableColumn>Capacity</TableColumn>
-          <TableColumn>Status</TableColumn>
           <TableColumn>Actions</TableColumn>
         </TableHeader>
         <TableBody
@@ -222,7 +223,7 @@ export function QueuesPage() {
               const runtime = runtimeByQueue.get(q.queue);
               return (
                 <TableRow key={q.queue} id={q.queue}>
-                  <TableCell className="max-w-[16rem] font-medium">
+                  <TableCell className="max-w-[13rem] font-medium">
                     <div className="min-w-0">
                       <Link
                         to="/queues/$name"
@@ -232,6 +233,9 @@ export function QueuesPage() {
                       >
                         {queueLabel(q)}
                       </Link>
+                      <div className="mt-1 empty:hidden">
+                        <QueueStatusBadges queue={q} runtime={runtime} />
+                      </div>
                       {q.description && (
                         <div className="mt-0.5 truncate text-xs font-normal text-muted-fg" title={q.description}>
                           {q.description}
@@ -245,10 +249,12 @@ export function QueuesPage() {
                     </div>
                   </TableCell>
                   <TableCell className={`text-right tabular-nums ${q.available === 0 ? "text-muted-fg" : ""}`}>
-                    {formatNumber(q.available)}
-                  </TableCell>
-                  <TableCell className="text-right tabular-nums">
-                    {q.available > 0 ? <LagValue seconds={q.lag_seconds} /> : <span className="text-muted-fg">—</span>}
+                    <div>{formatNumber(q.available)}</div>
+                    {q.available > 0 && q.lag_seconds !== null && (
+                      <div className="whitespace-nowrap text-xs text-muted-fg">
+                        oldest <LagValue seconds={q.lag_seconds} />
+                      </div>
+                    )}
                   </TableCell>
                   <TableCell className={`text-right tabular-nums ${q.running === 0 ? "text-muted-fg" : ""}`}>
                     {formatNumber(q.running)}
@@ -300,9 +306,6 @@ export function QueuesPage() {
                         </div>
                       )}
                     </div>
-                  </TableCell>
-                  <TableCell>
-                    <QueueStatusBadges queue={q} runtime={runtime} />
                   </TableCell>
                   <TableCell>
                     <div className="flex justify-end">

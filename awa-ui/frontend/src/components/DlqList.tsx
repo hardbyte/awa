@@ -241,10 +241,14 @@ export function DlqList({ lockedFilter }: DlqListProps) {
               <TableCell>
                 <QueueLink queue={row.queue} descriptor={row.queue_descriptor} />
               </TableCell>
-              <TableCell>{row.dlq_reason}</TableCell>
+              <TableCell>
+                <div className="max-w-[18rem] truncate" title={row.dlq_reason}>
+                  {row.dlq_reason}
+                </div>
+              </TableCell>
               <TableCell>
                 {lastErrorText(row) ? (
-                  <div className="max-w-[28rem] truncate" title={lastErrorText(row)!}>
+                  <div className="max-w-[20rem] truncate" title={lastErrorText(row)!}>
                     {lastErrorText(row)}
                   </div>
                 ) : (
