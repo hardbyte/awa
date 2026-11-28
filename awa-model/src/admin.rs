@@ -1686,20 +1686,139 @@ where
     Ok(())
 }
 
-/// Per-queue runtime overrides (ADR-038). `None` fields mean "no
+/// Per-queue runtime overrides (ADR-038, ADR-054). `None` fields mean "no
 /// override" — dispatchers fall back to their builder-configured values.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueueRuntimeOverrides {
     pub poll_interval_ms: Option<i32>,
     pub claim_batch_size: Option<i32>,
+    /// Per-runtime rate limit, jobs started per second (ADR-010).
     pub rate_limit: Option<f64>,
     pub deadline_ms: Option<i64>,
+    /// Burst for the per-runtime rate limit. Unset derives `ceil(rate)`.
+    #[serde(default)]
+    pub rate_burst: Option<i32>,
+    /// Fleet-wide rate limit, jobs started per second across every live
+    /// runtime serving the queue (ADR-054).
+    #[serde(default)]
+    pub fleet_rate_limit: Option<f64>,
+    /// Burst for the fleet rate limit. Unset derives `ceil(fleet rate)`.
+    #[serde(default)]
+    pub fleet_rate_burst: Option<i32>,
+}
+
+impl QueueRuntimeOverrides {
+    /// Whether any override needs migration v065's columns.
+    fn uses_fleet_columns(&self) -> bool {
+        self.rate_burst.is_some()
+            || self.fleet_rate_limit.is_some()
+            || self.fleet_rate_burst.is_some()
+    }
+}
+
+/// Who changed a queue's overrides and why, recorded with the write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueueRuntimeOverrideAudit {
+    pub updated_by: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// A queue's override row: the overrides, the revision every write advances,
+/// and who last wrote them, when and why.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueueRuntimeOverrideState {
+    pub overrides: QueueRuntimeOverrides,
+    /// Advanced by every write through this release's admin functions. 0
+    /// before migration v065 or when nothing has been written.
+    pub revision: i64,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_by: Option<String>,
+    pub reason: Option<String>,
 }
 
 /// Replace the full override state for a queue (whole-row semantics: the
 /// passed struct IS the new override set; `None` fields clear). Dispatchers
 /// apply the change on their next refresh cadence without a restart.
 pub async fn set_queue_runtime_overrides(
+    pool: &PgPool,
+    queue: &str,
+    overrides: &QueueRuntimeOverrides,
+) -> Result<(), AwaError> {
+    set_queue_runtime_overrides_audited(
+        pool,
+        queue,
+        overrides,
+        &QueueRuntimeOverrideAudit::default(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`set_queue_runtime_overrides`], recording who made the change and why.
+/// Returns the new revision, or 0 on a schema before migration v065, which
+/// keeps no revision and accepts only the ADR-038 overrides.
+pub async fn set_queue_runtime_overrides_audited(
+    pool: &PgPool,
+    queue: &str,
+    overrides: &QueueRuntimeOverrides,
+    audit: &QueueRuntimeOverrideAudit,
+) -> Result<i64, AwaError> {
+    let written: Result<i64, AwaError> = sqlx::query_scalar(
+        r#"
+        INSERT INTO awa.queue_meta (
+            queue, paused,
+            override_poll_interval_ms, override_claim_batch_size,
+            override_rate_limit, override_deadline_ms,
+            override_rate_burst, override_fleet_rate_limit, override_fleet_rate_burst,
+            overrides_revision, overrides_updated_by, overrides_reason,
+            overrides_updated_at
+        )
+        VALUES ($1, FALSE, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, now())
+        ON CONFLICT (queue) DO UPDATE SET
+            override_poll_interval_ms = EXCLUDED.override_poll_interval_ms,
+            override_claim_batch_size = EXCLUDED.override_claim_batch_size,
+            override_rate_limit = EXCLUDED.override_rate_limit,
+            override_deadline_ms = EXCLUDED.override_deadline_ms,
+            override_rate_burst = EXCLUDED.override_rate_burst,
+            override_fleet_rate_limit = EXCLUDED.override_fleet_rate_limit,
+            override_fleet_rate_burst = EXCLUDED.override_fleet_rate_burst,
+            overrides_revision = awa.queue_meta.overrides_revision + 1,
+            overrides_updated_by = EXCLUDED.overrides_updated_by,
+            overrides_reason = EXCLUDED.overrides_reason,
+            overrides_updated_at = now()
+        RETURNING overrides_revision
+        "#,
+    )
+    .bind(queue)
+    .bind(overrides.poll_interval_ms)
+    .bind(overrides.claim_batch_size)
+    .bind(overrides.rate_limit)
+    .bind(overrides.deadline_ms)
+    .bind(overrides.rate_burst)
+    .bind(overrides.fleet_rate_limit)
+    .bind(overrides.fleet_rate_burst)
+    .bind(audit.updated_by.as_deref())
+    .bind(audit.reason.as_deref())
+    .fetch_one(pool)
+    .await
+    .map_err(AwaError::from);
+    match written {
+        Err(err) if err.is_undefined_column() => {
+            if overrides.uses_fleet_columns() {
+                return Err(AwaError::Validation(
+                    "fleet rate limits and rate bursts need migration v065: run `awa migrate`"
+                        .into(),
+                ));
+            }
+            set_legacy_queue_runtime_overrides(pool, queue, overrides).await?;
+            Ok(0)
+        }
+        other => other,
+    }
+}
+
+/// The ADR-038 override write, for a schema before migration v065.
+async fn set_legacy_queue_runtime_overrides(
     pool: &PgPool,
     queue: &str,
     overrides: &QueueRuntimeOverrides,
@@ -1736,17 +1855,100 @@ pub async fn clear_queue_runtime_overrides(pool: &PgPool, queue: &str) -> Result
     set_queue_runtime_overrides(pool, queue, &QueueRuntimeOverrides::default()).await
 }
 
+/// [`clear_queue_runtime_overrides`], recording who cleared them and why.
+pub async fn clear_queue_runtime_overrides_audited(
+    pool: &PgPool,
+    queue: &str,
+    audit: &QueueRuntimeOverrideAudit,
+) -> Result<i64, AwaError> {
+    set_queue_runtime_overrides_audited(pool, queue, &QueueRuntimeOverrides::default(), audit).await
+}
+
 /// The current override state for a queue (`None` when the queue has no
 /// control-plane row).
 pub async fn queue_runtime_overrides(
     pool: &PgPool,
     queue: &str,
 ) -> Result<Option<QueueRuntimeOverrides>, AwaError> {
-    type OverrideRow = (Option<i32>, Option<i32>, Option<f64>, Option<i64>);
+    Ok(queue_runtime_override_state(pool, queue)
+        .await?
+        .map(|state| state.overrides))
+}
+
+/// A queue's override row with its revision and audit fields (`None` when
+/// the queue has no control-plane row). On a schema before migration v065
+/// it reads the ADR-038 overrides, with revision 0 and no audit.
+pub async fn queue_runtime_override_state(
+    pool: &PgPool,
+    queue: &str,
+) -> Result<Option<QueueRuntimeOverrideState>, AwaError> {
+    #[derive(sqlx::FromRow)]
+    struct OverrideRow {
+        override_poll_interval_ms: Option<i32>,
+        override_claim_batch_size: Option<i32>,
+        override_rate_limit: Option<f64>,
+        override_deadline_ms: Option<i64>,
+        override_rate_burst: Option<i32>,
+        override_fleet_rate_limit: Option<f64>,
+        override_fleet_rate_burst: Option<i32>,
+        overrides_revision: i64,
+        overrides_updated_at: Option<DateTime<Utc>>,
+        overrides_updated_by: Option<String>,
+        overrides_reason: Option<String>,
+    }
+    let read: Result<Option<OverrideRow>, AwaError> = sqlx::query_as(
+        r#"
+        SELECT override_poll_interval_ms, override_claim_batch_size,
+               override_rate_limit, override_deadline_ms,
+               override_rate_burst, override_fleet_rate_limit, override_fleet_rate_burst,
+               overrides_revision, overrides_updated_at,
+               overrides_updated_by, overrides_reason
+        FROM awa.queue_meta
+        WHERE queue = $1
+        "#,
+    )
+    .bind(queue)
+    .fetch_optional(pool)
+    .await
+    .map_err(AwaError::from);
+    let row = match read {
+        Err(err) if err.is_undefined_column() => {
+            return legacy_queue_runtime_override_state(pool, queue).await;
+        }
+        other => other?,
+    };
+    Ok(row.map(|row| QueueRuntimeOverrideState {
+        overrides: QueueRuntimeOverrides {
+            poll_interval_ms: row.override_poll_interval_ms,
+            claim_batch_size: row.override_claim_batch_size,
+            rate_limit: row.override_rate_limit,
+            deadline_ms: row.override_deadline_ms,
+            rate_burst: row.override_rate_burst,
+            fleet_rate_limit: row.override_fleet_rate_limit,
+            fleet_rate_burst: row.override_fleet_rate_burst,
+        },
+        revision: row.overrides_revision,
+        updated_at: row.overrides_updated_at,
+        updated_by: row.overrides_updated_by,
+        reason: row.overrides_reason,
+    }))
+}
+
+async fn legacy_queue_runtime_override_state(
+    pool: &PgPool,
+    queue: &str,
+) -> Result<Option<QueueRuntimeOverrideState>, AwaError> {
+    type OverrideRow = (
+        Option<i32>,
+        Option<i32>,
+        Option<f64>,
+        Option<i64>,
+        Option<DateTime<Utc>>,
+    );
     let row: Option<OverrideRow> = sqlx::query_as(
         r#"
         SELECT override_poll_interval_ms, override_claim_batch_size,
-               override_rate_limit, override_deadline_ms
+               override_rate_limit, override_deadline_ms, overrides_updated_at
         FROM awa.queue_meta
         WHERE queue = $1
         "#,
@@ -1755,11 +1957,18 @@ pub async fn queue_runtime_overrides(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(poll_interval_ms, claim_batch_size, rate_limit, deadline_ms)| QueueRuntimeOverrides {
-            poll_interval_ms,
-            claim_batch_size,
-            rate_limit,
-            deadline_ms,
+        |(poll_interval_ms, claim_batch_size, rate_limit, deadline_ms, updated_at)| {
+            QueueRuntimeOverrideState {
+                overrides: QueueRuntimeOverrides {
+                    poll_interval_ms,
+                    claim_batch_size,
+                    rate_limit,
+                    deadline_ms,
+                    ..Default::default()
+                },
+                updated_at,
+                ..Default::default()
+            }
         },
     ))
 }
@@ -2257,6 +2466,9 @@ pub struct QueueRuntimeConfigSnapshot {
     #[serde(default)]
     pub dlq_enabled: Option<bool>,
     pub rate_limit: Option<RateLimitSnapshot>,
+    /// The builder's fleet rate limit (ADR-054), before overrides.
+    #[serde(default)]
+    pub fleet_rate_limit: Option<RateLimitSnapshot>,
 }
 
 /// Runtime state for one queue on one worker instance.
@@ -2266,6 +2478,137 @@ pub struct QueueRuntimeSnapshot {
     pub in_flight: u32,
     pub overflow_held: Option<u32>,
     pub config: QueueRuntimeConfigSnapshot,
+    /// The rate limit this runtime applied (ADR-054). Absent from runtimes
+    /// before ADR-054.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_control: Option<QueueRateControlSnapshot>,
+}
+
+/// The rate limit one runtime applied to a queue: its weight in the fleet
+/// share, the override revision it read, its share of the fleet limit, and
+/// the rate and burst its bucket enforces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueRateControlSnapshot {
+    /// This runtime's worker capacity for the queue, its weight in the share.
+    pub weight: u32,
+    /// The `overrides_revision` the runtime last applied.
+    pub applied_overrides_revision: i64,
+    /// This runtime's share of the fleet limit, when one is in effect.
+    pub fleet_share: Option<f64>,
+    /// The rate the runtime enforces: the lower of its runtime limit and its
+    /// share of the fleet limit. `None` when the queue is unlimited.
+    pub effective_rate_limit: Option<RateLimitSnapshot>,
+}
+
+/// This runtime's share of a fleet limit: its weight over the total weight of
+/// the live runtimes serving the queue, itself included (ADR-054).
+pub fn fleet_rate_share(own_weight: u32, other_weights: impl IntoIterator<Item = u32>) -> f64 {
+    let own = f64::from(own_weight.max(1));
+    let total = own
+        + other_weights
+            .into_iter()
+            .map(|weight| f64::from(weight.max(1)))
+            .sum::<f64>();
+    own / total
+}
+
+/// The share weight of every live runtime serving `queue` other than
+/// `exclude`, from runtime snapshots. A runtime is live while its snapshot is
+/// within the stale cutoff and it is not shutting down. A runtime from before
+/// ADR-054 publishes no weight; its worker capacity from its configuration
+/// stands in, so the share stays conservative while it runs.
+pub async fn live_queue_rate_weights<'e, E>(
+    executor: E,
+    queue: &str,
+    exclude: Uuid,
+) -> Result<Vec<u32>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    Ok(list_runtime_instances(executor)
+        .await?
+        .into_iter()
+        .filter(|instance| {
+            instance.instance_id != exclude && !instance.stale && !instance.shutting_down
+        })
+        .filter_map(|instance| {
+            instance
+                .queues
+                .into_iter()
+                .find(|snapshot| snapshot.queue == queue)
+                .map(|snapshot| queue_rate_weight(&snapshot))
+        })
+        .collect())
+}
+
+fn queue_rate_weight(snapshot: &QueueRuntimeSnapshot) -> u32 {
+    snapshot
+        .rate_control
+        .as_ref()
+        .map(|control| control.weight)
+        .or(snapshot.config.max_workers)
+        .or(snapshot.config.min_workers)
+        .unwrap_or(1)
+}
+
+/// Which live runtimes applied a queue's current override revision.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QueueOverrideApplication {
+    /// Live runtimes serving the queue.
+    pub live_runtimes: usize,
+    /// Of those, the ones reporting the current revision applied.
+    pub applied_current: usize,
+    pub runtimes: Vec<RuntimeRateControl>,
+}
+
+/// One live runtime's applied rate limit for a queue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeRateControl {
+    pub instance_id: Uuid,
+    pub hostname: Option<String>,
+    /// `None` for a runtime from before ADR-054, which reports nothing.
+    pub rate_control: Option<QueueRateControlSnapshot>,
+}
+
+/// Report which live runtimes serving `queue` applied override `revision`.
+pub async fn queue_override_application<'e, E>(
+    executor: E,
+    queue: &str,
+    revision: i64,
+) -> Result<QueueOverrideApplication, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let runtimes: Vec<RuntimeRateControl> = list_runtime_instances(executor)
+        .await?
+        .into_iter()
+        .filter(|instance| !instance.stale && !instance.shutting_down)
+        .filter_map(|instance| {
+            let snapshot = instance
+                .queues
+                .into_iter()
+                .find(|snapshot| snapshot.queue == queue)?;
+            Some(RuntimeRateControl {
+                instance_id: instance.instance_id,
+                hostname: instance.hostname,
+                rate_control: snapshot.rate_control,
+            })
+        })
+        .collect();
+    let applied_current = runtimes
+        .iter()
+        .filter(|runtime| {
+            runtime
+                .rate_control
+                .as_ref()
+                .is_some_and(|control| control.applied_overrides_revision >= revision)
+        })
+        .count();
+    Ok(QueueOverrideApplication {
+        live_runtimes: runtimes.len(),
+        applied_current,
+        runtimes,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -2492,6 +2835,7 @@ fn queue_runtime_configs_match(
         && left.deadline_duration_secs == right.deadline_duration_secs
         && left.priority_aging_interval_secs == right.priority_aging_interval_secs
         && left.rate_limit == right.rate_limit
+        && left.fleet_rate_limit == right.fleet_rate_limit
         && (left.dlq_enabled.is_none()
             || right.dlq_enabled.is_none()
             || left.dlq_enabled == right.dlq_enabled)
@@ -5644,6 +5988,19 @@ fn apply_transform(job: &JobRow, payload_value: &serde_json::Value) -> serde_jso
             );
             payload_value.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod fleet_rate_share_tests {
+    use super::fleet_rate_share;
+
+    #[test]
+    fn a_share_is_this_runtimes_weight_over_the_live_total() {
+        assert_eq!(fleet_rate_share(10, []), 1.0);
+        assert_eq!(fleet_rate_share(10, [10, 20]), 0.25);
+        // A zero weight counts as one, so every runtime gets some share.
+        assert_eq!(fleet_rate_share(0, [3]), 0.25);
     }
 }
 

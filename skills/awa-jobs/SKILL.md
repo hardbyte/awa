@@ -73,7 +73,8 @@ client.start().await?;
 `QueueConfig` defaults worth knowing: `max_workers` 50, `poll_interval` 200ms,
 `deadline_duration` 300s, `claimers` 1, `claim_batch_size` 512. The trait form
 (`impl Worker` + `.register_worker(w)`) is equivalent to the typed closure.
-`max_workers` and `rate_limit` apply per worker process, not across the fleet.
+`max_workers` and `rate_limit` apply per worker process, not across the fleet;
+`fleet_rate_limit` caps the whole fleet, each process enforcing its share.
 To choose between separate queues, priority, claimers, enqueue shards and
 `PartitionedQueue`, see
 [queues, lanes and splitting work](../../docs/concepts/queues-lanes-and-splitting-work.md).
@@ -90,11 +91,15 @@ Concurrency has two modes. **Hard-reserved** (the default) gives each queue its
 own fixed `max_workers`. **Weighted** shares one pool: call `.global_max_workers(N)`
 (Rust) or pass `global_max_workers=N` with dict-form queues (Python), then use
 `min_workers` as a floor and `weight` to split overflow. Per-queue rate limiting
-is a token bucket (`RateLimit { max_rate, burst }` / `rate_limit=(rate, burst)`).
+is a token bucket (`RateLimit { max_rate, burst }` / `rate_limit=(rate, burst)`),
+per process for `rate_limit` and fleet-wide for `fleet_rate_limit` (Rust only so far).
 A runtime shares one LISTEN connection across queues. Empty notification-backed queues poll with backoff up to 2s; poll-only runtimes retain `poll_interval`. `ClientBuilder::max_concurrent_claims` bounds concurrent claim round trips across queues, on queue and canonical storage (default pool size / 4, clamped to 4..=64). `ClientBuilder::max_concurrent_finalizes` bounds concurrent direct finalize transactions on queue storage (retries, snoozes, cancels, failures, DLQ moves, completions with follow-ups; same default), so a retry storm cannot take the pool. This controls database pressure separately from worker capacity; increase it only with measured pool headroom. Extra `claimers` share each queue's worker permits.
 
-Enabling a rate limit live is not supported — you can only retune a queue that
-was built with one.
+`awa queue overrides set <queue> --fleet-rate-limit N --reason ...` enables,
+retunes or (with `clear`) removes a limit on a running fleet, including on a queue
+built without one; `awa queue overrides show <queue>` reports how many runtimes
+applied it. A handler that meets an upstream 429 should return
+`JobResult::Snooze`, which does not spend an attempt.
 
 ## Enqueue
 

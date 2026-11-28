@@ -392,6 +392,12 @@ v064 adds a nullable `enqueue_shard` column to `deferred_jobs` and `dlq_entries`
 
 Adding the column takes an `ACCESS EXCLUSIVE` lock on `deferred_jobs` and `dlq_entries` until the migration commits, waiting at most 2 s for each when no `lock_timeout` is set. Neither table is scanned or rewritten, and a schema that already has the column is not locked. Binaries before v064 write these rows with explicit column lists, which leave the column NULL, so they can run before or after it. Binaries from this release check for the column and leave it out until it exists, so they can run before the migration too. `awa.insert_job_compat` and `awa.insert_jobs_compat_batch` are unchanged and leave it NULL on scheduled rows. External migration runners apply `awa migrate --sql --from 63 --to 64`.
 
+## v065: fleet rate limit overrides
+
+v065 adds `override_fleet_rate_limit`, `override_fleet_rate_burst`, `override_rate_burst`, `overrides_revision`, `overrides_updated_by` and `overrides_reason` to `awa.queue_meta` ([ADR-054](adr/054-fleet-rate-limits.md)). It takes an `ACCESS EXCLUSIVE` lock on `awa.queue_meta`, a small control table, until the migration commits, waiting at most 2 s when no `lock_timeout` is set; `overrides_revision` has a constant default, so the table is not rewritten. Binaries before v065 read and write the ADR-038 override columns by name, so they can run before or after it; their writes leave the new columns alone and do not advance the revision. Binaries from this release read the ADR-038 columns when the new ones are missing, so they can run before the migration, but setting a fleet limit or a burst needs it.
+
+A runtime before this release ignores fleet limits and reports no applied revision. While it serves a queue, the other runtimes count its worker capacity in their shares, so the fleet stays nearer the limit, but its own starts are not limited. `awa queue overrides show` lists it as reporting no rate control. External migration runners apply `awa migrate --sql --from 64 --to 65`.
+
 ## Tag indexes (ADR-049)
 
 Tags become the indexed way to find jobs on queue storage. There is no

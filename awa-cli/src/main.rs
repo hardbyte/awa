@@ -977,17 +977,42 @@ enum OverrideCommands {
         /// Override the claim batch size
         #[arg(long)]
         claim_batch_size: Option<i32>,
-        /// Override the sustained rate limit (jobs/second; only retunes a
-        /// queue built with a rate limit)
+        /// Override the rate limit each runtime enforces on its own
+        /// (jobs/second). Enables one on a queue built without it.
         #[arg(long)]
         rate_limit: Option<f64>,
+        /// Override the burst for the per-runtime rate limit (default
+        /// ceil(rate))
+        #[arg(long)]
+        rate_burst: Option<i32>,
+        /// Override the rate limit across every live runtime serving the
+        /// queue (jobs/second). Each runtime enforces its share.
+        #[arg(long)]
+        fleet_rate_limit: Option<f64>,
+        /// Override the burst for the fleet rate limit (default ceil(rate))
+        #[arg(long)]
+        fleet_rate_burst: Option<i32>,
         /// Override the per-attempt deadline, in milliseconds (cannot cross
         /// the zero boundary — claim mode is fixed at startup)
         #[arg(long)]
         deadline_ms: Option<i64>,
+        /// Why the overrides changed, recorded with them
+        #[arg(long)]
+        reason: Option<String>,
+        /// Who changed them, recorded with them (default "cli")
+        #[arg(long)]
+        by: Option<String>,
     },
     /// Clear every override — workers revert to builder-configured values
-    Clear { queue: String },
+    Clear {
+        queue: String,
+        /// Why the overrides were cleared, recorded with the change
+        #[arg(long)]
+        reason: Option<String>,
+        /// Who cleared them (default "cli")
+        #[arg(long)]
+        by: Option<String>,
+    },
     /// Show the current override state
     Show {
         queue: String,
@@ -2222,52 +2247,74 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             poll_interval_ms,
                             claim_batch_size,
                             rate_limit,
+                            rate_burst,
+                            fleet_rate_limit,
+                            fleet_rate_burst,
                             deadline_ms,
+                            reason,
+                            by,
                         } => {
                             let overrides = awa_model::admin::QueueRuntimeOverrides {
                                 poll_interval_ms,
                                 claim_batch_size,
                                 rate_limit,
                                 deadline_ms,
+                                rate_burst,
+                                fleet_rate_limit,
+                                fleet_rate_burst,
                             };
-                            awa_model::admin::set_queue_runtime_overrides(
-                                &pool, &queue, &overrides,
+                            let audit = awa_model::admin::QueueRuntimeOverrideAudit {
+                                updated_by: Some(by.unwrap_or_else(|| "cli".to_string())),
+                                reason,
+                            };
+                            let revision = awa_model::admin::set_queue_runtime_overrides_audited(
+                                &pool, &queue, &overrides, &audit,
                             )
                             .await?;
                             println!(
-                                "Overrides set for queue '{queue}': {}",
+                                "Overrides set for queue '{queue}' (revision {revision}): {}",
                                 serde_json::to_string(&overrides)?
                             );
-                            println!("Workers apply them within their refresh cadence (~10s).");
+                            println!(
+                                "Workers apply them within their refresh cadence (~10s); \
+                                 `awa queue overrides show {queue}` reports which have."
+                            );
                         }
-                        OverrideCommands::Clear { queue } => {
-                            awa_model::admin::clear_queue_runtime_overrides(&pool, &queue).await?;
-                            println!("Overrides cleared for queue '{queue}' — workers revert to builder values.");
+                        OverrideCommands::Clear { queue, reason, by } => {
+                            let audit = awa_model::admin::QueueRuntimeOverrideAudit {
+                                updated_by: Some(by.unwrap_or_else(|| "cli".to_string())),
+                                reason,
+                            };
+                            let revision =
+                                awa_model::admin::clear_queue_runtime_overrides_audited(
+                                    &pool, &queue, &audit,
+                                )
+                                .await?;
+                            println!(
+                                "Overrides cleared for queue '{queue}' (revision {revision}) \
+                                 — workers revert to builder values."
+                            );
                         }
                         OverrideCommands::Show { queue, json } => {
-                            let overrides =
-                                awa_model::admin::queue_runtime_overrides(&pool, &queue).await?;
-                            match overrides {
-                                Some(overrides) if json => {
-                                    println!("{}", serde_json::to_string_pretty(&overrides)?)
-                                }
-                                Some(overrides) => {
-                                    println!("queue '{queue}' overrides:");
-                                    println!(
-                                        "  poll_interval_ms:  {:?}",
-                                        overrides.poll_interval_ms
-                                    );
-                                    println!(
-                                        "  claim_batch_size:  {:?}",
-                                        overrides.claim_batch_size
-                                    );
-                                    println!("  rate_limit:        {:?}", overrides.rate_limit);
-                                    println!("  deadline_ms:       {:?}", overrides.deadline_ms);
-                                }
-                                None if json => println!("null"),
-                                None => println!(
-                                    "queue '{queue}' has no control-plane row (no overrides)."
-                                ),
+                            let state =
+                                awa_model::admin::queue_runtime_override_state(&pool, &queue)
+                                    .await?;
+                            let application = awa_model::admin::queue_override_application(
+                                &pool,
+                                &queue,
+                                state.as_ref().map_or(0, |state| state.revision),
+                            )
+                            .await?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "state": state,
+                                        "application": application,
+                                    }))?
+                                );
+                            } else {
+                                print_queue_overrides(&queue, state.as_ref(), &application);
                             }
                         }
                     },
@@ -2317,6 +2364,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_queue_overrides(
+    queue: &str,
+    state: Option<&awa_model::admin::QueueRuntimeOverrideState>,
+    application: &awa_model::admin::QueueOverrideApplication,
+) {
+    match state {
+        None => println!("queue '{queue}' has no control-plane row (no overrides)."),
+        Some(state) => {
+            let overrides = &state.overrides;
+            println!("queue '{queue}' overrides (revision {}):", state.revision);
+            println!("  poll_interval_ms:  {:?}", overrides.poll_interval_ms);
+            println!("  claim_batch_size:  {:?}", overrides.claim_batch_size);
+            println!("  rate_limit:        {:?}", overrides.rate_limit);
+            println!("  rate_burst:        {:?}", overrides.rate_burst);
+            println!("  fleet_rate_limit:  {:?}", overrides.fleet_rate_limit);
+            println!("  fleet_rate_burst:  {:?}", overrides.fleet_rate_burst);
+            println!("  deadline_ms:       {:?}", overrides.deadline_ms);
+            if let Some(updated_at) = state.updated_at {
+                println!(
+                    "  updated:           {updated_at} by {} ({})",
+                    state.updated_by.as_deref().unwrap_or("unknown"),
+                    state.reason.as_deref().unwrap_or("no reason given"),
+                );
+            }
+        }
+    }
+    println!(
+        "applied by {} of {} live runtimes",
+        application.applied_current, application.live_runtimes
+    );
+    for runtime in &application.runtimes {
+        let host = runtime.hostname.as_deref().unwrap_or("?");
+        match &runtime.rate_control {
+            None => println!(
+                "  {} ({host}): reports no rate control (older version)",
+                runtime.instance_id
+            ),
+            Some(control) => {
+                let effective = control.effective_rate_limit.as_ref().map_or_else(
+                    || "unlimited".to_string(),
+                    |limit| format!("{:.3}/s burst {}", limit.max_rate, limit.burst),
+                );
+                let share = control
+                    .fleet_share
+                    .map_or_else(|| "-".to_string(), |share| format!("{:.1}%", share * 100.0));
+                println!(
+                    "  {} ({host}): revision {}, weight {}, fleet share {share}, enforces {effective}",
+                    runtime.instance_id, control.applied_overrides_revision, control.weight
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

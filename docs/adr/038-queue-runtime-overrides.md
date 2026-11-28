@@ -4,7 +4,9 @@
 
 Accepted — Tier 1 implemented for 0.7 ([#396](https://github.com/hardbyte/awa/issues/396),
 from [#385](https://github.com/hardbyte/awa/issues/385)); Tier 2 tracked in
-[#397](https://github.com/hardbyte/awa/issues/397).
+[#397](https://github.com/hardbyte/awa/issues/397). [ADR-054](054-fleet-rate-limits.md) adds
+fleet rate limits, burst overrides, an override revision and audit fields, and removes the first
+guard rail: rate limits can be enabled, retuned and cleared live.
 
 ## Context
 

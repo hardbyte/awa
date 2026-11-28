@@ -103,14 +103,24 @@ The key `QueueConfig` fields:
 | Field | Default | When you'd change it |
 | --- | --- | --- |
 | `max_workers` | `50` | Always — this is your concurrency cap per queue in each worker process |
-| `rate_limit` | `None` | External API rate limits, backpressure. The token bucket is per worker process |
+| `rate_limit` | `None` | A rate one worker process may not exceed, such as a per-host budget. The token bucket is per worker process |
+| `fleet_rate_limit` | `None` | External API rate limits across the fleet. Each worker process enforces its share, weighted by its worker capacity for the queue ([ADR-054](adr/054-fleet-rate-limits.md)) |
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on the claim batch's shared `lease_claim_batches.deadline_at` and the maintenance rescue path force-closes expired claims. |
 | `poll_interval` | `200ms` | How often a claimer polls when no `NOTIFY` reaches it; with LISTEN available, empty polls back off to 2 s (see below). Wake-ups from the enqueue and retry paths awa commits itself are coalesced to at most one per queue per 50 ms from each pool; SQL-function inserts and the public `*_tx` methods still notify once per transaction ([ADR-053](adr/053-coordination-off-the-commit-path.md)). |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
 
-Each worker process applies its `QueueConfig` on its own: `max_workers` is a semaphore and `rate_limit` a token bucket inside one runtime. Three replicas each configured with `max_workers: 20` and a rate of 50 per second allow 60 concurrent jobs and 150 jobs per second across the fleet, so divide the values by the replica count when you need a fleet-wide cap.
+Each worker process applies its `QueueConfig` on its own: `max_workers` is a semaphore and `rate_limit` a token bucket inside one runtime. Three replicas each configured with `max_workers: 20` and a `rate_limit` of 50 per second allow 60 concurrent jobs and 150 jobs per second across the fleet.
+
+`fleet_rate_limit` is the fleet-wide cap. Each worker process takes a share of it, its worker capacity for the queue over the total capacity of the live processes serving the queue, recomputed on the override refresh (10 s by default). When both limits are set, each process enforces the lower of `rate_limit` and its share. Shares lag the fleet's membership:
+
+- a process that starts can push the fleet over the limit by its own share until the others see its first snapshot, up to one snapshot interval plus one refresh interval (20 s by default);
+- a process that shuts down or dies leaves the fleet under the limit until the others stop counting it, one refresh interval after a clean shutdown and up to the 30 s stale cutoff after a crash.
+
+Each process holds at least one burst token, so with more processes than burst tokens the fleet can start one job per process at once.
+
+A handler that meets an upstream 429 should return `JobResult::Snooze`, which waits without spending an attempt.
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
@@ -151,7 +161,7 @@ let opts = customer_updates.route_opts_by_key(
 
 With one partition, `PartitionedQueue::new("email", 1)` uses the plain `email` queue. With more than one partition, partition 0 remains the logical queue name and later partitions use stable suffixes: `email`, `email__p1`, `email__p2`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO inside the selected partition even if each physical queue later raises `enqueue_shards`.
 
-`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue in each process. Divide those values yourself when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap. `global_max_workers` can cap total concurrency instead, but not the combined rate; divide `rate_limit` either way.
+`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` and `fleet_rate_limit` are also per physical queue. Divide them by the partition count when you need a total rate across the partitioned queue. `global_max_workers` can cap total concurrency instead, but not the combined rate.
 
 Python exposes the same deterministic router through the `awa.PartitionedQueue` class:
 
@@ -703,7 +713,16 @@ $ awa queue overrides show email
 $ awa queue overrides clear email
 ```
 
-Overridable: `poll_interval`, `claim_batch_size`, `rate_limit` (retunes a queue built with a rate limit; enabling limiting live is not supported), and `deadline_duration` (must stay on the same side of zero — the claim mode is fixed at startup). Semantics: the builder value is the default, a set override wins, clearing reverts. `set` replaces the whole override state, so `show` first when adjusting a single knob. Workers apply changes within their refresh cadence (10s by default; `AWA_OVERRIDE_REFRESH_MS` tunes it).
+Overridable: `poll_interval`, `claim_batch_size`, `rate_limit` and its burst, `fleet_rate_limit` and its burst, and `deadline_duration` (must stay on the same side of zero — the claim mode is fixed at startup). A rate override enables a limit on a queue built without one, and clearing it removes the limit again. Retuning keeps the tokens a bucket holds, capped at the new burst, so it never grants a fresh burst. Semantics: the builder value is the default, a set override wins, clearing reverts. `set` replaces the whole override state, so `show` first when adjusting a single knob. Workers apply changes within their refresh cadence (10s by default; `AWA_OVERRIDE_REFRESH_MS` tunes it).
+
+To throttle a queue during an incident:
+
+```console
+$ awa queue overrides set email --fleet-rate-limit 50 --reason "provider 429s" --by alice
+$ awa queue overrides show email
+```
+
+Every write records who made it and why, and advances the queue's override revision. `show` prints the overrides, who last changed them, and how many of the live runtimes report the current revision applied, with each runtime's share and the rate it enforces. `--json` prints the same as JSON.
 
 ## Worker health listener
 

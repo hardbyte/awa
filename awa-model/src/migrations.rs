@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 64;
+pub const CURRENT_VERSION: i32 = 65;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -352,6 +352,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Retain the enqueue shard on deferred and DLQ rows",
         &[V23_UP, V64_UP],
     ),
+    (
+        65,
+        "Fleet rate limit overrides with audit and revision",
+        &[V65_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -425,6 +430,7 @@ const V61_UP: &str = include_str!("../migrations/v061_claim_spent_prefix_gaps.sq
 const V62_UP: &str = include_str!("../migrations/v062_queue_ring_generation_floor.sql");
 const V63_UP: &str = include_str!("../migrations/v063_batch_operation_bulk_actions.sql");
 const V64_UP: &str = include_str!("../migrations/v064_retained_enqueue_shard.sql");
+const V65_UP: &str = include_str!("../migrations/v065_fleet_rate_limit_overrides.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
