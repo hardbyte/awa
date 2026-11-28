@@ -11,6 +11,7 @@ import type { JobRow } from "@/lib/api";
 import { StateBadge } from "./StateBadge";
 import { Time } from "./Time";
 import { jobStateMeta, TONE_DOT } from "@/lib/states";
+import { errorSummary, parseErrorEntry } from "@/lib/errors";
 
 interface TimelineEvent {
   timestamp: string;
@@ -29,24 +30,17 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
     label: "Created",
   });
 
-  // Error history — each entry in errors[] has a timestamp and attempt number
-  if (job.errors && job.errors.length > 0) {
-    for (const err of job.errors) {
-      if (err && typeof err === "object" && err !== null) {
-        const e = err as Record<string, unknown>;
-        const at = typeof e.at === "string" ? e.at : undefined;
-        const error = typeof e.error === "string" ? e.error : undefined;
-        const attempt = typeof e.attempt === "number" ? e.attempt : undefined;
-        if (at) {
-          events.push({
-            timestamp: at,
-            label: attempt != null ? `Attempt ${attempt} failed` : "Error",
-            state: "failed",
-            detail: error,
-            isError: true,
-          });
-        }
-      }
+  // Error history: one line per entry; the Errors card has the full text.
+  for (const entry of job.errors ?? []) {
+    const error = parseErrorEntry(entry);
+    if (error.at) {
+      events.push({
+        timestamp: error.at,
+        label: error.attempt !== null ? `Attempt ${error.attempt} failed` : "Error",
+        state: "failed",
+        detail: errorSummary(error) || undefined,
+        isError: true,
+      });
     }
   }
 
@@ -131,7 +125,9 @@ export function JobTimeline({ job }: { job: JobRow }) {
                 />
               </div>
               {event.detail && (
-                <p className="mt-1 text-sm text-danger">{event.detail}</p>
+                <p className="mt-1 truncate text-sm text-danger-subtle-fg" title={event.detail}>
+                  {event.detail}
+                </p>
               )}
             </div>
           </div>

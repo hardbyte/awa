@@ -26,6 +26,7 @@ import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { AdminButton } from "@/components/AdminAction";
 import { jobActionCopy } from "@/lib/job-actions";
@@ -464,25 +465,15 @@ export function JobDetailPage() {
         </Card>
       )}
 
-      {/* Errors */}
-      {job.errors && job.errors.length > 0 && (
-        <Card>
-          <CardHeader
-            title={`Errors (${job.errors.length})`}
-            className="text-danger"
-          />
-          <CardContent className="space-y-2">
-            {[...job.errors].reverse().map((err, i) => (
-              <div
-                key={i}
-                className="rounded-md border-l-[3px] border-danger bg-danger-subtle p-1"
-              >
-                <JsonView data={err} />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      )}
+      <ErrorBlock
+        errors={job.errors}
+        jobState={job.state}
+        lastAttempt={
+          job.state === "failed" || job.state === "cancelled"
+            ? { startedAt: job.attempted_at, finishedAt: job.finalized_at }
+            : undefined
+        }
+      />
     </Page>
   );
 }

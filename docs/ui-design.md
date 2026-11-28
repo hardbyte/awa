@@ -125,7 +125,7 @@ Desktop uses a table layout; mobile switches to a card layout. Both show the job
 
 ### Job Detail (`/jobs/:id`)
 
-Full inspection of a single job: state badge, queue (linked), priority, attempt count, creation time, a timeline reconstructed from timestamps and error history, syntax-highlighted JSON arguments, and retry/cancel actions. Declared queue and job-kind descriptors render alongside the raw fields so operators can jump from a job instance to its owning team or runbook without leaving the page.
+Full inspection of a single job: state badge, queue (linked), priority, attempt count, creation time, a timeline reconstructed from timestamps and error history, syntax-highlighted JSON arguments, and retry/cancel actions. Errors show once: the latest formatted (class, message and traceback, with library frames dimmed), then a table of every failed attempt with when it failed, the gap since the one before and its outcome. Runs are split where the attempt number goes down (a manual retry), identical consecutive errors collapse into one row, and the raw JSON is a toggle away. Entries record when an attempt failed but not when it started, so only the final attempt's duration is shown. The dead-letter page uses the same card. Declared queue and job-kind descriptors render alongside the raw fields so operators can jump from a job instance to its owning team or runbook without leaving the page.
 
 ### Queues (`/queues`)
 

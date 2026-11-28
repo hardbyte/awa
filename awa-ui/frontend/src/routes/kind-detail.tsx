@@ -16,6 +16,7 @@ import {
 } from "@/lib/api";
 import { SECTION_LABELS } from "@/lib/sections";
 import { bulkActionReason } from "@/lib/batch";
+import { groupFailures } from "@/lib/errors";
 import { AdminButton } from "@/components/AdminAction";
 import { BulkActionDialog } from "@/components/BulkActionDialog";
 import { formatNumber } from "@/lib/number";
@@ -36,16 +37,10 @@ import {
 
 /** How many recent failures the page reads to show and to find queues. */
 export const KIND_FAILURE_SAMPLE = 50;
-const FAILURES_SHOWN = 10;
+const FAILURE_GROUPS_SHOWN = 10;
 
 function kindLabel(kind: JobKindOverview): string {
   return kind.display_name?.trim() ? kind.display_name : kind.kind;
-}
-
-function lastError(job: JobRow): string {
-  const entry = job.errors?.[job.errors.length - 1];
-  if (entry && typeof entry === "object" && "error" in entry) return String((entry as { error: unknown }).error);
-  return "";
 }
 
 function CountStat({
@@ -234,8 +229,8 @@ export function KindDetailPage() {
 
       <Card>
         <CardHeader
-          title="Recent failures"
-          description={`The newest ${FAILURES_SHOWN} of the ${KIND_FAILURE_SAMPLE} most recent failed jobs of this kind.`}
+          title="Recent failures by error"
+          description={`The ${KIND_FAILURE_SAMPLE} most recent failed jobs of this kind, grouped by error class.`}
         />
         <CardContent>
           {failedJobs.length === 0 ? (
@@ -248,13 +243,14 @@ export function KindDetailPage() {
             />
           ) : (
             <ul className="divide-y text-sm" data-testid="kind-failures">
-              {failedJobs.slice(0, FAILURES_SHOWN).map((job) => (
-                <li key={job.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 py-2">
-                  <JobLink id={job.id} />
-                  <QueueLink queue={job.queue} descriptor={job.queue_descriptor} className="text-xs" />
-                  <Time value={job.finalized_at} className="text-xs text-muted-fg" />
-                  <span className="min-w-0 basis-full truncate text-danger-subtle-fg sm:basis-auto sm:flex-1" title={lastError(job)}>
-                    {lastError(job) || "—"}
+              {groupFailures(failedJobs).slice(0, FAILURE_GROUPS_SHOWN).map((group) => (
+                <li key={group.key} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 py-2">
+                  <span className="tabular-nums font-medium">{formatNumber(group.count)}×</span>
+                  <span className="min-w-0 flex-1 truncate text-danger-subtle-fg" title={group.summary}>
+                    {group.summary}
+                  </span>
+                  <span className="text-xs text-muted-fg">
+                    newest <JobLink id={group.jobIds[0]!} />
                   </span>
                 </li>
               ))}

@@ -3,6 +3,7 @@ import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useQueueHub } from "@/hooks/use-queue-hub";
 import { fetchCronJobs, fetchJobs, fetchRuntime, type CronJobRow, type JobRow, type RuntimeOverview } from "@/lib/api";
 import { dlqDepthQuery } from "@/lib/shared-queries";
+import { groupFailures } from "@/lib/errors";
 import { formatNumber } from "@/lib/number";
 import { formatDuration } from "@/lib/time";
 import { describeCron } from "@/components/CronExpr";
@@ -69,6 +70,11 @@ export function QueueOverviewTab() {
   const lag =
     queue.lag_seconds == null ? "—" : queue.lag_seconds < 10 ? `${queue.lag_seconds.toFixed(1)}s` : formatDuration(queue.lag_seconds);
 
+  // The commonest error of each kind in the sample.
+  const topErrors = new Map<string, string>();
+  for (const group of groupFailures(failures.data ?? [])) {
+    if (!topErrors.has(group.kind)) topErrors.set(group.kind, group.count > 1 ? `${group.count}× ${group.summary}` : group.summary);
+  }
   const failingKinds = [...(failures.data ?? []).reduce((groups, job) => {
     const group = groups.get(job.kind) ?? { count: 0, descriptor: job.kind_descriptor };
     groups.set(job.kind, { ...group, count: group.count + 1 });
@@ -129,7 +135,14 @@ export function QueueOverviewTab() {
               <ul className="space-y-1 text-sm" data-testid="queue-failing-kinds">
                 {failingKinds.map(([kind, { count, descriptor }]) => (
                   <li key={kind} className="flex items-center justify-between gap-2">
-                    <KindLink kind={kind} descriptor={descriptor} />
+                    <span className="min-w-0">
+                      <KindLink kind={kind} descriptor={descriptor} />
+                      {topErrors.get(kind) && (
+                        <span className="block truncate text-xs text-muted-fg" title={topErrors.get(kind)}>
+                          {topErrors.get(kind)}
+                        </span>
+                      )}
+                    </span>
                     <Link
                       to="/queues/$name/jobs"
                       params={{ name }}

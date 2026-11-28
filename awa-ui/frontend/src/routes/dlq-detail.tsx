@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/description-list";
 import { JsonView } from "@/components/JsonView";
 import { OutputCard } from "@/components/OutputCard";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { AdminButton } from "@/components/AdminAction";
 import { jobStateMeta } from "@/lib/states";
@@ -184,14 +185,11 @@ export function DlqDetailPage() {
       {/* The dead-lettered attempt's output, if a failed attempt recorded one (ADR-048) */}
       <OutputCard output={row.output} errors={row.errors} />
 
-      {row.errors && row.errors.length > 0 && (
-        <Card>
-          <CardHeader>Error history ({row.errors.length})</CardHeader>
-          <CardContent>
-            <JsonView data={row.errors} />
-          </CardContent>
-        </Card>
-      )}
+      <ErrorBlock
+        errors={row.errors}
+        jobState="dead_lettered"
+        lastAttempt={{ startedAt: row.attempted_at, finishedAt: row.finalized_at }}
+      />
 
       {row.progress != null && (
         <Card>

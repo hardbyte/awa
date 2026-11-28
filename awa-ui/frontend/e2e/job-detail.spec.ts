@@ -383,3 +383,76 @@ test.describe("Job detail page", () => {
     await expect(page).toHaveURL(/\/cron\/e2e_cron_owner$/);
   });
 });
+
+function mockJob(overrides: Record<string, unknown>) {
+  const now = new Date().toISOString();
+  return {
+    id: 990002, kind: "e2e_job", queue: "e2e_test", args: {}, state: "failed", priority: 2, attempt: 2,
+    max_attempts: 2, run_at: now, heartbeat_at: null, deadline_at: null, attempted_at: now, finalized_at: now,
+    created_at: now, errors: null, metadata: {}, tags: [], progress: null, callback_id: null,
+    callback_timeout_at: null, callback_filter: null, callback_on_complete: null, callback_on_fail: null,
+    callback_transform: null, original_priority: 2, queue_descriptor: null, kind_descriptor: null,
+    ...overrides,
+  };
+}
+
+test.describe("Job errors", () => {
+  test("the seeded failed job shows its latest error and a table of attempts", async ({ page }) => {
+    await page.goto("/jobs/800003");
+    const block = page.getByTestId("error-block");
+    await expect(block.getByTestId("latest-error")).toContainText("max retries exceeded");
+    const table = block.getByRole("table", { name: "Failed attempts" });
+    await expect(table.getByRole("row")).toHaveCount(4);
+    await expect(table).toContainText("connection refused");
+    await expect(table).toContainText("+1m");
+
+    await block.getByRole("button", { name: "Raw JSON" }).click();
+    await expect(block.getByText('"max retries exceeded"')).toBeVisible();
+    await expect(block.getByRole("table")).toHaveCount(0);
+    await block.getByRole("button", { name: "Formatted" }).click();
+    await expect(block.getByRole("table", { name: "Failed attempts" })).toBeVisible();
+  });
+
+  test("a Python traceback is formatted once, with runs and repeated errors grouped", async ({ page }) => {
+    const traceback = [
+      "TimeoutError: read timed out",
+      "Traceback (most recent call last):",
+      '  File "/app/jobs/sync.py", line 42, in handle',
+      "    rows = client.fetch()",
+    ].join("\n");
+    await page.route("**/api/jobs/990002", (route) =>
+      route.fulfill({
+        json: mockJob({
+          errors: [
+            { error: "connection refused", attempt: 1, at: "2026-11-28T10:00:00Z" },
+            { error: "connection refused", attempt: 2, at: "2026-11-28T10:01:00Z" },
+            { error: traceback, attempt: 1, at: "2026-11-28T11:00:00Z" },
+            { error: traceback, attempt: 2, at: "2026-11-28T11:02:00Z" },
+          ],
+        }),
+      })
+    );
+    await page.goto("/jobs/990002");
+    const block = page.getByTestId("error-block");
+    await expect(block).toContainText("4 entries in 2 runs");
+    const latest = block.getByTestId("latest-error");
+    await expect(latest.getByText("TimeoutError:", { exact: false }).first()).toBeVisible();
+    await expect(latest.getByTestId("error-traceback")).toContainText('File "/app/jobs/sync.py", line 42');
+    await expect(page.getByTestId("error-traceback")).toHaveCount(1);
+
+    const table = block.getByRole("table", { name: "Failed attempts" });
+    await expect(table.getByRole("row")).toHaveCount(3);
+    await expect(table).toContainText("Run 2");
+    await table.getByRole("button", { name: /Same error ×2/ }).first().click();
+    await expect(table.getByRole("row")).toHaveCount(4);
+    await expect(table).toContainText("Gave up");
+  });
+
+  test("the dead letter page uses the same error card", async ({ page }) => {
+    await page.goto("/dlq/600001");
+    const block = page.getByTestId("error-block");
+    await expect(block.getByTestId("latest-error")).toContainText("dead lettered");
+    await expect(block.getByTestId("latest-error")).toContainText("Terminal");
+    await expect(block.getByRole("table")).toHaveCount(0);
+  });
+});
