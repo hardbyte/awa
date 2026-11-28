@@ -1,3 +1,6 @@
+import type { BatchOperationKind, JobCount } from "@/lib/api";
+import { TYPE_TO_CONFIRM_MIN_JOBS } from "@/lib/constants";
+
 /**
  * How much confirmation an action takes:
  * - 0: reversible, one object; no dialog, an Undo toast.
@@ -14,3 +17,12 @@ export function selectionTier(count: number): ConfirmTier {
   return count <= 1 ? 1 : 2;
 }
 
+
+/** Tier for a bulk operation over a filter, given what its preview matched. */
+export function bulkTier(opKind: BatchOperationKind, count: JobCount | undefined): ConfirmTier {
+  if (opKind === "discard" || opKind === "purge_dlq") return 3;
+  if (opKind === "cancel" && (!count || count.kind === "at_least" || count.value >= TYPE_TO_CONFIRM_MIN_JOBS)) {
+    return 3;
+  }
+  return 2;
+}

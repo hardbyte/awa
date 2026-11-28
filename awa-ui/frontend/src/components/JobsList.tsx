@@ -12,9 +12,7 @@ import {
   fetchStats,
   bulkRetry,
   bulkCancel,
-  toWireFilter,
 } from "@/lib/api";
-import { isNarrowing } from "@/lib/batch";
 import { nextPageAnchor } from "@/lib/query";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts } from "@/lib/api";
@@ -26,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { AdminButton } from "@/components/AdminAction";
+import { BulkScopeBar } from "@/components/BulkScopeBar";
 import { JobLink, KindLink } from "@/components/links";
 import { jobActionCopy, selectionCopy, selectionOutcome } from "@/lib/job-actions";
 import { selectionTier } from "@/lib/confirm";
@@ -157,13 +156,8 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
     paused: hasSel,
   });
 
-  // A batch operation acts on available and scheduled jobs, so the jobs
-  // page offers one only when its filter can reach them and names which of
-  // them (a state alone doesn't). The batch form reads tags as a comma list,
-  // so a tag with a comma can't be carried over.
-  const batchEligible =
-    ["all", "available", "scheduled"].includes(filters.state) &&
-    isNarrowing(toWireFilter(filterParams));
+  // The new-operation form reads tags as a comma list, so a tag with a
+  // comma can't be carried over.
   const tagWithComma = (searchFilters.tags ?? []).some((tag) => tag.includes(","));
   const batchSearch: Record<string, string> = Object.fromEntries(
     Object.entries({
@@ -359,54 +353,52 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
               Count failed: {countQuery.error.message}
             </span>
           )}
-          {batchEligible && tagWithComma && (
-            <span>A tag containing a comma can't be carried into a batch operation.</span>
-          )}
-          {batchEligible && !tagWithComma && (
-            <AdminButton
-              size="sm"
-              intent="outline"
-              onPress={() =>
-                void navigate({ to: "/batch-ops/new", search: batchSearch })
-              }
-            >
-              Change priority or queue of matching jobs
-            </AdminButton>
-          )}
         </div>
       )}
 
-      {/* Bulk action toolbar */}
-      {selected.size > 0 && (
-        <div className="flex items-center gap-3 rounded-lg bg-muted p-3">
-          <span className="text-sm font-medium">{selected.size} selected</span>
-          <Badge intent="warning">Updates paused</Badge>
-          <AdminButton
-            intent="primary"
-            size="sm"
-            onPress={() => confirm("retry")}
-            isDisabled={retryMutation.isPending || retryableIds.length === 0}
-            disabledReason="None of the selected jobs is failed, cancelled or waiting"
-          >
-            Retry{retryableIds.length > 0 ? ` (${retryableIds.length})…` : ""}
-          </AdminButton>
-          <AdminButton
-            intent="outline"
-            size="sm"
-            className="text-danger"
-            onPress={() => confirm("cancel")}
-            isDisabled={cancelMutation.isPending || cancellableIds.length === 0}
-            disabledReason="All the selected jobs have already finished"
-          >
-            Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})…` : ""}
-          </AdminButton>
-          {autoRetryingCount > 0 && (
-            <span className="text-xs text-muted-fg" data-testid="bulk-retry-hint">
-              {autoRetryingCount} retryable job(s) already retry automatically
-              and are not retried here.
-            </span>
-          )}
-        </div>
+      {(hasFilter || hasSel) && (
+        <BulkScopeBar
+          target="jobs"
+          filter={filterParams}
+          count={searchError ? undefined : countQuery.data}
+          unavailableReason={searchError ? "Fix the search first" : undefined}
+          formPrefill={
+            tagWithComma ? "A tag containing a comma can't be carried into the new-operation form" : batchSearch
+          }
+          selection={{
+            count: selected.size,
+            actions: (
+              <>
+                <AdminButton
+                  intent="primary"
+                  size="sm"
+                  onPress={() => confirm("retry")}
+                  isDisabled={retryMutation.isPending || retryableIds.length === 0}
+                  disabledReason="None of the selected jobs is failed, cancelled or waiting"
+                >
+                  Retry{retryableIds.length > 0 ? ` (${retryableIds.length})…` : ""}
+                </AdminButton>
+                <AdminButton
+                  intent="outline"
+                  size="sm"
+                  className="text-danger"
+                  onPress={() => confirm("cancel")}
+                  isDisabled={cancelMutation.isPending || cancellableIds.length === 0}
+                  disabledReason="All the selected jobs have already finished"
+                >
+                  Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})…` : ""}
+                </AdminButton>
+                <Badge intent="warning">Updates paused</Badge>
+                {autoRetryingCount > 0 && (
+                  <span className="text-xs text-muted-fg" data-testid="bulk-retry-hint">
+                    {autoRetryingCount} retryable job(s) already retry automatically
+                    and are not retried here.
+                  </span>
+                )}
+              </>
+            ),
+          }}
+        />
       )}
 
       {/* Mobile card layout */}

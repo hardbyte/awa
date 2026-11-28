@@ -1,19 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 import {
   previewBatchOperation,
-  submitBatchOperation,
   type BatchOperationFilter,
   type BatchOperationKind,
   type BatchOperationPayload,
   type BatchOperationPreview,
 } from "@/lib/api";
-import { ConfirmAction } from "@/components/ConfirmAction";
+import { BulkActionDialog } from "@/components/BulkActionDialog";
 import { AdminButton } from "@/components/AdminAction";
 import {
   buildPayload,
-  describeOperation,
   filterError,
   formatCount,
   formFromSearch,
@@ -33,7 +31,6 @@ import { Input } from "@/components/ui/input";
 import { formatNumber } from "@/lib/number";
 
 export function BatchOpNewPage() {
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const search = useSearch({ strict: false }) as Record<string, unknown>;
   const [form, setForm] = useState<BatchForm>(() => formFromSearch(search));
@@ -75,19 +72,6 @@ export function BatchOpNewPage() {
       toast.success(`Preview matched ${formatCount(previewCount(result))} job(s)`);
     },
     onError: (error) => toast.error(error.message),
-  });
-
-  const submitMutation = useMutation({
-    mutationFn: () => {
-      if (!isPayloadValid || !currentPreview) throw new Error("Invalid batch operation payload");
-      return submitBatchOperation(payload);
-    },
-    onSuccess: (operation) => {
-      setPreview(null);
-      void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
-      toast.success(`Submitted operation ${operation.id.slice(0, 8)}`);
-      void navigate({ to: "/batch-ops/$id", params: { id: operation.id } });
-    },
   });
 
   return (
@@ -198,24 +182,21 @@ export function BatchOpNewPage() {
         )}
         <div className="mt-4 flex items-center gap-2">
           <AdminButton onPress={() => previewMutation.mutate(payload)} isDisabled={previewMutation.isPending || !isPayloadValid}>Preview</AdminButton>
-          <AdminButton intent="primary" onPress={() => setConfirming(true)} isDisabled={submitMutation.isPending || !isPayloadValid || !currentPreview}>Submit…</AdminButton>
+          <AdminButton intent="primary" onPress={() => setConfirming(true)} isDisabled={!isPayloadValid || !currentPreview}>Submit…</AdminButton>
           {submitHint && (
             <span className="text-xs text-muted-fg" data-testid="batch-submit-hint">{submitHint}</span>
           )}
         </div>
       </section>
 
-      <ConfirmAction
-        isOpen={confirming && currentPreview !== null}
-        onOpenChange={setConfirming}
-        tier={2}
-        intent={payload.op_kind === "discard" || payload.op_kind === "purge_dlq" ? "danger" : "primary"}
-        irreversible={payload.op_kind === "discard" || payload.op_kind === "purge_dlq"}
-        title={`Submit ${selectedKind.label.toLowerCase()} operation?`}
-        description={currentPreview ? describeOperation(payload, currentPreview) : ""}
-        confirmLabel={`Submit ${selectedKind.label.toLowerCase()}`}
-        onConfirm={() => submitMutation.mutateAsync()}
-      />
+      {currentPreview && (
+        <BulkActionDialog
+          isOpen={confirming}
+          onOpenChange={setConfirming}
+          payload={payload}
+          preview={currentPreview}
+        />
+      )}
     </Page>
   );
 }

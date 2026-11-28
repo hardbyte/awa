@@ -32,3 +32,10 @@ export const DASHBOARD_QUEUE_LIMIT = 10;
 
 /** A schedule whose next fire is this far in the past reads as overdue. */
 export const CRON_OVERDUE_GRACE_MS = 60_000;
+
+/** A cancel over this many jobs, or over a count the server could only bound
+ * from below, asks the user to type the count to confirm. */
+export const TYPE_TO_CONFIRM_MIN_JOBS = 1_000;
+
+/** Rows of a bulk action's preview sample shown in its dialog. */
+export const BULK_SAMPLE_ROWS = 8;

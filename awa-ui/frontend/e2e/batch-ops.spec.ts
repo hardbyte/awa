@@ -87,7 +87,7 @@ test.describe("Bulk operations form", () => {
     await expect(dialog).toContainText(
       "Set priority to 1 on 2 available or scheduled jobs with queue e2e_test."
     );
-    await dialog.getByRole("button", { name: "Submit" }).click();
+    await dialog.getByRole("button", { name: "Set priority on 2 jobs" }).click();
     await expect(page).toHaveURL(/\/batch-ops\/11111111-1111-4111-8111-111111111111$/);
     await expect(page.getByRole("heading", { name: "Set priority" })).toBeVisible();
   });
@@ -153,7 +153,7 @@ test.describe("Bulk operations form", () => {
     await expect(dialog).toContainText(
       "Move 1 available or scheduled jobs with queue e2e_test, kind e2e_job, id 800006 to queue escalations at priority 2."
     );
-    await dialog.getByRole("button", { name: "Submit" }).click();
+    await dialog.getByRole("button", { name: "Move 1 job" }).click();
     await expect(page.getByRole("heading", { name: "Move queue" })).toBeVisible();
     await expect(page.getByTestId("batch-op-spec")).toHaveText("To queue escalations, priority 2");
   });
@@ -296,6 +296,22 @@ test.describe("Bulk operations form", () => {
     await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).toHaveCount(0);
     expect(submits).toEqual([]);
+  });
+
+  test("cancelling an at-least count asks for the count to be typed", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({ json: { total_matched: { kind: "at_least", value: 10000 }, sample: [] } })
+    );
+    await page.goto("/batch-ops/new?op=cancel&kind=e2e_job");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Submit" }).click();
+    const dialog = page.getByRole("alertdialog");
+    const confirm = dialog.getByRole("button", { name: "Cancel at least 10,000 jobs" });
+    await expect(confirm).toBeDisabled();
+    await expect(dialog).not.toContainText("undone");
+    await dialog.getByRole("textbox", { name: /Type 10000/ }).fill("10000");
+    await expect(confirm).toBeEnabled();
   });
 
   test("a created date that doesn't parse blocks preview and submit", async ({ page }) => {

@@ -167,27 +167,82 @@ test.describe("Search bar filters", () => {
     await expect(page.getByText("#800006")).toHaveCount(0);
   });
 
-  test("the batch link carries the filter to the batch operations form", async ({ page }) => {
+  test("all matching → Retry previews the count and sample, then opens the operation", async ({ page }) => {
+    const id = "5a5a5a5a-0000-4000-8000-000000000000";
+    let submitted: unknown = null;
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({
+        json: {
+          total_matched: 2,
+          sample: [800003, 800013].map((jobId) => ({
+            id: jobId, kind: "e2e_job", queue: "e2e_test", state: "cancelled",
+            kind_descriptor: null, queue_descriptor: null,
+          })),
+        },
+      })
+    );
+    await page.route(
+      (url) => url.pathname === "/api/batch-ops",
+      (route) => {
+        if (route.request().method() !== "POST") return route.fallback();
+        submitted = route.request().postDataJSON();
+        return route.fulfill({ status: 201, json: batchOperation(id, "retry", { kind: "e2e_job", state: "cancelled" }) });
+      }
+    );
+    await page.route(`**/api/batch-ops/${id}`, (route) =>
+      route.fulfill({ json: batchOperation(id, "retry", { kind: "e2e_job", state: "cancelled" }) })
+    );
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
+      page.goto("/jobs?state=cancelled&q=kind%3Ae2e_job"),
+    ]);
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    await expect(bar.getByTestId("bulk-scope-all")).toHaveText(/^All \d+ matching$/);
+    await bar.getByRole("button", { name: "Retry…" }).click();
+
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: "Retry 2 jobs?" })).toBeVisible();
+    await expect(dialog).toContainText("Retry 2 cancelled jobs with kind e2e_job.");
+    await expect(dialog.getByTestId("bulk-sample").getByRole("link", { name: "#800003" })).toBeVisible();
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    await dialog.getByRole("button", { name: "Retry 2 jobs" }).click();
+
+    await expect(page).toHaveURL(new RegExp(`/batch-ops/${id}$`));
+    expect(submitted).toEqual({ op_kind: "retry", filter: { kind: "e2e_job", state: "cancelled" }, spec: {}, submitted_by: "ui" });
+  });
+
+  test("a state alone disables the all-matching actions and says why", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
+      page.goto("/jobs?state=failed"),
+    ]);
+    const retry = page.getByRole("toolbar", { name: "Bulk actions" }).getByRole("button", { name: "Retry…" });
+    await expect(retry).toBeDisabled();
+    await expect(retry).toHaveAccessibleDescription(/a state alone matches every job in it/);
+  });
+
+  test("an action that can't act on the list's state is disabled with the reason", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
+      page.goto("/jobs?state=available&q=queue%3Ae2e_test"),
+    ]);
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    await expect(bar.getByRole("button", { name: "Retry…" })).toHaveAccessibleDescription(
+      "Retry acts on failed or cancelled jobs, and this list shows available jobs"
+    );
+    await expect(bar.getByRole("button", { name: "Cancel…" })).toBeEnabled();
+  });
+
+  test("Set priority carries the filter to the new-operation form", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
       page.goto("/jobs?state=available&q=queue%3Ae2e_test%20tag%3Ae2e"),
     ]);
-    await page.getByRole("button", { name: "Change priority or queue of matching jobs" }).click();
+    await page.getByRole("toolbar", { name: "Bulk actions" }).getByRole("button", { name: "Set priority…" }).click();
     await page.waitForURL(/\/batch-ops\/new\?/);
     await expect(page.getByLabel("Queue filter")).toHaveValue("e2e_test");
     await expect(page.getByLabel("Tags filter")).toHaveValue("e2e");
     await expect(page.getByLabel("State filter")).toHaveValue("available");
-  });
-
-  test("a state tab alone offers no batch link", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
-      page.goto("/jobs?state=available"),
-    ]);
-    await expect(page.getByTestId("match-count")).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Change priority or queue of matching jobs" })
-    ).toHaveCount(0);
   });
 
   // A refused read shows within the default expect timeout only if the
@@ -221,8 +276,8 @@ test.describe("Search bar filters", () => {
     await expect(page.getByText("id:abc", { exact: true })).toBeVisible();
     await expect(page.getByText("No jobs found.").filter({ visible: true })).toHaveCount(0);
     await expect(
-      page.getByRole("button", { name: "Change priority or queue of matching jobs" })
-    ).toHaveCount(0);
+      page.getByRole("toolbar", { name: "Bulk actions" }).getByRole("button", { name: "Retry…" })
+    ).toHaveAccessibleDescription("Fix the search first");
     // Job detail requests (/api/jobs/<id>) aside, nothing lists or counts.
     expect(jobRequests.filter((url) => !/\/api\/jobs\/\d+/.test(url))).toEqual([]);
 
@@ -259,8 +314,11 @@ test.describe("Search bar filters", () => {
     await page.goto("/dlq?q=queue%3Ae2e_dlq%20id%3Aabc");
     await expect(page.getByRole("alert")).toContainText("whole job ids");
     await expect(page.getByText("DLQ is empty")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: /Retry matching/ })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Purge matching" })).toBeDisabled();
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    for (const name of ["Retry…", "Purge…"]) {
+      await expect(bar.getByRole("button", { name })).toBeDisabled();
+      await expect(bar.getByRole("button", { name })).toHaveAccessibleDescription("Fix the search first");
+    }
     expect(bulkRequests).toEqual([]);
   });
 
@@ -386,9 +444,10 @@ test.describe("Bulk actions", () => {
     await expect(firstRowCheckbox).toBeVisible();
     await firstRowCheckbox.click({ force: true });
 
-    // Bulk action toolbar should appear
-    await expect(page.getByText(/\d+ selected/)).toBeVisible();
-    await expect(page.getByText("Updates paused")).toBeVisible();
+    // The bulk-action bar switches to the selection
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    await expect(bar.getByRole("button", { name: "Selected (1)" })).toHaveAttribute("aria-pressed", "true");
+    await expect(bar.getByText("Updates paused")).toBeVisible();
   });
 
   test("select-all checkbox selects all visible jobs", async ({ page }) => {
@@ -409,12 +468,14 @@ test.describe("Bulk actions", () => {
     const selectAll = jobTable.getByRole("checkbox").first();
     await selectAll.click({ force: true });
 
-    // Toolbar should show selected count
-    await expect(page.getByText(/\d+ selected/)).toBeVisible();
+    // The bar shows the selected count
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    await expect(bar.getByRole("button", { name: /^Selected \(\d+\)$/ })).toBeVisible();
 
-    // Clicking again deselects all
+    // Clicking again deselects all, and the bar acts on all matching jobs again
     await selectAll.click({ force: true });
-    await expect(page.getByText(/\d+ selected/)).not.toBeVisible();
+    await expect(bar.getByRole("button", { name: /^Selected/ })).toHaveCount(0);
+    await expect(bar.getByTestId("bulk-scope-all")).toBeVisible();
   });
 
   test("bulk cancel shows confirmation dialog", async ({ page }) => {
@@ -465,8 +526,8 @@ test.describe("Bulk actions", () => {
   test("bulk retry reports what the server changed", async ({ page }) => {
     await page.route("**/api/jobs/bulk-retry", (route) => route.fulfill({ json: [] }));
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.url().includes("state=failed") && r.ok()),
-      page.goto("/jobs?state=failed&q=queue%3Ae2e_test"),
+      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.url().includes("state=cancelled") && r.ok()),
+      page.goto("/jobs?state=cancelled&q=queue%3Ae2e_test"),
     ]);
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await jobTable.getByRole("checkbox").nth(1).click({ force: true });
@@ -542,3 +603,12 @@ test.describe("Single-queue filter", () => {
     await expect(page.getByTestId("open-queue")).toHaveCount(0);
   });
 });
+
+function batchOperation(id: string, opKind: string, filter: Record<string, unknown>) {
+  return {
+    id, op_kind: opKind, filter, spec: {}, state: "pending", submitted_by: "ui",
+    submitted_at: new Date().toISOString(), started_at: null, finalized_at: null, cursor: null,
+    total_matched: null, processed: 0, skipped: 0, errored: 0, last_error: null,
+    runner_instance: null, retention_until: null, updated_at: new Date().toISOString(),
+  };
+}

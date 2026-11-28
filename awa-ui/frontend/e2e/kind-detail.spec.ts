@@ -36,6 +36,27 @@ test.describe("Job kind page", () => {
     await expect(page).toHaveURL(/\/queues\/e2e_test$/);
   });
 
+  test("Retry all failed previews the kind's failed jobs as a bulk retry", async ({ page }) => {
+    let previewed: unknown = null;
+    await page.route("**/api/jobs/count?*", (route) => {
+      const url = new URL(route.request().url());
+      return url.searchParams.get("state") === "failed"
+        ? route.fulfill({ json: { kind: "exact", value: 4 } })
+        : route.fallback();
+    });
+    await page.route("**/api/batch-ops/preview", (route) => {
+      previewed = route.request().postDataJSON();
+      return route.fulfill({ json: { total_matched: 4, sample: [] } });
+    });
+    await page.goto("/kinds/e2e_job");
+    await page.getByRole("button", { name: "Retry all failed (4)…" }).click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: "Retry 4 jobs?" })).toBeVisible();
+    await expect(dialog).toContainText("Retry 4 failed jobs with kind e2e_job.");
+    expect(previewed).toEqual({ op_kind: "retry", filter: { kind: "e2e_job", state: "failed" }, spec: {}, submitted_by: "ui" });
+    await dialog.getByRole("button", { name: "Keep" }).click();
+  });
+
   test("links the schedules that enqueue it", async ({ page }) => {
     await page.goto("/kinds/e2e_job");
     const schedule = page.getByTestId("kind-schedules").getByRole("link", { name: "e2e_cron_owner" });

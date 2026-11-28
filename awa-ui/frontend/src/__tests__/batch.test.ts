@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   batchOutcome,
+  bulkActionReason,
+  bulkConfirmLabel,
+  bulkConfirmText,
   describeFilter,
   describeSpec,
   filterToSearch,
@@ -13,6 +16,8 @@ import {
   searchFromForm,
 } from "@/lib/batch";
 import { toWireFilter } from "@/lib/api";
+import { bulkTier } from "@/lib/confirm";
+import { TYPE_TO_CONFIRM_MIN_JOBS } from "@/lib/constants";
 
 describe("isNarrowing", () => {
   it("is false for an empty filter", () => {
@@ -162,5 +167,65 @@ describe("operation details", () => {
   it("accepts only UUID ids", () => {
     expect(isBatchOperationId("44444444-4444-4444-8444-444444444444")).toBe(true);
     expect(isBatchOperationId("new")).toBe(false);
+  });
+});
+
+describe("bulkActionReason", () => {
+  const filter = { kind: "send_email" };
+
+  it("allows an action whose states overlap the list's", () => {
+    expect(bulkActionReason("retry", { filter, states: ["failed"] })).toBeNull();
+    expect(bulkActionReason("cancel", { filter, states: ["running"] })).toBeNull();
+    expect(bulkActionReason("retry", { filter })).toBeNull();
+  });
+
+  it("says why an action can't act on the list's state", () => {
+    expect(bulkActionReason("retry", { filter, states: ["running"] })).toBe(
+      "Retry acts on failed or cancelled jobs, and this list shows running jobs"
+    );
+    expect(bulkActionReason("discard", { filter, states: ["waiting_external"] })).toMatch(/shows waiting external jobs/);
+  });
+
+  it("needs a filter that names jobs, not just a state", () => {
+    expect(bulkActionReason("retry", { filter: { state: "failed" }, states: ["failed"] })).toMatch(/a state alone/);
+  });
+
+  it("is off when nothing matches", () => {
+    expect(bulkActionReason("retry", { filter, count: { kind: "exact", value: 0 } })).toBe("Nothing matches this filter");
+    expect(bulkActionReason("retry", { filter, count: { kind: "at_least", value: 0 } })).toBeNull();
+  });
+
+  it("ignores states for dead-letter kinds", () => {
+    expect(bulkActionReason("purge_dlq", { filter: { queue: "q" } })).toBeNull();
+  });
+});
+
+describe("bulkTier", () => {
+  it("asks to type for discards and purges at any size", () => {
+    expect(bulkTier("discard", { kind: "exact", value: 1 })).toBe(3);
+    expect(bulkTier("purge_dlq", { kind: "exact", value: 2 })).toBe(3);
+  });
+
+  it("asks to type for a cancel at the threshold or of an unbounded count", () => {
+    expect(bulkTier("cancel", { kind: "exact", value: TYPE_TO_CONFIRM_MIN_JOBS - 1 })).toBe(2);
+    expect(bulkTier("cancel", { kind: "exact", value: TYPE_TO_CONFIRM_MIN_JOBS })).toBe(3);
+    expect(bulkTier("cancel", { kind: "at_least", value: 10 })).toBe(3);
+    expect(bulkTier("cancel", undefined)).toBe(3);
+  });
+
+  it("keeps reversible actions at tier 2", () => {
+    for (const kind of ["retry", "set_priority", "move_queue", "move_to_dlq", "retry_from_dlq"] as const) {
+      expect(bulkTier(kind, { kind: "at_least", value: 100_000 })).toBe(2);
+    }
+  });
+});
+
+describe("bulkConfirmLabel", () => {
+  it("names the action, the count and what it counts", () => {
+    expect(bulkConfirmLabel("retry", { kind: "exact", value: 1234 })).toBe(`Retry ${(1234).toLocaleString()} jobs`);
+    expect(bulkConfirmLabel("cancel", { kind: "at_least", value: 10 })).toBe("Cancel at least 10 jobs");
+    expect(bulkConfirmLabel("purge_dlq", { kind: "exact", value: 1 })).toBe("Purge 1 dead letter");
+    expect(bulkConfirmLabel("move_to_dlq", { kind: "exact", value: 3 })).toBe("Move 3 jobs to the DLQ");
+    expect(bulkConfirmText({ kind: "exact", value: 1234 })).toBe("1234");
   });
 });

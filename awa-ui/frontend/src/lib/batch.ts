@@ -372,3 +372,69 @@ export function isCancellable(state: string): boolean {
 export function isBatchOperationId(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
+
+/** Labels for the actions a list offers on everything its filter matches. */
+const BULK_VERBS: Record<BatchOperationKind, string> = {
+  set_priority: "Set priority",
+  move_queue: "Move queue",
+  retry: "Retry",
+  cancel: "Cancel",
+  discard: "Discard",
+  move_to_dlq: "Move to DLQ",
+  retry_from_dlq: "Retry",
+  purge_dlq: "Purge",
+};
+
+export function bulkVerb(kind: BatchOperationKind): string {
+  return BULK_VERBS[kind];
+}
+
+/** The confirm button of a bulk action, e.g. "Retry 1,234 jobs". */
+export function bulkConfirmLabel(kind: BatchOperationKind, count: JobCount): string {
+  const noun = actsOnDlq(kind) ? (count.value === 1 && count.kind === "exact" ? "dead letter" : "dead letters") : count.value === 1 && count.kind === "exact" ? "job" : "jobs";
+  const amount = formatCount(count);
+  switch (kind) {
+    case "set_priority":
+      return `Set priority on ${amount} ${noun}`;
+    case "move_queue":
+      return `Move ${amount} ${noun}`;
+    case "move_to_dlq":
+      return `Move ${amount} ${noun} to the DLQ`;
+    default:
+      return `${bulkVerb(kind)} ${amount} ${noun}`;
+  }
+}
+
+/** What a tier-3 bulk action asks the user to type: the count, without separators. */
+export function bulkConfirmText(count: JobCount): string {
+  return String(count.value);
+}
+
+export interface BulkContext {
+  /** The states the list shows; empty or undefined for all of them. */
+  states?: string[];
+  filter: BatchOperationFilter;
+  /** What the list's filter matches, when counted. */
+  count?: JobCount;
+}
+
+/**
+ * Why a bulk action over a list's whole filter can't be offered, or null when
+ * it can. Read-only servers are handled where the button is drawn; refusals
+ * only the server can judge (canonical storage, an old runtime in the fleet)
+ * show in the dialog's preview or submit.
+ */
+export function bulkActionReason(kind: BatchOperationKind, context: BulkContext): string | null {
+  if (!isNarrowing(context.filter)) {
+    return "Add a queue, kind, tag, id or created bound first: a state alone matches every job in it";
+  }
+  const option = kindOption(kind);
+  const states = context.states ?? [];
+  if (option.states.length > 0 && states.length > 0 && !states.some((state) => option.states.includes(state))) {
+    return `${option.label} acts on ${option.scope} jobs, and this list shows ${states.join(" or ").replace(/_/g, " ")} jobs`;
+  }
+  if (context.count && context.count.kind === "exact" && context.count.value === 0) {
+    return "Nothing matches this filter";
+  }
+  return null;
+}

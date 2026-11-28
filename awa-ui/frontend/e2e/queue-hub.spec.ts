@@ -71,12 +71,33 @@ test.describe("Queue hub", () => {
     await expect(header.getByTestId("queue-paused")).toHaveCount(0);
   });
 
-  test("Drain asks for confirmation", async ({ page }) => {
+  test("Drain shows how many jobs it cancels and asks for the queue's name", async ({ page }) => {
+    let drains = 0;
+    await page.route("**/api/queues/e2e_test/drain", (route) => {
+      drains++;
+      return route.fulfill({ json: { drained: 3 } });
+    });
     await page.goto("/queues/e2e_test");
-    await page.locator('[data-slot="page-header"]').getByRole("button", { name: "Drain" }).click();
+    const drainButton = page.locator('[data-slot="page-header"]').getByRole("button", { name: "Drain" });
+    await drainButton.click();
     const dialog = page.getByRole("alertdialog");
-    await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: 'Drain queue "e2e_test"?' })).toBeVisible();
+    await expect(dialog.getByTestId("drain-count")).toHaveText(/^\d[\d,]* jobs?$/);
+    await expect(dialog).toContainText("whatever filter a list shows");
+    const confirm = dialog.getByRole("button", { name: 'Drain "e2e_test"' });
+    await expect(confirm).toBeDisabled();
+    await dialog.getByRole("textbox", { name: /Type e2e_test/ }).fill("e2e_tes");
+    await expect(confirm).toBeDisabled();
     await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).not.toBeVisible();
+    await expect(drainButton).toBeFocused();
+    expect(drains).toBe(0);
+
+    await drainButton.click();
+    await dialog.getByRole("textbox", { name: /Type e2e_test/ }).fill("e2e_test");
+    await confirm.click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByText('Drained queue "e2e_test": 3 job(s) cancelled')).toBeVisible();
+    expect(drains).toBe(1);
   });
 });

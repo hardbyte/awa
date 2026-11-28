@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
 import { useManagedQuery } from "@/hooks/use-managed-query";
@@ -5,6 +6,7 @@ import { usePollInterval } from "@/hooks/use-poll-interval";
 import {
   fetchCronJobs,
   fetchJobCount,
+  toWireFilter,
   fetchJobs,
   fetchKinds,
   type CronJobRow,
@@ -13,6 +15,9 @@ import {
   type JobRow,
 } from "@/lib/api";
 import { SECTION_LABELS } from "@/lib/sections";
+import { bulkActionReason } from "@/lib/batch";
+import { AdminButton } from "@/components/AdminAction";
+import { BulkActionDialog } from "@/components/BulkActionDialog";
 import { formatNumber } from "@/lib/number";
 import { Page, PageHeader } from "@/components/Page";
 import { FilterLink, JobLink, QueueLink, ScheduleLink } from "@/components/links";
@@ -147,9 +152,12 @@ export function KindDetailPage() {
         }
         description={kind.description || undefined}
         actions={
-          <FilterLink filter={{ kind: kind.kind }} className="text-sm">
-            All jobs of this kind
-          </FilterLink>
+          <>
+            <FilterLink filter={{ kind: kind.kind }} className="text-sm">
+              All jobs of this kind
+            </FilterLink>
+            <RetryAllFailed kind={kind.kind} count={failedCount.data} />
+          </>
         }
       />
 
@@ -300,5 +308,30 @@ export function KindDetailPage() {
         </Card>
       </div>
     </Page>
+  );
+}
+
+/** Retries every failed job of a kind as one bulk operation. */
+function RetryAllFailed({ kind, count }: { kind: string; count: JobCount | undefined }) {
+  const [open, setOpen] = useState(false);
+  const filter = toWireFilter({ kind, states: ["failed"] });
+  const reason = bulkActionReason("retry", { filter, states: ["failed"], count });
+  return (
+    <>
+      <AdminButton
+        size="sm"
+        intent="outline"
+        isDisabled={reason !== null}
+        disabledReason={reason ?? undefined}
+        onPress={() => setOpen(true)}
+      >
+        Retry all failed{count ? ` (${count.kind === "at_least" ? `${formatNumber(count.value)}+` : formatNumber(count.value)})` : ""}…
+      </AdminButton>
+      <BulkActionDialog
+        isOpen={open}
+        onOpenChange={setOpen}
+        payload={{ op_kind: "retry", filter, spec: {}, submitted_by: "ui" }}
+      />
+    </>
   );
 }

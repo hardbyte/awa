@@ -1,6 +1,10 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 
 const DLQ_PAGE = "/dlq?q=queue%3Ae2e_dlq";
+
+function bulk(page: Page, name: string) {
+  return page.getByRole("toolbar", { name: "Bulk actions" }).getByRole("button", { name });
+}
 
 test.describe("DLQ page", () => {
   test("a failed list shows the server's message and keeps bulk actions off", async ({ page }) => {
@@ -15,8 +19,8 @@ test.describe("DLQ page", () => {
       { timeout: 15_000 }
     );
     await expect(page.getByText("DLQ is empty")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: /Retry matching/ })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Purge matching" })).toBeDisabled();
+    await expect(bulk(page, "Retry…")).toBeDisabled();
+    await expect(bulk(page, "Purge…")).toBeDisabled();
   });
 
   test("a refused list shows its message without retrying", async ({ page }) => {
@@ -26,8 +30,8 @@ test.describe("DLQ page", () => {
     );
     await page.goto(DLQ_PAGE);
     await expect(page.getByRole("alert")).toHaveText("Failed to load the DLQ: narrow the filter");
-    await expect(page.getByRole("button", { name: /Retry matching/ })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Purge matching" })).toBeDisabled();
+    await expect(bulk(page, "Retry…")).toBeDisabled();
+    await expect(bulk(page, "Purge…")).toBeDisabled();
   });
 
   test("bulk actions wait for the list to load", async ({ page }) => {
@@ -41,61 +45,84 @@ test.describe("DLQ page", () => {
       }
     );
     await page.goto(DLQ_PAGE);
-    await expect(page.getByRole("button", { name: /Retry matching/ })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Purge matching" })).toBeDisabled();
+    await expect(bulk(page, "Retry…")).toBeDisabled();
+    await expect(bulk(page, "Purge…")).toBeDisabled();
 
     release();
-    await expect(page.getByRole("button", { name: /Retry matching/ })).toBeEnabled();
-    await expect(page.getByRole("button", { name: "Purge matching" })).toBeEnabled();
+    await expect(bulk(page, "Retry…")).toBeEnabled();
+    await expect(bulk(page, "Purge…")).toBeEnabled();
   });
 
-  for (const { button, endpoint, opKind, confirm, verb } of [
-    { button: /Retry matching/, endpoint: "/api/dlq/retry-matching", opKind: "retry_from_dlq", confirm: "Retry matching dead letters", verb: "retry" },
-    { button: /Purge matching/, endpoint: "/api/dlq/purge-matching", opKind: "purge_dlq", confirm: "Purge matching dead letters", verb: "purge" },
+  for (const { button, opKind, confirm, typed } of [
+    { button: "Retry…", opKind: "retry_from_dlq", confirm: "Retry 1 dead letter", typed: false },
+    { button: "Purge…", opKind: "purge_dlq", confirm: "Purge 1 dead letter", typed: true },
   ]) {
-    test(`${verb} matching submits a batch operation and links to it`, async ({ page }) => {
+    test(`${button} on all matching previews the rows and opens the submitted operation`, async ({ page }) => {
       const id = "0b2c4d6e-0000-4000-8000-000000000000";
       let body: unknown = null;
+      const op = {
+        id, op_kind: opKind, filter: { queue: "e2e_dlq" }, spec: {}, state: "pending", submitted_by: "ui",
+        submitted_at: new Date().toISOString(), started_at: null, finalized_at: null, cursor: null,
+        total_matched: null, processed: 0, skipped: 0, errored: 0, last_error: null,
+        runner_instance: null, retention_until: null, updated_at: new Date().toISOString(),
+      };
+      await page.route("**/api/batch-ops/preview", (route) =>
+        route.fulfill({
+          json: {
+            total_matched: 1,
+            sample: [{ id: 600001, kind: "dlq_job", queue: "e2e_dlq", state: "failed", kind_descriptor: null, queue_descriptor: null }],
+          },
+        })
+      );
       await page.route(
-        (url) => url.pathname === endpoint,
-        async (route) => {
+        (url) => url.pathname === "/api/batch-ops",
+        (route) => {
+          if (route.request().method() !== "POST") return route.fallback();
           body = route.request().postDataJSON();
-          await route.fulfill({
-            status: 202,
-            json: {
-              id,
-              op_kind: opKind,
-              filter: { queue: "e2e_dlq" },
-              spec: { op_kind: opKind },
-              state: "pending",
-              submitted_by: "http",
-              submitted_at: new Date().toISOString(),
-              started_at: null,
-              finalized_at: null,
-              cursor: null,
-              total_matched: null,
-              processed: 0,
-              skipped: 0,
-              errored: 0,
-              last_error: null,
-              runner_instance: null,
-              retention_until: null,
-              updated_at: new Date().toISOString(),
-            },
-          });
+          return route.fulfill({ status: 201, json: op });
         }
       );
+      await page.route(`**/api/batch-ops/${id}`, (route) => route.fulfill({ json: op }));
       await page.goto(DLQ_PAGE);
-      await page.getByRole("button", { name: button }).click();
-      await page.getByRole("alertdialog").getByRole("button", { name: confirm, exact: true }).click();
+      await bulk(page, button).click();
 
-      const status = page.getByTestId("dlq-batch-submitted");
-      await expect(status).toContainText(`Submitted ${verb} of the matching DLQ rows as batch operation 0b2c4d6e`);
-      expect(body).toEqual({ filter: { queue: "e2e_dlq" } });
-      await status.getByRole("link", { name: "follow its progress" }).click();
+      const dialog = page.getByRole("alertdialog");
+      await expect(dialog.getByRole("heading", { name: `${confirm}?` })).toBeVisible();
+      await expect(dialog).toContainText("dead-lettered jobs with queue e2e_dlq");
+      await expect(dialog.getByTestId("bulk-sample").getByRole("link", { name: "#600001" })).toHaveAttribute("href", "/dlq/600001");
+      const submit = dialog.getByRole("button", { name: confirm });
+      if (typed) {
+        await expect(dialog).toContainText("This can't be undone.");
+        await expect(submit).toBeDisabled();
+        await dialog.getByRole("textbox", { name: /Type 1/ }).fill("1");
+      } else {
+        await expect(dialog.getByRole("textbox")).toHaveCount(0);
+      }
+      await submit.click();
+
       await expect(page).toHaveURL(new RegExp(`/batch-ops/${id}$`));
+      expect(body).toEqual({ op_kind: opKind, filter: { queue: "e2e_dlq" }, spec: {}, submitted_by: "ui" });
     });
   }
+
+  test("a refused submit stays in the dialog with the server's reason", async ({ page }) => {
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({ json: { total_matched: 1, sample: [] } })
+    );
+    await page.route(
+      (url) => url.pathname === "/api/batch-ops",
+      (route) =>
+        route.request().method() === "POST"
+          ? route.fulfill({ status: 400, json: { error: "runtime worker-1 reports 0.6.15, older than 0.7.0-alpha.2" } })
+          : route.fallback()
+    );
+    await page.goto(DLQ_PAGE);
+    await bulk(page, "Retry…").click();
+    const dialog = page.getByRole("alertdialog");
+    await dialog.getByRole("button", { name: "Retry 1 dead letter" }).click();
+    await expect(dialog.getByTestId("confirm-error")).toHaveText("runtime worker-1 reports 0.6.15, older than 0.7.0-alpha.2");
+    await expect(dialog).toBeVisible();
+  });
 
   test("a queue chip narrows the list and pressing it again widens it", async ({ page }) => {
     await page.route("**/api/dlq/depth", (route) =>

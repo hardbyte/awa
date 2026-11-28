@@ -119,7 +119,7 @@ At-a-glance health check. Shows state counter cards (available, running, failed,
 
 ### Jobs (`/jobs`)
 
-Filterable, paginated job list with state filter pills (showing counts), a search bar supporting `kind:`, `queue:`, and `tag:` prefix filters, and checkbox-based bulk selection for retry/cancel operations. Queue and kind cells show declared display names when a descriptor is present; raw names otherwise.
+Filterable, paginated job list with state filter pills (showing counts), a search bar supporting `kind:`, `queue:`, and `tag:` prefix filters, and a bulk-action bar. The bar acts on the selected rows (Retry and Cancel, at once) or on all the jobs the filter matches (Retry, Cancel, Discard and Move to DLQ as bulk operations, plus Set priority and Move queue through the new-operation form); an action that can't apply to the filter is disabled and says why. Queue and kind cells show declared display names when a descriptor is present; raw names otherwise.
 
 Desktop uses a table layout; mobile switches to a card layout. Both show the job kind with an inline `#ID` suffix for easy reference. Cursor-based pagination using `before_id` on the primary key.
 
@@ -169,7 +169,7 @@ The first UI form intentionally covers the common operator paths. The API and Py
 Operator surface for queue-storage `dlq_entries`.
 
 - **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, age, and attempts.
-- **Bulk actions** — filter-scoped bulk retry and purge, each confirmed and then submitted as a `retry_from_dlq` or `purge_dlq` batch operation; the page names the submitted operation and links to the batch operations page, where its progress shows. Empty-filter actions require explicit `all=true` confirmation through the API.
+- **Bulk actions** — Retry and Purge on all the rows a filter matches, each previewed and then submitted as a `retry_from_dlq` or `purge_dlq` bulk operation, whose page then opens. Empty-filter actions require explicit `all=true` confirmation through the API.
 - **Detail (`/dlq/:id`)** — single-row inspection with retry and purge actions.
 - **Queue badge** — `/queues` shows a `+N DLQ` link next to queues with non-zero DLQ depth.
 
@@ -181,7 +181,7 @@ The shared `/jobs/:id` detail page also carries DLQ metadata when a job has alre
 
 **URL-driven state:** All filters live in URL search params (`/jobs?state=failed&kind=send_email`). Back/forward and bookmarks work naturally.
 
-**Confirming actions:** Confirmation scales with what an action can break. Pausing or resuming a queue or schedule takes one click and its toast offers Undo. An action on one job with side effects (Retry, Cancel, retrying or purging a dead letter, triggering a paused schedule, cancelling a bulk operation) opens a dialog that names the object and the risk. Acting on several selected jobs lists them in the dialog. A dialog's confirm button names the action ("Cancel job #918"), its dismiss button is "Keep", it stays open until the server answers and shows the server's error in place, and it says "This can't be undone" only when that is true.
+**Confirming actions:** Confirmation scales with what an action can break. Pausing or resuming a queue or schedule takes one click and its toast offers Undo. An action on one job with side effects (Retry, Cancel, retrying or purging a dead letter, triggering a paused schedule, cancelling a bulk operation) opens a dialog that names the object and the risk. Acting on several selected jobs lists them in the dialog. An action on everything a filter matches previews it first: the dialog shows the exact count, the filter in words and some of the matching jobs, and submitting opens the bulk operation's page. Discarding failed jobs, purging dead letters and cancelling 1,000 or more jobs (or a count the server could only bound from below) also ask you to type the count, and draining a queue asks for its name after showing how many jobs it cancels. A dialog's confirm button names the action ("Cancel job #918"), its dismiss button is "Keep", it stays open until the server answers and shows the server's error in place, and it says "This can't be undone" only when that is true.
 
 **Jump to:** ⌘K (Ctrl+K elsewhere) or the header's "Jump to…" button opens a palette that goes to a job by id (a dead-lettered one opens its DLQ row), a queue, job kind or schedule by name or display name, a bulk operation by id or its first eight characters, a jobs search (`kind:send_email`, or `tenant:acme` as a tag), or any page. It loads names when it opens and doesn't poll.
 

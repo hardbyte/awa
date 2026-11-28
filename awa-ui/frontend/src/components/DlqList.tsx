@@ -1,22 +1,12 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
 import { Time } from "@/components/Time";
-import {
-  useMutation,
-  useQueryClient,
-} from "@tanstack/react-query";
-import { useState, useCallback } from "react";
+import { useCallback } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import {
-  fetchDlq,
-  bulkRetryDlq,
-  bulkPurgeDlq,
-} from "@/lib/api";
-import type { BatchOperation, DlqRow, ListDlqParams } from "@/lib/api";
-import { toast } from "@/components/ui/toast";
+import { fetchDlq, fetchJobCount } from "@/lib/api";
+import type { DlqRow, JobCount, JobFilterParams, ListDlqParams } from "@/lib/api";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Button } from "@/components/ui/button";
-import { ConfirmAction } from "@/components/ConfirmAction";
-import { AdminButton } from "@/components/AdminAction";
+import { BulkScopeBar } from "@/components/BulkScopeBar";
 import {
   Table,
   TableHeader,
@@ -26,7 +16,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
-import { BatchOpLink, DlqLink, KindLink, QueueLink } from "@/components/links";
+import { DlqLink, KindLink, QueueLink } from "@/components/links";
 import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
@@ -64,7 +54,6 @@ export interface DlqListProps {
 export function DlqList({ lockedFilter }: DlqListProps) {
   const navigate = useNavigate();
   const filters = useDlqFilters();
-  const queryClient = useQueryClient();
 
   const searchFilters = { ...parseSearch(filters.search), ...lockedFilter };
   // A term that doesn't parse is left out of a request, so it would widen
@@ -90,47 +79,25 @@ export function DlqList({ lockedFilter }: DlqListProps) {
   });
 
 
-  // The bulk actions submit a batch operation, which the maintenance leader
-  // applies a chunk at a time after the request returns.
-  const [submitted, setSubmitted] = useState<BatchOperation | null>(null);
-  const onSubmitted = (operation: BatchOperation) => {
-    setSubmitted(operation);
-    void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
-    toast.success(`Submitted batch operation ${operation.id.slice(0, 8)}`);
+  const filterParams: JobFilterParams = {
+    kind: searchFilters.kind,
+    queue: searchFilters.queue,
+    tags: searchFilters.tags,
+    ids: searchFilters.ids,
+    created_at_gte: toRfc3339(searchFilters.createdGte),
+    created_at_lt: toRfc3339(searchFilters.createdLt),
   };
-
-  const retryFilterMutation = useMutation({
-    mutationFn: () =>
-      bulkRetryDlq({
-        kind: searchFilters.kind,
-        queue: searchFilters.queue,
-        tags: searchFilters.tags,
-        ids: searchFilters.ids,
-        created_at_gte: toRfc3339(searchFilters.createdGte),
-        created_at_lt: toRfc3339(searchFilters.createdLt),
-      }),
-    onSuccess: onSubmitted,
+  const hasActiveFilter = Object.keys(searchFilters).length > 0;
+  // Counted when the filter changes, not on every poll.
+  const countQuery = useManagedQuery<JobCount>({
+    queryKey: ["jobs-count", { ...filterParams, dead_lettered: true }],
+    queryFn: () => fetchJobCount({ ...filterParams, dead_lettered: true }),
+    enabled: hasActiveFilter && !searchError,
+    staleTime: 30_000,
   });
-
-  const purgeFilterMutation = useMutation({
-    mutationFn: () =>
-      bulkPurgeDlq({
-        kind: searchFilters.kind,
-        queue: searchFilters.queue,
-        tags: searchFilters.tags,
-        ids: searchFilters.ids,
-        created_at_gte: toRfc3339(searchFilters.createdGte),
-        created_at_lt: toRfc3339(searchFilters.createdLt),
-      }),
-    onSuccess: onSubmitted,
-  });
-
-  const [showRetryConfirm, setShowRetryConfirm] = useState(false);
-  const [showPurgeConfirm, setShowPurgeConfirm] = useState(false);
 
   // As on the jobs page: cached rows for the wider search stay hidden.
   const rows = searchError ? [] : dlqQuery.data ?? [];
-  const hasActiveFilter = Object.keys(searchFilters).length > 0;
   // Bulk actions are judged from the list beside them, so they wait for this
   // filter's rows; the previous filter's placeholder rows don't count.
   const listUnavailable = !listMatchesFilter(dlqQuery);
@@ -172,34 +139,20 @@ export function DlqList({ lockedFilter }: DlqListProps) {
       />
 
       {hasActiveFilter && (
-        <div className="flex gap-2">
-          <AdminButton
-            size="xs"
-            onPress={() => setShowRetryConfirm(true)}
-            isDisabled={retryFilterMutation.isPending || !!searchError || listUnavailable}
-          >
-            Retry matching ({rows.length}+)
-          </AdminButton>
-          <AdminButton
-            intent="outline"
-            size="xs"
-            className="text-danger"
-            onPress={() => setShowPurgeConfirm(true)}
-            isDisabled={purgeFilterMutation.isPending || !!searchError || listUnavailable}
-          >
-            Purge matching
-          </AdminButton>
-        </div>
-      )}
-
-      {submitted && (
-        <p className="text-sm" role="status" data-testid="dlq-batch-submitted">
-          Submitted {submitted.op_kind === "purge_dlq" ? "purge" : "retry"} of
-          the matching DLQ rows as batch operation{" "}
-          <BatchOpLink id={submitted.id} />. The rows change as the maintenance
-          leader runs it;{" "}
-          <BatchOpLink id={submitted.id}>follow its progress</BatchOpLink>.
-        </p>
+        <BulkScopeBar
+          target="dlq"
+          filter={filterParams}
+          count={countQuery.data}
+          unavailableReason={
+            searchError
+              ? "Fix the search first"
+              : dlqQuery.isError
+                ? "The list didn't load"
+                : listUnavailable
+                  ? "Waiting for the list to load"
+                  : undefined
+          }
+        />
       )}
 
       {searchError && (
@@ -282,27 +235,6 @@ export function DlqList({ lockedFilter }: DlqListProps) {
         </div>
       )}
 
-      <ConfirmAction
-        isOpen={showRetryConfirm}
-        onOpenChange={setShowRetryConfirm}
-        tier={2}
-        title="Retry the matching dead letters?"
-        description="Submits a bulk operation that moves every dead letter matching the current filter back to its queue to run again, so their handlers' side effects happen again. The maintenance leader applies it a chunk at a time."
-        confirmLabel="Retry matching dead letters"
-        onConfirm={() => retryFilterMutation.mutateAsync()}
-      />
-
-      <ConfirmAction
-        isOpen={showPurgeConfirm}
-        onOpenChange={setShowPurgeConfirm}
-        tier={2}
-        intent="danger"
-        irreversible
-        title="Purge the matching dead letters?"
-        description="Submits a bulk operation that deletes every dead letter matching the current filter. The maintenance leader applies it a chunk at a time."
-        confirmLabel="Purge matching dead letters"
-        onConfirm={() => purgeFilterMutation.mutateAsync()}
-      />
     </div>
   );
 }
