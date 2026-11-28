@@ -13,6 +13,7 @@
 use awa_model::{audited_sql, migrations, QueueStorage, QueueStorageConfig};
 use sqlx::PgPool;
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -164,11 +165,21 @@ async fn claim_once(
     queue: &str,
     max_batch: i64,
 ) -> Result<Vec<i64>, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    claim_on(&mut connection, schema, queue, max_batch).await
+}
+
+async fn claim_on(
+    connection: &mut sqlx::PgConnection,
+    schema: &str,
+    queue: &str,
+    max_batch: i64,
+) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(audited_sql(format!(
         "SELECT lane_seq FROM {schema}.claim_ready_runtime($1, {max_batch}, 0::float8, 0::float8)"
     )))
     .bind(queue)
-    .fetch_all(pool)
+    .fetch_all(connection)
     .await
 }
 
@@ -276,36 +287,40 @@ async fn claim_across_a_mover(
     .fetch_one(pool)
     .await?;
     let mut mover = pool.begin().await?;
+    let mover_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *mover)
+        .await?;
     sqlx::query(audited_sql(format!(
         "ALTER SEQUENCE {schema}.{claim_sequence} OWNER TO CURRENT_USER"
     )))
     .execute(&mut *mover)
     .await?;
 
-    let claim_pool = pool.clone();
+    let mut claimant = pool.acquire().await?;
+    let claimant_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *claimant)
+        .await?;
     let claim_schema = schema.to_string();
     let claim_queue = queue.to_string();
     let claim =
-        tokio::spawn(async move { claim_once(&claim_pool, &claim_schema, &claim_queue, 10).await });
+        tokio::spawn(async move { claim_on(&mut claimant, &claim_schema, &claim_queue, 10).await });
 
-    // Wait until the claim has started its first statement and is blocked on
-    // the mover's lock.
+    // Wait until this claimant, and no other session, is blocked on the
+    // mover's lock: its first statement has taken its snapshot.
     let mut blocked = false;
     for _ in 0..200 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
-               AND query LIKE '%claim_ready_runtime%'",
-        )
-        .fetch_one(pool)
-        .await?;
-        if waiting > 0 {
+        let waiting: bool = sqlx::query_scalar("SELECT pg_blocking_pids($1) @> ARRAY[$2]::int[]")
+            .bind(claimant_pid)
+            .bind(mover_pid)
+            .fetch_one(pool)
+            .await?;
+        if waiting {
             blocked = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(blocked, "the claim never blocked on the mover's lock");
+    assert!(blocked, "the claimant never blocked on the mover's lock");
 
     move_range(
         &mut mover,
@@ -396,37 +411,82 @@ async fn claim_functions(
     .await
 }
 
-/// Removes the text from the first `start` after `from` up to and including
-/// the first `end` after it.
-fn cut(text: &mut String, start: &str, end: &str) {
-    let begin = text.find(start).expect("start marker");
-    let finish = begin + text[begin..].find(end).expect("end marker") + end.len();
-    text.replace_range(begin..finish, "");
+const RELEASED_RUNTIME: &str = include_str!("fixtures/v063_claim_ready_runtime.sql");
+const RELEASED_SLOT: &str = include_str!("fixtures/v063_claim_ready_slot.sql");
+
+/// The claim functions as `pg_get_functiondef` renders them in a database
+/// migrated to v063, before the bound: the text v064 has to rewrite.
+fn released_functions(schema: &str) -> Vec<(String, String)> {
+    let mut functions = vec![(
+        "claim_ready_runtime".to_string(),
+        RELEASED_RUNTIME.replace("@SCHEMA@", schema),
+    )];
+    for slot in 0..SLOTS {
+        functions.push((
+            format!("claim_ready_slot_{slot}"),
+            RELEASED_SLOT
+                .replace("@SCHEMA@", schema)
+                .replace("@SLOT@", &slot.to_string()),
+        ));
+    }
+    functions
 }
 
-/// The claim functions as released before v064: no re-resolve after the head
-/// lock and no bound on the reads.
-fn without_the_bound(definition: &str, is_runtime: bool) -> String {
-    let mut old = definition.to_string();
-    if is_runtime {
-        cut(
-            &mut old,
-            "\n\n            -- The head lock can be granted",
-            "LIMIT 1;",
-        );
-        cut(
-            &mut old,
-            "\n              -- Rows of this slot at or after",
-            "9223372036854775807)",
-        );
-    } else {
-        cut(
-            &mut old,
-            "\n                  -- Stop below the next segment of another slot",
-            "9223372036854775807)",
-        );
+async fn install_released_functions(pool: &PgPool, functions: &[(String, String)]) -> TestResult {
+    for (_, sql) in functions {
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(pool)
+            .await?;
     }
-    old
+    Ok(())
+}
+
+async fn run_v064(pool: &PgPool) -> TestResult {
+    for (_, _, sql) in migrations::migration_sql_range(63, 64) {
+        sqlx::raw_sql(audited_sql(sql)).execute(pool).await?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("capture lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+/// Runs v064 and returns the warnings the server raised. Notices reach the
+/// test through sqlx's tracing events on this thread, so the runtime must be
+/// the single-threaded one `sqlx::test` uses.
+async fn run_v064_capturing_warnings(pool: &PgPool) -> Result<String, Box<dyn std::error::Error>> {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = run_v064(pool).await;
+    drop(guard);
+    result?;
+    let bytes = captured.0.lock().expect("capture lock").clone();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[sqlx::test(migrations = false)]
@@ -437,16 +497,21 @@ async fn v064_bounds_the_released_claim_functions_in_place(pool: PgPool) -> Test
     assert_eq!(installed.len(), 1 + SLOTS as usize);
     for (name, _, definition) in &installed {
         assert!(
-            definition.contains("GREATEST(p_max_batch, 0) + 1")
+            definition.contains("Rows of this slot at or after the next segment")
                 || definition.contains("GREATEST(p_claim_limit, 0) + 1"),
             "{name}: the installer carries the bound"
         );
     }
 
-    for (name, _, definition) in &installed {
-        let old = without_the_bound(definition, name == "claim_ready_runtime");
-        assert_ne!(&old, definition);
-        sqlx::raw_sql(audited_sql(old)).execute(&pool).await?;
+    let released = released_functions(schema);
+    install_released_functions(&pool, &released).await?;
+    let before = claim_functions(&pool, schema).await?;
+    for ((name, sql), (installed_name, _, definition)) in released.iter().zip(&before) {
+        assert_eq!(name, installed_name);
+        assert_eq!(
+            sql, definition,
+            "{name}: the fixture is the text the database renders"
+        );
     }
     let unbounded = build_interleaved_lane(&pool, &store, "before").await?;
     let claimed = drain(&pool, schema, "before", 15).await?;
@@ -455,17 +520,17 @@ async fn v064_bounds_the_released_claim_functions_in_place(pool: PgPool) -> Test
         "the released functions skip rows of an interleaved lane"
     );
 
-    for (_, _, sql) in migrations::migration_sql_range(63, 64) {
-        sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
-    }
+    let warnings = run_v064_capturing_warnings(&pool).await?;
+    assert!(
+        warnings.is_empty(),
+        "v064 warned on released text: {warnings}"
+    );
     assert_eq!(
         claim_functions(&pool, schema).await?,
         installed,
         "v064 rewrites each function in place to the installer's text"
     );
-    for (_, _, sql) in migrations::migration_sql_range(63, 64) {
-        sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
-    }
+    run_v064(&pool).await?;
     assert_eq!(
         claim_functions(&pool, schema).await?,
         installed,
@@ -476,4 +541,57 @@ async fn v064_bounds_the_released_claim_functions_in_place(pool: PgPool) -> Test
     let claimed = drain(&pool, schema, "after", 15).await?;
     assert_every_row_claimed_once(&claimed, &all, "migrated claim functions");
     Ok(())
+}
+
+/// A `claim_ready_runtime` in which only one of the two places v064 rewrites
+/// is recognisable must be left byte for byte as it was, and named in a
+/// warning, rather than installed with half of the change.
+async fn v064_leaves_a_half_recognised_runtime_alone(
+    pool: PgPool,
+    schema: &str,
+    broken_anchor: &str,
+) -> TestResult {
+    install(&pool, schema).await?;
+    let mut released = released_functions(schema);
+    released[0].1 =
+        released[0]
+            .1
+            .replacen(broken_anchor, &format!("{broken_anchor} /* edited */"), 1);
+    install_released_functions(&pool, &released).await?;
+    let before = claim_functions(&pool, schema).await?;
+
+    let warnings = run_v064_capturing_warnings(&pool).await?;
+    assert!(
+        warnings.contains("claim_ready_runtime") && warnings.contains("keeps its old read"),
+        "v064 warns about the runtime function: {warnings:?}"
+    );
+    let after = claim_functions(&pool, schema).await?;
+    assert_eq!(after[0], before[0], "the runtime function is unchanged");
+    assert!(
+        after[1..]
+            .iter()
+            .all(|(_, _, definition)| definition.contains("GREATEST(p_claim_limit, 0) + 1")),
+        "the slot functions are rewritten independently"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn v064_leaves_a_runtime_whose_resolve_anchor_is_missing_alone(pool: PgPool) -> TestResult {
+    v064_leaves_a_half_recognised_runtime_alone(
+        pool,
+        "bound_half_resolve",
+        "FOR UPDATE OF claims SKIP LOCKED;",
+    )
+    .await
+}
+
+#[sqlx::test(migrations = false)]
+async fn v064_leaves_a_runtime_whose_head_anchor_is_missing_alone(pool: PgPool) -> TestResult {
+    v064_leaves_a_half_recognised_runtime_alone(
+        pool,
+        "bound_half_head",
+        "AND ready.lane_seq >= v_lane_claim_seq",
+    )
+    .await
 }

@@ -5015,9 +5015,10 @@ BEGIN
               -- Rows of this slot at or after the next segment of another
               -- slot are out of reach of this claim, whether to take or to
               -- move the cursor to.
-              -- Segments do not overlap, so the nearest max_batch + 1 in
-              -- next_lane_seq order contain the first one of another slot
-              -- that a batch of at most max_batch rows could reach.
+              -- This reads one row, and every segment holds a row, so the
+              -- first row at or after the cursor lies in the first segment
+              -- past it when that is in this slot, and the second segment is
+              -- all that is needed to see where another slot begins.
               AND ready.lane_seq < COALESCE((
                   SELECT min(bounding.first_lane_seq)
                   FROM (
@@ -5031,7 +5032,7 @@ BEGIN
                         AND segment.enqueue_shard = v_lane_shard
                         AND segment.next_lane_seq > v_lane_claim_seq
                       ORDER BY segment.next_lane_seq ASC
-                      LIMIT GREATEST(p_max_batch, 0) + 1
+                      LIMIT 2
                   ) AS bounding
                   WHERE (bounding.ready_slot, bounding.ready_generation)
                         IS DISTINCT FROM (v_target_slot, v_target_generation)

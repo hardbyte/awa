@@ -34,3 +34,4 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber.workspace = true

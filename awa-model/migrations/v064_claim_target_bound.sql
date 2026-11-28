@@ -12,14 +12,16 @@
 -- whose rows are interleaved across slots, or a transaction that moves rows
 -- between slots and commits after the claim's snapshot and before its head
 -- lock, makes the cursor pass rows that are then never claimed and are pruned
--- with their slot. Nothing in a release moves rows between slots, so this is
--- latent; it is a prerequisite for doing so.
+-- with their slot. #847 was that layout, written by a producer above READ
+-- COMMITTED, and binaries before v062 can still write it; moving rows between
+-- slots (#779) would also produce it.
 --
 -- The claim now resolves its target again after the head lock, in a fresh
 -- statement, and both reads stop below the smallest first_lane_seq of any
--- segment of the lane past the cursor that is in another (slot, generation),
--- taken from the nearest max_batch + 1 segments in next_lane_seq order. The
--- bound is computed in the statement that reads the rows. At worst a claim
+-- segment of the lane past the cursor that is in another (slot, generation).
+-- The head step, which reads one row, looks at the first two segments in
+-- next_lane_seq order; claim_ready_slot_<n> looks at the nearest max_batch + 1.
+-- The bound is computed in the statement that reads the rows. At worst a claim
 -- returns fewer rows, or none, and the next claim re-resolves.
 --
 -- V23_UP writes the new bodies into new substrates. This file rewrites
@@ -28,8 +30,9 @@
 -- exact signatures, from their own definitions, so signatures, owners,
 -- privileges and settings are unchanged. A function that already carries a
 -- change (a fresh install or a replay) is left alone. No table DDL, no
--- trigger change and no substrate reinstallation. A body that does not match
--- the released text is left as it is and a warning names it.
+-- trigger change and no substrate reinstallation. A function is rewritten only
+-- when every one of its changes applies; a body that does not match the
+-- released text is left exactly as it is and a warning names it.
 --
 -- N-1 binaries call the same functions with the same arguments and results
 -- and the claim protocol is unchanged, so they run the same before and after
@@ -41,9 +44,9 @@
 -- queue-storage table, and its work scales with the number of claim
 -- functions, not with job count. A claim in flight finishes on the old body;
 -- the next call uses the new one. Each claim adds one probe of ready_segments
--- for the re-resolve and one bounded probe in each of the head step and the
--- slot function, all on the (queue, priority, enqueue_shard, next_lane_seq)
--- index.
+-- for the re-resolve and one bounded probe in each of the head step (two
+-- segments) and the slot function (max_batch + 1), all on the
+-- (queue, priority, enqueue_shard, next_lane_seq) index.
 --
 -- External runners apply the complete `awa migrate --sql --from 63 --to 64`
 -- bundle, which refreshes trusted queue-storage discovery before this block.
@@ -57,6 +60,10 @@ DECLARE
     v_function RECORD;
     v_definition TEXT;
     v_updated TEXT;
+    v_complete BOOLEAN;
+    v_head_marker TEXT := 'Rows of this slot at or after the next segment';
+    v_resolve_marker TEXT := 'Resolve the target';
+    v_slot_marker TEXT := 'LIMIT GREATEST(p_claim_limit, 0) + 1';
     v_resolve TEXT := $resolve$
             -- The head lock can be granted after the statement above took its
             -- snapshot, and a transaction that moved rows between slots and
@@ -75,9 +82,10 @@ DECLARE
               -- Rows of this slot at or after the next segment of another
               -- slot are out of reach of this claim, whether to take or to
               -- move the cursor to.
-              -- Segments do not overlap, so the nearest max_batch + 1 in
-              -- next_lane_seq order contain the first one of another slot
-              -- that a batch of at most max_batch rows could reach.
+              -- This reads one row, and every segment holds a row, so the
+              -- first row at or after the cursor lies in the first segment
+              -- past it when that is in this slot, and the second segment is
+              -- all that is needed to see where another slot begins.
               AND ready.lane_seq < COALESCE((
                   SELECT min(bounding.first_lane_seq)
                   FROM (
@@ -91,7 +99,7 @@ DECLARE
                         AND segment.enqueue_shard = v_lane_shard
                         AND segment.next_lane_seq > v_lane_claim_seq
                       ORDER BY segment.next_lane_seq ASC
-                      LIMIT GREATEST(p_max_batch, 0) + 1
+                      LIMIT 2
                   ) AS bounding
                   WHERE (bounding.ready_slot, bounding.ready_generation)
                         IS DISTINCT FROM (v_target_slot, v_target_generation)
@@ -158,37 +166,36 @@ BEGIN
             v_definition := pg_get_functiondef(v_function.proc::oid);
             v_updated := v_definition;
             IF v_function.is_runtime THEN
-                IF position('LIMIT GREATEST(p_max_batch, 0) + 1' IN v_updated) = 0 THEN
+                IF position(v_head_marker IN v_updated) = 0 THEN
                     v_updated := regexp_replace(
                         v_updated,
                         '(AND ready[.]ready_generation = v_target_generation[[:space:]]+AND ready[.]lane_seq >= v_lane_claim_seq)([[:space:]]+ORDER BY ready[.]lane_seq ASC[[:space:]]+LIMIT 1;)',
                         '\1' || format(v_head_bound, v_schema) || '\2'
                     );
                 END IF;
-                IF position('Resolve the target' IN v_updated) = 0 THEN
+                IF position(v_resolve_marker IN v_updated) = 0 THEN
                     v_updated := regexp_replace(
                         v_updated,
                         '(FOR UPDATE OF claims SKIP LOCKED;[[:space:]]+IF NOT FOUND THEN[[:space:]]+RETURN;[[:space:]]+END IF;)',
                         '\1' || chr(10) || format(v_resolve, v_schema)
                     );
                 END IF;
-                IF position('LIMIT GREATEST(p_max_batch, 0) + 1' IN v_updated) = 0
-                   OR position('Resolve the target' IN v_updated) = 0 THEN
-                    RAISE WARNING 'awa v064: % does not match the released claim text and keeps its old read',
-                        v_function.proc;
-                END IF;
+                v_complete := position(v_head_marker IN v_updated) > 0
+                          AND position(v_resolve_marker IN v_updated) > 0;
             ELSE
-                IF position('LIMIT GREATEST(p_claim_limit, 0) + 1' IN v_updated) = 0 THEN
+                IF position(v_slot_marker IN v_updated) = 0 THEN
                     v_updated := regexp_replace(
                         v_updated,
                         '(AND ready[.]lane_seq >= p_lane_claim_seq)([[:space:]]+ORDER BY ready[.]lane_seq ASC[[:space:]]+LIMIT p_claim_limit)',
                         '\1' || format(v_slot_bound, v_schema) || '\2'
                     );
-                    IF position('LIMIT GREATEST(p_claim_limit, 0) + 1' IN v_updated) = 0 THEN
-                        RAISE WARNING 'awa v064: % does not match the released claim text and keeps its old read',
-                            v_function.proc;
-                    END IF;
                 END IF;
+                v_complete := position(v_slot_marker IN v_updated) > 0;
+            END IF;
+            IF NOT v_complete THEN
+                RAISE WARNING 'awa v064: % does not match the released claim text and keeps its old read',
+                    v_function.proc;
+                CONTINUE;
             END IF;
             IF v_updated <> v_definition THEN
                 EXECUTE v_updated;

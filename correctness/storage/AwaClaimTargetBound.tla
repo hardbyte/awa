@@ -19,13 +19,15 @@ EXTENDS Naturals, FiniteSets, TLC
 \*   Lock       the head lock is granted;
 \*   Reresolve  a fresh statement picks the target again (Reresolve only);
 \*   Head       finds the first visible row of the target slot at or after
-\*              the cursor and moves the cursor TO it;
+\*              the cursor and moves the cursor TO it, looking at the first
+\*              two segments past the cursor for the bound;
 \*   Read       claim_ready_slot_N reads up to Limit rows of the target slot
 \*              at or after the cursor and the cursor moves past the last.
 \* Head and Read each see the state at their own start.
 \*
-\* Bounded       reads stop below the first segment, among the Limit + 1
-\*               nearest ones past the cursor, that is in another slot
+\* Bounded       reads stop below the first segment that is in another slot
+\*               among the n + 1 nearest ones past the cursor, where n is the
+\*               number of rows the read takes: 1 for Head, Limit for Read
 \*               (production: TRUE).
 \* Reresolve     the target is picked again after the lock (production: TRUE).
 \* Interleave    enqueues may put a position in either slot (#847 carry-
@@ -52,14 +54,14 @@ HasSegment(p) == status[p] \in {"ready", "claimed"}
 Past == {p \in Positions : p >= cursor /\ HasSegment(p)}
 FirstTarget == where[Min(Past)]
 
-\* Smallest first_lane_seq among the Limit + 1 segments nearest the cursor
-\* that are in another slot than t; N + 1 when there is none.
-Bound(t) ==
+\* Smallest first_lane_seq among the n + 1 segments nearest the cursor that
+\* are in another slot than t; N + 1 when there is none.
+Bound(t, n) ==
     IF ~Bounded THEN N + 1
-    ELSE LET other == {p \in Lowest(Past, Limit + 1) : where[p] # t}
+    ELSE LET other == {p \in Lowest(Past, n + 1) : where[p] # t}
          IN IF other = {} THEN N + 1 ELSE Min(other)
-Rows(t) == {p \in Positions : p >= cursor /\ status[p] = "ready"
-                              /\ where[p] = t /\ p < Bound(t)}
+Rows(t, n) == {p \in Positions : p >= cursor /\ status[p] = "ready"
+                                 /\ where[p] = t /\ p < Bound(t, n)}
 
 Init == /\ status = [p \in Positions |-> "free"]
         /\ where = [p \in Positions |-> "A"]
@@ -95,15 +97,15 @@ Retarget ==
 
 Head ==
     /\ pc = "retargeted"
-    /\ IF Rows(tgt) = {}
+    /\ IF Rows(tgt, 1) = {}
        THEN /\ pc' = "idle" /\ UNCHANGED cursor
-       ELSE /\ pc' = "headed" /\ cursor' = Max({cursor, Min(Rows(tgt))})
+       ELSE /\ pc' = "headed" /\ cursor' = Max({cursor, Min(Rows(tgt, 1))})
     /\ UNCHANGED <<status, where, next, tgt>>
 
 Read ==
     /\ pc = "headed"
     /\ pc' = "idle"
-    /\ LET taken == Lowest(Rows(tgt), Limit)
+    /\ LET taken == Lowest(Rows(tgt, Limit), Limit)
        IN IF taken = {}
           THEN UNCHANGED <<status, cursor>>
           ELSE /\ status' = [p \in Positions |->
