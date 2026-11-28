@@ -109,7 +109,7 @@ def series_names(name: str, unit: str, kind: str) -> list[str]:
 
 def instruments(source: str) -> list[tuple[str, str, str]]:
     """(kind, OTel name, unit) for every instrument awa-metrics builds."""
-    names = dict(re.findall(r'pub const ([A-Z0-9_]+): &str = "([^"]+)";', source))
+    names = dict(re.findall(r'pub const ([A-Z0-9_]+): &str =\s*"([^"]+)";', source))
     found = []
     builder = re.compile(
         r"\.(?:u64|f64|i64)_(counter|up_down_counter|histogram|gauge)\(\s*names::([A-Z0-9_]+)\s*\)"

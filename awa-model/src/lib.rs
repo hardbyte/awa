@@ -67,6 +67,7 @@ pub use queue_storage::{
     PruneDurations, PruneOutcome, QueueCounts, QueueRingPin, QueueStorage, QueueStorageConfig,
     RescueBatch, RescueBatchOptions, RescueScanCursor, RescueScanProgress, RescueSlotOrder,
     RingLedgerFoldOutcome, RingRotationCadence, RotateOutcome, RuntimeBatchCompletion, SkipReason,
+    SpentClaimHeadAdvance, SpentClaimHeadAdvances, SpentClaimHeadFailure,
     TerminalDeltaRollupOutcome, TerminalRollupFoldOutcome,
 };
 pub use storage::StorageStatus;

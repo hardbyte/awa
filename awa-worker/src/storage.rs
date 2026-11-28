@@ -9,6 +9,8 @@ pub(crate) struct QueueStorageRuntime {
     pub lease_rotate_interval: Duration,
     pub claim_rotate_interval: Duration,
     pub rotation_cadence: RingRotationCadence,
+    #[cfg(test)]
+    pub ring_pin_advance_budget_override: Option<Duration>,
 }
 
 impl QueueStorageRuntime {
@@ -28,7 +30,15 @@ impl QueueStorageRuntime {
             lease_rotate_interval,
             claim_rotate_interval,
             rotation_cadence: RingRotationCadence::default(),
+            #[cfg(test)]
+            ring_pin_advance_budget_override: None,
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_ring_pin_advance_budget(mut self, budget: Duration) -> Self {
+        self.ring_pin_advance_budget_override = Some(budget);
+        self
     }
 
     /// Set the prune `lock_timeout` on the store. Only valid before the store
