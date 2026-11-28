@@ -163,11 +163,13 @@ test.describe("Queues page", () => {
     await expect(page.getByRole("heading", { name: "E2E Queue" })).toBeVisible();
     await expect(page.getByText("e2e_test").first()).toBeVisible();
     await expect(page.getByText("End-to-end queue used for UI coverage")).toBeVisible();
+    await page.getByRole("tab", { name: "Config" }).click();
+    await expect(page).toHaveURL(/\/queues\/e2e_test\/config$/);
     await expect(page.getByText("qa-platform")).toBeVisible();
     await expect(page.getByText("critical")).toBeVisible();
   });
 
-  test("queue detail links to filtered DLQ rows when DLQ is enabled", async ({ page }) => {
+  test("the Dead letters tab shows rows whenever depth > 0", async ({ page }) => {
     await page.route("**/api/queues/payments", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -217,7 +219,7 @@ test.describe("Queues page", () => {
               poll_interval_ms: 200,
               deadline_duration_secs: 300,
               priority_aging_interval_secs: 60,
-              dlq_enabled: true,
+              dlq_enabled: false,
               rate_limit: null,
             },
           },
@@ -227,19 +229,23 @@ test.describe("Queues page", () => {
     await page.route("**/api/dlq/depth", async (route) => {
       await route.fulfill({
         contentType: "application/json",
-        body: JSON.stringify({ total: 0, by_queue: [] }),
+        body: JSON.stringify({ total: 2, by_queue: [{ queue: "payments", count: 2 }] }),
       });
     });
-    await page.route("**/api/dlq**", async (route) => {
+    let listUrl = "";
+    await page.route("**/api/dlq?*", async (route) => {
+      listUrl = route.request().url();
       await route.fulfill({ contentType: "application/json", body: JSON.stringify([]) });
     });
 
+    // Rows can reach the DLQ by `dlq move` even with the queue's DLQ off.
     await page.goto("/queues/payments");
-
-    const dlqLink = page.getByRole("link", { name: "View DLQ rows" });
-    await expect(dlqLink).toBeVisible();
+    const dlqLink = page.getByTestId("queue-dlq-rows").getByRole("link");
+    await expect(dlqLink).toHaveText("2 dead-lettered job(s)");
     await dlqLink.click();
-    await expect(page).toHaveURL(/\/dlq\?q=queue%3Apayments$/);
+    await expect(page).toHaveURL(/\/queues\/payments\/dlq$/);
+    await expect(page.getByTestId("locked-filter")).toHaveText("queue:payments");
+    await expect.poll(() => new URL(listUrl || "http://x/").searchParams.get("queue")).toBe("payments");
   });
 
   test("legacy queue still renders without descriptors", async ({ page }) => {
@@ -249,6 +255,7 @@ test.describe("Queues page", () => {
     ]);
 
     await expect(page.getByRole("heading", { name: "legacy_queue" })).toBeVisible();
+    await page.getByRole("tab", { name: "Config" }).click();
     await expect(page.getByText("Descriptor health")).toBeVisible();
     await expect(page.getByText("Not declared by a live worker")).toBeVisible();
   });

@@ -496,99 +496,23 @@ test.describe("Pagination", () => {
   });
 });
 
-test.describe("Queue context banner", () => {
-  test("banner appears when filtering by a single queue", async ({ page }) => {
+test.describe("Single-queue filter", () => {
+  test("shows an Open queue link and no queue banner", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
-        (r) =>
-          r.url().includes("/api/jobs") &&
-          r.url().includes("queue=e2e_test") &&
-          r.ok()
+        (r) => r.url().includes("/api/jobs") && r.url().includes("queue=e2e_test") && r.ok()
       ),
       page.goto("/jobs?q=queue%3Ae2e_test"),
     ]);
-
-    // Banner should show queue status badge
-    const banner = page.locator(".rounded-lg.border.bg-muted\\/30");
-    await expect(banner).toBeVisible();
-
-    // Should show Active or Paused badge
-    const activeBadge = banner.getByText("Active");
-    const pausedBadge = banner.getByText("Paused");
-    const activeVisible = await activeBadge.isVisible().catch(() => false);
-    const pausedVisible = await pausedBadge.isVisible().catch(() => false);
-    expect(activeVisible || pausedVisible).toBeTruthy();
-
-    // Should show stats text (available, running, failed)
-    await expect(banner.getByText(/available/)).toBeVisible();
-    await expect(banner.getByText(/running/)).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Jobs", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Drain" })).toHaveCount(0);
+    await page.getByTestId("open-queue").click();
+    await expect(page).toHaveURL(/\/queues\/e2e_test$/);
   });
 
-  test("banner shows Pause button for active queue", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse(isQueuesListResponse),
-      page.waitForResponse(
-        (r) =>
-          r.url().includes("/api/jobs") &&
-          r.url().includes("queue=e2e_test") &&
-          r.ok()
-      ),
-      page.goto("/jobs?q=queue%3Ae2e_test"),
-    ]);
-
-    const banner = page.locator(".rounded-lg.border.bg-muted\\/30");
-    await expect(banner).toBeVisible();
-
-    // Active queue should show Pause button
-    const pauseBtn = banner.getByRole("button", { name: "Pause" });
-    const resumeBtn = banner.getByRole("button", { name: "Resume" });
-
-    // One of these should be visible based on queue state
-    const pauseVisible = await pauseBtn.isVisible().catch(() => false);
-    const resumeVisible = await resumeBtn.isVisible().catch(() => false);
-    expect(pauseVisible || resumeVisible).toBeTruthy();
-
-    // Drain button should always be visible
-    await expect(banner.getByRole("button", { name: "Drain" })).toBeVisible();
-  });
-
-  test("Drain button shows confirmation dialog", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse(isQueuesListResponse),
-      page.waitForResponse(
-        (r) =>
-          r.url().includes("/api/jobs") &&
-          r.url().includes("queue=e2e_test") &&
-          r.ok()
-      ),
-      page.goto("/jobs?q=queue%3Ae2e_test"),
-    ]);
-
-    const banner = page.locator(".rounded-lg.border.bg-muted\\/30");
-    const drainBtn = banner.getByRole("button", { name: "Drain" });
-    await expect(drainBtn).toBeVisible();
-
-    await drainBtn.click();
-
-    // Confirmation dialog should appear
-    const dialog = page.getByRole("alertdialog");
-    await expect(dialog).toBeVisible();
-    await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
-
-    // Close without confirming
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
-    await expect(dialog).not.toBeVisible();
-  });
-
-  test("banner does not appear without queue filter", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
-      page.goto("/jobs"),
-    ]);
-
-    // No banner should be visible
-    const banner = page.locator(".rounded-lg.border.bg-muted\\/30");
-    await expect(banner).not.toBeVisible();
+  test("no Open queue link without a queue filter", async ({ page }) => {
+    await page.goto("/jobs");
+    await expect(page.getByRole("grid", { name: "Jobs" })).toBeVisible();
+    await expect(page.getByTestId("open-queue")).toHaveCount(0);
   });
 });

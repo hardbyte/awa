@@ -551,8 +551,8 @@ export function RuntimePage() {
                 <div key={queue.queue} className="rounded-lg border p-4">
                   <div className="flex items-center justify-between gap-3">
                     <Link
-                      to="/jobs"
-                      search={{ q: `queue:${queue.queue}` }}
+                      to="/queues/$name"
+                      params={{ name: queue.queue }}
                       className="font-medium text-primary no-underline hover:underline"
                     >
                       {queue.queue}
@@ -635,8 +635,8 @@ export function RuntimePage() {
                   <TableRow key={queue.queue} id={queue.queue}>
                     <TableCell className="font-medium">
                       <Link
-                        to="/jobs"
-                        search={{ q: `queue:${queue.queue}` }}
+                        to="/queues/$name"
+                        params={{ name: queue.queue }}
                         className="text-primary no-underline hover:underline"
                       >
                         {queue.queue}

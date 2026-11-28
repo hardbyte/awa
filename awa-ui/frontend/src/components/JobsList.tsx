@@ -111,12 +111,15 @@ export interface JobsListProps {
   /** Filter terms the page fixes; they apply to every read and can't be
    * removed from the search. */
   lockedFilter?: { queue?: string; kind?: string };
+  /** Per-state counts for the pills when the global ones don't apply, e.g.
+   * one queue's. Without them the pills show the whole install's counts. */
+  stateCounts?: Partial<StateCounts>;
 }
 
 /** The filterable jobs list: state pills, search, selection actions, table
  * and phone cards, and pagination. Its filter lives in the current URL's
  * `state`, `q`, `before_id` and `limit`. */
-export function JobsList({ lockedFilter }: JobsListProps) {
+export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
   const navigate = useNavigate();
   const filters = useJobFilters();
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -183,7 +186,9 @@ export function JobsList({ lockedFilter }: JobsListProps) {
   const statsQuery = useManagedQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
+    enabled: !stateCounts,
   });
+  const counts: Partial<StateCounts> | undefined = stateCounts ?? statsQuery.data;
   const readOnly = useReadOnly();
 
   const retryMutation = useMutation({
@@ -275,7 +280,7 @@ export function JobsList({ lockedFilter }: JobsListProps) {
     });
   };
 
-  const total = statsQuery.data
+  const total = statsQuery.data && !stateCounts
     ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
     : undefined;
 
@@ -289,7 +294,7 @@ export function JobsList({ lockedFilter }: JobsListProps) {
       {/* Compact state filter pills + search on same row */}
       <div className="flex flex-wrap items-center gap-2">
         {STATES.map((s) => {
-          const count = s === "all" ? total : statsQuery.data?.[s];
+          const count = s === "all" ? total : counts?.[s];
           const isActive = filters.state === s;
           const meta = s === "all" ? null : jobStateMeta(s);
           const Icon = isActive ? CheckIcon : meta?.Icon;

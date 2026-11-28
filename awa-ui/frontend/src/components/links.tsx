@@ -23,7 +23,8 @@ export function QueueLink({
   descriptor,
   className = "",
   children,
-}: EntityLinkProps & { queue: string; descriptor?: Descriptor | null }) {
+  "data-testid": testId,
+}: EntityLinkProps & { queue: string; descriptor?: Descriptor | null; "data-testid"?: string }) {
   const label = displayName(queue, descriptor);
   return (
     <Link
@@ -31,6 +32,7 @@ export function QueueLink({
       params={{ name: queue }}
       className={`${entityLinkClass} ${className}`}
       title={label === queue ? undefined : queue}
+      data-testid={testId}
     >
       {children ?? label}
     </Link>

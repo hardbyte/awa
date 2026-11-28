@@ -374,8 +374,8 @@ export function DashboardPage() {
                       className="cursor-pointer"
                       onAction={() =>
                         void navigate({
-                          to: "/jobs",
-                          search: { q: `queue:${q.queue}` },
+                          to: "/queues/$name",
+                          params: { name: q.queue },
                         })
                       }
                     >

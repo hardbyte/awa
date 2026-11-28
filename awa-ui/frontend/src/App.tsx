@@ -16,7 +16,9 @@ import { JobDetailPage } from "./routes/job-detail";
 import { KindsPage } from "./routes/kinds";
 import { KindDetailPage } from "./routes/kind-detail";
 import { QueuesPage } from "./routes/queues";
-import { QueueDetailPage } from "./routes/queue-detail";
+import { QueueDlqTab, QueueHubLayout, QueueJobsTab } from "./routes/queue-hub";
+import { QueueOverviewTab } from "./routes/queue-overview";
+import { QueueConfigTab } from "./routes/queue-config";
 import { CronPage } from "./routes/cron";
 import { CronDetailPage } from "./routes/cron-detail";
 import { DlqPage } from "./routes/dlq";
@@ -71,10 +73,34 @@ const queuesRoute = createRoute({
   component: QueuesPage,
 });
 
-const queueDetailRoute = createRoute({
+const queueHubRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/queues/$name",
-  component: QueueDetailPage,
+  component: QueueHubLayout,
+});
+
+const queueOverviewRoute = createRoute({
+  getParentRoute: () => queueHubRoute,
+  path: "/",
+  component: QueueOverviewTab,
+});
+
+const queueJobsRoute = createRoute({
+  getParentRoute: () => queueHubRoute,
+  path: "jobs",
+  component: QueueJobsTab,
+});
+
+const queueDlqRoute = createRoute({
+  getParentRoute: () => queueHubRoute,
+  path: "dlq",
+  component: QueueDlqTab,
+});
+
+const queueConfigRoute = createRoute({
+  getParentRoute: () => queueHubRoute,
+  path: "config",
+  component: QueueConfigTab,
 });
 
 const cronRoute = createRoute({
@@ -145,7 +171,7 @@ const routeTree = rootRoute.addChildren([
   kindsRoute,
   kindDetailRoute,
   queuesRoute,
-  queueDetailRoute,
+  queueHubRoute.addChildren([queueOverviewRoute, queueJobsRoute, queueDlqRoute, queueConfigRoute]),
   runtimeRoute,
   runtimeInstanceRoute,
   cronRoute,

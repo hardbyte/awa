@@ -93,7 +93,7 @@ test.describe("Job detail page", () => {
       ),
       page.goto("/jobs?q=queue%3Alegacy_queue"),
     ]);
-    await expect(page.getByRole("heading", { name: "Queue: legacy_queue" })).toBeVisible();
+    await expect(page.getByTestId("open-queue")).toContainText("legacy_queue");
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await openFirstJob(page, jobTable);

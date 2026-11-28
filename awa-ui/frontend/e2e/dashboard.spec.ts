@@ -97,7 +97,7 @@ test.describe("Dashboard page", () => {
     expect(page.url()).toContain("state=failed");
   });
 
-  test("queue row click navigates to /jobs with queue filter", async ({ page }) => {
+  test("queue row click opens the queue", async ({ page }) => {
     await Promise.all([
       page.waitForResponse(isQueuesListResponse),
       page.goto("/"),
@@ -112,9 +112,7 @@ test.describe("Dashboard page", () => {
     await expect(e2eRow).toBeVisible();
     await e2eRow.click();
 
-    await page.waitForURL(/\/jobs/);
-    expect(page.url()).toContain("queue");
-    expect(page.url()).toContain("e2e_test");
+    await page.waitForURL(/\/queues\/e2e_test$/);
   });
 
   test("runtime card renders with stat counters", async ({ page }) => {
