@@ -331,6 +331,12 @@ export interface ListJobsParams {
   limit?: number;
 }
 
+export class HttpError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(apiPath(path), {
     headers: { "Content-Type": "application/json" },
@@ -338,7 +344,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((body as { error?: string }).error ?? res.statusText);
+    throw new HttpError((body as { error?: string }).error ?? res.statusText, res.status);
   }
   return res.json() as Promise<T>;
 }

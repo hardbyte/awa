@@ -29,6 +29,7 @@ import { LagValue } from "@/components/LagValue";
 import { AvailableCount } from "@/components/AvailableCount";
 import type { QueueRuntimeSummary } from "@/lib/api";
 import { timeAgo } from "@/lib/time";
+import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import {
   dlqPolicyIntent,
   dlqPolicyLabel,
@@ -90,19 +91,33 @@ export function QueueDetailPage() {
       },
     });
 
+  const queueNotFound = (
+    <ResourceNotFound
+      title={`Queue "${queueName}" not found`}
+      reason="No jobs or configuration exist for this queue name."
+      backTo="/queues"
+      backLabel="Back to queues"
+    />
+  );
   if (!queueName) {
-    return <p className="text-sm text-muted-fg">Queue not found.</p>;
+    return queueNotFound;
   }
   if (queueQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading...</p>;
   }
-  if (queueQuery.error) {
+  if (queueQuery.error && !isNotFoundError(queueQuery.error)) {
     return (
-      <p className="text-sm text-danger">Error: {String(queueQuery.error)}</p>
+      <ResourceLoadError
+        noun={`queue "${queueName}"`}
+        error={queueQuery.error}
+        onRetry={() => void queueQuery.refetch()}
+        backTo="/queues"
+        backLabel="Back to queues"
+      />
     );
   }
   if (!queueQuery.data) {
-    return <p className="text-sm text-muted-fg">Queue not found.</p>;
+    return queueNotFound;
   }
 
   const queue = queueQuery.data;

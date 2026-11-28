@@ -123,3 +123,21 @@ test.describe("Failed reads are not shown as empty", () => {
     await expect(page.getByText("No cron schedules found.")).toHaveCount(0);
   });
 });
+
+test.describe("Not-found detail pages", () => {
+  for (const { path, title, back } of [
+    { path: "/jobs/999999999", title: "Job #999999999 not found", back: "Back to jobs" },
+    { path: "/queues/no-such-queue", title: 'Queue "no-such-queue" not found', back: "Back to queues" },
+    { path: "/dlq/999999999", title: "DLQ row #999999999 not found", back: "Back to DLQ" },
+    { path: "/runtime/no-such-instance", title: "Runtime instance not found", back: "Back to runtime" },
+  ]) {
+    test(`${path} explains and links back`, async ({ page }) => {
+      await page.goto(path);
+      const notFound = page.getByTestId("resource-not-found");
+      await expect(notFound.getByRole("heading", { name: title })).toBeVisible();
+      await expect(page.getByText(/ApiError|Error:/)).toHaveCount(0);
+      await notFound.getByRole("link", { name: back }).click();
+      await expect(page).toHaveURL(new RegExp(`${path.split("/")[1]}$`));
+    });
+  }
+});
