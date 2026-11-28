@@ -380,6 +380,10 @@ test.describe("Job detail page", () => {
     await expect(origin).toContainText("(manual trigger)");
     await origin.getByRole("link", { name: "e2e_cron_owner" }).click();
     await expect(page).toHaveURL(/\/cron\/e2e_cron_owner$/);
+    await page.goBack();
+    await origin.getByRole("link", { name: "Jobs from this schedule" }).click();
+    await page.waitForURL(/\/jobs\?/);
+    expect(new URL(page.url()).searchParams.get("q")).toBe("kind:e2e_job cron:e2e_cron_owner");
   });
 });
 

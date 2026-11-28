@@ -180,6 +180,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
     ids: searchFilters.ids,
     created_at_gte: toRfc3339(searchFilters.createdGte),
     created_at_lt: toRfc3339(searchFilters.createdLt),
+    cron_name: searchFilters.cron,
     dead_lettered: filters.liveOnly ? false : undefined,
   };
   const params: ListJobsParams = {
@@ -212,6 +213,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
       state: filters.state === "all" ? undefined : filters.state,
       created_at_gte: searchFilters.createdGte,
       created_at_lt: searchFilters.createdLt,
+      cron_name: searchFilters.cron,
     }).filter((entry): entry is [string, string] => Boolean(entry[1]))
   );
 

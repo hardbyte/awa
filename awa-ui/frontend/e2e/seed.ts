@@ -167,7 +167,7 @@ export default async function globalSetup() {
       (
         0, 0, 800005, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 1, 0,
         0, 3, 1, now() - interval '10 seconds', NULL, now() - interval '4 minutes',
-        '{"metadata":{"source":"playwright"},"tags":["e2e","priority"],"errors":[],"progress":null}'::jsonb
+        '{"metadata":{"source":"playwright","cron_name":"e2e_cron_owner"},"tags":["e2e","priority"],"errors":[],"progress":null}'::jsonb
       ),
       (
         0, 0, 800004, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 2, 1,

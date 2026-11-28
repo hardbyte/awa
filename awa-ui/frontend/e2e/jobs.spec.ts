@@ -186,6 +186,38 @@ test.describe("Search bar filters", () => {
     await expect(page.getByText("#800006")).toHaveCount(0);
   });
 
+  test("cron: narrows to the jobs a schedule enqueued", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.url().includes("cron=e2e_cron_owner") && r.ok()),
+      page.goto("/jobs?q=cron%3Ae2e_cron_owner"),
+    ]);
+    await expect(page.getByText("cron:e2e_cron_owner", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("match-count")).toHaveText("1 matching");
+    await expect(page.getByText("#800005").filter({ visible: true }).first()).toBeVisible();
+    await expect(page.getByText("#800006")).toHaveCount(0);
+  });
+
+  test("reason: is refused on the jobs page and points to the dead letters", async ({ page }) => {
+    const reads: string[] = [];
+    page.on("request", (r) => {
+      if (r.url().includes("/api/jobs")) reads.push(r.url());
+    });
+    await page.goto("/jobs?q=queue%3Ae2e_test%20reason%3Amanual_test");
+    await expect(page.getByRole("alert").filter({ hasText: "reason: filters dead letters" })).toBeVisible();
+    await expect(page.locator("[data-invalid]").filter({ hasText: "reason:manual_test" })).toBeVisible();
+    expect(reads.filter((url) => url.includes("reason="))).toEqual([]);
+  });
+
+  test("the suggestions offer cron: but not reason:", async ({ page }) => {
+    await page.goto("/jobs");
+    await page.getByLabel("Search jobs").focus();
+    const listbox = page.getByRole("listbox");
+    await expect(listbox.getByText("cron:<schedule>")).toBeVisible();
+    await expect(listbox.getByText("reason:<dlq reason>")).toHaveCount(0);
+    await page.getByLabel("Search jobs").fill("cron:");
+    await expect(listbox.getByText("cron:e2e_cron_owner")).toBeVisible();
+  });
+
   test("all matching → Retry previews the count and sample, then opens the operation", async ({ page }) => {
     const id = "5a5a5a5a-0000-4000-8000-000000000000";
     let submitted: unknown = null;

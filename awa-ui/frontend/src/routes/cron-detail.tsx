@@ -161,9 +161,14 @@ export function CronDetailPage() {
             <DescriptionTerm>Updated</DescriptionTerm>
             <DescriptionDetails><Time value={cron.updated_at} /></DescriptionDetails>
           </DescriptionList>
-          <FilterLink filter={{ kind: cron.kind, queue: cron.queue }} className="text-sm">
-            Jobs of this kind in this queue (includes jobs not from this schedule)
-          </FilterLink>
+          <div className="flex flex-col gap-1 text-sm">
+            <FilterLink filter={{ kind: cron.kind, cron: cron.name }} data-testid="cron-jobs-link">
+              Jobs from this schedule
+            </FilterLink>
+            <FilterLink filter={{ kind: cron.kind, queue: cron.queue }}>
+              Jobs of this kind in this queue
+            </FilterLink>
+          </div>
         </CardContent>
       </Card>
 

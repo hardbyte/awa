@@ -66,7 +66,7 @@ export function DlqList({ lockedFilter }: DlqListProps) {
   const searchFilters = { ...parseSearch(filters.search), ...lockedFilter };
   // A term that doesn't parse is left out of a request, so it would widen
   // what is listed and what a bulk action touches.
-  const searchError = termError(filters.search);
+  const searchError = termError(filters.search, "dlq");
 
   const params: ListDlqParams = {
     kind: searchFilters.kind,
@@ -75,6 +75,8 @@ export function DlqList({ lockedFilter }: DlqListProps) {
     ids: searchFilters.ids,
     created_at_gte: toRfc3339(searchFilters.createdGte),
     created_at_lt: toRfc3339(searchFilters.createdLt),
+    cron_name: searchFilters.cron,
+    dlq_reason: searchFilters.reason,
     before_id: filters.beforeId,
     before_dlq_at: filters.beforeDlqAt,
     limit: filters.limit,
@@ -94,6 +96,8 @@ export function DlqList({ lockedFilter }: DlqListProps) {
     ids: searchFilters.ids,
     created_at_gte: toRfc3339(searchFilters.createdGte),
     created_at_lt: toRfc3339(searchFilters.createdLt),
+    cron_name: searchFilters.cron,
+    dlq_reason: searchFilters.reason,
   };
   const hasActiveFilter = Object.keys(searchFilters).length > 0;
   // Counted when the filter changes, not on every poll.
@@ -141,6 +145,7 @@ export function DlqList({ lockedFilter }: DlqListProps) {
       <SearchBar
         value={filters.search}
         onChange={setSearch}
+        view="dlq"
         locked={[lockedFilter?.kind && `kind:${lockedFilter.kind}`, lockedFilter?.queue && `queue:${lockedFilter.queue}`].filter(
           (term): term is string => Boolean(term)
         )}

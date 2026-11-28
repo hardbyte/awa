@@ -11,7 +11,7 @@ import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Page, PageHeader } from "@/components/Page";
-import { KindLink, QueueLink, ScheduleLink, TagChip } from "@/components/links";
+import { FilterLink, KindLink, QueueLink, ScheduleLink, TagChip } from "@/components/links";
 import { SECTION_LABELS } from "@/lib/sections";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import {
@@ -261,6 +261,10 @@ export function JobDetailPage() {
             <DescriptionDetails data-testid="job-cron-origin">
               Schedule <ScheduleLink name={cronOrigin.name} />
               {cronOrigin.manual && <span className="text-muted-fg"> (manual trigger)</span>}
+              {" · "}
+              <FilterLink filter={{ kind: job.kind, cron: cronOrigin.name }} className="text-sm">
+                Jobs from this schedule
+              </FilterLink>
             </DescriptionDetails>
           </>
         )}

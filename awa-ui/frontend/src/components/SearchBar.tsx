@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchDistinctKinds, fetchDistinctQueues } from "@/lib/api";
+import { fetchCronJobs, fetchDistinctKinds, fetchDistinctQueues, fetchDlqReasons } from "@/lib/api";
 import { POLL, MAX_SUGGESTIONS } from "@/lib/constants";
 import { LockClosedIcon } from "@heroicons/react/16/solid";
 
@@ -14,37 +14,128 @@ export interface SearchFilters {
   createdGte?: string;
   /** Created before, as typed. */
   createdLt?: string;
+  /** The cron schedule that enqueued the job. */
+  cron?: string;
+  /** The reason a dead letter was dead-lettered, matched exactly. */
+  reason?: string;
+}
+
+/** Which list a search filters. `reason:` only means something for dead
+ * letters, so the jobs list refuses it rather than listing only them. */
+export type SearchView = "jobs" | "dlq";
+
+/** The prefixes a search term can start with. */
+export const FILTER_PREFIXES = [
+  "kind:",
+  "queue:",
+  "tag:",
+  "cron:",
+  "reason:",
+  "id:",
+  "created>=",
+  "created<",
+] as const;
+
+type FilterPrefix = (typeof FILTER_PREFIXES)[number];
+
+/** The filter prefix `term` starts with, if any. */
+export function filterPrefix(term: string): FilterPrefix | undefined {
+  return FILTER_PREFIXES.find((p) => term.startsWith(p));
 }
 
 /**
- * Parse a search string of `kind:`, `queue:`, `tag:`, `id:`, `created>=` and
- * `created<` terms. `tag:` and `id:` repeat (`id:` also takes a comma
- * list); for the others the last value wins.
+ * Split a search into terms at whitespace. A value written in double quotes
+ * (`reason:"bad input"`, with `\"` and `\\` for a quote and a backslash)
+ * stays one term, spaces and all.
+ */
+export function splitTerms(search: string): string[] {
+  const out: string[] = [];
+  const isSpace = (at: number) => /\s/.test(search[at] ?? "");
+  let at = 0;
+  while (at < search.length) {
+    while (at < search.length && isSpace(at)) at++;
+    if (at >= search.length) break;
+    const start = at;
+    const prefix = FILTER_PREFIXES.find((p) => search.startsWith(p, at));
+    if (prefix && search[at + prefix.length] === '"') {
+      at += prefix.length + 1;
+      while (at < search.length && search[at] !== '"') at += search[at] === "\\" ? 2 : 1;
+      at = Math.min(at + 1, search.length);
+    }
+    while (at < search.length && !isSpace(at)) at++;
+    out.push(search.slice(start, at));
+  }
+  return out;
+}
+
+/** A term's value without its quotes and escapes, or undefined when a quote
+ * is left open or text follows the closing one. Unquoted values are taken as
+ * written. */
+function unquote(raw: string): string | undefined {
+  if (!raw.startsWith('"')) return raw;
+  let out = "";
+  for (let at = 1; at < raw.length; at++) {
+    const c = raw[at]!;
+    if (c === '"') return at === raw.length - 1 ? out : undefined;
+    if (c === "\\") {
+      at++;
+      if (at >= raw.length) return undefined;
+      out += raw[at];
+    } else {
+      out += c;
+    }
+  }
+  return undefined;
+}
+
+/** A value as a search term writes it: quoted when it holds whitespace or
+ * starts with a quote, so it reads back as one term. */
+export function quoteValue(value: string): string {
+  if (!/\s/.test(value) && !value.startsWith('"')) return value;
+  return `"${value.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+}
+
+/**
+ * Parse a search string of `kind:`, `queue:`, `tag:`, `cron:`, `reason:`,
+ * `id:`, `created>=` and `created<` terms. `tag:` and `id:` repeat (`id:`
+ * also takes a comma list); for the others the last value wins.
  */
 export function parseSearch(search: string): SearchFilters {
   const filters: SearchFilters = {};
-  const parts = search.trim().split(/\s+/);
-  for (const part of parts) {
-    if (part.startsWith("kind:") && part.length > 5) {
-      filters.kind = part.slice(5);
-    } else if (part.startsWith("queue:") && part.length > 6) {
-      filters.queue = part.slice(6);
-    } else if (part.startsWith("tag:") && part.length > 4) {
-      const tag = part.slice(4);
-      filters.tags = [...(filters.tags ?? []).filter((t) => t !== tag), tag];
-    } else if (part.startsWith("id:") && part.length > 3) {
-      const ids = part
-        .slice(3)
-        .split(",")
-        .filter(isJobId)
-        .map(Number);
-      if (ids.length > 0) {
-        filters.ids = [...new Set([...(filters.ids ?? []), ...ids])];
+  for (const part of splitTerms(search)) {
+    const prefix = filterPrefix(part);
+    if (!prefix) continue;
+    const value = unquote(part.slice(prefix.length));
+    if (!value) continue;
+    switch (prefix) {
+      case "kind:":
+        filters.kind = value;
+        break;
+      case "queue:":
+        filters.queue = value;
+        break;
+      case "tag:":
+        filters.tags = [...(filters.tags ?? []).filter((t) => t !== value), value];
+        break;
+      case "cron:":
+        filters.cron = value;
+        break;
+      case "reason:":
+        filters.reason = value;
+        break;
+      case "id:": {
+        const ids = value.split(",").filter(isJobId).map(Number);
+        if (ids.length > 0) {
+          filters.ids = [...new Set([...(filters.ids ?? []), ...ids])];
+        }
+        break;
       }
-    } else if (part.startsWith("created>=") && part.length > 9) {
-      filters.createdGte = part.slice(9);
-    } else if (part.startsWith("created<") && part.length > 8) {
-      filters.createdLt = part.slice(8);
+      case "created>=":
+        filters.createdGte = value;
+        break;
+      case "created<":
+        filters.createdLt = value;
+        break;
     }
   }
   return filters;
@@ -53,12 +144,15 @@ export function parseSearch(search: string): SearchFilters {
 /** Build a search string from individual filter values. */
 export function buildSearch(filters: SearchFilters): string {
   const parts: string[] = [];
-  if (filters.kind) parts.push(`kind:${filters.kind}`);
-  if (filters.queue) parts.push(`queue:${filters.queue}`);
-  for (const tag of filters.tags ?? []) parts.push(`tag:${tag}`);
+  const add = (prefix: FilterPrefix, value: string) => parts.push(`${prefix}${quoteValue(value)}`);
+  if (filters.kind) add("kind:", filters.kind);
+  if (filters.queue) add("queue:", filters.queue);
+  for (const tag of filters.tags ?? []) add("tag:", tag);
+  if (filters.cron) add("cron:", filters.cron);
+  if (filters.reason) add("reason:", filters.reason);
   for (const id of filters.ids ?? []) parts.push(`id:${id}`);
-  if (filters.createdGte) parts.push(`created>=${filters.createdGte}`);
-  if (filters.createdLt) parts.push(`created<${filters.createdLt}`);
+  if (filters.createdGte) add("created>=", filters.createdGte);
+  if (filters.createdLt) add("created<", filters.createdLt);
   return parts.join(" ");
 }
 
@@ -81,29 +175,32 @@ export interface InvalidTerm {
   error: string;
 }
 
-/** The prefixes a search term can start with. */
-export const FILTER_PREFIXES = ["kind:", "queue:", "tag:", "id:", "created>=", "created<"] as const;
-
-/** The filter prefix `term` starts with, if any. */
-export function filterPrefix(term: string): (typeof FILTER_PREFIXES)[number] | undefined {
-  return FILTER_PREFIXES.find((p) => term.startsWith(p));
+function prefixList(view: SearchView): string {
+  const prefixes = FILTER_PREFIXES.filter((p) => view === "dlq" || p !== "reason:");
+  return `${prefixes.slice(0, -1).join(", ")} or ${prefixes[prefixes.length - 1]}`;
 }
 
 /**
  * The terms of a search, typed or from the URL, that `parseSearch` would
- * drop. Dropping one leaves a wider filter than the one written, so a page
- * must not list, count or act on the search while any remain.
+ * drop, or that `view` can't apply. Dropping one leaves a wider filter than
+ * the one written, so a page must not list, count or act on the search while
+ * any remain.
  */
-export function invalidTerms(search: string): InvalidTerm[] {
+export function invalidTerms(search: string, view: SearchView = "jobs"): InvalidTerm[] {
   const out: InvalidTerm[] = [];
-  for (const term of search.trim().split(/\s+/).filter(Boolean)) {
+  for (const term of splitTerms(search)) {
     const prefix = filterPrefix(term);
-    const value = prefix ? term.slice(prefix.length) : "";
+    const raw = prefix ? term.slice(prefix.length) : "";
+    const value = unquote(raw);
     let error: string | undefined;
     if (!prefix) {
-      error = `${term} isn't a filter; use kind:, queue:, tag:, id:, created>= or created<`;
+      error = `${term} isn't a filter; use ${prefixList(view)}`;
+    } else if (value === undefined) {
+      error = `${prefix} has an unclosed quote; write ${prefix}"two words"`;
     } else if (!value) {
       error = `${prefix} needs a value`;
+    } else if (prefix === "reason:" && view !== "dlq") {
+      error = "reason: filters dead letters; search for it on the Dead letters page";
     } else if (prefix === "id:" && !value.split(",").every(isJobId)) {
       error = "id: takes whole job ids, e.g. id:123 or id:123,456";
     } else if (prefix.startsWith("created") && !toRfc3339(value)) {
@@ -115,13 +212,13 @@ export function invalidTerms(search: string): InvalidTerm[] {
 }
 
 /** Why a search can't be applied as written, or undefined when it can. */
-export function termError(search: string): string | undefined {
-  return invalidTerms(search)[0]?.error;
+export function termError(search: string, view: SearchView = "jobs"): string | undefined {
+  return invalidTerms(search, view)[0]?.error;
 }
 
 /** One removable term: which filter it belongs to, and its value. */
 type Term =
-  | { key: "kind" | "queue" | "createdGte" | "createdLt"; value: string }
+  | { key: "kind" | "queue" | "cron" | "reason" | "createdGte" | "createdLt"; value: string }
   | { key: "tags"; value: string }
   | { key: "ids"; value: number };
 
@@ -135,6 +232,8 @@ function terms(filters: SearchFilters): Term[] {
   if (filters.kind) out.push({ key: "kind", value: filters.kind });
   if (filters.queue) out.push({ key: "queue", value: filters.queue });
   for (const tag of filters.tags ?? []) out.push({ key: "tags", value: tag });
+  if (filters.cron) out.push({ key: "cron", value: filters.cron });
+  if (filters.reason) out.push({ key: "reason", value: filters.reason });
   for (const id of filters.ids ?? []) out.push({ key: "ids", value: id });
   if (filters.createdGte) out.push({ key: "createdGte", value: filters.createdGte });
   if (filters.createdLt) out.push({ key: "createdLt", value: filters.createdLt });
@@ -144,15 +243,15 @@ function terms(filters: SearchFilters): Term[] {
 function termLabel(term: Term): string {
   switch (term.key) {
     case "tags":
-      return `tag:${term.value}`;
+      return `tag:${quoteValue(term.value)}`;
     case "ids":
       return `id:${term.value}`;
     case "createdGte":
-      return `created>=${term.value}`;
+      return `created>=${quoteValue(term.value)}`;
     case "createdLt":
-      return `created<${term.value}`;
+      return `created<${quoteValue(term.value)}`;
     default:
-      return `${term.key}:${term.value}`;
+      return `${term.key}:${quoteValue(term.value)}`;
   }
 }
 
@@ -170,7 +269,7 @@ function withoutTerm(filters: SearchFilters, term: Term): SearchFilters {
   return next;
 }
 
-function mergeFilters(base: SearchFilters, added: SearchFilters): SearchFilters {
+export function mergeFilters(base: SearchFilters, added: SearchFilters): SearchFilters {
   return parseSearch(`${buildSearch(base)} ${buildSearch(added)}`);
 }
 
@@ -185,6 +284,8 @@ interface SearchBarProps {
   onChange: (value: string) => void;
   /** Terms the page fixes, shown as chips that can't be removed. */
   locked?: string[];
+  /** The list the search filters; `reason:` applies only to dead letters. */
+  view?: SearchView;
 }
 
 /**
@@ -192,7 +293,7 @@ interface SearchBarProps {
  * Applied filters appear as removable chips. The text input is for
  * adding new filters only — it clears after each filter is applied.
  */
-export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
+export function SearchBar({ value, onChange, locked = [], view = "jobs" }: SearchBarProps) {
   const [inputValue, setInputValue] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -203,7 +304,7 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
   const activeFilters = parseSearch(value);
   // Kept beside the valid terms, so editing the search never quietly drops
   // one and widens it.
-  const malformed = invalidTerms(value);
+  const malformed = invalidTerms(value, view);
   const withMalformed = useCallback(
     (search: string) => [search, ...malformed.map((m) => m.term)].filter(Boolean).join(" "),
     [malformed]
@@ -221,6 +322,28 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
     queryFn: fetchDistinctQueues,
     staleTime: POLL.SLOW,
     refetchInterval: false,
+  });
+
+  // Schedule names and DLQ reasons are fetched only once a term asks for them.
+  const typed = inputValue.trim();
+  const schedulesQuery = useQuery<string[]>({
+    queryKey: ["search-schedules"],
+    queryFn: async () => (await fetchCronJobs()).map((cron) => cron.name),
+    enabled: typed.startsWith("cron:"),
+    staleTime: POLL.SLOW,
+    refetchInterval: false,
+    retry: false,
+  });
+  const reasonsQuery = useQuery<string[]>({
+    queryKey: ["search-dlq-reasons", activeFilters.queue ?? null, activeFilters.kind ?? null],
+    queryFn: async () => {
+      const groups = await fetchDlqReasons({ queue: activeFilters.queue, kind: activeFilters.kind });
+      return [...new Set((groups ?? []).map((group) => group.reason))];
+    },
+    enabled: view === "dlq" && typed.startsWith("reason:"),
+    staleTime: POLL.SLOW,
+    refetchInterval: false,
+    retry: false,
   });
 
   // Global "/" shortcut to focus search
@@ -260,6 +383,22 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
             results.push({ label: `queue:${queue}`, value: `queue:${queue}` });
           }
         }
+      } else if (trimmed.startsWith("cron:")) {
+        const prefix = trimmed.slice(5).toLowerCase();
+        for (const name of schedulesQuery.data ?? []) {
+          if (name.toLowerCase().includes(prefix)) {
+            const term = `cron:${quoteValue(name)}`;
+            results.push({ label: term, value: term });
+          }
+        }
+      } else if (trimmed.startsWith("reason:")) {
+        const prefix = trimmed.slice(7).toLowerCase();
+        for (const reason of view === "dlq" ? reasonsQuery.data ?? [] : []) {
+          if (reason.toLowerCase().includes(prefix)) {
+            const term = `reason:${quoteValue(reason)}`;
+            results.push({ label: term, value: term });
+          }
+        }
       } else if (
         trimmed.startsWith("tag:") ||
         trimmed.startsWith("id:") ||
@@ -275,6 +414,12 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
           results.push({ label: "queue:<name>", value: "queue:" });
         }
         results.push({ label: "tag:<name>", value: "tag:" });
+        if (!activeFilters.cron) {
+          results.push({ label: "cron:<schedule>", value: "cron:" });
+        }
+        if (view === "dlq" && !activeFilters.reason) {
+          results.push({ label: "reason:<dlq reason>", value: "reason:" });
+        }
         results.push({ label: "id:<job id>", value: "id:" });
         if (!activeFilters.createdGte) {
           results.push({ label: "created>=<date>", value: "created>=" });
@@ -283,8 +428,19 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
 
       return results.slice(0, MAX_SUGGESTIONS);
     },
-    [kindsQuery.data, queuesQuery.data, activeFilters]
+    [kindsQuery.data, queuesQuery.data, schedulesQuery.data, reasonsQuery.data, activeFilters, view]
   );
+
+  // Schedule names and reasons arrive after their term is typed; offer them
+  // once they do, while the input still has focus.
+  useEffect(() => {
+    if (!containerRef.current?.contains(document.activeElement)) return;
+    const suggs = computeSuggestions(inputValue);
+    setSuggestions(suggs);
+    setShowSuggestions(suggs.length > 0);
+    // Only new data should reopen the list, not every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schedulesQuery.data, reasonsQuery.data]);
 
   const handleInputChange = (text: string) => {
     setInputValue(text);
@@ -298,7 +454,7 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
   /** Apply a filter token — merges into existing filters, clears input */
   const applyToken = useCallback(
     (token: string) => {
-      const problem = termError(token);
+      const problem = termError(token, view);
       if (problem) {
         setError(problem);
         setShowSuggestions(false);
@@ -309,7 +465,7 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
       setShowSuggestions(false);
       setSelectedIdx(-1);
     },
-    [activeFilters, onChange, withMalformed]
+    [activeFilters, onChange, withMalformed, view]
   );
 
   /** Remove a single term */
@@ -450,7 +606,11 @@ export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
             setShowSuggestions(suggs.length > 0);
           }}
           onKeyDown={handleKeyDown}
-          placeholder={hasFilters ? "Add filter..." : "Filter by kind:, queue:, tag:, id:, created>= ...  (press /)"}
+          placeholder={
+            hasFilters
+              ? "Add filter..."
+              : `Filter by kind:, queue:, tag:, cron:${view === "dlq" ? ", reason:" : ""}, id:, created>= ...  (press /)`
+          }
           className="min-w-[120px] flex-1 border-0 bg-transparent p-0 text-sm text-fg outline-none placeholder:text-muted-fg"
           aria-label="Search jobs"
           aria-invalid={error ? true : undefined}

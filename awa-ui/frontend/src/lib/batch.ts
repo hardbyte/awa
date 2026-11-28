@@ -26,7 +26,9 @@ export function isNarrowing(filter: BatchOperationFilter): boolean {
       tags.length > 0 ||
       (filter.ids && filter.ids.length > 0) ||
       filter.created_at_gte ||
-      filter.created_at_lt
+      filter.created_at_lt ||
+      filter.cron_name ||
+      filter.dlq_reason
   );
 }
 
@@ -74,6 +76,8 @@ export function describeFilter(
   if (filter.queue) parts.push(`queue ${filter.queue}`);
   if (filter.kind) parts.push(`kind ${filter.kind}`);
   if (filter.tag !== undefined) parts.push(`tagged ${list(filter.tag)}`);
+  if (filter.cron_name) parts.push(`from schedule ${filter.cron_name}`);
+  if (filter.dlq_reason) parts.push(`dead-lettered for "${filter.dlq_reason}"`);
   if (filter.ids && filter.ids.length > 0) parts.push(`id ${list(filter.ids)}`);
   if (filter.created_at_gte) parts.push(`created from ${filter.created_at_gte}`);
   if (filter.created_at_lt) parts.push(`created before ${filter.created_at_lt}`);
@@ -154,6 +158,10 @@ export interface BatchForm {
   state: string;
   createdGte: string;
   createdLt: string;
+  /** The cron schedule that enqueued the jobs. */
+  cronName: string;
+  /** The exact DLQ reason; only the DLQ kinds take it. */
+  dlqReason: string;
   priority: string;
   destinationQueue: string;
   /** move_to_dlq's reason; "" for the server's default. */
@@ -171,8 +179,13 @@ export function splitList(value: string): string[] {
  * Why the form's filter can't be sent: a field that doesn't parse would
  * otherwise be left out, widening the jobs the operation changes.
  */
-export function filterError(form: Pick<BatchForm, "ids" | "createdGte" | "createdLt">): string | null {
+export function filterError(
+  form: Pick<BatchForm, "ids" | "createdGte" | "createdLt"> & Partial<Pick<BatchForm, "opKind" | "dlqReason">>
+): string | null {
   if (!splitList(form.ids).every(isJobId)) return "IDs must be whole job ids";
+  if (form.dlqReason?.trim() && form.opKind && !actsOnDlq(form.opKind)) {
+    return "A DLQ reason matches only dead letters; choose Retry from DLQ or Purge DLQ, or clear it";
+  }
   if (form.createdGte.trim() && !toRfc3339(form.createdGte.trim())) return "Created from is not a date";
   if (form.createdLt.trim() && !toRfc3339(form.createdLt.trim())) return "Created before is not a date";
   return null;
@@ -188,6 +201,8 @@ export function buildFilter(form: BatchForm): BatchOperationFilter {
     states: form.state ? [form.state] : [],
     created_at_gte: toRfc3339(form.createdGte.trim()),
     created_at_lt: toRfc3339(form.createdLt.trim()),
+    cron_name: form.cronName.trim() || undefined,
+    dlq_reason: form.dlqReason.trim() || undefined,
   });
 }
 
@@ -264,6 +279,8 @@ export const BATCH_PREFILL_KEYS = [
   "state",
   "created_at_gte",
   "created_at_lt",
+  "cron_name",
+  "dlq_reason",
 ] as const;
 
 const DEFAULT_OP: BatchOperationKind = "set_priority";
@@ -289,6 +306,8 @@ export function formFromSearch(search: Record<string, unknown>): BatchForm {
     state: kindOption(op).states.includes(state) ? state : "",
     createdGte: searchText(search.created_at_gte),
     createdLt: searchText(search.created_at_lt),
+    cronName: searchText(search.cron_name),
+    dlqReason: searchText(search.dlq_reason),
     priority: search.priority === undefined ? DEFAULT_PRIORITY : searchText(search.priority),
     destinationQueue: searchText(search.destination),
     reason: searchText(search.reason),
@@ -306,6 +325,8 @@ export function searchFromForm(form: BatchForm): Record<string, string> {
     state: form.state,
     created_at_gte: form.createdGte,
     created_at_lt: form.createdLt,
+    cron_name: form.cronName,
+    dlq_reason: form.dlqReason,
     priority: form.priority === DEFAULT_PRIORITY ? "" : form.priority,
     destination: form.destinationQueue,
     reason: form.reason,
@@ -348,6 +369,8 @@ export function filterToSearch(
   if (filter.ids && filter.ids.length > 0) search.ids = filter.ids;
   if (filter.created_at_gte) search.createdGte = filter.created_at_gte;
   if (filter.created_at_lt) search.createdLt = filter.created_at_lt;
+  if (filter.cron_name) search.cron = filter.cron_name;
+  if (filter.dlq_reason) search.reason = filter.dlq_reason;
   return {
     filter: search,
     state: states.length === 1 ? states[0] : undefined,
@@ -454,7 +477,7 @@ export interface BulkContext {
  */
 export function bulkActionReason(kind: BatchOperationKind, context: BulkContext): string | null {
   if (!isNarrowing(context.filter)) {
-    return "Add a queue, kind, tag, id or created bound first: a state alone matches every job in it";
+    return "Add a queue, kind, tag, schedule, id or created bound first: a state alone matches every job in it";
   }
   const option = kindOption(kind);
   const states = context.states ?? [];

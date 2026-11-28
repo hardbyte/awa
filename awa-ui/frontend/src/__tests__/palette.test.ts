@@ -92,4 +92,16 @@ describe("paletteItems", () => {
     expect(paletteSearchProblem("tenant:acme")).toBeUndefined();
     expect(paletteSearchProblem("kind:send_email")).toBeUndefined();
   });
+
+  it("sends a reason: search to the dead letters and a cron: search to the jobs", () => {
+    expect(paletteItems("queue:email reason:poison", data)[0]).toMatchObject({
+      label: "Dead letters matching queue:email reason:poison",
+      target: { to: "/dlq", search: { q: "queue:email reason:poison" } },
+    });
+    expect(paletteItems('kind:report cron:"nightly report"', data)[0]).toMatchObject({
+      target: { to: "/jobs", search: { q: 'kind:report cron:"nightly report"' } },
+    });
+    expect(paletteSearchProblem("reason:poison")).toBeUndefined();
+    expect(paletteSearchProblem('reason:"poison')).toMatch(/unclosed quote/);
+  });
 });

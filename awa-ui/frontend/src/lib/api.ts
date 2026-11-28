@@ -1,4 +1,4 @@
-import { checkedJson, currentReadSignal, ReadProtocolError } from "./observation/read-control.ts";
+import { ApiError, checkedJson, currentReadSignal, ReadProtocolError } from "./observation/read-control.ts";
 /** Typed fetch wrapper for the AWA API. */
 import { apiPath } from "./base-path.ts";
 
@@ -260,6 +260,10 @@ export interface BatchOperationFilter {
   dead_lettered?: boolean;
   created_at_gte?: string;
   created_at_lt?: string;
+  /** The cron schedule that enqueued the job. */
+  cron_name?: string;
+  /** The exact DLQ reason; only dead-lettered jobs have one. */
+  dlq_reason?: string;
 }
 
 export interface BatchOperationPayload {
@@ -368,7 +372,14 @@ export interface JobFilterParams {
   dead_lettered?: boolean;
   created_at_gte?: string;
   created_at_lt?: string;
+  /** The cron schedule that enqueued the job; `cron=` on the wire. */
+  cron_name?: string;
+  /** The exact DLQ reason; `reason=` on the wire. */
+  dlq_reason?: string;
 }
+
+/** Query parameters whose name differs from the filter field. */
+const QUERY_NAMES: Record<string, string> = { tags: "tag", states: "state", cron_name: "cron", dlq_reason: "reason" };
 
 export interface ListJobsParams extends JobFilterParams {
   /** One state; kept for callers that predate `states`. */
@@ -391,11 +402,11 @@ function jobFilterQuery(params: ListJobsParams): URLSearchParams {
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null || v === "") continue;
     if (k === "tags" || k === "states") {
-      for (const item of v as string[]) qs.append(k === "tags" ? "tag" : "state", item);
+      for (const item of v as string[]) qs.append(QUERY_NAMES[k]!, item);
     } else if (k === "ids") {
       if ((v as number[]).length > 0) qs.set("ids", (v as number[]).join(","));
     } else {
-      qs.append(k, String(v));
+      qs.append(QUERY_NAMES[k] ?? k, String(v));
     }
   }
   return qs;
@@ -527,6 +538,39 @@ export function fetchDlq(params: ListDlqParams = {}): Promise<DlqRow[]> {
 
 export function fetchDlqDepth(): Promise<DlqDepthResponse> {
   return apiRead("/dlq/depth");
+}
+
+/** Dead letters sharing a reason, queue and kind. */
+export interface DlqReasonGroup {
+  reason: string;
+  queue: string;
+  kind: string;
+  count: number;
+  /** When the group's earliest row was dead-lettered. */
+  oldest: string;
+  /** When its latest row was. */
+  newest: string;
+}
+
+/**
+ * The DLQ grouped by reason, queue and kind, largest first, or null when
+ * the server has no such endpoint. A server without it answers 404, or 400
+ * where its `/api/dlq/{id}` route reads `reasons` as an id.
+ */
+export async function fetchDlqReasons(
+  params: { queue?: string; kind?: string; limit?: number } = {}
+): Promise<DlqReasonGroup[] | null> {
+  const qs = new URLSearchParams();
+  if (params.queue) qs.set("queue", params.queue);
+  if (params.kind) qs.set("kind", params.kind);
+  if (params.limit !== undefined) qs.set("limit", String(params.limit));
+  const query = qs.toString();
+  try {
+    return await apiRead<DlqReasonGroup[]>(`/dlq/reasons${query ? `?${query}` : ""}`);
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 404 || error.status === 400)) return null;
+    throw error;
+  }
 }
 
 export function fetchDlqJob(id: number): Promise<DlqRow | null> {

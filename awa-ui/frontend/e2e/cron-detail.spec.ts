@@ -63,12 +63,32 @@ test.describe("Schedule page", () => {
     await expect(page.getByTestId("cron-overdue")).toBeVisible();
   });
 
-  test("links the jobs it may have created, saying the link is wider", async ({ page }) => {
+  test("links the jobs of its kind in its queue", async ({ page }) => {
     await serveCron(page, [schedule()]);
     await page.goto(`/cron/${encodeURIComponent("nightly/report run")}`);
     await page.getByRole("link", { name: /Jobs of this kind in this queue/ }).click();
     await page.waitForURL(/\/jobs\?/);
     expect(new URL(page.url()).searchParams.get("q")).toBe("kind:e2e_job queue:e2e_test");
+  });
+
+  test("links the jobs it enqueued, quoting a name with spaces", async ({ page }) => {
+    await serveCron(page, [schedule()]);
+    await page.goto(`/cron/${encodeURIComponent("nightly/report run")}`);
+    await page.getByTestId("cron-jobs-link").click();
+    await page.waitForURL(/\/jobs\?/);
+    expect(new URL(page.url()).searchParams.get("q")).toBe('kind:e2e_job cron:"nightly/report run"');
+    await expect(page.getByText('cron:"nightly/report run"', { exact: true })).toBeVisible();
+  });
+
+  test("its jobs link lists only the jobs the schedule enqueued", async ({ page }) => {
+    await page.goto("/cron/e2e_cron_owner");
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs?") && r.url().includes("cron=e2e_cron_owner") && r.ok()),
+      page.getByRole("link", { name: "Jobs from this schedule" }).click(),
+    ]);
+    expect(new URL(page.url()).searchParams.get("q")).toBe("kind:e2e_job cron:e2e_cron_owner");
+    await expect(page.getByText("#800005").filter({ visible: true }).first()).toBeVisible();
+    await expect(page.getByText("#800006")).toHaveCount(0);
   });
 
   test("retirement is previewed and applied on the page", async ({ page }) => {

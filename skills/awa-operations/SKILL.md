@@ -531,7 +531,10 @@ queries and two reads at once. The UI shows retained data as stale on read
 failure; authentication failures stop retries until an explicit refresh. Hidden
 tabs pause reads and resume with one paced refresh. Selecting jobs pauses that
 list; filtered counts refresh on filter change or explicit refresh, not every
-poll. A pill in the header says how old the page's data is and turns amber
+poll. The search bar takes `cron:<schedule>` and, on dead-letter views,
+`reason:<dlq_reason>` (quote a value with spaces); a schedule's page links to
+its jobs, and the Dead letters page lists the commonest reasons, each linking
+to its filter, when the server has `/api/dlq/reasons`. A pill in the header says how old the page's data is and turns amber
 while some reads fail and red when every read does; the reconciliation interval
 is a scheduling policy, not a data-age SLO. Other processes and workers are observed through ordinary timed reads.
 See [admin observation](../../docs/admin-observation.md) for cache metadata and

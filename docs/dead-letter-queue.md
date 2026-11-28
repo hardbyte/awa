@@ -31,7 +31,7 @@ awa dlq list --kind nightly_report --cron nightly-report
 
 `GET /api/dlq/reasons` groups the DLQ by reason, queue and kind, largest groups first: `[{"reason", "queue", "kind", "count", "oldest", "newest"}]`, where `oldest` and `newest` are the earliest and latest `dlq_at` in the group. `queue=` and `kind=` narrow the rows grouped and `limit=` caps the groups (20 by default, at most 100); other parameters are refused. It reads every matching DLQ row, through the `(queue, dlq_at)` index when `queue=` is given.
 
-The web UI's **Dead letters** page (served by `awa serve`), and the Dead letters tab on each queue, show the same data with filters and per-row drill-down.
+The web UI's **Dead letters** page (served by `awa serve`), and the Dead letters tab on each queue, show the same data with filters and per-row drill-down. Above the list, the Dead letters page shows the most common reasons with their counts, each a link that filters the list with `reason:`.
 
 Each DLQ row carries:
 
