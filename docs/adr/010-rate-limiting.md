@@ -30,7 +30,7 @@ Rate limiting is applied in `poll_once()` after acquiring concurrency permits bu
 ```
 permits = acquire_permits()          // non-blocking
 rate_available = token_bucket.available()
-batch_size = min(permits, rate_available, 10)
+batch_size = min(permits, rate_available, claim_batch_size)
 if batch_size == 0: return           // rate limited, try next poll
 jobs = claim(batch_size)             // DB claim
 token_bucket.consume(jobs.len())
@@ -66,7 +66,7 @@ Build-time validation rejects `max_rate <= 0.0`.
 
 ### Negative
 
-- **Per-worker, not global:** Each worker instance has its own token bucket. With N workers, the effective global rate is `N * max_rate`. This is acceptable for most use cases; global rate limiting would require distributed coordination (Redis, advisory locks).
+- **Per-worker, not global:** Each worker instance has its own token bucket. With N workers, the effective global rate is `N * max_rate`. [ADR-054](054-fleet-rate-limits.md) adds a fleet rate limit that each runtime enforces its share of; this limit keeps its per-runtime meaning.
 - **Approximate under low poll intervals:** The bucket refills on each poll. If `poll_interval` is longer than `1/max_rate`, tokens accumulate between polls and dispatch in bursts equal to the burst size. This is by design — the burst parameter controls this behavior.
 
 ## Relationship to ADR-019

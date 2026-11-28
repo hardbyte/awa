@@ -74,6 +74,17 @@ pub struct RateLimit {
     pub burst: u32,
 }
 
+impl RateLimit {
+    /// The burst, with 0 resolved to `ceil(max_rate)`, at least 1.
+    fn resolved_burst(&self) -> u32 {
+        if self.burst == 0 {
+            (self.max_rate.ceil() as u32).max(1)
+        } else {
+            self.burst
+        }
+    }
+}
+
 /// Internal token bucket state for rate limiting.
 pub(crate) struct TokenBucket {
     tokens: f64,
@@ -84,11 +95,7 @@ pub(crate) struct TokenBucket {
 
 impl TokenBucket {
     fn new(rate_limit: &RateLimit) -> Self {
-        let burst = if rate_limit.burst == 0 {
-            (rate_limit.max_rate.ceil() as u32).max(1)
-        } else {
-            rate_limit.burst
-        };
+        let burst = rate_limit.resolved_burst();
         Self {
             tokens: burst as f64,
             max_tokens: burst as f64,
@@ -115,28 +122,186 @@ impl TokenBucket {
         self.tokens = (self.tokens + n as f64).min(self.max_tokens);
     }
 
-    /// Live retune (ADR-038): change the sustained rate (and derived burst)
-    /// without resetting accumulated tokens beyond the new ceiling. All
-    /// claimers share this bucket through the Arc, so one refresh applies
-    /// queue-wide.
+    /// Live retune (ADR-038): change the sustained rate and burst without
+    /// granting tokens beyond the new ceiling, so a retune never hands out a
+    /// fresh burst.
     pub(crate) fn reconfigure(&mut self, rate_limit: &RateLimit) {
-        let burst = if rate_limit.burst == 0 {
-            (rate_limit.max_rate.ceil() as u32).max(1)
-        } else {
-            rate_limit.burst
-        };
-        self.max_tokens = burst as f64;
+        // Bank what accrued at the old rate before switching rates.
+        self.available();
+        self.max_tokens = rate_limit.resolved_burst() as f64;
         self.tokens = self.tokens.min(self.max_tokens);
         self.refill_rate = rate_limit.max_rate;
     }
 }
 
-pub(crate) fn shared_rate_limiter(config: &QueueConfig) -> Option<Arc<StdMutex<TokenBucket>>> {
-    config
-        .rate_limit
-        .as_ref()
-        .map(TokenBucket::new)
-        .map(|bucket| Arc::new(StdMutex::new(bucket)))
+/// The rate limit one runtime enforces for a queue: the lower of its runtime
+/// limit and its `share` of the fleet limit (ADR-054). A share's burst is
+/// floored at one token, or the bucket could never start a job.
+pub(crate) fn effective_rate_limit(
+    runtime: Option<&RateLimit>,
+    fleet: Option<&RateLimit>,
+    share: f64,
+) -> Option<RateLimit> {
+    let fleet_share = fleet.map(|fleet| RateLimit {
+        max_rate: fleet.max_rate * share,
+        burst: ((fleet.resolved_burst() as f64 * share).ceil() as u32).max(1),
+    });
+    let runtime = runtime.map(|runtime| RateLimit {
+        max_rate: runtime.max_rate,
+        burst: runtime.resolved_burst(),
+    });
+    match (runtime, fleet_share) {
+        (Some(runtime), Some(fleet_share)) => Some(RateLimit {
+            max_rate: runtime.max_rate.min(fleet_share.max_rate),
+            burst: runtime.burst.min(fleet_share.burst),
+        }),
+        (limit, None) | (None, limit) => limit,
+    }
+}
+
+/// A queue's rate limiting in one runtime (ADR-054), shared by its claimers
+/// and read by the runtime snapshot. The bucket is absent while the queue is
+/// unlimited, so an override can enable, retune or remove a limit live.
+pub(crate) struct QueueRateControl {
+    bucket: StdMutex<Option<TokenBucket>>,
+    applied: StdMutex<awa_model::admin::QueueRateControlSnapshot>,
+    /// When a claimer last recomputed the limit, so a queue's claimers
+    /// recompute it once per refresh interval between them.
+    recomputed_at: StdMutex<Option<Instant>>,
+}
+
+impl QueueRateControl {
+    /// The control for a queue at startup: its builder limits, with the
+    /// whole fleet limit until the first refresh computes this runtime's
+    /// share. Dispatchers refresh before their first claim.
+    pub(crate) fn new(config: &QueueConfig, weight: u32) -> Arc<Self> {
+        let effective = effective_rate_limit(
+            config.rate_limit.as_ref(),
+            config.fleet_rate_limit.as_ref(),
+            1.0,
+        );
+        Arc::new(Self {
+            bucket: StdMutex::new(effective.as_ref().map(TokenBucket::new)),
+            applied: StdMutex::new(awa_model::admin::QueueRateControlSnapshot {
+                weight,
+                applied_overrides_revision: 0,
+                fleet_share: config.fleet_rate_limit.as_ref().map(|_| 1.0),
+                effective_rate_limit: effective.as_ref().map(rate_limit_snapshot),
+            }),
+            recomputed_at: StdMutex::new(None),
+        })
+    }
+
+    /// Take up to `wanted` tokens, all of them when the queue is unlimited.
+    fn take(&self, wanted: usize) -> usize {
+        let mut bucket = self.bucket.lock().expect("rate limiter lock poisoned");
+        match bucket.as_mut() {
+            None => wanted,
+            Some(bucket) => {
+                let taken = wanted.min(bucket.available() as usize);
+                if taken > 0 {
+                    bucket.consume(taken as u32);
+                }
+                taken
+            }
+        }
+    }
+
+    fn refund(&self, n: usize) {
+        if let Some(bucket) = self
+            .bucket
+            .lock()
+            .expect("rate limiter lock poisoned")
+            .as_mut()
+        {
+            bucket.refund(n as u32);
+        }
+    }
+
+    /// Whether the limit is due for a recompute, claiming it for the caller.
+    fn claim_recompute(&self, interval: Duration) -> bool {
+        let mut at = self
+            .recomputed_at
+            .lock()
+            .expect("rate control lock poisoned");
+        if at.is_some_and(|at| at.elapsed() < interval) {
+            return false;
+        }
+        *at = Some(Instant::now());
+        true
+    }
+
+    /// Install `effective` as the enforced limit and record what was applied.
+    fn apply(
+        &self,
+        effective: Option<RateLimit>,
+        weight: u32,
+        fleet_share: Option<f64>,
+        revision: i64,
+    ) {
+        {
+            let mut bucket = self.bucket.lock().expect("rate limiter lock poisoned");
+            match (bucket.as_mut(), effective.as_ref()) {
+                (Some(current), Some(limit)) => current.reconfigure(limit),
+                (None, Some(limit)) => *bucket = Some(TokenBucket::new(limit)),
+                (_, None) => *bucket = None,
+            }
+        }
+        *self.applied.lock().expect("rate control lock poisoned") =
+            awa_model::admin::QueueRateControlSnapshot {
+                weight,
+                applied_overrides_revision: revision,
+                fleet_share,
+                effective_rate_limit: effective.as_ref().map(rate_limit_snapshot),
+            };
+    }
+
+    #[cfg(test)]
+    fn available_tokens(&self) -> Option<u32> {
+        self.bucket
+            .lock()
+            .expect("rate limiter lock poisoned")
+            .as_mut()
+            .map(TokenBucket::available)
+    }
+
+    /// What this runtime applied, for its snapshot.
+    pub(crate) fn snapshot(&self) -> awa_model::admin::QueueRateControlSnapshot {
+        self.applied
+            .lock()
+            .expect("rate control lock poisoned")
+            .clone()
+    }
+}
+
+fn rate_limit_snapshot(limit: &RateLimit) -> awa_model::admin::RateLimitSnapshot {
+    awa_model::admin::RateLimitSnapshot {
+        max_rate: limit.max_rate,
+        burst: limit.resolved_burst(),
+    }
+}
+
+/// A limit with its override applied: an overridden rate replaces the
+/// builder's rate, and its burst comes from the burst override, or is derived
+/// from the overridden rate. A rate override enables a limit the builder did
+/// not configure.
+fn override_rate_limit(
+    base: Option<&RateLimit>,
+    rate: Option<f64>,
+    burst: Option<i32>,
+) -> Option<RateLimit> {
+    let burst_override = burst.map(|burst| burst.max(1) as u32);
+    match (rate, base) {
+        (Some(max_rate), _) => Some(RateLimit {
+            max_rate,
+            burst: burst_override.unwrap_or(0),
+        }),
+        (None, Some(base)) => Some(RateLimit {
+            max_rate: base.max_rate,
+            burst: burst_override.unwrap_or(base.burst),
+        }),
+        (None, None) => None,
+    }
 }
 
 /// Configuration for a single queue.
@@ -146,8 +311,13 @@ pub struct QueueConfig {
     pub poll_interval: Duration,
     pub deadline_duration: Duration,
     pub priority_aging_interval: Duration,
-    /// Optional rate limit for this queue. None means unlimited.
+    /// Optional rate limit for this queue in this runtime (ADR-010). None
+    /// means unlimited.
     pub rate_limit: Option<RateLimit>,
+    /// Optional rate limit across every live runtime serving this queue
+    /// (ADR-054). Each runtime enforces its share, weighted by its worker
+    /// capacity for the queue. None means no fleet limit.
+    pub fleet_rate_limit: Option<RateLimit>,
     /// Minimum guaranteed workers in weighted mode (default: 0).
     pub min_workers: u32,
     /// Weight for overflow allocation in weighted mode (default: 1).
@@ -170,6 +340,7 @@ impl Default for QueueConfig {
             deadline_duration: Duration::from_secs(300), // 5 minutes
             priority_aging_interval: Duration::from_secs(60),
             rate_limit: None,
+            fleet_rate_limit: None,
             min_workers: 0,
             weight: 1,
             claimers: 1,
@@ -354,13 +525,14 @@ pub struct Dispatcher {
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
     job_set: Arc<Mutex<JoinSet<()>>>,
-    rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
+    rate_control: Arc<QueueRateControl>,
     /// Builder-configured baseline for the hot-reloadable knobs (ADR-038):
     /// a NULL override reverts to these.
     base_poll_interval: Duration,
     base_claim_batch_size: usize,
     base_deadline_duration: Duration,
     base_rate_limit: Option<RateLimit>,
+    base_fleet_rate_limit: Option<RateLimit>,
     overrides_refreshed_at: Option<Instant>,
     applied_overrides: awa_model::admin::QueueRuntimeOverrides,
     storage: RuntimeStorage,
@@ -398,7 +570,7 @@ impl Dispatcher {
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
         concurrency: ConcurrencyMode,
-        rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
+        rate_control: Arc<QueueRateControl>,
         capacity_wake: Arc<Notify>,
         notify_wake: Option<Arc<Notify>>,
         claim_gate: Arc<Semaphore>,
@@ -412,6 +584,7 @@ impl Dispatcher {
             base_claim_batch_size: config.claim_batch_size,
             base_deadline_duration: config.deadline_duration,
             base_rate_limit: config.rate_limit.clone(),
+            base_fleet_rate_limit: config.fleet_rate_limit.clone(),
             config,
             pool,
             executor,
@@ -421,7 +594,7 @@ impl Dispatcher {
             alive,
             cancel,
             job_set,
-            rate_limiter,
+            rate_control,
             overrides_refreshed_at: None,
             applied_overrides: awa_model::admin::QueueRuntimeOverrides::default(),
             storage,
@@ -592,21 +765,16 @@ impl Dispatcher {
         if n == 0 {
             return;
         }
-        if let Some(rate_limiter) = &self.rate_limiter {
-            let mut rate_limiter = rate_limiter.lock().expect("rate limiter lock poisoned");
-            rate_limiter.refund(n as u32);
-        }
+        self.rate_control.refund(n);
     }
 
-    /// Drain immediately available work after a wake-up until the queue is empty,
-    /// capacity is exhausted, rate limiting stops us, or shutdown is requested.
     /// ADR-038 hot reload: apply per-queue overrides from `queue_meta` on a
     /// slow cadence. NULL (or a missing row) reverts each knob to its
-    /// builder-configured baseline. Two guard rails: a rate-limit override
-    /// only retunes an existing limiter (enabling limiting on an unlimited
-    /// queue live is Tier 2), and a deadline override never crosses the
+    /// builder-configured baseline. A deadline override never crosses the
     /// zero boundary — receipts-vs-legacy claim mode is chosen by
-    /// zero/non-zero deadline and must stay stable while running.
+    /// zero/non-zero deadline and must stay stable while running. Rate
+    /// limits are recomputed on the same cadence (ADR-054), since a
+    /// runtime's share of a fleet limit moves as runtimes join and leave.
     async fn refresh_runtime_overrides(&mut self) {
         let due = self
             .overrides_refreshed_at
@@ -616,9 +784,9 @@ impl Dispatcher {
         }
         self.overrides_refreshed_at = Some(Instant::now());
 
-        let overrides =
-            match awa_model::admin::queue_runtime_overrides(&self.pool, &self.queue).await {
-                Ok(overrides) => overrides.unwrap_or_default(),
+        let state =
+            match awa_model::admin::queue_runtime_override_state(&self.pool, &self.queue).await {
+                Ok(state) => state.unwrap_or_default(),
                 Err(err) => {
                     debug!(
                         queue = %self.queue,
@@ -629,6 +797,18 @@ impl Dispatcher {
                     return;
                 }
             };
+        let overrides = state.overrides;
+
+        // A queue's claimers share one rate control: whichever refreshes
+        // first recomputes it, and an override change always does.
+        if self
+            .rate_control
+            .claim_recompute(override_refresh_interval() / 2)
+            || overrides != self.applied_overrides
+        {
+            self.refresh_rate_limit(&overrides, state.revision).await;
+        }
+
         if overrides == self.applied_overrides {
             return;
         }
@@ -661,34 +841,73 @@ impl Dispatcher {
             }
         }
 
-        match (&self.rate_limiter, &self.base_rate_limit) {
-            (Some(limiter), Some(base)) => {
-                let effective = RateLimit {
-                    max_rate: overrides.rate_limit.unwrap_or(base.max_rate),
-                    burst: if overrides.rate_limit.is_some() {
-                        0 // derive burst from the overridden rate
-                    } else {
-                        base.burst
-                    },
-                };
-                limiter
-                    .lock()
-                    .expect("rate limiter mutex poisoned")
-                    .reconfigure(&effective);
-            }
-            _ if overrides.rate_limit.is_some() => {
-                warn!(
-                    queue = %self.queue,
-                    messaging.destination.name = %self.queue,
-                    "Ignoring rate-limit override: queue was built without a rate \
-                     limit (enabling limiting live is Tier 2)"
-                );
-            }
-            _ => {}
-        }
-
-        info!(queue = %self.queue, messaging.destination.name = %self.queue, ?overrides, "Applied queue runtime overrides");
+        info!(
+            queue = %self.queue,
+            messaging.destination.name = %self.queue,
+            ?overrides,
+            revision = state.revision,
+            "Applied queue runtime overrides"
+        );
         self.applied_overrides = overrides;
+    }
+
+    /// Recompute the rate this runtime enforces from the overrides, the
+    /// builder limits and, under a fleet limit, this runtime's share of it.
+    /// If the share cannot be read, the previous limit stays in force.
+    async fn refresh_rate_limit(
+        &self,
+        overrides: &awa_model::admin::QueueRuntimeOverrides,
+        revision: i64,
+    ) {
+        let runtime = override_rate_limit(
+            self.base_rate_limit.as_ref(),
+            overrides.rate_limit,
+            overrides.rate_burst,
+        );
+        let fleet = override_rate_limit(
+            self.base_fleet_rate_limit.as_ref(),
+            overrides.fleet_rate_limit,
+            overrides.fleet_rate_burst,
+        );
+        let weight = self.rate_weight();
+        let fleet_share = match &fleet {
+            None => None,
+            Some(_) => match awa_model::admin::live_queue_rate_weights(
+                &self.pool,
+                &self.queue,
+                self.runtime_instance_id,
+            )
+            .await
+            {
+                Ok(others) => Some(awa_model::admin::fleet_rate_share(weight, others)),
+                Err(err) => {
+                    debug!(
+                        queue = %self.queue,
+                        messaging.destination.name = %self.queue,
+                        error = %err,
+                        "Fleet share refresh failed; keeping the current rate limit"
+                    );
+                    return;
+                }
+            },
+        };
+        let effective =
+            effective_rate_limit(runtime.as_ref(), fleet.as_ref(), fleet_share.unwrap_or(1.0));
+        self.rate_control
+            .apply(effective, weight, fleet_share, revision);
+    }
+
+    /// This runtime's worker capacity for the queue, its weight in a fleet
+    /// limit's share: `max_workers` when hard-reserved, `min_workers` plus
+    /// the overflow pool when weighted.
+    fn rate_weight(&self) -> u32 {
+        match &self.concurrency {
+            ConcurrencyMode::HardReserved { .. } => self.config.max_workers,
+            ConcurrencyMode::Weighted { overflow_pool, .. } => self
+                .config
+                .min_workers
+                .saturating_add(overflow_pool.total()),
+        }
     }
 
     /// Returns whether any job was claimed.
@@ -750,20 +969,9 @@ impl Dispatcher {
         }
 
         // Phase 2: Apply rate limit
-        let batch_size = if let Some(rate_limiter) = &self.rate_limiter {
-            let mut rate_limiter = rate_limiter.lock().expect("rate limiter lock poisoned");
-            let rate_available = rate_limiter.available() as usize;
-            let batch_size = permits
-                .len()
-                .min(rate_available)
-                .min(self.config.claim_batch_size);
-            if batch_size > 0 {
-                rate_limiter.consume(batch_size as u32);
-            }
-            batch_size
-        } else {
-            permits.len().min(self.config.claim_batch_size)
-        };
+        let batch_size = self
+            .rate_control
+            .take(permits.len().min(self.config.claim_batch_size));
         if batch_size == 0 {
             // Drop all permits — rate limited
             if let Some((reason, _)) = wake_context {
@@ -1099,7 +1307,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let rate_limiter = shared_rate_limiter(&config);
+        let rate_control = QueueRateControl::new(&config, config.max_workers);
         let capacity = Arc::new(Semaphore::new(1));
         let cancel = CancellationToken::new();
         let dispatcher = Dispatcher::with_concurrency(
@@ -1116,7 +1324,7 @@ mod tests {
             ConcurrencyMode::HardReserved {
                 semaphore: capacity.clone(),
             },
-            rate_limiter,
+            rate_control,
             Arc::new(Notify::new()),
             None,
             Arc::new(Semaphore::new(0)),
@@ -1144,16 +1352,7 @@ mod tests {
                 .unwrap());
         }
         assert_eq!(capacity.available_permits(), 1);
-        assert_eq!(
-            dispatcher
-                .rate_limiter
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .available(),
-            1
-        );
+        assert_eq!(dispatcher.rate_control.available_tokens().unwrap(), 1);
         assert!(dispatcher.job_set.lock().await.is_empty());
         // Cancellation wins even if a gate permit becomes available concurrently.
         dispatcher.claim_gate.add_permits(1);
@@ -1259,16 +1458,7 @@ mod tests {
                 .unwrap());
         }
         assert_eq!(capacity.available_permits(), 1);
-        assert_eq!(
-            dispatcher
-                .rate_limiter
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .available(),
-            1
-        );
+        assert_eq!(dispatcher.rate_control.available_tokens().unwrap(), 1);
         let claimed = store
             .claim_runtime_batch(&pool, "blocked", 10, Duration::from_secs(60))
             .await
@@ -1301,16 +1491,7 @@ mod tests {
                 .unwrap());
         }
         assert_eq!(capacity.available_permits(), 1);
-        assert_eq!(
-            dispatcher
-                .rate_limiter
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .available(),
-            1
-        );
+        assert_eq!(dispatcher.rate_control.available_tokens().unwrap(), 1);
         assert_eq!(dispatcher.claim_gate.available_permits(), 0);
     }
 
@@ -1360,6 +1541,78 @@ mod tests {
         .unwrap();
         finish_tx.send(()).unwrap();
         task.await.unwrap();
+    }
+
+    fn limit(max_rate: f64, burst: u32) -> RateLimit {
+        RateLimit { max_rate, burst }
+    }
+
+    #[test]
+    fn a_fleet_share_takes_the_lower_rate_and_floors_its_burst_at_one() {
+        // A quarter of 40/s with burst 40: 10/s, burst 10.
+        let share = effective_rate_limit(None, Some(&limit(40.0, 0)), 0.25).unwrap();
+        assert_eq!((share.max_rate, share.burst), (10.0, 10));
+        // A runtime limit below the share wins, with its own burst.
+        let both = effective_rate_limit(Some(&limit(4.0, 2)), Some(&limit(40.0, 0)), 0.25).unwrap();
+        assert_eq!((both.max_rate, both.burst), (4.0, 2));
+        // A tiny share still holds one whole token.
+        let tiny = effective_rate_limit(None, Some(&limit(1.0, 1)), 0.01).unwrap();
+        assert_eq!((tiny.max_rate, tiny.burst), (0.01, 1));
+        assert!(effective_rate_limit(None, None, 0.5).is_none());
+        let runtime_only = effective_rate_limit(Some(&limit(3.0, 0)), None, 0.5).unwrap();
+        assert_eq!((runtime_only.max_rate, runtime_only.burst), (3.0, 3));
+    }
+
+    #[test]
+    fn a_rate_override_enables_retunes_and_takes_its_own_burst() {
+        // No builder limit: an override enables one, burst derived.
+        let enabled = override_rate_limit(None, Some(5.0), None).unwrap();
+        assert_eq!((enabled.max_rate, enabled.resolved_burst()), (5.0, 5));
+        // An overridden rate derives its burst unless the burst is overridden.
+        let base = limit(10.0, 30);
+        let retuned = override_rate_limit(Some(&base), Some(2.0), None).unwrap();
+        assert_eq!(retuned.resolved_burst(), 2);
+        let with_burst = override_rate_limit(Some(&base), Some(2.0), Some(8)).unwrap();
+        assert_eq!(with_burst.resolved_burst(), 8);
+        // A burst override alone keeps the builder rate.
+        let burst_only = override_rate_limit(Some(&base), None, Some(4)).unwrap();
+        assert_eq!((burst_only.max_rate, burst_only.burst), (10.0, 4));
+        assert!(override_rate_limit(None, None, Some(4)).is_none());
+    }
+
+    #[test]
+    fn rate_control_enables_retunes_without_a_fresh_burst_and_removes() {
+        let control = QueueRateControl::new(&QueueConfig::default(), 50);
+        assert_eq!(control.available_tokens(), None, "built unlimited");
+        assert_eq!(control.take(7), 7);
+
+        control.apply(Some(limit(0.001, 3)), 50, None, 1);
+        assert_eq!(
+            control.take(10),
+            3,
+            "an enabled limit starts with its burst"
+        );
+        assert_eq!(control.take(1), 0);
+
+        control.apply(Some(limit(0.001, 20)), 50, Some(0.5), 2);
+        assert_eq!(control.take(10), 0, "a retune grants no fresh burst");
+        let applied = control.snapshot();
+        assert_eq!(applied.applied_overrides_revision, 2);
+        assert_eq!(applied.fleet_share, Some(0.5));
+        assert_eq!(applied.effective_rate_limit.unwrap().burst, 20);
+
+        control.apply(None, 50, None, 3);
+        assert_eq!(control.take(9), 9, "a cleared limit is unlimited again");
+        assert!(control.snapshot().effective_rate_limit.is_none());
+    }
+
+    #[test]
+    fn a_queues_claimers_recompute_its_rate_once_per_interval() {
+        let control = QueueRateControl::new(&QueueConfig::default(), 1);
+        let interval = Duration::from_secs(60);
+        assert!(control.claim_recompute(interval));
+        assert!(!control.claim_recompute(interval));
+        assert!(control.claim_recompute(Duration::ZERO));
     }
 
     #[test]
@@ -1515,6 +1768,7 @@ mod tests {
             ..Default::default()
         };
         let job_set = Arc::new(Mutex::new(JoinSet::new()));
+        let rate_control = QueueRateControl::new(&config, config.max_workers);
         let dispatcher = Dispatcher::with_concurrency(
             queue.into(),
             Uuid::new_v4(),
@@ -1529,7 +1783,7 @@ mod tests {
             ConcurrencyMode::HardReserved {
                 semaphore: Arc::new(Semaphore::new(jobs)),
             },
-            None,
+            rate_control,
             Arc::new(Notify::new()),
             None,
             Arc::new(Semaphore::new(1)),

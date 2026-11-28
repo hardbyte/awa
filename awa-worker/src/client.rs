@@ -1,7 +1,5 @@
 use crate::completion::CompletionBatcher;
-use crate::dispatcher::{
-    shared_rate_limiter, ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig,
-};
+use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig, QueueRateControl};
 use crate::events::{BoxedUntypedEventHandler, JobEvent, UntypedJobEvent};
 use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, Worker};
 use crate::health_server::{self, HealthProbe};
@@ -1205,7 +1203,10 @@ impl ClientBuilder {
 
         // Validate rate limits and weights
         for (_, config) in &self.queues {
-            if let Some(rl) = &config.rate_limit {
+            for rl in [&config.rate_limit, &config.fleet_rate_limit]
+                .into_iter()
+                .flatten()
+            {
                 if rl.max_rate <= 0.0 {
                     return Err(BuildError::InvalidRateLimit);
                 }
@@ -1291,6 +1292,15 @@ impl ClientBuilder {
                 .map(|(name, _)| (name.clone(), Arc::new(AtomicBool::new(false))))
                 .collect(),
         );
+        let queue_rate_controls = Arc::new(
+            self.queues
+                .iter()
+                .map(|(name, config)| {
+                    let weight = queue_worker_capacity(config, overflow_pool.as_deref());
+                    (name.clone(), QueueRateControl::new(config, weight))
+                })
+                .collect(),
+        );
         let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides)
             .with_queue_stripe_count(
                 self.storage
@@ -1347,6 +1357,7 @@ impl ClientBuilder {
             in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
             dispatcher_alive,
+            queue_rate_controls,
             heartbeat_alive: Arc::new(AtomicBool::new(false)),
             maintenance_alive: Arc::new(AtomicBool::new(false)),
             leader: Arc::new(AtomicBool::new(false)),
@@ -1455,6 +1466,9 @@ pub struct Client {
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
+    /// Each queue's rate limiting (ADR-054), shared by its claimers and
+    /// read by the runtime snapshot.
+    queue_rate_controls: Arc<HashMap<String, Arc<QueueRateControl>>>,
     heartbeat_alive: Arc<AtomicBool>,
     maintenance_alive: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
@@ -1506,6 +1520,9 @@ struct RuntimeReporterState {
     worker_kinds: Vec<String>,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
+    /// Each queue's rate limiting (ADR-054), shared by its claimers and
+    /// read by the runtime snapshot.
+    queue_rate_controls: Arc<HashMap<String, Arc<QueueRateControl>>>,
     heartbeat_alive: Arc<AtomicBool>,
     maintenance_alive: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
@@ -1759,6 +1776,7 @@ impl Client {
             worker_kinds: self.workers.keys().cloned().collect(),
             queue_in_flight: self.queue_in_flight.clone(),
             dispatcher_alive: self.dispatcher_alive.clone(),
+            queue_rate_controls: self.queue_rate_controls.clone(),
             heartbeat_alive: self.heartbeat_alive.clone(),
             maintenance_alive: self.maintenance_alive.clone(),
             leader: self.leader.clone(),
@@ -2177,7 +2195,16 @@ impl Client {
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
             let claimers = usize::from(config.claimers.max(1));
             let capacity_wake = Arc::new(tokio::sync::Notify::new());
-            let rate_limiter = shared_rate_limiter(config);
+            let rate_control = self
+                .queue_rate_controls
+                .get(queue_name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    QueueRateControl::new(
+                        config,
+                        queue_worker_capacity(config, self.overflow_pool.as_deref()),
+                    )
+                });
 
             let hard_reserved = self
                 .overflow_pool
@@ -2226,7 +2253,7 @@ impl Client {
                     self.dispatch_cancel.clone(),
                     self.job_set.clone(),
                     concurrency,
-                    rate_limiter.clone(),
+                    rate_control.clone(),
                     capacity_wake.clone(),
                     notify_wake.clone(),
                     claim_gate.clone(),
@@ -2882,7 +2909,18 @@ impl RuntimeReporterState {
                     max_rate: rl.max_rate,
                     burst: rl.burst,
                 }),
+                fleet_rate_limit: config
+                    .fleet_rate_limit
+                    .as_ref()
+                    .map(|rl| RateLimitSnapshot {
+                        max_rate: rl.max_rate,
+                        burst: rl.burst,
+                    }),
             },
+            rate_control: self
+                .queue_rate_controls
+                .get(queue)
+                .map(|control| control.snapshot()),
         }
     }
 
