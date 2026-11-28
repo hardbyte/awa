@@ -120,6 +120,43 @@ test.describe("Failed reads are not shown as empty", () => {
   });
 });
 
+test.describe("Batch operation progress", () => {
+  test("a fully skipped operation does not read as a success", async ({ page }) => {
+    await page.route("**/api/batch-ops*", (route) => {
+      const url = new URL(route.request().url());
+      if (route.request().method() !== "GET" || url.pathname !== "/api/batch-ops") return route.fallback();
+      return route.fulfill({
+        json: [
+          batchOperation(),
+          batchOperation({
+            id: "33333333-3333-4333-8333-333333333333",
+            op_kind: "retry_from_dlq",
+            state: "failed",
+            total_matched: 1250,
+            processed: 400,
+            skipped: 12,
+            last_error: "chunk 5 failed: canceling statement due to statement timeout",
+          }),
+        ],
+      });
+    });
+    await page.goto("/batch-ops");
+    const grid = page.getByRole("grid", { name: "Batch operations" });
+    for (const header of ["Processed", "Skipped", "Errors"]) {
+      await expect(grid.getByRole("columnheader", { name: header, exact: true })).toBeVisible();
+    }
+    const skippedRow = grid.getByRole("row").filter({ hasText: "22222222" });
+    await expect(skippedRow.getByTestId("batch-op-changed-nothing")).toHaveText("No jobs changed");
+    await expect(skippedRow.getByRole("gridcell").nth(4)).toHaveText("0");
+    await expect(skippedRow.getByRole("gridcell").nth(5)).toHaveText("3,000");
+
+    const failedRow = grid.getByRole("row").filter({ hasText: "33333333" });
+    await expect(failedRow.getByTestId("batch-op-last-error")).toHaveText(
+      "chunk 5 failed: canceling statement due to statement timeout"
+    );
+  });
+});
+
 test.describe("Not-found detail pages", () => {
   for (const { path, title, back } of [
     { path: "/jobs/999999999", title: "Job #999999999 not found", back: "Back to jobs" },
