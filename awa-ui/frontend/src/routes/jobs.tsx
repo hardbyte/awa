@@ -580,7 +580,7 @@ export function JobsPage() {
             setSelected(new Set(keys as Set<number>));
           }
         }}
-        className="hidden sm:table"
+        className="hidden sm:block"
       >
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>

@@ -303,7 +303,7 @@ export function DashboardPage() {
           )}
 
           {/* Desktop runtime table */}
-          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+          <Table bleed aria-label="Runtime instances" className="hidden sm:block">
             <TableHeader>
               <TableColumn isRowHeader>Instance</TableColumn>
               <TableColumn>Health</TableColumn>

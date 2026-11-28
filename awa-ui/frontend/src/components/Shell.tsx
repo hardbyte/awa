@@ -227,7 +227,9 @@ function useSidebarOpenState(): [boolean, (value: boolean) => void] {
   return [open, setOpen];
 }
 
-// Closes the mobile sidebar sheet on route change. No-op on desktop.
+// Closes the mobile sidebar sheet on route change. No-op on desktop. Must be
+// rendered outside <Sidebar>: on mobile the sidebar's children mount only
+// when the sheet opens, so the effect would close it on that first mount.
 function CloseMobileOnNavigate({ path }: { path: string }) {
   const { isMobile, isOpenOnMobile, setIsOpenOnMobile } = useSidebar();
   useEffect(() => {
@@ -421,6 +423,7 @@ export function Shell() {
       onOpenChange={setSidebarOpen}
       style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}
     >
+      <CloseMobileOnNavigate path={currentPath} />
       <Sidebar collapsible="dock">
         <SidebarHeader>
           <AriaLink
@@ -458,7 +461,6 @@ export function Shell() {
             />
           </div>
         </SidebarFooter>
-        <CloseMobileOnNavigate path={currentPath} />
       </Sidebar>
 
       <SidebarInset>

@@ -146,7 +146,7 @@ export function KindsPage() {
         </div>
       )}
 
-      <Table aria-label="Job kinds" className="hidden sm:table">
+      <Table aria-label="Job kinds" className="hidden sm:block">
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn className="text-right">Jobs</TableColumn>

@@ -394,7 +394,7 @@ export function RuntimePage() {
               ))}
             </div>
           )}
-          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+          <Table bleed aria-label="Runtime instances" className="hidden sm:block">
             <TableHeader>
               <TableColumn isRowHeader>Instance</TableColumn>
               <TableColumn>Health</TableColumn>
@@ -610,7 +610,7 @@ export function RuntimePage() {
               ))}
             </div>
           )}
-          <Table bleed aria-label="Queue runtime summary" className="hidden sm:table">
+          <Table bleed aria-label="Queue runtime summary" className="hidden sm:block">
             <TableHeader>
               <TableColumn isRowHeader>Queue</TableColumn>
               <TableColumn>Mode</TableColumn>
