@@ -388,4 +388,56 @@ test.describe("Bulk operations history", () => {
     await expect(page).toHaveURL(/\/batch-ops\/11111111-1111-4111-8111-111111111111$/);
     await expect(page.getByTestId("batch-op-outcome")).toHaveText("2 changed, 0 skipped");
   });
+
+  test("pages to older operations by submitted time and id, and back", async ({ page }) => {
+    const base = Date.parse("2026-03-01T12:00:00Z");
+    const newest = Array.from({ length: 50 }, (_, n) =>
+      operation({
+        id: `aaaaaaaa-0000-4000-8000-${String(n).padStart(12, "0")}`,
+        state: "completed",
+        submitted_at: new Date(base - n * 60_000).toISOString(),
+      })
+    );
+    const older = [
+      operation({ id: "bbbbbbbb-0000-4000-8000-000000000001", state: "completed", submitted_at: new Date(base - 3_600_000).toISOString() }),
+    ];
+    const cursors: Array<string | null> = [];
+    await stubSharedApi(page, newest);
+    await page.route("**/api/batch-ops*", (route) => {
+      const url = new URL(route.request().url());
+      if (route.request().method() !== "GET" || url.pathname !== "/api/batch-ops") return route.fallback();
+      const at = url.searchParams.get("before_submitted_at");
+      const id = url.searchParams.get("before_id");
+      cursors.push(at && id ? `${at}|${id}` : null);
+      return route.fulfill({ json: at && id ? older : newest });
+    });
+
+    await page.goto("/batch-ops");
+    const paging = page.getByTestId("batch-ops-paging");
+    await expect(paging).toContainText("Showing the 50 most recent operations.");
+    await expect(paging.getByRole("button", { name: "Newest operations" })).toHaveCount(0);
+    await paging.getByRole("button", { name: "Older operations" }).click();
+
+    const last = newest[49]!;
+    await expect(page).toHaveURL((url) =>
+      url.searchParams.get("before_id") === last.id && url.searchParams.get("before_submitted_at") === last.submitted_at
+    );
+    await expect(page.getByRole("link", { name: "bbbbbbbb" }).last()).toBeVisible();
+    await expect(page.getByRole("link", { name: "aaaaaaaa" })).toHaveCount(0);
+    expect(cursors).toContain(`${last.submitted_at}|${last.id}`);
+    // A short page is the last one.
+    await expect(paging.getByRole("button", { name: "Older operations" })).toHaveCount(0);
+
+    await paging.getByRole("button", { name: "Newest operations" }).click();
+    await expect(page).toHaveURL(/\/batch-ops$/);
+    await expect(paging).toContainText("Showing the 50 most recent operations.");
+  });
+
+  test("an older page with no operations says so", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.goto("/batch-ops?before_submitted_at=2026-01-01T00%3A00%3A00Z&before_id=cccccccc-0000-4000-8000-000000000000");
+    await expect(page.getByText("No older operations.")).toBeVisible();
+    await page.getByRole("button", { name: "Newest operations" }).click();
+    await expect(page.getByText("No batch operations yet.")).toBeVisible();
+  });
 });

@@ -740,7 +740,10 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
                 $1::text[], $2::smallint[], $3::smallint[], $4::bigint[], $5::bigint[]
             ) AS captured(queue, priority, enqueue_shard, claim_seq, next_seq)
         )
-            SELECT lane.kind, heads.queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            SELECT
+                lane.kind, heads.queue, count(*)::bigint AS n, 0::bigint AS n_recent,
+                count(*)::bigint AS available, 0::bigint AS retryable, 0::bigint AS running,
+                0::bigint AS failed, 0::bigint AS dead_lettered
             FROM heads
             CROSS JOIN LATERAL (
                 {available}
@@ -750,7 +753,11 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
         ),
         KindCountSource::Leased => format!(
             r#"
-            SELECT ready.kind, leases.queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            SELECT
+                ready.kind, leases.queue, count(*)::bigint AS n, 0::bigint AS n_recent,
+                0::bigint AS available, 0::bigint AS retryable,
+                count(*) FILTER (WHERE leases.state = 'running')::bigint AS running,
+                0::bigint AS failed, 0::bigint AS dead_lettered
             FROM {schema}.leases AS leases
             JOIN {schema}.ready_entries AS ready
               ON ready.ready_slot = leases.ready_slot
@@ -777,7 +784,11 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
         ),
         KindCountSource::Deferred => format!(
             r#"
-            SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            SELECT
+                kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent,
+                0::bigint AS available,
+                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
+                0::bigint AS running, 0::bigint AS failed, 0::bigint AS dead_lettered
             FROM {schema}.deferred_jobs
             GROUP BY kind, queue
             "#
@@ -791,7 +802,10 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
                 count(*) FILTER (
                     WHERE state = 'completed'
                       AND finalized_at > clock_timestamp() - interval '1 hour'
-                )::bigint AS n_recent
+                )::bigint AS n_recent,
+                0::bigint AS available, 0::bigint AS retryable, 0::bigint AS running,
+                count(*) FILTER (WHERE state = 'failed')::bigint AS failed,
+                0::bigint AS dead_lettered
             FROM {schema}.done_entries
             GROUP BY kind, queue
             "#
@@ -804,7 +818,9 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
                 count(*)::bigint AS n,
                 count(*) FILTER (
                     WHERE batch.finalized_at > clock_timestamp() - interval '1 hour'
-                )::bigint AS n_recent
+                )::bigint AS n_recent,
+                0::bigint AS available, 0::bigint AS retryable, 0::bigint AS running,
+                0::bigint AS failed, 0::bigint AS dead_lettered
             FROM {schema}.receipt_completion_batches AS batch
             CROSS JOIN LATERAL unnest(
                 batch.job_ids,
@@ -837,7 +853,10 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
         ),
         KindCountSource::Dlq => format!(
             r#"
-            SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            SELECT
+                kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent,
+                0::bigint AS available, 0::bigint AS retryable, 0::bigint AS running,
+                0::bigint AS failed, count(*)::bigint AS dead_lettered
             FROM {schema}.dlq_entries
             GROUP BY kind, queue
             "#
@@ -845,13 +864,38 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
     }
 }
 
+/// One read source's counts for a (kind, queue) pair: `n` jobs of any state,
+/// `n_recent` completions in the last hour, and the jobs in each state the
+/// kinds page breaks out. `failed` excludes dead letters, which are
+/// `dead_lettered`.
+#[derive(Debug, sqlx::FromRow)]
+struct KindQueueCounts {
+    kind: String,
+    queue: String,
+    n: i64,
+    n_recent: i64,
+    available: i64,
+    retryable: i64,
+    running: i64,
+    failed: i64,
+    dead_lettered: i64,
+}
+
 // Merge small (kind, queue) aggregates from separately locked read sources.
 fn queue_storage_kind_counts_cte() -> &'static str {
     r#"
         kind_queue AS (
-            SELECT kind, queue, sum(n)::bigint AS n, sum(n_recent)::bigint AS n_recent
-            FROM unnest($1::text[], $2::text[], $3::bigint[], $4::bigint[])
-                AS sources(kind, queue, n, n_recent)
+            SELECT
+                kind, queue, sum(n)::bigint AS n, sum(n_recent)::bigint AS n_recent,
+                sum(available)::bigint AS available, sum(retryable)::bigint AS retryable,
+                sum(running)::bigint AS running, sum(failed)::bigint AS failed,
+                sum(dead_lettered)::bigint AS dead_lettered
+            FROM unnest(
+                $1::text[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[],
+                $6::bigint[], $7::bigint[], $8::bigint[], $9::bigint[]
+            ) AS sources(
+                kind, queue, n, n_recent, available, retryable, running, failed, dead_lettered
+            )
             GROUP BY kind, queue
         ),
         kind_counts AS (
@@ -859,7 +903,13 @@ fn queue_storage_kind_counts_cte() -> &'static str {
                 kind,
                 sum(n)::bigint AS job_count,
                 count(*)::bigint AS queue_count,
-                sum(n_recent)::bigint AS completed_last_hour
+                array_agg(queue ORDER BY queue) AS queues,
+                sum(n_recent)::bigint AS completed_last_hour,
+                sum(available)::bigint AS available,
+                sum(retryable)::bigint AS retryable,
+                sum(running)::bigint AS running,
+                sum(failed)::bigint AS failed,
+                sum(dead_lettered)::bigint AS dead_lettered
             FROM kind_queue
             GROUP BY kind
         )
@@ -2203,6 +2253,11 @@ pub struct QueueOverview {
     pub completed_last_hour: i64,
     pub lag_seconds: Option<f64>,
     pub paused: bool,
+    /// When the queue was paused; `None` while it is not paused.
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Who paused the queue, as given to the pause; `None` while it is not
+    /// paused or when the pause named no one.
+    pub paused_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -2221,7 +2276,21 @@ pub struct JobKindOverview {
     pub descriptor_mismatch: bool,
     pub job_count: i64,
     pub queue_count: i64,
+    /// The queues counted in `queue_count`, sorted by name.
+    pub queues: Vec<String>,
     pub completed_last_hour: i64,
+    /// Jobs of this kind ready to claim now.
+    pub available: i64,
+    /// Jobs of this kind waiting for their next attempt after a failure.
+    pub retryable: i64,
+    /// Jobs of this kind running, not counting those waiting for a callback.
+    pub running: i64,
+    /// Failed jobs of this kind, not counting dead letters (which
+    /// `QueueOverview::failed` does count).
+    pub failed: i64,
+    /// Dead-lettered jobs of this kind; always 0 without queue storage,
+    /// which the DLQ needs.
+    pub dead_lettered: i64,
 }
 
 /// Snapshot of a per-queue rate limit configuration.
@@ -2893,7 +2962,9 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
                 COALESCE(sg.waiting_external, 0) AS waiting_external,
                 COALESCE(sg.completed_last_hour, 0) AS completed_last_hour,
                 sg.lag_seconds,
-                COALESCE(qm.paused, FALSE) AS paused
+                COALESCE(qm.paused, FALSE) AS paused,
+                CASE WHEN qm.paused THEN qm.paused_at END AS paused_at,
+                CASE WHEN qm.paused THEN qm.paused_by END AS paused_by
             FROM all_queues q
             LEFT JOIN signals sg ON sg.queue = q.queue
             LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
@@ -2998,7 +3069,9 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
             COALESCE(qs.waiting_external, 0) AS waiting_external,
             COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
             al.lag_seconds,
-            COALESCE(qm.paused, FALSE) AS paused
+            COALESCE(qm.paused, FALSE) AS paused,
+            CASE WHEN qm.paused THEN qm.paused_at END AS paused_at,
+            CASE WHEN qm.paused THEN qm.paused_by END AS paused_by
         FROM all_queues q
         LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue
         LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
@@ -3606,7 +3679,7 @@ async fn queue_storage_base_kind_counts(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     store: &QueueStorage,
     heads: LaneHeads,
-) -> Result<Vec<(String, String, i64, i64)>, sqlx::Error> {
+) -> Result<Vec<KindQueueCounts>, sqlx::Error> {
     let mut counts = Vec::new();
     for source in [
         KindCountSource::Available,
@@ -3620,7 +3693,7 @@ async fn queue_storage_base_kind_counts(
         sqlx::query("SAVEPOINT awa_kind_source")
             .execute(tx.as_mut())
             .await?;
-        let mut query = sqlx::query_as::<_, (String, String, i64, i64)>(audited_sql(sql));
+        let mut query = sqlx::query_as::<_, KindQueueCounts>(audited_sql(sql));
         if source == KindCountSource::Available {
             query = bind_lane_heads!(query, heads.clone());
         }
@@ -3873,7 +3946,13 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
                 COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
                 COALESCE(kc.job_count, 0) AS job_count,
                 COALESCE(kc.queue_count, 0) AS queue_count,
-                COALESCE(kc.completed_last_hour, 0) AS completed_last_hour
+                COALESCE(kc.queues, ARRAY[]::text[]) AS queues,
+                COALESCE(kc.completed_last_hour, 0) AS completed_last_hour,
+                COALESCE(kc.available, 0) AS available,
+                COALESCE(kc.retryable, 0) AS retryable,
+                COALESCE(kc.running, 0) AS running,
+                COALESCE(kc.failed, 0) AS failed,
+                COALESCE(kc.dead_lettered, 0) AS dead_lettered
             FROM all_kinds k
             LEFT JOIN kind_counts kc ON kc.kind = k.kind
             LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
@@ -3900,25 +3979,43 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             queue_storage_running_kind_counts(&mut tx, &store)
                 .await?
                 .into_iter()
-                .map(|(kind, queue, n)| (kind, queue, n, 0)),
+                .map(|(kind, queue, n)| KindQueueCounts {
+                    kind,
+                    queue,
+                    n,
+                    n_recent: 0,
+                    available: 0,
+                    retryable: 0,
+                    running: n,
+                    failed: 0,
+                    dead_lettered: 0,
+                }),
         );
+        let mut columns: [Vec<i64>; 7] = Default::default();
         let mut kinds = Vec::with_capacity(sources.len());
         let mut queues = Vec::with_capacity(sources.len());
-        let mut counts = Vec::with_capacity(sources.len());
-        let mut recent_counts = Vec::with_capacity(sources.len());
-        for (kind, queue, count, recent) in sources {
-            kinds.push(kind);
-            queues.push(queue);
-            counts.push(count);
-            recent_counts.push(recent);
+        for source in sources {
+            kinds.push(source.kind);
+            queues.push(source.queue);
+            for (column, value) in columns.iter_mut().zip([
+                source.n,
+                source.n_recent,
+                source.available,
+                source.retryable,
+                source.running,
+                source.failed,
+                source.dead_lettered,
+            ]) {
+                column.push(value);
+            }
         }
-        let rows = sqlx::query_as::<_, JobKindOverview>(audited_sql(sql))
+        let mut query = sqlx::query_as::<_, JobKindOverview>(audited_sql(sql))
             .bind(kinds)
-            .bind(queues)
-            .bind(counts)
-            .bind(recent_counts)
-            .fetch_all(tx.as_mut())
-            .await?;
+            .bind(queues);
+        for column in columns {
+            query = query.bind(column);
+        }
+        let rows = query.fetch_all(tx.as_mut()).await?;
         tx.commit().await?;
         drop(begin_guard);
         return Ok(rows);
@@ -3968,11 +4065,23 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             -- semantic this produces — "queues this kind is currently
             -- active on" — is the one admin surfaces actually care about;
             -- a kind that hasn't enqueued in 3 months shouldn't be
-            -- counted as still spanning N queues.
+            -- counted as still spanning N queues. The per-state counts
+            -- ride on the same pass.
             SELECT
                 kind,
-                count(DISTINCT queue)::bigint AS queue_count
+                count(DISTINCT queue)::bigint AS queue_count,
+                array_agg(DISTINCT queue ORDER BY queue) AS queues,
+                count(*) FILTER (WHERE state = 'available')::bigint AS available,
+                count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                count(*) FILTER (WHERE state = 'failed')::bigint AS failed
             FROM awa.jobs_hot
+            GROUP BY kind
+        ),
+        retryable_counts AS (
+            -- `retryable` jobs live only in `scheduled_jobs`.
+            SELECT kind, count(*)::bigint AS retryable
+            FROM awa.scheduled_jobs
+            WHERE state = 'retryable'
             GROUP BY kind
         )
         SELECT
@@ -3994,12 +4103,19 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
             COALESCE(kc.ref_count, 0) AS job_count,
             COALESCE(qc.queue_count, 0) AS queue_count,
-            COALESCE(cr.completed_last_hour, 0) AS completed_last_hour
+            COALESCE(qc.queues, ARRAY[]::text[]) AS queues,
+            COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
+            COALESCE(qc.available, 0) AS available,
+            COALESCE(rc.retryable, 0) AS retryable,
+            COALESCE(qc.running, 0) AS running,
+            COALESCE(qc.failed, 0) AS failed,
+            0::bigint AS dead_lettered
         FROM all_kinds k
         LEFT JOIN awa.job_kind_catalog kc ON kc.kind = k.kind
         LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
         LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
         LEFT JOIN queue_counts qc ON qc.kind = k.kind
+        LEFT JOIN retryable_counts rc ON rc.kind = k.kind
         LEFT JOIN completed_recent cr ON cr.kind = k.kind
         ORDER BY k.kind
         "#,

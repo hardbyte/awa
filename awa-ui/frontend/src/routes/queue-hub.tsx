@@ -10,6 +10,7 @@ import { JobsList } from "@/components/JobsList";
 import { DlqList } from "@/components/DlqList";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import { Badge } from "@/components/ui/badge";
+import { PausedBadge } from "@/components/PausedBadge";
 import { Tab, TabList, TabPanel, TabPanels, Tabs } from "@/components/ui/tabs";
 
 const TABS = [
@@ -69,7 +70,7 @@ export function QueueHubLayout() {
             {title !== queue.queue && (
               <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{queue.queue}</code>
             )}
-            {queue.paused && <Badge intent="warning" data-testid="queue-paused">Paused</Badge>}
+            {queue.paused && <PausedBadge queue={queue} data-testid="queue-paused" />}
             {runtime?.config?.dlq_enabled === true && <Badge intent="secondary">DLQ on</Badge>}
             {queue.descriptor_stale && <Badge intent="secondary">Descriptor stale</Badge>}
             {queue.descriptor_mismatch && <Badge intent="warning">Descriptor drift</Badge>}

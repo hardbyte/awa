@@ -1,17 +1,17 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
 import { Time } from "@/components/Time";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useState } from "react";
 import type { BatchOperation } from "@/lib/api";
 import { ListState } from "@/components/ListState";
-import { batchOpsQuery, BATCH_OPS_LIST_LIMIT } from "@/lib/shared-queries";
+import { batchOpsQuery, BATCH_OPS_LIST_LIMIT, olderBatchOpsQuery } from "@/lib/shared-queries";
 import { BatchStateBadge } from "@/components/StateBadge";
 import { BatchOpLink } from "@/components/links";
 import { changedNothing, isCancellable, operationLabel, progressText } from "@/lib/batch";
 import { AdminButton } from "@/components/AdminAction";
 import { CancelOperationDialog } from "@/components/CancelOperationDialog";
 import { Page, PageHeader } from "@/components/Page";
-import { buttonStyles } from "@/components/ui/button";
+import { Button, buttonStyles } from "@/components/ui/button";
 import {
   Table,
   TableHeader,
@@ -23,13 +23,26 @@ import {
 import { formatNumber } from "@/lib/number";
 import { RowCards } from "@/components/RowCards";
 
+/** The `(submitted_at, id)` cursor in the URL, when both halves are there. */
+function usePageCursor() {
+  const search = useSearch({ strict: false }) as Record<string, unknown>;
+  const at = typeof search.before_submitted_at === "string" ? search.before_submitted_at : undefined;
+  const id = typeof search.before_id === "string" ? search.before_id : undefined;
+  return at && id ? { before_submitted_at: at, before_id: id } : null;
+}
+
 export function BatchOpsPage() {
   const navigate = useNavigate();
-  const operationsQuery = useManagedQuery(batchOpsQuery);
+  const cursor = usePageCursor();
+  // The newest page shares the sidebar badge's read; older pages are read by cursor.
+  const operationsQuery = useManagedQuery(cursor ? olderBatchOpsQuery(cursor) : batchOpsQuery);
 
   const [cancelling, setCancelling] = useState<BatchOperation | null>(null);
 
   const operations = operationsQuery.data ?? [];
+  const last = operations.length >= BATCH_OPS_LIST_LIMIT ? operations[operations.length - 1] : undefined;
+  const goToPage = (next: { before_submitted_at: string; before_id: string } | null) =>
+    void navigate({ to: "/batch-ops", search: next ?? {} });
 
   return (
     <Page>
@@ -49,7 +62,7 @@ export function BatchOpsPage() {
           error={operationsQuery.isError ? operationsQuery.error : null}
           onRetry={() => void operationsQuery.refetch()}
           noun="batch operations"
-          empty="No batch operations yet."
+          empty={cursor ? "No older operations." : "No batch operations yet."}
         />
       )}
 
@@ -137,10 +150,32 @@ export function BatchOpsPage() {
         </TableBody>
       </Table>
       )}
-      {operations.length >= BATCH_OPS_LIST_LIMIT && (
-        <p className="text-sm text-muted-fg">
-          Showing the {BATCH_OPS_LIST_LIMIT} most recent operations.
-        </p>
+      {(last || cursor) && (
+        <div className="flex flex-wrap items-center justify-between gap-2" data-testid="batch-ops-paging">
+          <p className="text-sm text-muted-fg">
+            {cursor ? (
+              <>Operations submitted before <Time value={cursor.before_submitted_at} />.</>
+            ) : (
+              `Showing the ${BATCH_OPS_LIST_LIMIT} most recent operations.`
+            )}
+          </p>
+          <div className="flex gap-2">
+            {cursor && (
+              <Button intent="outline" size="xs" onPress={() => goToPage(null)}>
+                Newest operations
+              </Button>
+            )}
+            {last && (
+              <Button
+                intent="outline"
+                size="xs"
+                onPress={() => goToPage({ before_submitted_at: last.submitted_at, before_id: last.id })}
+              >
+                Older operations
+              </Button>
+            )}
+          </div>
+        </div>
       )}
       <CancelOperationDialog
         operation={cancelling}

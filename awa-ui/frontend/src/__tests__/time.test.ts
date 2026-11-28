@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { durationBetween, formatAbsolute, formatRelative } from "@/lib/time";
 import { formatNumber, plural } from "@/lib/number";
+import { pausedLabel } from "@/lib/pause";
 
 const NOW = Date.parse("2026-11-28T12:00:00Z");
 
@@ -47,5 +48,20 @@ describe("numbers", () => {
     expect(formatNumber(3000)).toBe((3000).toLocaleString());
     expect(plural(1, "job")).toBe("1 job");
     expect(plural(3000, "job")).toBe(`${(3000).toLocaleString()} jobs`);
+  });
+});
+
+describe("pausedLabel", () => {
+  const now = Date.parse("2026-11-28T12:00:00Z");
+  const at = new Date(now - 25 * 60_000).toISOString();
+  it("says when and by whom, as far as the server reports them", () => {
+    expect(pausedLabel({ paused_at: at, paused_by: "ops" }, now)).toBe("Paused 25m ago by ops");
+    expect(pausedLabel({ paused_at: at, paused_by: null }, now)).toBe("Paused 25m ago");
+    expect(pausedLabel({ paused_at: null, paused_by: "ops" }, now)).toBe("Paused by ops");
+    expect(pausedLabel({ paused_at: null, paused_by: "  " }, now)).toBe("Paused");
+  });
+  it("falls back to Paused for a server that sends neither field", () => {
+    expect(pausedLabel({}, now)).toBe("Paused");
+    expect(pausedLabel({ paused_at: "not a time" }, now)).toBe("Paused");
   });
 });

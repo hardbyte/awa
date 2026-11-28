@@ -70,18 +70,27 @@ POST /api/jobs/bulk-cancel              { ids: [...] }
 
 POST /api/batch-ops/preview             { op_kind, filter, spec }
 POST /api/batch-ops                     { op_kind, filter, spec, all?, submitted_by? }
-GET  /api/batch-ops?state=&limit=
-GET  /api/batch-ops/:id
+GET  /api/batch-ops?state=&limit=&before_submitted_at=&before_id=
+                                        Newest first by (submitted_at, id); the last row's submitted_at
+                                        and id, given together, read the page after it. A malformed or
+                                        lone cursor parameter is a 400.
+GET  /api/batch-ops/:id                 404 for an unknown id or one that isn't a UUID
 PATCH /api/batch-ops/:id                { state: "cancelling" }
 
-GET  /api/queues
+GET  /api/queues                         Per-queue counts; `failed` includes dead letters. `paused_at` and
+                                        `paused_by` say when and by whom a paused queue was paused (null
+                                        while it isn't paused; `paused_by` also null when the pause named no one)
 GET  /api/queues/:name
 GET  /api/queues/runtime
 POST /api/queues/:name/pause
 POST /api/queues/:name/resume
 POST /api/queues/:name/drain
 
-GET  /api/kinds                         Job kinds with descriptor metadata
+GET  /api/kinds                         Job kinds with descriptor metadata, `job_count`, `queue_count` and
+                                        `queues` (the queues counted, sorted), and per-state counts:
+                                        `available`, `retryable`, `running` (callback waits left out),
+                                        `failed` (dead letters left out) and `dead_lettered` (0 without
+                                        queue storage)
 
 GET  /api/runtime                       Worker instances and health
 GET  /api/storage                       Storage transition status
@@ -121,8 +130,8 @@ A health strip and a ranked list of what needs attention, built from reads the o
 
 - **Health strip**: ready jobs in unpaused queues with the oldest one's wait (jobs held in paused queues are counted apart), retrying jobs and the queue with the most, failed jobs with the completions of the last hour, dead letters and the queue with the most, stuck running jobs (past their deadline or without a heartbeat for 90 seconds, among the 100 newest running jobs), and bulk operations in flight with the latest failure. Each figure links to the jobs behind it. A figure whose read failed shows "—" and the error, never 0.
 - **Fleet and deferred work** each get one line: how many live instances are healthy, which one leads and how many are stale; and how many jobs are scheduled or waiting for a callback, with the next schedule fire. Work that isn't due yet is not counted as backlog.
-- **Needs attention** ranks problems, each linking to a scoped view: unhealthy instances, no live workers, stuck running jobs, failure groups (kind and error class across the 50 newest failed jobs, dead letters left out), recently failed bulk operations, paused queues holding ready jobs, more or fewer than one maintenance leader, queues whose oldest ready job has waited a minute, dead letters per queue, queue config drift between workers, overdue and paused schedules, descriptor drift, mixed worker versions and running bulk operations. Red marks what needs an operator now, amber what needs one soon, grey what's worth knowing. With nothing to report it says "Nothing needs attention" and when it last checked; checks whose reads failed are named.
-- **Queues needing attention** lists up to five queues with failures, dead letters, retries or held work, with a link to every queue.
+- **Needs attention** ranks problems, each linking to a scoped view: unhealthy instances, no live workers, stuck running jobs, failure groups (kind and error class across the 50 newest failed jobs, dead letters left out), recently failed bulk operations, paused queues holding ready jobs (saying when and by whom they were paused), more or fewer than one maintenance leader, queues whose oldest ready job has waited a minute, dead letters per queue, queue config drift between workers, overdue and paused schedules, descriptor drift, mixed worker versions and running bulk operations. Red marks what needs an operator now, amber what needs one soon, grey what's worth knowing. With nothing to report it says "Nothing needs attention" and when it last checked; checks whose reads failed are named.
+- **Queues needing attention** lists up to five queues with failures, dead letters, retries or held work, with a link to every queue. While the dead-letter count fails to load, their Failed shows "—" with the error rather than a count that includes dead letters.
 
 Failure rate against a baseline and a dead-letter trend need outcome counts bucketed by finish time, which the API doesn't provide yet.
 
@@ -140,15 +149,15 @@ Full inspection of a single job. A line under the title says where it stands: ho
 
 ### Queues (`/queues`)
 
-Per-queue table: ready jobs with the oldest one's wait, running, retrying, failed, dead letters, deferred (scheduled, plus jobs waiting for a callback), completions per hour and capacity, with Pause, Resume and Drain in each row's Actions menu. Badges beside the name mark exceptions only: Paused, DLQ on, a stale or drifted descriptor and config mismatch between workers. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
+Per-queue table: ready jobs with the oldest one's wait, running, retrying, failed, dead letters, deferred (scheduled, plus jobs waiting for a callback), completions per hour and capacity, with Pause, Resume and Drain in each row's Actions menu. Badges beside the name mark exceptions only: Paused (with when and by whom, "Paused 25m ago by ops", when the server reports them), DLQ on, a stale or drifted descriptor and config mismatch between workers. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative. The server's failed counts include dead letters, so a queue's Failed shows "—" and the error while the dead-letter count fails to load.
 
 ### Queue hub (`/queues/:name`)
 
-Each queue's page, with Pause, Resume and Drain in its header and four tabs: Overview (counts linking into the jobs tab, failing kinds, the schedules that enqueue into it and serving instances), Jobs (the jobs list locked to the queue), Dead letters (the dead-letter list locked to the queue) and Config (the runtime configuration each worker reports). Tabs are deep links: `/queues/:name/jobs`, `/queues/:name/dlq` and `/queues/:name/config`.
+Each queue's page, with its pause badge (when and by whom), Pause, Resume and Drain in its header and four tabs: Overview (counts linking into the jobs tab, failing kinds, the schedules that enqueue into it and serving instances), Jobs (the jobs list locked to the queue), Dead letters (the dead-letter list locked to the queue) and Config (the runtime configuration each worker reports). Tabs are deep links: `/queues/:name/jobs`, `/queues/:name/dlq` and `/queues/:name/config`.
 
 ### Job kinds (`/kinds`, `/kinds/:kind`)
 
-Catalog of every declared job kind, with job and queue counts, completions per hour, owner and declared output type. Declared-but-never-enqueued kinds still appear because the descriptor catalog is authoritative. A kind's page shows its descriptor, its recent failures grouped by error, the schedules that enqueue it and the queues it runs in, with a "Retry all failed" bulk action.
+Catalog of every declared job kind, with job and queue counts, failed jobs (dead letters left out, linking to them) and retrying jobs, completions per hour, owner and declared output type; against a server that doesn't report per-kind state counts the Failed and Retryable columns are left out. Declared-but-never-enqueued kinds still appear because the descriptor catalog is authoritative. A kind's page shows its descriptor, its recent failures grouped by error, the schedules that enqueue it and every queue holding its jobs (inferred from its recent failures and schedules on a server that doesn't list them), with a "Retry all failed" bulk action.
 
 ### Fleet (`/runtime`, `/runtime/:instanceId`)
 
@@ -164,7 +173,7 @@ When the target queue is itself paused, the row shows a "Queue paused" badge: fi
 
 Operator surface for durable async mutations recorded in `awa.batch_operations`.
 
-- **History** lists recent operations with kind, state, progress, processed, skipped and errored counts, the last error and submitted age. An operation that skipped every row says it changed nothing.
+- **History** lists recent operations, 50 at a time newest first with Older and Newest buttons, with kind, state, progress, processed, skipped and errored counts, the last error and submitted age. An operation that skipped every row says it changed nothing.
 - **An operation's page** shows its filter with a link to the matching jobs, its spec, progress, last error, submitter and runner. Active operations offer Cancel, which requests cooperative cancellation at chunk boundaries.
 - **New operation** (`/batch-ops/new`) chooses `set_priority`, `move_queue`, `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` or `purge_dlq`, filters by queue, kind, tags, ids, state or created time, and previews the exact count and sample rows before submitting. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation. The Jobs and Dead letters lists open this form with their filter for Set priority and Move queue.
 

@@ -47,7 +47,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
+import { PausedBadge } from "@/components/PausedBadge";
 import { QueueLink, entityLinkClass } from "@/components/links";
 import { Time } from "@/components/Time";
 
@@ -188,6 +188,10 @@ export function DashboardPage() {
     ? queuesNeedingAttention(queuesQuery.data, dlqQuery.data, OVERVIEW_QUEUE_LIMIT)
     : [];
   const statsError = statsQuery.isError ? statsQuery.error : null;
+  // A queue's failed count includes its dead letters until their count loads.
+  const failedUnknownReason = dlqQuery.isError
+    ? `Failed to load dead letters: ${dlqQuery.error.message}`
+    : "Waiting for the dead-letter count";
   // Dead letters have their own tile, so the Failed tile counts the rest.
   const liveFailed =
     stats && dlqQuery.data ? liveFailedCount(stats.failed ?? 0, dlqQuery.data.total) : undefined;
@@ -378,13 +382,15 @@ export function DashboardPage() {
                   <li key={q.queue} className="py-3">
                     <div className="flex items-center gap-2">
                       <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
-                      {q.paused && <Badge intent="warning">Paused</Badge>}
+                      {q.paused && <PausedBadge queue={q} />}
                     </div>
                     <div className="mt-1 text-sm text-muted-fg">
                       {[
                         q.available > 0 && `${formatNumber(q.available)} ready`,
                         q.retryable > 0 && `${formatNumber(q.retryable)} retrying`,
-                        q.liveFailed > 0 && `${formatNumber(q.liveFailed)} failed`,
+                        q.liveFailed === null
+                          ? q.failed > 0 && "failed: —"
+                          : q.liveFailed > 0 && `${formatNumber(q.liveFailed)} failed`,
                         (q.deadLetters ?? 0) > 0 && plural(q.deadLetters!, "dead letter"),
                       ]
                         .filter(Boolean)
@@ -408,7 +414,7 @@ export function DashboardPage() {
                       <TableCell>
                         <span className="inline-flex items-center gap-2">
                           <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
-                          {q.paused && <Badge intent="warning">Paused</Badge>}
+                          {q.paused && <PausedBadge queue={q} />}
                         </span>
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(q.available)}</TableCell>
@@ -416,8 +422,14 @@ export function DashboardPage() {
                         {q.available > 0 && q.lag_seconds !== null ? formatDuration(q.lag_seconds) : "—"}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(q.retryable)}</TableCell>
-                      <TableCell className={`text-right tabular-nums ${q.liveFailed > 0 ? "text-danger-subtle-fg" : ""}`}>
-                        {formatNumber(q.liveFailed)}
+                      <TableCell className={`text-right tabular-nums ${(q.liveFailed ?? 0) > 0 ? "text-danger-subtle-fg" : ""}`}>
+                        {q.liveFailed === null ? (
+                          <span className="text-muted-fg" title={failedUnknownReason} data-testid="queue-failed-unknown">
+                            —
+                          </span>
+                        ) : (
+                          formatNumber(q.liveFailed)
+                        )}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {q.deadLetters === null ? "—" : formatNumber(q.deadLetters)}
@@ -426,6 +438,11 @@ export function DashboardPage() {
                   ))}
                 </TableBody>
               </Table>
+              {dlqQuery.isError && (
+                <p className="mt-2 text-sm text-warning-subtle-fg" role="alert" data-testid="queues-attention-dlq-error">
+                  Failed and dead-letter counts are unknown: {failedUnknownReason}.
+                </p>
+              )}
             </>
           )}
         </CardContent>

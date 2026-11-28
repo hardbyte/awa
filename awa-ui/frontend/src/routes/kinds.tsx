@@ -72,6 +72,8 @@ export function KindsPage() {
   });
 
   const kinds = kindsQuery.data ?? [];
+  // A server before 0.7 sends no per-state counts; its table keeps the old columns.
+  const hasStateCounts = kinds.some((kind) => kind.failed !== undefined);
 
   return (
     <Page className="space-y-4">
@@ -97,6 +99,12 @@ export function KindsPage() {
           meta: (
             <>
               <span>{plural(kind.job_count, "job")}</span>
+              {kind.failed !== undefined && kind.failed > 0 && (
+                <span className="text-danger-subtle-fg">{formatNumber(kind.failed)} failed</span>
+              )}
+              {kind.retryable !== undefined && kind.retryable > 0 && (
+                <span>{formatNumber(kind.retryable)} retrying</span>
+              )}
               <span>{plural(kind.queue_count, "queue")}</span>
               <span>{formatNumber(kind.completed_last_hour)} completed/hr</span>
               {kind.owner && <span>{kind.owner}</span>}
@@ -110,6 +118,8 @@ export function KindsPage() {
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn className="text-right">Jobs</TableColumn>
           <TableColumn className="text-right">Queues</TableColumn>
+          {hasStateCounts && <TableColumn className="text-right">Failed</TableColumn>}
+          {hasStateCounts && <TableColumn className="text-right">Retryable</TableColumn>}
           <TableColumn className="text-right">Completed/hr</TableColumn>
           <TableColumn>Owner</TableColumn>
           <TableColumn>Status</TableColumn>
@@ -154,6 +164,28 @@ export function KindsPage() {
                 <TableCell className="text-right tabular-nums">
                   {kind.queue_count.toLocaleString()}
                 </TableCell>
+                {hasStateCounts && (
+                  <TableCell
+                    className={`text-right tabular-nums ${kind.failed ? "text-danger-subtle-fg" : "text-muted-fg"}`}
+                  >
+                    {kind.failed === undefined ? "—" : (
+                      <FilterLink
+                        filter={{ kind: kind.kind }}
+                        state="failed"
+                        liveOnly
+                        className="text-inherit"
+                        aria-label={`Failed jobs of ${kind.kind}: ${kind.failed}`}
+                      >
+                        {formatNumber(kind.failed)}
+                      </FilterLink>
+                    )}
+                  </TableCell>
+                )}
+                {hasStateCounts && (
+                  <TableCell className={`text-right tabular-nums ${kind.retryable ? "" : "text-muted-fg"}`}>
+                    {kind.retryable === undefined ? "—" : formatNumber(kind.retryable)}
+                  </TableCell>
+                )}
                 <TableCell className="text-right tabular-nums">
                   {kind.completed_last_hour.toLocaleString()}
                 </TableCell>

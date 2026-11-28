@@ -35,7 +35,7 @@ import {
 import { ProgressBar, ProgressBarHeader, ProgressBarTrack, ProgressBarValue } from "@/components/ui/progress-bar";
 import { Label } from "@/components/ui/field";
 
-/** The API answers an unknown or malformed id with 400 rather than 404. */
+/** The API answers an unknown or malformed id with 404; servers before 0.7 answer 400. */
 function isMissingOperation(error: unknown): boolean {
   if (isNotFoundError(error)) return true;
   return error instanceof HttpError && error.status === 400 && /not found|uuid|invalid url/i.test(error.message);

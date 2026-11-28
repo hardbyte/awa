@@ -127,7 +127,11 @@ export function KindDetailPage() {
 
   const schedules = (cronQuery.data ?? []).filter((cron) => cron.kind === kind.kind);
   const failedJobs = failures.data ?? [];
-  const queues = [...new Set([...failedJobs.map((job) => job.queue), ...schedules.map((cron) => cron.queue)])].sort();
+  // A server before 0.7 doesn't list the kind's queues, so they are inferred
+  // from its recent failures and schedules.
+  const exactQueues = kind.queues;
+  const queues =
+    exactQueues ?? [...new Set([...failedJobs.map((job) => job.queue), ...schedules.map((cron) => cron.queue)])].sort();
   const label = kindLabel(kind);
 
   return (
@@ -286,11 +290,15 @@ export function KindDetailPage() {
         <Card>
           <CardHeader
             title="Queues"
-            description={`Seen in its ${KIND_FAILURE_SAMPLE} most recent failures and its schedules, so the list may be incomplete. It runs in ${kind.queue_count} queue(s) in all.`}
+            description={
+              exactQueues
+                ? "Every queue holding jobs of this kind."
+                : `Seen in its ${KIND_FAILURE_SAMPLE} most recent failures and its schedules, so the list may be incomplete. It runs in ${kind.queue_count} queue(s) in all.`
+            }
           />
           <CardContent>
             {queues.length === 0 ? (
-              <p className="text-sm text-muted-fg">None seen.</p>
+              <p className="text-sm text-muted-fg">{exactQueues ? "No jobs in any queue." : "None seen."}</p>
             ) : (
               <ul className="flex flex-wrap gap-x-4 gap-y-1 text-sm" data-testid="kind-queues">
                 {queues.map((queue) => (

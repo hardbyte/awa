@@ -67,6 +67,8 @@ test.describe("Queue hub", () => {
       header.getByRole("button", { name: "Pause" }).click(),
     ]);
     await expect(header.getByTestId("queue-paused")).toBeVisible();
+    // The UI pauses as "ui"; the server reports when and by whom.
+    await expect(header.getByTestId("queue-paused")).toHaveText(/^Paused (just now|\d+s ago) by ui$/);
     await Promise.all([
       page.waitForResponse((r) => r.url().endsWith("/api/queues/legacy_queue/resume") && r.ok()),
       header.getByRole("button", { name: "Resume" }).click(),
@@ -102,5 +104,13 @@ test.describe("Queue hub", () => {
     await expect(dialog).toBeHidden();
     await expect(page.getByText('Drained queue "e2e_test": 3 job(s) cancelled')).toBeVisible();
     expect(drains).toBe(1);
+  });
+
+  test("the Failed figure is a dash with the error while the dead-letter count can't load", async ({ page }) => {
+    await page.route("**/api/dlq/depth", (route) => route.fulfill({ status: 500, json: { error: "depth unavailable" } }));
+    await page.goto("/queues/e2e_test");
+    const failed = page.getByTestId("queue-stat-failed");
+    await expect(failed.getByRole("link")).toHaveText("—");
+    await expect(failed).toContainText("Failed to load dead letters: depth unavailable");
   });
 });
