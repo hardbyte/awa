@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use awa_model::bulk::{self, BulkBatch, BulkCursor, BulkRun, BulkRunOptions};
 use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+use awa_model::queue_storage::QueueStorage;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -25,6 +26,9 @@ pub async fn list_dlq(
     State(state): State<AppState>,
     Query(params): Query<ListDlqParams>,
 ) -> Result<Json<Vec<DlqRow>>, ApiError> {
+    if !dlq_storage_exists(&state).await? {
+        return Ok(Json(Vec::new()));
+    }
     let filter = ListDlqFilter {
         kind: params.kind,
         queue: params.queue,
@@ -37,10 +41,18 @@ pub async fn list_dlq(
     Ok(Json(rows))
 }
 
+/// Whether a queue_storage backend is active; the DLQ cannot hold rows without one.
+async fn dlq_storage_exists(state: &AppState) -> Result<bool, ApiError> {
+    Ok(QueueStorage::active_schema(&state.pool).await?.is_some())
+}
+
 pub async fn get_dlq_job(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
 ) -> Result<Json<Option<DlqRow>>, ApiError> {
+    if !dlq_storage_exists(&state).await? {
+        return Ok(Json(None));
+    }
     let row = dlq::get_dlq_job(&state.pool, job_id).await?;
     Ok(Json(row))
 }
@@ -58,6 +70,12 @@ pub struct DlqDepthByQueue {
 }
 
 pub async fn dlq_depth(State(state): State<AppState>) -> Result<Json<DlqDepthResponse>, ApiError> {
+    if !dlq_storage_exists(&state).await? {
+        return Ok(Json(DlqDepthResponse {
+            total: 0,
+            by_queue: Vec::new(),
+        }));
+    }
     let total = dlq::dlq_depth(&state.pool, None).await?;
     let by_queue_raw = dlq::dlq_depth_by_queue(&state.pool).await?;
     let by_queue = by_queue_raw

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   useQuery,
   useMutation,
@@ -25,6 +25,9 @@ import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { POLL } from "@/lib/constants";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { timeUntil } from "@/lib/time";
+import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 
 function hasMetadata(job: JobRow): boolean {
   return (
@@ -58,6 +61,7 @@ export function JobDetailPage() {
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
   const navigate = useNavigate();
+  const [confirmRetryWaiting, setConfirmRetryWaiting] = useState(false);
 
   const jobQuery = useQuery<JobRow>({
     queryKey: ["job", jobId],
@@ -106,13 +110,26 @@ export function JobDetailPage() {
   if (jobQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading...</p>;
   }
-  if (jobQuery.error) {
+  if (jobQuery.error && !isNotFoundError(jobQuery.error)) {
     return (
-      <p className="text-sm text-danger">Error: {String(jobQuery.error)}</p>
+      <ResourceLoadError
+        noun={`job #${id}`}
+        error={jobQuery.error}
+        onRetry={() => void jobQuery.refetch()}
+        backTo="/jobs"
+        backLabel="Back to jobs"
+      />
     );
   }
-  if (!jobQuery.data) {
-    return <p className="text-sm text-muted-fg">Job not found.</p>;
+  if (!jobQuery.data || isNotFoundError(jobQuery.error)) {
+    return (
+      <ResourceNotFound
+        title={`Job #${id} not found`}
+        reason="No job has this ID. It may have been deleted by retention after it finished, or the link is wrong."
+        backTo="/jobs"
+        backLabel="Back to jobs"
+      />
+    );
   }
 
   const job = jobQuery.data;
@@ -148,15 +165,19 @@ export function JobDetailPage() {
       )}
 
       {/* Actions */}
-      <div className="flex gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {canRetry && (
           <Button
-            intent="primary"
+            intent={job.state === "waiting_external" ? "outline" : "primary"}
             size="sm"
-            onPress={() => retryMutation.mutate()}
+            onPress={() =>
+              job.state === "waiting_external"
+                ? setConfirmRetryWaiting(true)
+                : retryMutation.mutate()
+            }
             isDisabled={readOnly || retryMutation.isPending}
           >
-            Retry
+            {job.state === "waiting_external" ? "Restart…" : "Retry"}
           </Button>
         )}
         {canCancel && (
@@ -170,7 +191,24 @@ export function JobDetailPage() {
             Cancel
           </Button>
         )}
+        {job.state === "retryable" && (
+          <span className="text-sm text-muted-fg" data-testid="retryable-hint">
+            Retries automatically{" "}
+            {new Date(job.run_at).getTime() > Date.now() ? timeUntil(job.run_at) : "shortly"}.
+            Manual retry is for failed or cancelled jobs.
+          </span>
+        )}
       </div>
+
+      <ConfirmDialog
+        isOpen={confirmRetryWaiting}
+        onOpenChange={setConfirmRetryWaiting}
+        title={`Restart job #${job.id}?`}
+        description="This job is waiting for an external callback. Restarting runs it again from the first attempt and discards the pending callback, so work the handler already started (a payment, an email, a request) may happen twice. To finish it instead, resolve the callback; to stop it, cancel it."
+        confirmLabel="Restart job"
+        onConfirm={() => retryMutation.mutate()}
+        isPending={retryMutation.isPending}
+      />
 
       {/* Properties */}
       <DescriptionList>

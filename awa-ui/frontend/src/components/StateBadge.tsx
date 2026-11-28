@@ -13,7 +13,7 @@ const STATE_INTENT_MAP: Record<string, BadgeProps["intent"]> = {
 
 // Custom styling for waiting_external (indigo/purple per design spec)
 const WAITING_EXTERNAL_CLASS =
-  "[--badge-bg:oklch(0.87_0.07_280)] [--badge-fg:oklch(0.45_0.15_280)] [--badge-border:transparent]";
+  "[--badge-bg:oklch(0.87_0.07_280)] [--badge-fg:oklch(0.45_0.15_280)] [--badge-border:transparent] dark:[--badge-bg:oklch(0.55_0.15_280/0.2)] dark:[--badge-fg:oklch(0.82_0.1_280)]";
 
 interface StateBadgeProps {
   state: string;

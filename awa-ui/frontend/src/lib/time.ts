@@ -40,7 +40,15 @@ export function timeUntil(dateStr: string): string {
 export function durationSince(dateStr: string, nowMs: number = Date.now()): string {
   const startMs = new Date(dateStr).getTime();
   if (!Number.isFinite(startMs)) return "—";
-  const totalSeconds = Math.max(0, Math.floor((nowMs - startMs) / 1000));
+  return formatDuration((nowMs - startMs) / 1000);
+}
+
+/**
+ * Compact duration for a number of seconds, pairing the largest unit with
+ * the next non-zero one: "45s", "25m 25s", "2h 14m", "3d 4h".
+ */
+export function formatDuration(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
   if (totalSeconds < 60) return `${totalSeconds}s`;
   const totalMinutes = Math.floor(totalSeconds / 60);
   if (totalMinutes < 60) {

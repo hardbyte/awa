@@ -18,6 +18,7 @@ import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
+import { ListState } from "@/components/ListState";
 import { JsonView } from "@/components/JsonView";
 import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
 import { usePollInterval } from "@/hooks/use-poll-interval";
@@ -342,10 +343,15 @@ export function CronPage() {
             );
           })}
         </div>
-      ) : cronQuery.isLoading ? (
-        <p className="text-sm text-muted-fg">Loading...</p>
       ) : (
-        <p className="text-sm text-muted-fg">No cron schedules found.</p>
+        <ListState
+          className="rounded-lg border"
+          isLoading={cronQuery.isLoading}
+          error={cronQuery.isError ? cronQuery.error : null}
+          onRetry={() => void cronQuery.refetch()}
+          noun="cron schedules"
+          empty="No cron schedules found."
+        />
       )}
     </div>
   );

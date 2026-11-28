@@ -50,7 +50,7 @@ export function KindsPage() {
 
       {kinds.length === 0 ? (
         <div
-          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
         >
           {kindsQuery.isLoading
             ? "Loading job kinds…"
@@ -125,7 +125,7 @@ export function KindsPage() {
         </div>
       )}
 
-      <Table aria-label="Job kinds" className="hidden sm:table">
+      <Table aria-label="Job kinds" className="hidden sm:block">
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn className="text-right">Jobs</TableColumn>
@@ -137,7 +137,7 @@ export function KindsPage() {
         <TableBody
           renderEmptyState={() => (
             <div
-              className={`p-6 text-center text-sm ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`p-6 text-center text-sm ${kindsQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {kindsQuery.isLoading
                 ? "Loading job kinds…"

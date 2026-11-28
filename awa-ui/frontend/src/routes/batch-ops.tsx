@@ -9,6 +9,7 @@ import {
   type BatchOperationKind,
   type BatchOperationPayload,
 } from "@/lib/api";
+import { ListState } from "@/components/ListState";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
@@ -25,8 +26,14 @@ import {
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
 
-function stateTone(state: string): "success" | "warning" | "danger" | "secondary" {
-  if (state === "completed") return "success";
+/** A completed operation that matched rows but changed none of them. */
+function changedNothing(operation: BatchOperation): boolean {
+  return operation.state === "completed" && operation.processed === 0 && operation.skipped + operation.errored > 0;
+}
+
+function stateTone(operation: BatchOperation): "success" | "warning" | "danger" | "secondary" {
+  const state = operation.state;
+  if (state === "completed") return changedNothing(operation) ? "warning" : "success";
   if (state === "failed") return "danger";
   if (state === "cancelled" || state === "cancelling") return "warning";
   return "secondary";
@@ -35,8 +42,8 @@ function stateTone(state: string): "success" | "warning" | "danger" | "secondary
 function progressText(operation: BatchOperation): string {
   const total = operation.total_matched ?? 0;
   const accounted = operation.processed + operation.skipped + operation.errored;
-  if (total === 0) return `${accounted}`;
-  return `${accounted}/${total}`;
+  if (total === 0) return accounted.toLocaleString();
+  return `${accounted.toLocaleString()}/${total.toLocaleString()}`;
 }
 
 function parsePriority(value: string): number | null {
@@ -210,18 +217,44 @@ export function BatchOpsPage() {
           <TableColumn>Kind</TableColumn>
           <TableColumn>State</TableColumn>
           <TableColumn>Progress</TableColumn>
+          <TableColumn>Processed</TableColumn>
+          <TableColumn>Skipped</TableColumn>
           <TableColumn>Errors</TableColumn>
           <TableColumn>Submitted</TableColumn>
           <TableColumn>Action</TableColumn>
         </TableHeader>
-        <TableBody>
+        <TableBody
+          renderEmptyState={() => (
+            <ListState
+              isLoading={operationsQuery.isLoading}
+              error={operationsQuery.isError ? operationsQuery.error : null}
+              onRetry={() => void operationsQuery.refetch()}
+              noun="batch operations"
+              empty="No batch operations yet."
+            />
+          )}
+        >
           {operations.map((operation) => (
-            <TableRow key={operation.id}>
+            <TableRow key={operation.id} id={operation.id}>
               <TableCell className="font-mono text-xs">{operation.id.slice(0, 8)}</TableCell>
               <TableCell>{operation.op_kind.replace("_", " ")}</TableCell>
-              <TableCell><Badge intent={stateTone(operation.state)}>{operation.state}</Badge></TableCell>
-              <TableCell>{progressText(operation)}</TableCell>
-              <TableCell>{operation.errored}</TableCell>
+              <TableCell>
+                <Badge intent={stateTone(operation)}>{operation.state}</Badge>
+                {changedNothing(operation) && (
+                  <div className="mt-1 text-xs text-muted-fg" data-testid="batch-op-changed-nothing">
+                    No jobs changed
+                  </div>
+                )}
+                {operation.last_error && (
+                  <div className="mt-1 max-w-xs whitespace-normal break-words text-xs text-danger-subtle-fg" data-testid="batch-op-last-error">
+                    {operation.last_error}
+                  </div>
+                )}
+              </TableCell>
+              <TableCell className="tabular-nums">{progressText(operation)}</TableCell>
+              <TableCell className="tabular-nums">{operation.processed.toLocaleString()}</TableCell>
+              <TableCell className="tabular-nums">{operation.skipped.toLocaleString()}</TableCell>
+              <TableCell className="tabular-nums">{operation.errored.toLocaleString()}</TableCell>
               <TableCell>{timeAgo(operation.submitted_at)}</TableCell>
               <TableCell>
                 {operation.state === "pending" || operation.state === "scanning" || operation.state === "running" ? (
