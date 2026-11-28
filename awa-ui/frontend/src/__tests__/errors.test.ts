@@ -81,6 +81,14 @@ describe("groupAttempts", () => {
     ]);
   });
 
+  it("starts a new run when a manual retry repeats the attempt number", () => {
+    // A job allowed one attempt, retried by hand twice.
+    const runs = groupAttempts([entry(1, "a", 1), entry(1, "b", 30), entry(1, "c", 40, { terminal: true })]);
+    expect(runs.map((run) => run.rows.map((row) => row.error.message))).toEqual([["a"], ["b", "c"]]);
+    const afterTerminal = groupAttempts([entry(1, "a", 1, { terminal: true }), entry(1, "b", 30, { terminal: true })]);
+    expect(afterTerminal).toHaveLength(2);
+  });
+
   it("collapses identical consecutive errors and measures the next gap from the last of them", () => {
     const runs = groupAttempts([
       entry(1, "timeout", 1),

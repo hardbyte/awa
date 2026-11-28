@@ -2,7 +2,7 @@
  * Reading a job's `errors` entries, which workers write as
  * `{error, attempt, at, terminal?, output?}`. An entry records when an attempt
  * failed, not when it started, and nothing marks a manual retry, so a new run
- * is inferred where the attempt number goes down.
+ * is inferred from the attempt numbers; see `startsNewRun`.
  */
 
 export interface ParsedError {
@@ -76,17 +76,29 @@ export interface Run {
 }
 
 /**
- * Entries grouped into runs, oldest first. A run ends where the attempt
- * number goes down; within a run, identical consecutive errors collapse into
- * one row.
+ * Whether `error` begins a new run after `previous`. A manual retry starts
+ * counting attempts again, so a lower attempt number begins a new run. So
+ * does the same number, except for a terminal note about the attempt just
+ * recorded (e.g. a retry cancelled as a duplicate), which belongs to its run;
+ * after a terminal entry the job had finished, so the same number again can
+ * only be a new run, e.g. a manual retry of a job allowed one attempt.
+ */
+function startsNewRun(previous: ParsedError, error: ParsedError): boolean {
+  if (error.attempt === null || previous.attempt === null) return false;
+  if (error.attempt < previous.attempt) return true;
+  return error.attempt === previous.attempt && (previous.terminal || !error.terminal);
+}
+
+/**
+ * Entries grouped into runs, oldest first (see `startsNewRun`); within a run,
+ * identical consecutive errors collapse into one row.
  */
 export function groupAttempts(errors: unknown[] | null | undefined): Run[] {
   const runs: Run[] = [];
   let previous: ParsedError | null = null;
   for (const entry of errors ?? []) {
     const error = parseErrorEntry(entry);
-    const startsRun =
-      !previous || (error.attempt !== null && previous.attempt !== null && error.attempt < previous.attempt);
+    const startsRun = !previous || startsNewRun(previous, error);
     if (startsRun) runs.push({ run: runs.length + 1, rows: [] });
     const run = runs[runs.length - 1]!;
     const last = run.rows[run.rows.length - 1];
