@@ -409,8 +409,8 @@ within one ring cycle. `--now` builds populated partitions immediately with
 pruning of each partition while it builds. Tag lookups work throughout and
 scan any partition that has no index yet. See [Finding jobs](finding-jobs.md).
 
-A batch operation whose filter uses several tags, several states or
-`dead_lettered` is refused until every live runtime is 0.7.0-alpha.2 or
+A batch operation whose filter uses several tags, several states,
+`dead_lettered`, `cron_name` or `dlq_reason` is refused until every live runtime is 0.7.0-alpha.2 or
 later. Several tags or states travel as a list under `tag` or `state`,
 which a 0.6 server or runner refuses rather than ignoring, and DLQ retry and
 purge by the full filter go to new endpoints (`/api/dlq/retry-matching`,

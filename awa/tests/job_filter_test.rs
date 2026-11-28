@@ -446,6 +446,33 @@ async fn extended_filters_wait_for_the_fleet() {
     .await
     .expect_err("an old runner would ignore `tags`");
     assert!(err.to_string().contains("0.6.9"), "{err}");
+    for filter in [
+        JobFilter::new().queue(QUEUE).cron_name("nightly"),
+        JobFilter::new().queue(QUEUE).dlq_reason("poison"),
+    ] {
+        let spec = if filter.dlq_reason.is_some() {
+            BatchOperationSpec::PurgeDlq
+        } else {
+            BatchOperationSpec::SetPriority { priority: 1 }
+        };
+        let err = batch_operations::submit_batch_operation(
+            &pool,
+            SubmitBatchOperation {
+                spec,
+                filter: filter.clone(),
+                submitted_by: Some("test".into()),
+                allow_all: false,
+            },
+        )
+        .await
+        .expect_err("an old runner would ignore the field and act on more jobs");
+        let message = err.to_string();
+        assert!(message.contains("0.6.9"), "{filter:?}: {message}");
+        assert!(
+            message.contains("cron_name or dlq_reason"),
+            "{filter:?}: {message}"
+        );
+    }
     batch_operations::submit_batch_operation(&pool, submit(JobFilter::new().tag("batch:a")))
         .await
         .expect("one tag keeps the ADR-030 shape an old runner reads");
@@ -772,4 +799,261 @@ async fn a_pruned_job_drops_out_of_tag_lookups() {
         admin::count_jobs(&pool, &tagged).await.unwrap(),
         JobCount::Exact(0)
     );
+}
+
+const CRON_QUEUE: &str = "job_filter_cron";
+
+/// Nine untagged jobs: `nightly` cron jobs, `hourly` cron jobs and plain
+/// ones in turn. Three complete, two are dead-lettered with different
+/// reasons, one fails, and three stay available. Returns every job id.
+async fn seed_cron_and_dlq(pool: &PgPool, store: &QueueStorage) -> Vec<i64> {
+    let params: Vec<InsertParams> = (0..9)
+        .map(|n| InsertParams {
+            kind: "jf_cron".into(),
+            args: json!({ "n": n }),
+            opts: InsertOpts {
+                queue: CRON_QUEUE.into(),
+                metadata: match n % 3 {
+                    0 => json!({ "cron_name": "nightly", "cron_fire_time": "t" }),
+                    1 => json!({ "cron_name": "hourly", "triggered_manually": true }),
+                    _ => json!({}),
+                },
+                max_attempts: 1,
+                ..Default::default()
+            },
+        })
+        .collect();
+    let ids: Vec<i64> = awa::insert_many(pool, &params)
+        .await
+        .unwrap()
+        .iter()
+        .map(|job| job.id)
+        .collect();
+    let claimed = store
+        .claim_runtime_batch(pool, CRON_QUEUE, 6, Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 6);
+    let by_n = |n: usize| claimed.iter().find(|c| c.job.id == ids[n]).unwrap().clone();
+    store
+        .complete_runtime_batch(pool, &[by_n(0), by_n(1), by_n(2)])
+        .await
+        .unwrap();
+    for (n, reason) in [(3, "poison"), (4, "timeout")] {
+        let job = by_n(n).job;
+        store
+            .fail_to_dlq(pool, job.id, job.run_lease, reason, "bad input", None)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let job = by_n(5).job;
+    store
+        .fail_terminal(pool, job.id, job.run_lease, "boom", None)
+        .await
+        .unwrap()
+        .unwrap();
+    ids
+}
+
+#[tokio::test]
+async fn cron_and_dlq_reason_filters_agree_with_each_jobs_current_row() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool).await.unwrap().unwrap();
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    let ids = seed_cron_and_dlq(&pool, &store).await;
+    let deferring: i64 = sqlx::query_scalar(awa::audited_sql(format!(
+        "SELECT count(*) FROM {}.done_entries WHERE queue = $1 AND payload IS NULL",
+        store.schema()
+    )))
+    .bind(CRON_QUEUE)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        deferring > 0,
+        "the seed covers a done row whose metadata is on its ready row"
+    );
+    let mut rows = Vec::new();
+    for &id in &ids {
+        rows.push(admin::get_job_with_source(&pool, id).await.unwrap());
+    }
+    let filters = [
+        JobFilter::new().cron_name("nightly"),
+        JobFilter::new().cron_name("hourly"),
+        JobFilter::new().cron_name("weekly"),
+        JobFilter::new()
+            .cron_name("nightly")
+            .state(JobState::Completed),
+        JobFilter::new()
+            .cron_name("hourly")
+            .state(JobState::Available),
+        JobFilter::new().cron_name("nightly").dead_lettered(false),
+        JobFilter::new().dlq_reason("poison"),
+        JobFilter::new().dlq_reason("timeout"),
+        JobFilter::new().dlq_reason("other"),
+        JobFilter::new().dlq_reason("poison").cron_name("nightly"),
+        JobFilter::new().dlq_reason("poison").cron_name("hourly"),
+        JobFilter::new().dlq_reason("poison").dead_lettered(false),
+        JobFilter::new()
+            .dlq_reason("poison")
+            .state(JobState::Available),
+    ];
+    let mut nonempty = 0;
+    for filter in filters {
+        let expected: BTreeSet<i64> = rows
+            .iter()
+            .filter(|(job, dlq)| {
+                filter.matches(job, dlq.is_some())
+                    && filter.matches_dlq_reason(dlq.as_ref().map(|m| m.reason.as_str()))
+            })
+            .map(|(job, _)| job.id)
+            .collect();
+        nonempty += usize::from(!expected.is_empty());
+        let found: BTreeSet<i64> = admin::find_jobs(&pool, &filter, JobPage::first(1000))
+            .await
+            .unwrap()
+            .iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(found, expected, "find_jobs for {filter:?}");
+        let scoped = filter.clone().queue(CRON_QUEUE);
+        assert_eq!(
+            admin::count_jobs(&pool, &scoped).await.unwrap(),
+            JobCount::Exact(expected.len() as i64),
+            "count_jobs for {scoped:?}"
+        );
+        let dead: BTreeSet<i64> = dlq::find_dlq(&pool, &filter, DlqPage::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.job.id)
+            .collect();
+        let expected_dead: BTreeSet<i64> = rows
+            .iter()
+            .filter(|(job, dlq)| dlq.is_some() && expected.contains(&job.id))
+            .map(|(job, _)| job.id)
+            .collect();
+        assert_eq!(dead, expected_dead, "find_dlq for {filter:?}");
+    }
+    assert!(nonempty >= 6, "the seed exercises the filters");
+    assert_eq!(
+        admin::find_jobs(
+            &pool,
+            &JobFilter::new().dlq_reason("poison"),
+            JobPage::first(10)
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|job| job.id)
+        .collect::<Vec<_>>(),
+        vec![ids[3]]
+    );
+}
+
+#[tokio::test]
+async fn a_dlq_reason_is_refused_by_batch_kinds_that_never_reach_the_dlq() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool).await.unwrap().unwrap();
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    let ids = seed_cron_and_dlq(&pool, &store).await;
+    let filter = JobFilter::new().queue(CRON_QUEUE).dlq_reason("poison");
+    for spec in [
+        BatchOperationSpec::SetPriority { priority: 1 },
+        BatchOperationSpec::MoveQueue {
+            queue: "elsewhere".into(),
+            priority: None,
+        },
+        BatchOperationSpec::Retry,
+        BatchOperationSpec::Cancel,
+        BatchOperationSpec::Discard,
+        BatchOperationSpec::MoveToDlq { reason: None },
+    ] {
+        let kind = spec.kind();
+        let err = batch_operations::preview_batch_operation(&pool, spec, filter.clone())
+            .await
+            .expect_err("a dlq_reason cannot match outside the DLQ");
+        assert!(err.to_string().contains("dlq_reason"), "{kind:?}: {err}");
+    }
+    for spec in [
+        BatchOperationSpec::RetryFromDlq,
+        BatchOperationSpec::PurgeDlq,
+    ] {
+        let preview = batch_operations::preview_batch_operation(&pool, spec, filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(preview.total_matched, 1);
+        assert_eq!(preview.sample[0].id, ids[3]);
+    }
+    let cron = JobFilter::new().cron_name("nightly");
+    let preview = batch_operations::preview_batch_operation(
+        &pool,
+        BatchOperationSpec::SetPriority { priority: 1 },
+        cron.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview.total_matched, 1, "only job 6 is available");
+    let submitted = batch_operations::submit_batch_operation(
+        &pool,
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::PurgeDlq,
+            filter: JobFilter::new().dlq_reason("timeout"),
+            submitted_by: Some("test".into()),
+            allow_all: false,
+        },
+    )
+    .await
+    .expect("a DLQ reason narrows the DLQ without allow_all");
+    assert_eq!(submitted.filter.0, JobFilter::new().dlq_reason("timeout"));
+    let unscoped = dlq::purge_dlq_matching(&pool, &JobFilter::new().dlq_reason("timeout"), false)
+        .await
+        .unwrap();
+    assert_eq!(unscoped, 1, "a DLQ reason scopes a purge");
+}
+
+#[tokio::test]
+async fn dlq_reasons_group_by_reason_queue_and_kind() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool).await.unwrap().unwrap();
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    seed_cron_and_dlq(&pool, &store).await;
+    seed_queue_storage(&pool, &store).await;
+    let groups = dlq::dlq_reasons(&pool, None, None, 10).await.unwrap();
+    let keys: Vec<(&str, &str, &str, i64)> = groups
+        .iter()
+        .map(|g| {
+            (
+                g.reason.as_str(),
+                g.queue.as_str(),
+                g.kind.as_str(),
+                g.count,
+            )
+        })
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert!(
+        keys.contains(&("poison", CRON_QUEUE, "jf_cron", 1)),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&("timeout", CRON_QUEUE, "jf_cron", 1)),
+        "{keys:?}"
+    );
+    assert!(keys.contains(&("poison", QUEUE, "jf_even", 1)), "{keys:?}");
+    assert!(groups.iter().all(|g| g.oldest <= g.newest));
+    let narrowed = dlq::dlq_reasons(&pool, Some(QUEUE), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(narrowed.len(), 1);
+    assert_eq!(narrowed[0].queue, QUEUE);
+    let by_kind = dlq::dlq_reasons(&pool, None, Some("jf_cron"), 1)
+        .await
+        .unwrap();
+    assert_eq!(by_kind.len(), 1, "limit caps the groups");
+    assert_eq!(by_kind[0].kind, "jf_cron");
 }

@@ -1551,3 +1551,153 @@ async fn test_dlq_matching_endpoints_submit_batch_operations() {
         "the purged row is gone"
     );
 }
+
+async fn get_status(app: &axum::Router, path: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed")
+        .status()
+}
+
+/// `cron=` and `reason=` narrow the job and DLQ listings, and
+/// `/api/dlq/reasons` groups the DLQ by reason, queue and kind.
+#[tokio::test]
+async fn test_cron_and_reason_filters_and_dlq_reasons() {
+    use awa_model::queue_storage::QueueStorage;
+
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool)
+        .await
+        .unwrap()
+        .expect("queue storage should be active");
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    let queue = "api_cron_reason";
+    let params: Vec<awa_model::InsertParams> = ["nightly", "nightly", "hourly"]
+        .iter()
+        .map(|cron| awa_model::InsertParams {
+            kind: "api_cron_reason_job".to_string(),
+            args: serde_json::json!({}),
+            opts: awa_model::InsertOpts {
+                queue: queue.to_string(),
+                metadata: serde_json::json!({ "cron_name": cron }),
+                ..Default::default()
+            },
+        })
+        .collect();
+    let inserted = awa_model::insert_many(&pool, &params).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+        .await
+        .unwrap();
+    for claim in &claimed {
+        let reason = if claim.job.id == inserted[2].id {
+            "timeout"
+        } else {
+            "poison"
+        };
+        store
+            .fail_to_dlq(
+                &pool,
+                claim.job.id,
+                claim.job.run_lease,
+                reason,
+                "bad",
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+    let ids = |value: Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    assert_eq!(
+        ids(get_json(&app, "/api/jobs?cron=nightly").await),
+        vec![inserted[0].id, inserted[1].id]
+    );
+    assert_eq!(
+        ids(get_json(&app, "/api/dlq?cron=hourly").await),
+        vec![inserted[2].id]
+    );
+    assert_eq!(
+        ids(get_json(&app, &format!("/api/dlq?queue={queue}&reason=poison")).await),
+        vec![inserted[0].id, inserted[1].id]
+    );
+    assert_eq!(
+        ids(get_json(&app, "/api/jobs?reason=timeout").await),
+        vec![inserted[2].id],
+        "a reason lists dead-lettered jobs"
+    );
+    assert_eq!(
+        get_json(&app, "/api/jobs?reason=timeout&dead_lettered=false").await,
+        serde_json::json!([]),
+        "as dead_lettered does, a reason that cannot match lists nothing"
+    );
+    assert_eq!(
+        get_json(&app, "/api/jobs/count?cron=nightly&reason=poison").await["value"],
+        serde_json::json!(2)
+    );
+
+    let groups = get_json(&app, "/api/dlq/reasons").await;
+    let groups = groups.as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert_eq!(groups[0]["reason"], serde_json::json!("poison"));
+    assert_eq!(groups[0]["queue"], serde_json::json!(queue));
+    assert_eq!(groups[0]["kind"], serde_json::json!("api_cron_reason_job"));
+    assert_eq!(groups[0]["count"], serde_json::json!(2));
+    assert!(groups[0]["oldest"].is_string() && groups[0]["newest"].is_string());
+    assert_eq!(groups[1]["reason"], serde_json::json!("timeout"));
+    assert_eq!(
+        get_json(&app, "/api/dlq/reasons?queue=elsewhere").await,
+        serde_json::json!([])
+    );
+    assert_eq!(
+        get_json(&app, "/api/dlq/reasons?kind=api_cron_reason_job&limit=1")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for path in [
+        "/api/dlq/reasons?reason=poison",
+        "/api/dlq/reasons?queue=",
+        "/api/dlq/reasons?limit=x",
+    ] {
+        assert_eq!(
+            get_status(&app, path).await,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/batch-ops/preview",
+        serde_json::json!({
+            "op_kind": "retry",
+            "filter": { "queue": queue, "dlq_reason": "poison" },
+            "spec": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

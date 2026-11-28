@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-const FIELDS: [&str; 8] = [
+const FIELDS: [&str; 10] = [
     "kind",
     "queue",
     "ids",
@@ -15,6 +15,8 @@ const FIELDS: [&str; 8] = [
     "dead_lettered",
     "created_at_gte",
     "created_at_lt",
+    "cron_name",
+    "dlq_reason",
 ];
 
 fn item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -70,6 +72,8 @@ pub(crate) fn parse_job_filter(py: Python<'_>, filter: Option<&Py<PyAny>>) -> Py
         created_at_lt: item(dict, "created_at_lt")?
             .map(extract_datetime)
             .transpose()?,
+        cron_name: item(dict, "cron_name")?.map(|v| v.extract()).transpose()?,
+        dlq_reason: item(dict, "dlq_reason")?.map(|v| v.extract()).transpose()?,
         ..Default::default()
     };
     if let Some(tag) = item(dict, "tag")? {

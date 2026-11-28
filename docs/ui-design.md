@@ -56,9 +56,11 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 GET  /api/stats                         Job counts by state
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
-GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&limit=&before_id=
+GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&cron=&reason=&limit=&before_id=
                                         The shared job filter (ADR-049): `state` and `tag` repeat
-                                        (any of the states, all of the tags), `ids` is comma-separated.
+                                        (any of the states, all of the tags), `ids` is comma-separated,
+                                        `cron` is the schedule that enqueued the job and `reason` its
+                                        DLQ reason (dead-lettered jobs only).
                                         Rows omit output. Unknown or empty parameters are a 400; a 0.6
                                         server ignores unknown parameters and returns a wider list.
 GET  /api/jobs/count?<same filter>      { kind: "exact" | "at_least", value }; capped at 10,000
@@ -96,6 +98,7 @@ POST /api/cron/:name/resume
 GET  /api/dlq?<job filter>&limit=&before_id=&before_dlq_at=
 GET  /api/dlq/:id
 GET  /api/dlq/depth
+GET  /api/dlq/reasons?queue=&kind=&limit=   [{ reason, queue, kind, count, oldest, newest }], largest first
 POST   /api/dlq/:id/retry
 DELETE /api/dlq/:id
 POST   /api/dlq/retry-matching          { filter, all? }   all only with an empty filter; 202 with a retry_from_dlq batch operation

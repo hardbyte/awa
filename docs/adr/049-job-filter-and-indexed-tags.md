@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Amends [ADR-030](030-batch-operations.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading.
+Accepted. Amends [ADR-030](030-batch-operations.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading. Amended for 0.7: the filter gains `cron_name` and `dlq_reason` (see [Amendment: cron schedule and DLQ reason](#amendment-cron-schedule-and-dlq-reason)).
 
 ## Context
 
@@ -299,3 +299,17 @@ It's deferred because the index serves explicit tags today, and derivation can b
 - **ADR-026 / ADR-048.** The compact completion path is unchanged. Tagged jobs already leave it.
 - **ADR-044.** The lane cursor sits outside MVCC, which is why listing re-checks each job's current row instead of trusting the branches.
 - **ADR-045.** No trigger is added.
+
+## Amendment: cron schedule and DLQ reason
+
+**0.7.0-alpha.2.** `JobFilter` gains two fields, `cron_name: Option<String>` and `dlq_reason: Option<String>`. Operators ask "what did this schedule enqueue?" from a schedule's page, and "what failed this way?" from the DLQ. Neither question had a filter, so neither answer could be carried into a count or a batch operation.
+
+- **`cron_name` is the schedule that enqueued the job.** It matches the `cron_name` key a cron schedule writes into each job's metadata, scheduled or triggered by hand. On queue storage it compiles to `payload -> 'metadata' ->> 'cron_name'` in every branch. A done row whose payload is NULL, or narrow and without metadata, takes it from the ready row in the same ring slot, as the loader does. The compact completion branch is skipped, since a job with metadata never takes that path.
+- **`dlq_reason` is the reason the job was dead-lettered,** matched exactly against the DLQ's reason column. It selects only dead-lettered jobs, as `dead_lettered: true` does. With `dead_lettered: false`, or with states that leave out `failed`, it matches nothing; listing and counting return nothing, as they do for `dead_lettered: true` with those states. A job row carries no reason, so after loading a page the reasons of its dead-lettered jobs are read and re-checked.
+- **Batch kinds outside the DLQ refuse `dlq_reason`.** Every kind but `retry_from_dlq` and `purge_dlq` acts on no dead-lettered job, so a reason in its filter could match nothing; preview and submit return an error naming the field, as `dead_lettered: true` does.
+- **Both narrow.** Each counts as a field that picks out particular jobs, so a DLQ purge or bulk retry, or a batch operation, filtered by either alone needs no `allow_all`.
+- **The JSON keys are `cron_name` and `dlq_reason`,** single values like `kind`. Deserialization stays strict, so a reader from this version on refuses a misspelt key.
+- **New fields wait for the fleet.** An older runner ignores both keys and would act on more jobs, so a batch operation using either is refused while a live runtime is older than 0.7.0-alpha.2, the same floor as `dead_lettered`. No release before 0.7.0-alpha.2 has `JobFilter`, so the floor covers every older reader; a pre-release build of 0.7.0-alpha.2 from before this amendment refuses the unknown key rather than widening.
+- **Surfaces.** `GET /api/jobs`, `/api/jobs/count` and `/api/dlq` take `cron=` and `reason=`; `awa job list` and the DLQ commands take `--cron` and `--reason`; Python takes `cron_name` and `dlq_reason` keys. `GET /api/dlq/reasons` groups the DLQ by reason, queue and kind with counts and the oldest and newest `dlq_at`, narrowed by `queue=` and `kind=`.
+
+**No index.** This departs from the non-goal on [searching args or metadata](#non-goals) for one key, because the admin UI pairs it with a kind or queue: a schedule's page links to its jobs by kind and schedule, and the DLQ's reasons link within a queue and kind. `dlq_reason` reads only the DLQ, which retention bounds. An unpaired `cron_name` filter walks recent jobs newest first until the page fills, within the listing's 30-second budget; with 30,000 retained completions and 50,000 DLQ rows a page took under 200 ms. `/api/dlq/reasons` scans the DLQ, through the `(queue, dlq_at)` index when narrowed by queue; 50,000 rows grouped in under 20 ms. An expression index on the metadata key would tax every job for a lookup only cron jobs need, so it waits for measurements that call for it.

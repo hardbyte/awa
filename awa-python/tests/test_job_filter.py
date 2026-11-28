@@ -132,6 +132,46 @@ def test_dlq_helpers_take_the_filter(client):
     assert client.dlq_depth(queue=queue) == 6
 
 
+@dataclass
+class FilterPyOtherJob:
+    n: int
+
+
+def test_cron_name_and_dlq_reason_narrow_the_filter(client):
+    queue = "pyfilter_cron"
+    nightly = client.insert(
+        FilterPyJob(n=0), queue=queue, metadata={"cron_name": "nightly"}
+    )
+    other = client.insert(FilterPyOtherJob(n=1), queue=queue)
+    found = client.find_jobs(queue=queue, cron_name="nightly")
+    assert [j.id for j in found] == [nightly.id]
+    assert client.count_jobs({"queue": queue, "cron_name": "hourly"}) == {
+        "count": 0,
+        "exact": True,
+    }
+
+    for job in (nightly, other):
+        _move_ready_to_failed_done(client, job.id)
+    assert client.bulk_move_failed_to_dlq(
+        queue=queue, kind=nightly.kind, reason="py_poison"
+    ) == 1
+    assert client.bulk_move_failed_to_dlq(
+        queue=queue, kind=other.kind, reason="py_timeout"
+    ) == 1
+    listed = client.list_dlq(filter={"queue": queue, "dlq_reason": "py_timeout"})
+    assert [row.job.id for row in listed] == [other.id]
+    found = client.find_jobs(dlq_reason="py_poison", cron_name="nightly")
+    assert [j.id for j in found] == [nightly.id]
+
+    operation = client.purge_dlq(filter={"dlq_reason": "py_poison"})
+    _delete_batch_operation(client, operation["id"])
+    assert operation["filter"] == {"dlq_reason": "py_poison"}
+    with pytest.raises(Exception, match="dlq_reason"):
+        client.preview_batch_operation(
+            "retry", filter={"queue": queue, "dlq_reason": "py_poison"}
+        )
+
+
 def test_batch_preview_uses_the_same_population(client):
     queue = "pyfilter_batch"
     jobs = _seed(client, queue)

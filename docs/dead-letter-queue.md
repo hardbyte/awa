@@ -21,7 +21,15 @@ awa dlq depth --queue billing
 awa dlq list --limit 20
 awa dlq list --queue billing --kind charge_card --limit 50
 awa dlq list --tag urgent --before-dlq-at 2026-04-30T00:00:00Z
+
+# Rows dead-lettered for one reason, or enqueued by one cron schedule
+awa dlq list --queue billing --reason heartbeat_stale
+awa dlq list --kind nightly_report --cron nightly-report
 ```
+
+`--reason` matches `dlq_reason` exactly and `--cron` matches the schedule's name; both take the other filter flags beside them, and so do `awa dlq retry-bulk` and `awa dlq purge`. See [Finding jobs](finding-jobs.md#the-filter) for the full filter.
+
+`GET /api/dlq/reasons` groups the DLQ by reason, queue and kind, largest groups first: `[{"reason", "queue", "kind", "count", "oldest", "newest"}]`, where `oldest` and `newest` are the earliest and latest `dlq_at` in the group. `queue=` and `kind=` narrow the rows grouped and `limit=` caps the groups (20 by default, at most 100); other parameters are refused. It reads every matching DLQ row, through the `(queue, dlq_at)` index when `queue=` is given.
 
 The web UI's **Dead letters** page (served by `awa serve`), and the Dead letters tab on each queue, show the same data with filters and per-row drill-down.
 
@@ -81,6 +89,9 @@ The `--reason` is recorded in `dlq_reason` so you can distinguish bulk historica
 ```bash
 # Purge by filter
 awa dlq purge --queue billing --kind charge_card
+
+# Purge the rows dead-lettered for one reason
+awa dlq purge --queue billing --reason terminal_error
 
 # Purge everything (safety guard requires --all)
 awa dlq purge --all

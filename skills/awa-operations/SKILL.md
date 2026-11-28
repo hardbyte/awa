@@ -232,6 +232,7 @@ the fix, then `awa dlq retry-bulk --queue <q> --kind <kind>`.
 ```bash
 awa dlq depth --queue emails
 awa dlq list --queue emails --limit 20
+awa dlq list --queue emails --reason heartbeat_stale   # exact dlq_reason
 awa dlq retry <id>                       # resets attempt/lease, re-runs
 awa dlq retry-bulk --queue emails        # bulk; --all required with no filter
 awa dlq purge --kind SendEmail           # destructive; --all required if unfiltered
@@ -260,6 +261,13 @@ awa dlq purge --kind SendEmail --wait    # wait for the batch operation to finis
   claimed after a purge.
 - Enabling `dlq_enabled` does not retroactively move existing `failed` rows.
   Move them explicitly with `awa dlq move --reason ... [--all]`.
+- `awa dlq list`, `retry-bulk` and `purge` take `--reason` (exact `dlq_reason`)
+  and `--cron` (the schedule that enqueued the job) beside the other filter
+  flags; either alone scopes a bulk action without `--all`. In JSON filters
+  they are `dlq_reason` and `cron_name`; over HTTP, `reason=` and `cron=`.
+- `GET /api/dlq/reasons?queue=&kind=&limit=` groups the DLQ by reason, queue
+  and kind (`count`, `oldest`, `newest`), largest first, to triage which
+  failure to retry or purge.
 
 For large sets, run bulk actions as durable batch operations, which the
 maintenance leader applies a chunk per transaction with progress, cancellation
@@ -283,6 +291,11 @@ awa batch-ops cancel <id>
   page (`/batch-ops/<id>`) or with `awa batch-ops get`. Nothing changes until a worker's
   maintenance leader runs it. `awa dlq retry-bulk` and `purge` submit the same
   operations.
+- A `dlq_reason` filter is refused by every kind but `retry_from_dlq` and
+  `purge_dlq`, since the others act on no dead-lettered job. A filter with
+  several tags or states, `dead_lettered`, `cron_name` or `dlq_reason` is
+  refused while a live runtime is older than 0.7.0-alpha.2, which would ignore
+  them and act on more jobs.
 - An item whose row another transaction holds stays pending and is retried on
   a later chunk; one whose retry hits a unique key held by a newer job is
   recorded `errored` and the rest proceed.

@@ -228,7 +228,8 @@ admin operations (the web UI and admin API, and the Python client), not part of
 the code-defined builder; a paused schedule leaves `last_enqueued_at` untouched,
 so `missed_fire_policy` governs catch-up on resume. Cron pause and queue pause
 are independent. To purge in-flight cron work, pause the schedule, then
-bulk-cancel jobs filtered by `metadata.cron_name`.
+bulk-cancel its jobs by schedule name: the `cron_name` filter field
+(`awa batch-ops submit --op-kind cancel --filter '{"cron_name":"nightly-report"}'`).
 
 ### Complete owned schedule sets (v045+)
 

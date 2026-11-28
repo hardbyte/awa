@@ -138,6 +138,8 @@ pub(crate) fn dlq_predicate(filter: &JobFilter) -> Option<Predicate> {
         ids,
         created_at_gte,
         created_at_lt,
+        cron_name,
+        dlq_reason,
     } = filter;
     if *dead_lettered == Some(false) || (!states.is_empty() && !states.contains(&JobState::Failed))
     {
@@ -173,6 +175,16 @@ pub(crate) fn dlq_predicate(filter: &JobFilter) -> Option<Predicate> {
         let p = predicate.param(Bind::Time(lt));
         predicate.conditions.push(format!("created_at < {p}"));
     }
+    if let Some(name) = cron_name {
+        let p = predicate.param(Bind::Text(name.clone()));
+        predicate
+            .conditions
+            .push(format!("{} = {p}", cron_name_of("payload")));
+    }
+    if let Some(reason) = dlq_reason {
+        let p = predicate.param(Bind::Text(reason.clone()));
+        predicate.conditions.push(format!("dlq_reason = {p}"));
+    }
     Some(predicate)
 }
 
@@ -183,6 +195,12 @@ fn tag_condition(payload: &str, param: &str) -> String {
         "{} AND {payload} -> 'tags' @> {param}::jsonb",
         crate::tag_index::has_tags(payload)
     )
+}
+
+/// The `cron_name` a cron schedule writes into a job's metadata, read from
+/// the payload column `payload`.
+fn cron_name_of(payload: &str) -> String {
+    format!("({payload} -> 'metadata' ->> 'cron_name')")
 }
 
 fn state_names(states: &[JobState]) -> Vec<String> {
@@ -206,6 +224,11 @@ struct Branch {
     /// The payload column holding this row's tags, when it has one an index
     /// can serve.
     payload: Option<&'static str>,
+    /// The job's `cron_name` metadata, or `None` where no job with metadata
+    /// can be.
+    cron_name: Option<String>,
+    /// The DLQ reason column, on the branch that has one.
+    dlq_reason: Option<&'static str>,
 }
 
 impl Branch {
@@ -218,7 +241,7 @@ impl Branch {
     ) -> String {
         // No `..`, so a new field must be handled here before it compiles.
         // `states` and `dead_lettered` arrive as `states` and through the
-        // choice of branch.
+        // choice of branch; a `dlq_reason` also limits the choice to the DLQ.
         let JobFilter {
             kind,
             queue,
@@ -228,6 +251,8 @@ impl Branch {
             ids,
             created_at_gte,
             created_at_lt,
+            cron_name,
+            dlq_reason,
         } = filter;
         let mut conditions = self.conditions.clone();
         if let Some(kind) = kind {
@@ -268,6 +293,21 @@ impl Branch {
         if let Some(lt) = *created_at_lt {
             let p = statement.param(Bind::Time(lt));
             conditions.push(format!("{} < {p}", self.created_at));
+        }
+        if let Some(name) = cron_name {
+            let p = statement.param(Bind::Text(name.clone()));
+            let column = self
+                .cron_name
+                .as_ref()
+                .expect("branches without metadata are skipped for cron filters");
+            conditions.push(format!("{column} = {p}"));
+        }
+        if let Some(reason) = dlq_reason {
+            let column = self
+                .dlq_reason
+                .expect("a DLQ reason filter reads only the DLQ branch");
+            let p = statement.param(Bind::Text(reason.clone()));
+            conditions.push(format!("{column} = {p}"));
         }
         // With a tag, the order is computed rather than read from the
         // `job_id` index: otherwise the planner walks that index backwards,
@@ -440,6 +480,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         state: None,
         created_at: "r.created_at",
         payload: Some("r.payload"),
+        cron_name: Some(cron_name_of("r.payload")),
+        dlq_reason: None,
     }];
     branches.push(Branch {
         states: &[Scheduled, Retryable],
@@ -452,6 +494,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         state: Some("d.state"),
         created_at: "d.created_at",
         payload: Some("d.payload"),
+        cron_name: Some(cron_name_of("d.payload")),
+        dlq_reason: None,
     });
     branches.push(Branch {
         states: &[Running, WaitingExternal],
@@ -467,6 +511,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         state: Some("l.state"),
         created_at: "r.created_at",
         payload: Some("r.payload"),
+        cron_name: Some(cron_name_of("r.payload")),
+        dlq_reason: None,
     });
     let mut claim_conditions = vec![
         "c.closed_at IS NULL".to_string(),
@@ -495,6 +541,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         state: None,
         created_at: "r.created_at",
         payload: Some("r.payload"),
+        cron_name: Some(cron_name_of("r.payload")),
+        dlq_reason: None,
     });
     let mut batch_conditions = vec![
         // Skips, before unnesting, a batch whose receipts closure batches
@@ -534,8 +582,17 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         state: None,
         created_at: "r.created_at",
         payload: Some("r.payload"),
+        cron_name: Some(cron_name_of("r.payload")),
+        dlq_reason: None,
     });
     let done_created = "COALESCE(d.created_at, r.created_at, d.finalized_at)";
+    // A done row with a NULL payload, or a narrow one without metadata,
+    // takes its metadata from the ready row in the same ring slot.
+    let done_cron_name = format!(
+        "COALESCE({}, {})",
+        cron_name_of("d.payload"),
+        cron_name_of("r.payload")
+    );
     if tagged {
         // A done row identical to its ready row stores a NULL payload; its
         // tags live on the ready row in the same ring slot. Each half reads
@@ -554,6 +611,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             state: Some("d.state"),
             created_at: done_created,
             payload: Some("d.payload"),
+            cron_name: Some(done_cron_name),
+            dlq_reason: None,
         });
         branches.push(Branch {
             states: &[Completed, Failed, Cancelled],
@@ -569,6 +628,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             state: Some("d.state"),
             created_at: done_created,
             payload: Some("r.payload"),
+            cron_name: Some(cron_name_of("r.payload")),
+            dlq_reason: None,
         });
     } else {
         branches.push(Branch {
@@ -585,10 +646,13 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             state: Some("d.state"),
             created_at: done_created,
             payload: None,
+            cron_name: Some(done_cron_name),
+            dlq_reason: None,
         });
         // Compact completions. A tagged job never takes this path
         // (`receipt_fast_complete_candidate` requires an empty tag list), so
-        // tag filters skip it.
+        // tag filters skip it. Nor does a job with metadata, such as a cron
+        // job, so cron filters skip it too.
         branches.push(Branch {
             states: &[Completed],
             dead_lettered: false,
@@ -615,6 +679,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             state: None,
             created_at: "r.created_at",
             payload: None,
+            cron_name: None,
+            dlq_reason: None,
         });
     }
     branches.push(Branch {
@@ -628,6 +694,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         state: None,
         created_at: "q.created_at",
         payload: Some("q.payload"),
+        cron_name: Some(cron_name_of("q.payload")),
+        dlq_reason: Some("q.dlq_reason"),
     });
     branches
 }
@@ -645,10 +713,11 @@ fn reachable_branches(
         .filter(|branch| branch.states.iter().any(|state| states.contains(state)))
         .filter(|branch| {
             filter
-                .dead_lettered
+                .dead_lettered_scope()
                 .is_none_or(|wanted| wanted == branch.dead_lettered)
         })
         .filter(|branch| filter.tags.is_empty() || branch.payload.is_some())
+        .filter(|branch| filter.cron_name.is_none() || branch.cron_name.is_some())
         .collect();
     (!branches.is_empty()).then_some((states, branches))
 }
@@ -1085,8 +1154,13 @@ async fn find_within(
             return Ok(Vec::new());
         };
         let exhausted = (ids.len() as i64) < fetch;
-        for (job, dead_lettered) in load(pool, &store, &ids, budget.remaining()?).await? {
-            if effective.contains(&job.state) && filter.matches(&job, dead_lettered) {
+        let loaded = load(pool, &store, &ids, budget.remaining()?).await?;
+        let reasons = dlq_reasons(pool, filter, &loaded, budget).await?;
+        for (job, dead_lettered) in loaded {
+            if effective.contains(&job.state)
+                && filter.matches(&job, dead_lettered)
+                && filter.matches_dlq_reason(reasons.get(&job.id).map(String::as_str))
+            {
                 jobs.push(job);
                 if jobs.len() as i64 >= limit {
                     return Ok(jobs);
@@ -1112,6 +1186,30 @@ async fn find_within(
             Window::Unbounded { .. } => unreachable!("rejected above"),
         };
     }
+}
+
+/// The DLQ reasons of the dead-lettered jobs among `loaded`, read only
+/// when `filter` names a reason: a job row does not carry one.
+async fn dlq_reasons(
+    pool: &PgPool,
+    filter: &JobFilter,
+    loaded: &[(JobRow, bool)],
+    budget: &ReadBudget,
+) -> Result<std::collections::HashMap<i64, String>, AwaError> {
+    if filter.dlq_reason.is_none() {
+        return Ok(Default::default());
+    }
+    let ids: Vec<i64> = loaded
+        .iter()
+        .filter(|(_, dead_lettered)| *dead_lettered)
+        .map(|(job, _)| job.id)
+        .collect();
+    budget.remaining()?;
+    Ok(crate::dlq::dlq_metadata_for(pool, &ids)
+        .await?
+        .into_iter()
+        .map(|(id, metadata)| (id, metadata.reason))
+        .collect())
 }
 
 /// How many jobs `filter` selects among `eligible` states, counted in SQL
@@ -1329,5 +1427,53 @@ mod tests {
         assert!(!sql.contains("done_entries"), "{sql}");
         let none = self::sql(&JobFilter::new().dead_lettered(false), &ALL_STATES).unwrap();
         assert!(!none.contains("dlq_entries AS q"), "{none}");
+    }
+
+    #[test]
+    fn a_dlq_reason_reads_only_the_dlq_and_its_reason_column() {
+        let sql = sql(&JobFilter::new().dlq_reason("bad input"), &ALL_STATES).unwrap();
+        assert!(sql.contains("q.dlq_reason = $"), "{sql}");
+        assert!(!sql.contains("done_entries"), "{sql}");
+        assert!(!sql.contains("claim_cursors"), "{sql}");
+        assert!(self::sql(
+            &JobFilter::new()
+                .dlq_reason("bad input")
+                .dead_lettered(false),
+            &ALL_STATES
+        )
+        .is_none());
+        assert!(self::sql(
+            &JobFilter::new().dlq_reason("bad input"),
+            &[JobState::Available, JobState::Scheduled]
+        )
+        .is_none());
+        let predicate = dlq_predicate(&JobFilter::new().dlq_reason("bad input")).unwrap();
+        assert_eq!(predicate.conditions, vec!["dlq_reason = $1".to_string()]);
+    }
+
+    #[test]
+    fn a_cron_name_reads_job_metadata_in_every_branch() {
+        let sql = sql(&JobFilter::new().cron_name("nightly"), &ALL_STATES).unwrap();
+        assert!(
+            sql.contains("(r.payload -> 'metadata' ->> 'cron_name') = $"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("(d.payload -> 'metadata' ->> 'cron_name') = $"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "COALESCE((d.payload -> 'metadata' ->> 'cron_name'), \
+                 (r.payload -> 'metadata' ->> 'cron_name')) = $"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("receipt_completion_batches"), "{sql}");
+        let predicate = dlq_predicate(&JobFilter::new().cron_name("nightly")).unwrap();
+        assert_eq!(
+            predicate.conditions,
+            vec!["(payload -> 'metadata' ->> 'cron_name') = $1".to_string()]
+        );
     }
 }
