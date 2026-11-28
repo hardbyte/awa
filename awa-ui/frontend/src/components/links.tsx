@@ -58,7 +58,7 @@ export function KindLink({
 
 export function ScheduleLink({ name, className = "", children }: EntityLinkProps & { name: string }) {
   return (
-    <Link to="/cron" className={`${entityLinkClass} ${className}`}>
+    <Link to="/cron/$name" params={{ name }} className={`${entityLinkClass} ${className}`}>
       {children ?? name}
     </Link>
   );

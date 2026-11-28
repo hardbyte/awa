@@ -1,112 +1,95 @@
-import { useManagedQuery } from "@/hooks/use-managed-query";
-import { Time } from "@/components/Time";
-import { fetchCronReconciliation, cronOwnerAction, type CronActionPlan, type CronOwnerAction } from "../lib/api";
 import { useMemo, useState } from "react";
-import {
-  useMutation,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useManagedQuery } from "@/hooks/use-managed-query";
+import { useReadOnly } from "@/hooks/use-read-only";
+import { useNow } from "@/hooks/use-now";
+import { useCronActions } from "@/hooks/use-cron-actions";
 import {
   fetchCronJobs,
+  fetchCronReconciliation,
   fetchQueues,
-  pauseCronJob,
-  resumeCronJob,
-  triggerCronJob,
+  type CronJobRow,
+  type QueueOverview,
 } from "@/lib/api";
-import { useReadOnly } from "@/hooks/use-read-only";
-import { toast } from "@/components/ui/toast";
-import type { CronJobRow, QueueOverview } from "@/lib/api";
+import { isOverdue } from "@/lib/cron";
 import { Page, PageHeader } from "@/components/Page";
+import { ListState } from "@/components/ListState";
+import { describeCron } from "@/components/CronExpr";
+import { CronPlanNotice } from "@/components/CronPlanNotice";
+import { KindLink, QueueLink, ScheduleLink } from "@/components/links";
+import { Time } from "@/components/Time";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { CronExpr } from "@/components/CronExpr";
-import { ListState } from "@/components/ListState";
-import { JsonView } from "@/components/JsonView";
-import { formatInTimezone } from "@/lib/time";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableColumn,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+
+/** Badges for the states that need a look; a healthy schedule shows none. */
+export function CronStatusBadges({
+  cron,
+  queuePaused,
+  nowMs,
+}: {
+  cron: CronJobRow;
+  queuePaused: boolean;
+  nowMs: number;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {cron.retired_at && <Badge intent="warning" data-testid="cron-retired">Retired</Badge>}
+      {cron.paused_at && <Badge intent="warning" data-testid="cron-paused">Paused</Badge>}
+      {queuePaused && <Badge intent="warning" data-testid="cron-queue-paused">Queue paused</Badge>}
+      {isOverdue(cron, nowMs) && <Badge intent="danger" data-testid="cron-overdue">Overdue</Badge>}
+    </div>
+  );
+}
+
+/** The schedule in words with the raw expression after it. */
+export function CronSchedule({ cron }: { cron: Pick<CronJobRow, "cron_expr" | "timezone"> }) {
+  const words = describeCron(cron.cron_expr);
+  return (
+    <div className="min-w-0">
+      {words !== cron.cron_expr && <div>{words}</div>}
+      <code className="font-mono text-xs text-muted-fg">{cron.cron_expr}</code>
+      {cron.timezone !== "UTC" && <span className="ml-2 text-xs text-muted-fg">{cron.timezone}</span>}
+    </div>
+  );
+}
 
 export function CronPage() {
-  const queryClient = useQueryClient();
-  const [expandedName, setExpandedName] = useState<string | null>(null);
   const readOnly = useReadOnly();
+  const nowMs = useNow();
+  const actions = useCronActions();
 
   const cronQuery = useManagedQuery<CronJobRow[]>({
     queryKey: ["cron"],
     queryFn: fetchCronJobs,
   });
-
   const queuesQuery = useManagedQuery<QueueOverview[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
   });
+  const reconciliation = useManagedQuery({ queryKey: ["cron-reconciliation"], queryFn: fetchCronReconciliation });
 
-  const pausedQueues = useMemo(() => {
-    const set = new Set<string>();
-    for (const q of queuesQuery.data ?? []) {
-      if (q.paused) set.add(q.queue);
-    }
-    return set;
-  }, [queuesQuery.data]);
+  const pausedQueues = useMemo(
+    () => new Set((queuesQuery.data ?? []).filter((q) => q.paused).map((q) => q.queue)),
+    [queuesQuery.data]
+  );
 
-  const invalidateCron = () =>
-    queryClient.invalidateQueries({ queryKey: ["cron"] });
-
-  const triggerMutation = useMutation({
-    mutationFn: (name: string) => triggerCronJob(name),
-    onSuccess: (_data, name) => {
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Cron job "${name}" triggered`);
-    },
-    onError: () => {
-      toast.error("Failed to trigger cron job");
-    },
-  });
-
-  const pauseMutation = useMutation({
-    mutationFn: (name: string) => pauseCronJob(name),
-    onSuccess: (_data, name) => {
-      void invalidateCron();
-      toast.success(`Paused "${name}"`);
-    },
-    onError: () => {
-      toast.error("Failed to pause cron job");
-    },
-  });
-
-  const resumeMutation = useMutation({
-    mutationFn: (name: string) => resumeCronJob(name),
-    onSuccess: (_data, name) => {
-      void invalidateCron();
-      toast.success(`Resumed "${name}"`);
-    },
-    onError: () => {
-      toast.error("Failed to resume cron job");
-    },
-  });
-
-  const [actionPlan, setActionPlan] = useState<CronActionPlan | null>(null);
   const [adoptName, setAdoptName] = useState("");
   const [adoptOwner, setAdoptOwner] = useState("");
   const [expectedOwner, setExpectedOwner] = useState("");
-  const reconciliation = useManagedQuery({ queryKey: ["cron-reconciliation"], queryFn: fetchCronReconciliation });
-  const ownerMutation = useMutation({
-    mutationFn: ({ action, apply }: { action: CronOwnerAction; apply: boolean }) => cronOwnerAction(action, apply),
-    onSuccess: (plan) => {
-      if (plan.applied) {
-        setActionPlan(null);
-        void invalidateCron();
-        void queryClient.invalidateQueries({ queryKey: ["cron-reconciliation"] });
-        toast.success("Schedule operation applied");
-      } else { setActionPlan(plan); }
-    },
-    onError: (error: Error) => toast.error(error.message),
-  });
-  const preview = (action: CronOwnerAction) => ownerMutation.mutate({ action, apply: false });
 
   const cronJobs = cronQuery.data ?? [];
+  const toggling = actions.pause.isPending || actions.resume.isPending;
 
   return (
     <Page className="space-y-4">
-      <PageHeader title="Schedules" />
+      <PageHeader title="Schedules" description="Cron schedules and the jobs they enqueue." />
       {(reconciliation.data ?? []).map((plan) => (
         <details key={plan.owner_id} className="rounded-lg border p-3">
           <summary className="cursor-pointer font-medium">
@@ -120,8 +103,8 @@ export function CronPage() {
             {plan.retirements.length > 0 && <p>Would retire: {plan.retirements.join(", ")}</p>}
             {plan.declarations.map((d) => <p key={d.instance_id} className="break-all">{d.instance_id} · revision {d.revision} · manifest {d.desired_hash} · expires {d.expires_at}</p>)}
             {!readOnly && <div className="flex gap-2">
-              <Button intent="outline" size="xs" onPress={() => preview({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</Button>
-              <Button intent="outline" size="xs" onPress={() => preview({ action: "restore_owner", owner_id: plan.owner_id })}>Preview owner restoration</Button>
+              <Button intent="outline" size="xs" onPress={() => actions.previewOwner({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</Button>
+              <Button intent="outline" size="xs" onPress={() => actions.previewOwner({ action: "restore_owner", owner_id: plan.owner_id })}>Preview owner restoration</Button>
             </div>}
           </div>
         </details>
@@ -133,273 +116,99 @@ export function CronPage() {
           <input aria-label="Schedule name" placeholder="Schedule name" className="rounded border p-2" value={adoptName} onChange={(e) => setAdoptName(e.target.value)} />
           <input aria-label="New owner" placeholder="New owner" className="rounded border p-2" value={adoptOwner} onChange={(e) => setAdoptOwner(e.target.value)} />
           <input aria-label="Expected current owner" placeholder="Current owner (blank if unowned)" className="rounded border p-2" value={expectedOwner} onChange={(e) => setExpectedOwner(e.target.value)} />
-          <Button isDisabled={!adoptName || !adoptOwner || ownerMutation.isPending} onPress={() => preview({ action: "adopt", name: adoptName, owner_id: adoptOwner, expected_owner: expectedOwner || null })}>Preview</Button>
+          <Button isDisabled={!adoptName || !adoptOwner || actions.owner.isPending} onPress={() => actions.previewOwner({ action: "adopt", name: adoptName, owner_id: adoptOwner, expected_owner: expectedOwner || null })}>Preview</Button>
         </div>
       </details>}
-      {actionPlan && <div role="status" className="space-y-2 rounded-lg border p-4">
-        <p>Apply {actionPlan.action.action.replace(/_/g, " ")} to: {actionPlan.schedules.join(", ") || "no schedules"}?</p>
-        <p className="text-sm text-muted-fg">Retirement stops future scheduled runs. Restore starts from now. Already enqueued jobs continue.</p>
-        <Button isDisabled={readOnly || ownerMutation.isPending} onPress={() => ownerMutation.mutate({ action: actionPlan.action, apply: true })}>Apply</Button>
-        <Button intent="outline" onPress={() => setActionPlan(null)}>Cancel</Button>
-      </div>}
-
-      {cronJobs.length > 0 ? (
-        <div className="space-y-3">
-          {cronJobs.map((cj) => {
-            const isExpanded = expandedName === cj.name;
-            const domId = cj.name.replace(/[^a-zA-Z0-9_-]/g, "-");
-            const summaryId = `cron-summary-${domId}`;
-            const panelId = `cron-panel-${domId}`;
-            const hasArgs =
-              cj.args != null &&
-              typeof cj.args === "object" &&
-              Object.keys(cj.args as Record<string, unknown>).length > 0;
-            const hasTags = cj.tags.length > 0;
-            const hasMetadata =
-              cj.metadata != null &&
-              typeof cj.metadata === "object" &&
-              Object.keys(cj.metadata as Record<string, unknown>).length > 0;
-            const isPaused = cj.paused_at != null;
-            const isRetired = cj.retired_at != null;
-            const targetQueuePaused = pausedQueues.has(cj.queue);
-            const mutating =
-              pauseMutation.isPending || resumeMutation.isPending;
-
-            return (
-              <div
-                key={cj.name}
-                className="rounded-lg border transition-colors"
-              >
-                <div className="flex items-start gap-2 px-4 py-3">
-                  <button
-                    id={summaryId}
-                    type="button"
-                    aria-expanded={isExpanded}
-                    aria-controls={panelId}
-                    className="flex min-w-0 flex-1 flex-wrap items-center gap-3 rounded-md px-2 py-1 -mx-2 -my-1 text-left hover:bg-secondary/30 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-                    onClick={() =>
-                      setExpandedName(isExpanded ? null : cj.name)
-                    }
-                  >
-                    <svg
-                      className={`size-4 shrink-0 text-muted-fg transition-transform ${
-                        isExpanded ? "rotate-90" : ""
-                      }`}
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                      aria-hidden="true"
-                    >
-                      <path
-                        fillRule="evenodd"
-                        d="M7.21 14.77a.75.75 0 0 1 .02-1.06L11.168 10 7.23 6.29a.75.75 0 1 1 1.04-1.08l4.5 4.25a.75.75 0 0 1 0 1.08l-4.5 4.25a.75.75 0 0 1-1.06-.02Z"
-                        clipRule="evenodd"
-                      />
-                    </svg>
-
-                    <span className="font-medium">{cj.name}</span>
-                    {cj.owner_id && <Badge intent="secondary">{cj.owner_id}</Badge>}
-                    {isRetired && <Badge intent="warning">retired</Badge>}
-                    {isPaused && (
-                      <Badge intent="warning" className="text-[10px]">
-                        paused
-                      </Badge>
-                    )}
-                    <CronExpr expr={cj.cron_expr} />
-                    {cj.timezone !== "UTC" && (
-                      <span className="text-xs text-muted-fg">
-                        {cj.timezone}
-                      </span>
-                    )}
-
-                    <span className="text-sm text-muted-fg">{cj.kind}</span>
-                    <span className="text-sm text-muted-fg">
-                      &rarr; {cj.queue}
-                    </span>
-                    {targetQueuePaused && (
-                      <Badge intent="warning" className="text-[10px]">
-                        queue paused
-                      </Badge>
-                    )}
-
-                    {cj.priority !== 2 && (
-                      <Badge
-                        intent={cj.priority === 1 ? "danger" : "secondary"}
-                        className="text-[10px]"
-                      >
-                        P{cj.priority}
-                      </Badge>
-                    )}
-
-                    <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
-                      {cj.next_fire_at && !isPaused && !isRetired && (
-                        <Time value={cj.next_fire_at} format="relative" className="text-success" />
-                      )}
-                      {cj.last_enqueued_at ? (
-                        <Time value={cj.last_enqueued_at} />
-                      ) : (
-                        "Never run"
-                      )}
-                    </span>
-                  </button>
-
-                  {!readOnly && <Button intent="outline" size="xs" isDisabled={ownerMutation.isPending} onPress={() => preview({ action: isRetired ? "restore" : "retire", name: cj.name })}>{isRetired ? "Restore" : "Retire"}</Button>}
-                  {isPaused ? (
-                    <Button
-                      intent="outline"
-                      size="xs"
-                      onPress={() => {
-                        resumeMutation.mutate(cj.name);
-                      }}
-                      isDisabled={readOnly || mutating || isRetired}
-                    >
-                      Resume
-                    </Button>
-                  ) : (
-                    <Button
-                      intent="outline"
-                      size="xs"
-                      onPress={() => {
-                        pauseMutation.mutate(cj.name);
-                      }}
-                      isDisabled={readOnly || mutating || isRetired}
-                    >
-                      Pause
-                    </Button>
-                  )}
-
-                  <Button
-                    intent="outline"
-                    size="xs"
-                    onPress={() => {
-                      triggerMutation.mutate(cj.name);
-                    }}
-                    isDisabled={readOnly || triggerMutation.isPending || isRetired}
-                  >
-                    Trigger now
-                  </Button>
-                </div>
-
-                {/* Expanded detail */}
-                {isExpanded && (
-                  <div
-                    id={panelId}
-                    aria-labelledby={summaryId}
-                    className="border-t px-4 py-3 space-y-3"
-                  >
-                    {isPaused && (
-                      <div className="rounded-md bg-warning/10 border border-warning/30 px-3 py-2 text-sm">
-                        <span className="font-medium">Paused</span>
-                        {cj.paused_at && (
-                          <>
-                            {" "}
-                            <span className="text-muted-fg">
-                              since <Time value={cj.paused_at} />
-                            </span>
-                          </>
-                        )}
-                        {cj.paused_by && (
-                          <>
-                            {" by "}
-                            <span className="font-mono">{cj.paused_by}</span>
-                          </>
-                        )}
-                        <span className="text-muted-fg">
-                          {" "}— manual triggers still work; resume to restart automatic fires.
-                        </span>
-                      </div>
-                    )}
-                    {targetQueuePaused && (
-                      <div className="rounded-md bg-warning/10 border border-warning/30 px-3 py-2 text-sm">
-                        <span className="font-medium">Target queue paused.</span>
-                        <span className="text-muted-fg">
-                          {" "}Fires continue to enqueue jobs into{" "}
-                          <span className="font-mono">{cj.queue}</span>; they
-                          dispatch when the queue is resumed.
-                        </span>
-                      </div>
-                    )}
-
-                    <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm sm:grid-cols-4">
-                      <div>
-                        <dt className="text-muted-fg">Kind</dt>
-                        <dd className="font-medium">{cj.kind}</dd>
-                      </div>
-                      <div>
-                        <dt className="text-muted-fg">Queue</dt>
-                        <dd className="font-medium">{cj.queue}</dd>
-                      </div>
-                      <div>
-                        <dt className="text-muted-fg">Priority</dt>
-                        <dd className="font-medium">{cj.priority}</dd>
-                      </div>
-                      <div>
-                        <dt className="text-muted-fg">Max attempts</dt>
-                        <dd className="font-medium">{cj.max_attempts}</dd>
-                      </div>
-                    </div>
-
-                    {hasTags && (
-                      <div>
-                        <dt className="text-sm text-muted-fg mb-1">Tags</dt>
-                        <div className="flex flex-wrap gap-1">
-                          {cj.tags.map((tag) => (
-                            <Badge key={tag} intent="secondary" className="text-[10px]">
-                              {tag}
-                            </Badge>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {hasArgs && (
-                      <div>
-                        <dt className="text-sm text-muted-fg mb-1">Arguments</dt>
-                        <JsonView data={cj.args} />
-                      </div>
-                    )}
-
-                    {hasMetadata && (
-                      <div>
-                        <dt className="text-sm text-muted-fg mb-1">Metadata</dt>
-                        <JsonView data={cj.metadata} />
-                      </div>
-                    )}
-
-                    {cj.next_fire_at && (
-                      <div>
-                        <dt className="text-sm text-muted-fg">
-                          {isPaused ? "Next fire (if resumed)" : "Next fire"}
-                        </dt>
-                        <dd className="font-medium">
-                          {formatInTimezone(cj.next_fire_at, cj.timezone)}
-                          <span className="ml-2 text-muted-fg font-normal">
-                            (<Time value={cj.next_fire_at} format="relative" />)
-                          </span>
-                        </dd>
-                      </div>
-                    )}
-
-                    <div className="text-xs text-muted-fg">
-                      Created <Time value={cj.created_at} />
-                      {" · "}
-                      Updated <Time value={cj.updated_at} />
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      ) : (
-        <ListState
-          className="rounded-lg border"
-          isLoading={cronQuery.isLoading}
-          error={cronQuery.isError ? cronQuery.error : null}
-          onRetry={() => void cronQuery.refetch()}
-          noun="cron schedules"
-          empty="No cron schedules found."
+      {actions.plan && (
+        <CronPlanNotice
+          plan={actions.plan}
+          onApply={actions.applyPlan}
+          onCancel={actions.clearPlan}
+          isDisabled={readOnly || actions.owner.isPending}
         />
       )}
+
+      <Table aria-label="Schedules">
+        <TableHeader>
+          <TableColumn isRowHeader>Name</TableColumn>
+          <TableColumn>Schedule</TableColumn>
+          <TableColumn>Next</TableColumn>
+          <TableColumn>Last enqueued</TableColumn>
+          <TableColumn>Target</TableColumn>
+          <TableColumn>Status</TableColumn>
+          <TableColumn>Actions</TableColumn>
+        </TableHeader>
+        <TableBody
+          renderEmptyState={() => (
+            <ListState
+              isLoading={cronQuery.isLoading}
+              error={cronQuery.isError ? cronQuery.error : null}
+              onRetry={() => void cronQuery.refetch()}
+              noun="cron schedules"
+              empty="No cron schedules found."
+            />
+          )}
+        >
+          {cronJobs.map((cron) => {
+            const isPaused = cron.paused_at != null;
+            const isRetired = cron.retired_at != null;
+            return (
+              <TableRow key={cron.name} id={cron.name} data-testid="cron-row">
+                <TableCell className="font-medium">
+                  <ScheduleLink name={cron.name} />
+                  {cron.owner_id && (
+                    <div className="text-xs font-normal text-muted-fg">owner {cron.owner_id}</div>
+                  )}
+                </TableCell>
+                <TableCell>
+                  <CronSchedule cron={cron} />
+                </TableCell>
+                <TableCell>
+                  {isRetired ? (
+                    <span className="text-muted-fg">—</span>
+                  ) : (
+                    <span className={isPaused ? "text-muted-fg" : ""}>
+                      <Time value={cron.next_fire_at} format="relative" />
+                      {isPaused && <span className="sr-only"> (if resumed)</span>}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell>
+                  <Time value={cron.last_enqueued_at} fallback="Never" />
+                </TableCell>
+                <TableCell className="text-sm">
+                  <KindLink kind={cron.kind} /> <span aria-hidden="true">&rarr;</span>
+                  <span className="sr-only"> in queue </span> <QueueLink queue={cron.queue} />
+                </TableCell>
+                <TableCell>
+                  <CronStatusBadges cron={cron} queuePaused={pausedQueues.has(cron.queue)} nowMs={nowMs} />
+                </TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap gap-1">
+                    {isPaused ? (
+                      <Button intent="outline" size="xs" onPress={() => actions.resume.mutate(cron.name)} isDisabled={readOnly || toggling || isRetired}>
+                        Resume
+                      </Button>
+                    ) : (
+                      <Button intent="outline" size="xs" onPress={() => actions.pause.mutate(cron.name)} isDisabled={readOnly || toggling || isRetired}>
+                        Pause
+                      </Button>
+                    )}
+                    <Button intent="outline" size="xs" onPress={() => actions.trigger.mutate(cron.name)} isDisabled={readOnly || actions.trigger.isPending || isRetired}>
+                      Trigger now
+                    </Button>
+                    {!readOnly && (
+                      <Button intent="outline" size="xs" isDisabled={actions.owner.isPending} onPress={() => actions.previewOwner({ action: isRetired ? "restore" : "retire", name: cron.name })}>
+                        {isRetired ? "Restore" : "Retire"}
+                      </Button>
+                    )}
+                  </div>
+                </TableCell>
+              </TableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
     </Page>
   );
 }

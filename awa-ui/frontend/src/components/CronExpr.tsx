@@ -1,7 +1,7 @@
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 
 /** Simple human-readable description of common cron expressions. */
-function describeCron(expr: string): string {
+export function describeCron(expr: string): string {
   const parts = expr.trim().split(/\s+/);
   if (parts.length < 5) return expr;
 

@@ -18,6 +18,7 @@ import { KindDetailPage } from "./routes/kind-detail";
 import { QueuesPage } from "./routes/queues";
 import { QueueDetailPage } from "./routes/queue-detail";
 import { CronPage } from "./routes/cron";
+import { CronDetailPage } from "./routes/cron-detail";
 import { DlqPage } from "./routes/dlq";
 import { DlqDetailPage } from "./routes/dlq-detail";
 import { BatchOpsPage } from "./routes/batch-ops";
@@ -82,6 +83,12 @@ const cronRoute = createRoute({
   component: CronPage,
 });
 
+const cronDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/cron/$name",
+  component: CronDetailPage,
+});
+
 const dlqRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/dlq",
@@ -142,6 +149,7 @@ const routeTree = rootRoute.addChildren([
   runtimeRoute,
   runtimeInstanceRoute,
   cronRoute,
+  cronDetailRoute,
   dlqRoute,
   dlqDetailRoute,
   batchOpsRoute,

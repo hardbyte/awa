@@ -9,10 +9,6 @@ function isCronListResponse(response: Response): boolean {
   return response.ok() && response.request().method() === "GET" && url.pathname === "/api/cron";
 }
 
-function cronPanelId(name: string): string {
-  return `cron-panel-${name.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-}
-
 async function loadCronPage(page: Page) {
   const [cronResponse] = await Promise.all([
     page.waitForResponse(isCronListResponse),
@@ -24,10 +20,11 @@ async function loadCronPage(page: Page) {
   }>;
 }
 
-function firstCronSummary(page: Page, name: string) {
-  return page.getByRole("button", {
-    name: new RegExp(`\\b${escapeRegex(name)}\\b`),
-  });
+function cronRow(page: Page, name: string) {
+  return page
+    .getByRole("grid", { name: "Schedules" })
+    .getByRole("row")
+    .filter({ has: page.getByRole("link", { name, exact: true }) });
 }
 
 test.describe("Cron page", () => {
@@ -46,7 +43,7 @@ test.describe("Cron page", () => {
       return;
     }
 
-    await expect(firstCronSummary(page, cronJobs[0].name)).toBeVisible();
+    await expect(cronRow(page, cronJobs[0].name)).toBeVisible();
     await expect(page.getByRole("button", { name: "Trigger now" }).first()).toBeVisible();
     // Every row shows either a Pause or a Resume action.
     const hasPauseOrResume =
@@ -62,8 +59,7 @@ test.describe("Cron page", () => {
     }
 
     const target = cronJobs[0];
-    const summary = firstCronSummary(page, target.name);
-    const row = summary.locator("xpath=ancestor::div[contains(@class, 'rounded-lg')][1]");
+    const row = cronRow(page, target.name);
 
     const pauseBtn = row.getByRole("button", { name: "Pause" });
     const resumeBtn = row.getByRole("button", { name: "Resume" });
@@ -94,7 +90,7 @@ test.describe("Cron page", () => {
       pauseBtn.click(),
     ]);
     expect(pauseRes.ok()).toBeTruthy();
-    await expect(row.getByText(/^paused$/)).toBeVisible();
+    await expect(row.getByTestId("cron-paused")).toBeVisible();
     await expect(row.getByRole("button", { name: "Resume" })).toBeVisible();
 
     // Resume to restore initial state.
@@ -110,28 +106,20 @@ test.describe("Cron page", () => {
     await expect(row.getByRole("button", { name: "Pause" })).toBeVisible();
   });
 
-  test("clicking cron row toggles expand/collapse", async ({ page }) => {
+  test("a schedule's name opens its page", async ({ page }) => {
     const cronJobs = await loadCronPage(page);
     if (cronJobs.length === 0) {
       test.skip();
       return;
     }
 
-    const firstCron = cronJobs[0];
-    const summary = firstCronSummary(page, firstCron.name);
-    const panel = page.locator(`#${cronPanelId(firstCron.name)}`);
-
-    await expect(panel).toHaveCount(0);
-    await summary.click();
-
-    await expect(panel).toBeVisible();
-    await expect(panel.getByText("Kind", { exact: true })).toBeVisible();
-    await expect(panel.getByText("Queue", { exact: true })).toBeVisible();
-    await expect(panel.getByText("Priority", { exact: true })).toBeVisible();
-    await expect(panel.getByText("Max attempts", { exact: true })).toBeVisible();
-
-    await summary.click();
-    await expect(panel).toHaveCount(0);
+    const target = cronJobs[0];
+    await cronRow(page, target.name).getByRole("link", { name: target.name, exact: true }).click();
+    await expect(page).toHaveURL(new RegExp(`/cron/${escapeRegex(encodeURIComponent(target.name))}$`));
+    await expect(page.getByRole("heading", { level: 1, name: target.name })).toBeVisible();
+    for (const term of ["Kind", "Queue", "Priority", "Max attempts"]) {
+      await expect(page.getByText(term, { exact: true })).toBeVisible();
+    }
   });
 
   test("cron API response includes next_fire_at", async ({ page }) => {
@@ -153,30 +141,26 @@ test.describe("Cron page", () => {
     }
   });
 
-  test("cron summary row shows next fire time", async ({ page }) => {
+  test("the schedule list shows the next fire time", async ({ page }) => {
     const cronJobs = await loadCronPage(page);
-    if (cronJobs.length === 0) {
+    const live = cronJobs.find((job) => job.next_fire_at !== null);
+    if (!live) {
       test.skip();
       return;
     }
 
-    await expect(firstCronSummary(page, cronJobs[0].name)).toContainText(
-      /in \d+[smhd]|\d+[smhd] ago|just now/,
-    );
+    await expect(cronRow(page, live.name)).toContainText(/in \d+[smhd]|\d+[smhd] ago|just now/);
   });
 
-  test("expanded cron detail shows Next fire with timezone", async ({ page }) => {
+  test("a schedule's page shows Next fire with its time zone", async ({ page }) => {
     const cronJobs = await loadCronPage(page);
     if (cronJobs.length === 0) {
       test.skip();
       return;
     }
 
-    const firstCron = cronJobs[0];
-    const summary = firstCronSummary(page, firstCron.name);
-    const panel = page.locator(`#${cronPanelId(firstCron.name)}`);
-    await summary.click();
-    await expect(panel.getByText("Next fire")).toBeVisible();
+    await page.goto(`/cron/${encodeURIComponent(cronJobs[0].name)}`);
+    await expect(page.getByText(/^Next fire/)).toBeVisible();
   });
 
   test("trigger now button creates a job", async ({ page }) => {
@@ -218,14 +202,13 @@ test("owner operations preview, adopt, retire and restore", async ({ page, reque
   let rows = await (await request.get("/api/cron")).json();
   expect(rows.find((r: { name: string }) => r.name === "e2e_cron_owner").owner_id).toBeNull();
   await page.getByRole("button", { name: "Apply", exact: true }).click();
-  const summary = firstCronSummary(page, "e2e_cron_owner");
-  await expect(summary).toContainText("e2e-owner");
-  const row = summary.locator("xpath=ancestor::div[contains(@class, 'rounded-lg')][1]");
+  const row = cronRow(page, "e2e_cron_owner");
+  await expect(row).toContainText("e2e-owner");
   await row.getByRole("button", { name: "Retire", exact: true }).click();
   await expect(page.getByRole("status").filter({ hasText: "Apply retire" })).toBeVisible();
-  await expect(row.getByText(/^retired$/)).toHaveCount(0);
+  await expect(row.getByTestId("cron-retired")).toHaveCount(0);
   await page.getByRole("button", { name: "Apply", exact: true }).click();
-  await expect(row.getByText(/^retired$/)).toBeVisible();
+  await expect(row.getByTestId("cron-retired")).toBeVisible();
   await expect(row.getByRole("button", { name: "Trigger now" })).toBeDisabled();
   rows = await (await request.get("/api/cron")).json();
   expect(rows.find((r: { name: string }) => r.name === "e2e_cron_owner").next_fire_at).toBeNull();

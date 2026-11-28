@@ -41,7 +41,7 @@ export function pageTitle(pathname: string): string {
     case "runtime":
       return detail ? "Fleet instance" : "Fleet";
     case "cron":
-      return "Schedules";
+      return detail ? `Schedule ${detail}` : "Schedules";
     case "batch-ops":
       if (!detail) return "Bulk operations";
       return detail === "new" ? "New operation" : `Operation ${detail.slice(0, 8)}`;

@@ -29,3 +29,6 @@ export const MAX_SUGGESTIONS = 8;
 
 /** Dashboard queue table limit */
 export const DASHBOARD_QUEUE_LIMIT = 10;
+
+/** A schedule whose next fire is this far in the past reads as overdue. */
+export const CRON_OVERDUE_GRACE_MS = 60_000;

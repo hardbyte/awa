@@ -41,7 +41,7 @@ test.describe("Job kind page", () => {
     const schedule = page.getByTestId("kind-schedules").getByRole("link", { name: "e2e_cron_owner" });
     await expect(schedule).toBeVisible();
     await schedule.click();
-    await expect(page).toHaveURL(/\/cron/);
+    await expect(page).toHaveURL(/\/cron\/e2e_cron_owner$/);
   });
 
   test("a legacy kind without a descriptor still renders", async ({ page }) => {
