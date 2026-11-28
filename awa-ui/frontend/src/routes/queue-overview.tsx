@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useQueueHub } from "@/hooks/use-queue-hub";
 import { fetchCronJobs, fetchJobs, fetchRuntime, type CronJobRow, type JobRow, type RuntimeOverview } from "@/lib/api";
+import { fleetCapacity } from "@/lib/capacity";
 import { dlqDepthQuery } from "@/lib/shared-queries";
 import { groupFailures } from "@/lib/errors";
 import { formatNumber } from "@/lib/number";
@@ -66,7 +67,6 @@ export function QueueOverviewTab() {
   if (!queue) return null;
 
   const dlqRows = depthQuery.data?.by_queue.find((entry) => entry.queue === name)?.count ?? 0;
-  const capacity = runtime?.config?.mode === "hard_reserved" ? runtime.config.max_workers : null;
   const lag =
     queue.lag_seconds == null ? "—" : queue.lag_seconds < 10 ? `${queue.lag_seconds.toFixed(1)}s` : formatDuration(queue.lag_seconds);
 
@@ -84,6 +84,7 @@ export function QueueOverviewTab() {
   const instances = (fleetQuery.data?.instances ?? []).filter(
     (instance) => !instance.stale && instance.queues.some((entry) => entry.queue === name)
   );
+  const capacity = fleetCapacity(fleetQuery.data?.instances ?? [], name);
 
   return (
     <div className="space-y-6">
