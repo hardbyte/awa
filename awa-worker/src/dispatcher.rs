@@ -332,6 +332,18 @@ pub struct Dispatcher {
     /// Set for a timer wake that follows an empty poll: before claiming,
     /// read the queue's ready signal and skip the claim when it is zero.
     check_ready_signal: bool,
+    /// The lanes pinning the queue ring, for aging escalation. `None` leaves
+    /// claims at the configured aging interval.
+    ring_pin_watch: Option<Arc<crate::ring_pin::RingPinWatch>>,
+}
+
+/// Whether `err` is the database's `numeric_value_out_of_range`.
+fn is_numeric_overflow(err: &awa_model::AwaError) -> bool {
+    matches!(
+        err,
+        awa_model::AwaError::Database(sqlx::Error::Database(db_err))
+            if db_err.code().as_deref() == Some("22003")
+    )
 }
 
 /// Two default deadline-rescue scans.
@@ -380,6 +392,29 @@ impl Dispatcher {
             claimer_owner_id,
             abandon_grace: DEFAULT_ABANDON_GRACE,
             check_ready_signal: false,
+            ring_pin_watch: None,
+        }
+    }
+
+    /// Escalate this queue's aging while one of its lanes is starved and pins
+    /// the queue ring.
+    pub(crate) fn ring_pin_watch(mut self, watch: Arc<crate::ring_pin::RingPinWatch>) -> Self {
+        self.ring_pin_watch = Some(watch);
+        self
+    }
+
+    /// The aging interval to claim with, and whether it is escalated: the
+    /// configured one, or a shorter one while a lane of this queue is
+    /// starved and pins the queue ring.
+    fn claim_aging_interval(&self) -> (Duration, bool) {
+        let configured = self.config.priority_aging_interval;
+        let escalated = self
+            .ring_pin_watch
+            .as_ref()
+            .and_then(|watch| watch.escalated_interval(&self.queue, configured, Instant::now()));
+        match escalated {
+            Some(interval) => (interval, true),
+            None => (configured, false),
         }
     }
 
@@ -717,31 +752,58 @@ impl Dispatcher {
                         }
                     }
                 }
-                let claimed = runtime
-                    .store
-                    .claim_runtime_batch_with_aging_for_instance(
+                let (aging_interval, mut aging_escalated) = self.claim_aging_interval();
+                let claim_with = |aging_interval: Duration| {
+                    runtime.store.claim_runtime_batch_with_aging_for_instance(
                         &self.pool,
                         &self.queue,
                         batch_size as i64,
                         self.config.deadline_duration,
-                        self.config.priority_aging_interval,
+                        aging_interval,
                         self.claimer_owner_id,
                         max_claimers_per_queue().max(self.config.claimers as i16),
                         CLAIMER_LEASE_TTL,
                         CLAIMER_IDLE_THRESHOLD,
                     )
-                    .await;
+                };
+                let mut claimed = claim_with(aging_interval).await;
+                if aging_escalated && claimed.as_ref().is_err_and(is_numeric_overflow) {
+                    // A row of the claimed batch is older than the escalated
+                    // interval allows (the claim computes its priority as a
+                    // smallint), and the failed claim moved no cursor. Claim
+                    // with the configured interval instead, and leave the
+                    // queue unescalated until the pin is read again.
+                    self.metrics
+                        .record_dispatch_ring_pin_escalation_overflow(&self.queue);
+                    if let Some(watch) = &self.ring_pin_watch {
+                        watch.suppress(&self.queue, aging_interval);
+                        if watch.overflow_warn_due(&self.queue, Instant::now()) {
+                            warn!(
+                                queue = %self.queue,
+                                escalated_interval_secs = aging_interval.as_secs_f64(),
+                                "A claim with the escalated aging interval overflowed on an old row; claiming with the configured interval until the queue ring pin is read again, and escalating to a longer interval after"
+                            );
+                        }
+                    }
+                    aging_escalated = false;
+                    claimed = claim_with(self.config.priority_aging_interval).await;
+                }
                 drop(claim_slot);
                 match claimed {
-                    Ok(jobs) => jobs
-                        .into_iter()
-                        .map(|claimed| DispatchedJob {
-                            job: claimed.job,
-                            queue_storage_claim: Some(claimed.claim),
-                            queue_storage_unique_states: claimed.unique_states,
-                            abandon_after,
-                        })
-                        .collect(),
+                    Ok(jobs) => {
+                        if aging_escalated && !jobs.is_empty() {
+                            self.metrics
+                                .record_dispatch_ring_pin_escalated_claim(&self.queue);
+                        }
+                        jobs.into_iter()
+                            .map(|claimed| DispatchedJob {
+                                job: claimed.job,
+                                queue_storage_claim: Some(claimed.claim),
+                                queue_storage_unique_states: claimed.unique_states,
+                                abandon_after,
+                            })
+                            .collect()
+                    }
                     Err(err) => {
                         warn!(
                             queue = %self.queue,

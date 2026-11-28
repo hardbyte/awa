@@ -1030,7 +1030,7 @@ const QUEUE_RING_PIN_ADVANCE_LANES: usize = 32;
 const QUEUE_RING_PIN_ADVANCE_WINDOWS: usize = 4;
 
 /// A `(queue, priority, enqueue_shard)` ready lane.
-type ReadyLaneKey = (String, i16, i16);
+type ReadyLaneKey = crate::ring_pin::LaneKey;
 
 /// The lanes the leader last reported as pinning the queue ring, so their
 /// gauges can be zeroed once they stop, and when it last warned.
@@ -1153,6 +1153,9 @@ pub struct MaintenanceService {
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
     queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
+    /// Where the leader's reads of the queue ring pin are shared with this
+    /// runtime's dispatchers.
+    ring_pin_watch: Arc<crate::ring_pin::RingPinWatch>,
     /// The connection the leader runs the ring idle checks on while it leads,
     /// detached from the pool so it does not take a pool slot.
     idle_check_conn: std::sync::Mutex<Option<sqlx::PgConnection>>,
@@ -1572,6 +1575,7 @@ impl MaintenanceService {
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
             queue_ring_pin: std::sync::Mutex::new(QueueRingPinReport::default()),
+            ring_pin_watch: Arc::new(crate::ring_pin::RingPinWatch::default()),
             idle_check_conn: std::sync::Mutex::new(None),
             queue_ring_advance_warned_at: std::sync::Mutex::new(None),
             rescue_others_first_offset: AtomicUsize::new(0),
@@ -1672,6 +1676,11 @@ impl MaintenanceService {
     /// queue-storage deferred backlog after the routing flip.
     pub(crate) fn standby_queue_storage(mut self, runtime: Option<QueueStorageRuntime>) -> Self {
         self.standby_queue_storage = runtime;
+        self
+    }
+
+    pub(crate) fn ring_pin_watch(mut self, watch: Arc<crate::ring_pin::RingPinWatch>) -> Self {
+        self.ring_pin_watch = watch;
         self
     }
 
@@ -4416,6 +4425,10 @@ impl MaintenanceService {
             self.clear_queue_ring_pin();
             return;
         };
+        let causes = self.ring_pin_watch.publish(
+            crate::ring_pin::read_pin(store, &self.pool, &pin).await,
+            Instant::now(),
+        );
         let pinning: Vec<(ReadyLaneKey, Duration)> = pin
             .lanes
             .iter()
@@ -4433,7 +4446,12 @@ impl MaintenanceService {
             .observe(&pinning, &self.metrics, Instant::now());
         if warn {
             let oldest = &pin.lanes[0];
+            let cause = causes
+                .get(&(oldest.queue.clone(), oldest.priority, oldest.enqueue_shard))
+                .copied()
+                .unwrap_or(crate::ring_pin::PinCause::Unknown);
             warn!(
+                cause = %cause.as_str(),
                 slot = pin.slot,
                 queue = %oldest.queue,
                 priority = oldest.priority,
@@ -4555,6 +4573,7 @@ impl MaintenanceService {
     }
 
     fn clear_queue_ring_pin(&self) {
+        self.ring_pin_watch.clear(Instant::now());
         let cleared = self
             .queue_ring_pin
             .lock()

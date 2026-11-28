@@ -403,7 +403,7 @@ Symptoms on queue storage, while claims, completions and the other queues stay h
 - `awa.maintenance.prune.attempts` for the queue ring reports `skipped_active` with reason `queue.pending_ready`, and once rotation reaches the same slot `awa.maintenance.rotate.attempts` reports `skipped_busy` with blocker `queue.ready_rows`
 - `awa.ring.generation` for the queue ring stops advancing
 - the current slot's `ready_entries_*`, `done_entries_*`, `ready_segments_*` and `ready_claim_attempt_batches_*` partitions grow at the cluster's enqueue rate, for every queue
-- since 0.6.18, `awa.maintenance.prune.pinned_ready_age` reports the lane responsible, and the maintenance leader logs `Queue ring prune is pinned by unclaimed ready rows` with its `queue`, `priority`, `enqueue_shard` and `oldest_ready_age_secs`
+- since 0.6.18, `awa.maintenance.prune.pinned_ready_age` reports the lane responsible, and the maintenance leader logs `Queue ring prune is pinned by unclaimed ready rows` with its `queue`, `priority`, `enqueue_shard` and `oldest_ready_age_secs`; since 0.6.20 the warning also carries `cause`, why that oldest lane is not being claimed (below)
 
 Queue prune truncates the oldest sealed slot only once every lane's ready rows in it are behind that lane's claim cursor, and rotation cannot reuse a slot until prune has truncated it. A lane that nobody claims therefore holds the oldest slot, and with it storage reclamation for the whole ring, until it is claimed. The usual causes are:
 
@@ -411,9 +411,23 @@ Queue prune truncates the oldest sealed slot only once every lane's ready rows i
 - a queue no running worker serves, such as a deployment scaled to zero, or one rate-limited far below its arrival rate
 - a lower priority under strict priority (`priority_aging_interval` of zero) while a higher priority of the same queue stays backlogged
 
+The warning's `cause` field says which:
+
+| `cause` | Meaning |
+| --- | --- |
+| `paused` | the lane's queue is paused (`awa.queue_meta.paused`) |
+| `no_runtime` | the queue is not paused, but no live runtime on queue storage lists it among the queues it serves; a runtime still on canonical storage, or only draining it during a cutover, does not count |
+| `advancing` | a runtime serves the queue and the lane's claim cursor moved between two reads of the same slot: it is being claimed, more slowly than rows arrive or the ring rotates |
+| `starved` | a runtime serves the queue and the cursor did not move between two reads at least five seconds apart: a higher priority is taking every claim, or the queue is rate limited or out of workers, where nothing is claimed from any lane |
+| `unknown` | there are not yet two such reads of the lane in this slot, or the cause could not be read |
+
+The warning is logged when a lane first pins the ring and every five minutes after, so the first warning for a lane has no earlier read to compare with: it says `paused`, `no_runtime` or `unknown`, and `advancing` or `starved` appear on the repeats.
+
+Since 0.6.20, a `starved` lane above priority 1 is claimed without operator action unless the queue has `ring_pin_aging_escalation` off or a runtime before 0.6.20 serves it. Once a runtime reads the lane as `starved` on two consecutive reads, about 10 to 20 seconds after the pin is first seen, the queue claims with an aging interval of the time since the lane's last write in the slot over its priority minus one (at least one second, and raised so the oldest pending segment of the queue stays within the claim's priority arithmetic; a claim that overflows on an older row is made again with the configured interval), until the lane no longer pins the slot. For a queue that is rate limited or out of workers, `starved` as well, escalation serves the queue oldest-first across priorities as capacity frees. See [escalation while a lane pins the queue ring](configuration.md#escalation-while-a-lane-pins-the-queue-ring) for the details and cost. `awa.dispatch.ring_pin_escalated_claims` shows when it is active. A lane that is `advancing` is not escalated, and escalation does not help when a higher lane's head is older than the starved one's, or when the queue is paused, unserved, rate limited or out of workers.
+
 A claim on the lane releases the slot:
 
-- on a queue with strict priority, set a non-zero `priority_aging_interval`; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed, which is the fastest fix for a starved lane
+- on a queue with strict priority, set a non-zero `priority_aging_interval`; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed. Since 0.6.20, escalation does this for a starved pinning lane on its own
 - resume a paused queue
 - start workers for the queue, or raise its rate limit
 

@@ -321,6 +321,36 @@ The admin UI shows the priority on the current job snapshot and, when `_awa_orig
 
 Under queue storage, strict priority on a queue whose higher priorities stay backlogged leaves its lower-priority rows unclaimed, and unclaimed rows keep queue prune from reclaiming the oldest ring slot for every queue. Keep aging on for queues that mix priorities under sustained backlog; see [queue ring stops wrapping behind an unclaimed lane](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
 
+#### Escalation while a lane pins the queue ring
+
+Since 0.6.20, a queue claims with a shorter aging interval while one of its lanes is starved and keeps prune from reclaiming the oldest ring slot. This is on by default. A lane that is merely backlogged, and is being claimed, is never escalated.
+
+**When it starts.** A lane is escalated once a runtime reads it as `starved` on two consecutive reads. That needs all of:
+
+- the lane has pending rows in the oldest sealed ring slot, so it is in the pin that `awa.maintenance.prune.pinned_ready_age` reports
+- the queue is not paused and a live runtime on queue storage lists it
+- the lane's claim cursor did not move between two reads of the same slot at least five seconds apart
+
+Every runtime with escalation enabled reads the pin every 10 seconds, and the maintenance leader's own reads count too, so escalation starts about 10 to 20 seconds after the pin is first seen at the defaults. A lane above priority 1 is the only kind that can be escalated. A lane whose cursor moves between two reads is `advancing` and is left alone.
+
+`starved` means only that the cursor did not move. It also covers a queue that is rate limited or out of workers, where no lane's cursor moves because nothing is claimed. Escalation then changes which lane is claimed first as capacity frees: the queue is served oldest-first across priorities, instead of strictly by priority, until the lane has drained.
+
+**What interval it uses.** How long ago the lane's last ready segment in the pinned slot was written, divided by the lane's priority minus one, rounded down to a millisecond and at least one second. No row of the lane in the slot is younger than that write: a ready row is due when written, and a row promoted from deferred keeps the older `run_at` it had then. Every row of the lane in the slot is therefore at least that old, so each reaches effective priority 1 and the slot drains in consecutive claims instead of one row per read. The age is of the write, not of the last row's `run_at`, so a retry promoted late behind younger rows does not lengthen the interval. With several escalated lanes in a queue the shortest interval applies.
+
+The interval is raised, if needed, to the age of the queue's oldest pending ready segment divided by 16,384, rounded up to a whole second. The claim computes `priority - floor(age / interval)` as a `smallint` for the first segment of every lane of the queue and for every row it claims, and it fails if that passes 32,767. The floor covers the first pending segment of each lane as of the last read, which keeps those at half of that limit. It cannot see a row far older than the rest of its lane, such as a retry promoted after a long outage, until a claim reaches it, nor a head that changes after the read.
+
+When a claim made with an escalated interval fails with `numeric_value_out_of_range`, the dispatcher makes the same claim again at once with the configured interval and leaves the queue unescalated until the pin is next read. The failed claim moved no cursor, so nothing is lost. The queue is then escalated again no shorter than twice the interval that overflowed, and each further overflow doubles that, for as long as the pin stays in the same slot, so escalation gets past an old row in a few readings, about 10 seconds apart. If the interval reaches the configured one, the queue stays unescalated. Each overflow is counted in `awa.dispatch.ring_pin_escalation_overflows`, by `awa_job_queue`, and logged as `A claim with the escalated aging interval overflowed on an old row`, at most once a minute for each queue.
+
+The escalated interval is used only when it is shorter than the configured `priority_aging_interval`, or the configured interval is zero. If the floor is at or above the configured interval, the queue is not escalated.
+
+**When it stops.** The lane is escalated until it no longer pins that slot, whether or not claims have since moved its cursor, so a slot drains once started. It also stops when the queue is paused or no runtime on queue storage lists it, when the pin moves to another slot or clears, and, on a runtime that cannot read the pin, 45 seconds after its last read. The configured interval then applies again. A lane that pins a new slot has to be read as `starved` again.
+
+**What it costs.** While escalated, rows of the queue older than the lane's last write are served oldest-first across priorities, a bounded priority inversion that strict-priority queues may not want. It helps only when the starved rows are older than the heads of the lanes above them; if a higher lane's head is older, that lane is claimed first, as under strict priority. It does nothing for a paused or unserved queue, and rate limits, permits and `max_workers` apply as before. Each runtime that serves a queue with escalation enabled reads the pin every 10 seconds. While a lane pins the ring, the read is three queries: the pin itself, which probes each lane's rows in the slot by index (about 17 ms warm for 256 lanes over 2 million ready rows), whether the pinned queues are served, and the age of each queue's oldest pending segment, an index probe per lane (about 4 ms for the same lanes). `awa.dispatch.ring_pin_escalated_claims` counts the claims that returned jobs with an escalated interval, by `awa_job_queue`.
+
+No schema change. Runtimes before 0.6.20 do not escalate.
+
+To turn escalation off for a queue, call `ClientBuilder::queue_ring_pin_aging_escalation(queue, false)` (Rust), or set `"ring_pin_aging_escalation": False` in a Python queue dict or pass `ring_pin_aging_escalation=False` to `PartitionedQueue.queue_configs`. The queue then always claims with `priority_aging_interval`. See [queue ring stops wrapping behind an unclaimed lane](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
+
 There is a separate top-level `ClientBuilder::priority_aging_interval` that controls the legacy canonical-storage maintenance pass that physically rewrites stored priorities. With queue storage (the 0.6 default) it is a no-op; the per-queue setting above is the one to tune.
 
 ### Changing priority after enqueue
