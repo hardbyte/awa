@@ -343,3 +343,11 @@ test("read status separates failed first loads, stale retained data and not-foun
   assert.equal(scheduler.readStatus(), "1 view(s) failed to refresh; retained data is stale; 1 view(s) failed to load");
   scheduler.setVisible(false); await settle();
 });
+
+test("a replacement entry whose view still holds cached data reports a stale refresh, not a failed load", async () => {
+  const scheduler = new RefreshScheduler({}, () => 0); scheduler.setReady(true);
+  scheduler.attach(demand("runtime", async () => { throw new HttpError("unavailable", 500); }, { retained: () => true }));
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.readStatus(), "1 view(s) failed to refresh; retained data is stale");
+  scheduler.setVisible(false); await settle();
+});

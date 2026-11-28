@@ -21,6 +21,8 @@ export interface Demand {
   paused?: boolean;
   intervalMs?: number;
   stopAfterNull?: boolean;
+  /** Whether the view still holds data from an earlier read (e.g. in a shared query cache). */
+  retained?: () => boolean;
   run: (signal: AbortSignal) => Promise<unknown>;
   stale: (stale: boolean) => void;
 }
@@ -226,7 +228,7 @@ export class RefreshScheduler {
         if (this.entries.get(id) !== entry) return;
         entry.dirty = true;
         if (!controller.signal.aborted || error instanceof ReadTimeoutError) {
-          this.failure(error); entry.error = true;
+          this.failure(error); entry.error = true; entry.loaded ||= !!demand.retained?.();
           entry.missing = error instanceof HttpError && error.status === 404;
           entry.blocked = refusesRepeat(error);
           this.syncWatchdog(entry);
