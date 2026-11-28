@@ -416,16 +416,18 @@ The warning's `cause` field says which:
 | `cause` | Meaning |
 | --- | --- |
 | `paused` | the lane's queue is paused (`awa.queue_meta.paused`) |
-| `no_runtime` | the queue is not paused, but no live runtime lists it among the queues it serves |
-| `advancing` | a runtime serves the queue and the lane's claim cursor moved since the previous read: it is being claimed, more slowly than rows arrive or the ring rotates |
-| `starved` | a runtime serves the queue and the cursor has not moved: a higher priority is taking every claim, or the queue is rate limited or out of workers |
-| `unknown` | the cause could not be read |
+| `no_runtime` | the queue is not paused, but no live runtime on queue storage lists it among the queues it serves; a runtime still on canonical storage, or only draining it during a cutover, does not count |
+| `advancing` | a runtime serves the queue and the lane's claim cursor moved between two reads of the same slot: it is being claimed, more slowly than rows arrive or the ring rotates |
+| `starved` | a runtime serves the queue and the cursor did not move between two reads at least five seconds apart: a higher priority is taking every claim, or the queue is rate limited or out of workers |
+| `unknown` | there are not yet two such reads of the lane in this slot, or the cause could not be read |
 
-Since 0.6.20, a `starved` lane of a queue that has priority aging off or long is claimed without operator action: while a lane above priority 1 pins the slot, the queue claims with an aging interval short enough for that lane's head to reach priority 1 (see [escalation while a lane pins the queue ring](configuration.md#escalation-while-a-lane-pins-the-queue-ring)). `awa.dispatch.ring_pin_escalated_claims` shows when it is active. It does not help when a higher lane's head is older than the starved one's, when the queue is paused or unserved, or on a queue with `ring_pin_aging_escalation` off, and a runtime before 0.6.20 does not escalate.
+The warning is logged when a lane first pins the ring and every five minutes after, so the first warning for a lane has no earlier read to compare with: it says `paused`, `no_runtime` or `unknown`, and `advancing` or `starved` appear on the repeats.
+
+Since 0.6.20, a `starved` lane above priority 1 is claimed without operator action unless the queue has `ring_pin_aging_escalation` off or a runtime before 0.6.20 serves it. Once a runtime reads the lane as `starved` on two consecutive reads, about 10 to 20 seconds after the pin is first seen, the queue claims with an aging interval of the lane's newest pending row's age over its priority minus one (at least one second, and raised so no row of the queue can overflow the claim's priority arithmetic), until the lane no longer pins the slot. See [escalation while a lane pins the queue ring](configuration.md#escalation-while-a-lane-pins-the-queue-ring) for the details and cost. `awa.dispatch.ring_pin_escalated_claims` shows when it is active. A lane that is `advancing` is not escalated, and escalation does not help when a higher lane's head is older than the starved one's, or when the queue is paused, unserved, rate limited or out of workers.
 
 A claim on the lane releases the slot:
 
-- on a queue with strict priority, set a non-zero `priority_aging_interval`; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed. Since 0.6.20, escalation does this for the pinning lane on its own
+- on a queue with strict priority, set a non-zero `priority_aging_interval`; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed. Since 0.6.20, escalation does this for a starved pinning lane on its own
 - resume a paused queue
 - start workers for the queue, or raise its rate limit
 

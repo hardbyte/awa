@@ -131,11 +131,6 @@ pub struct QueueConfig {
     pub poll_interval: Duration,
     pub deadline_duration: Duration,
     pub priority_aging_interval: Duration,
-    /// While one of this queue's lanes keeps queue prune from reclaiming the
-    /// oldest sealed ring slot, claim with an aging interval short enough for
-    /// that lane's head row to reach priority 1 (default: true). Set to
-    /// `false` to always claim with `priority_aging_interval`.
-    pub ring_pin_aging_escalation: bool,
     /// Optional rate limit for this queue. None means unlimited.
     pub rate_limit: Option<RateLimit>,
     /// Minimum guaranteed workers in weighted mode (default: 0).
@@ -159,7 +154,6 @@ impl Default for QueueConfig {
             poll_interval: Duration::from_millis(200),
             deadline_duration: Duration::from_secs(300), // 5 minutes
             priority_aging_interval: Duration::from_secs(60),
-            ring_pin_aging_escalation: true,
             rate_limit: None,
             min_workers: 0,
             weight: 1,
@@ -393,25 +387,22 @@ impl Dispatcher {
         }
     }
 
-    /// Escalate this queue's aging while one of its lanes pins the queue
-    /// ring, when the queue has not opted out.
+    /// Escalate this queue's aging while one of its lanes is starved and pins
+    /// the queue ring.
     pub(crate) fn ring_pin_watch(mut self, watch: Arc<crate::ring_pin::RingPinWatch>) -> Self {
-        self.ring_pin_watch = self.config.ring_pin_aging_escalation.then_some(watch);
+        self.ring_pin_watch = Some(watch);
         self
     }
 
     /// The aging interval to claim with, and whether it is escalated: the
-    /// configured one, or a shorter one while a lane of this queue pins the
-    /// queue ring.
-    fn claim_aging_interval(&self, store: &awa_model::QueueStorage) -> (Duration, bool) {
+    /// configured one, or a shorter one while a lane of this queue is
+    /// starved and pins the queue ring.
+    fn claim_aging_interval(&self) -> (Duration, bool) {
         let configured = self.config.priority_aging_interval;
-        let escalated = self.ring_pin_watch.as_ref().and_then(|watch| {
-            watch.escalated_interval(
-                configured,
-                |lane_queue| store.queue_claims_lane(&self.queue, lane_queue),
-                Instant::now(),
-            )
-        });
+        let escalated = self
+            .ring_pin_watch
+            .as_ref()
+            .and_then(|watch| watch.escalated_interval(&self.queue, configured, Instant::now()));
         match escalated {
             Some(interval) => (interval, true),
             None => (configured, false),
@@ -752,7 +743,7 @@ impl Dispatcher {
                         }
                     }
                 }
-                let (aging_interval, aging_escalated) = self.claim_aging_interval(&runtime.store);
+                let (aging_interval, aging_escalated) = self.claim_aging_interval();
                 let claimed = runtime
                     .store
                     .claim_runtime_batch_with_aging_for_instance(

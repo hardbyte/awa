@@ -171,6 +171,7 @@ pub struct ClientBuilder {
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
     dlq_overrides: HashMap<String, bool>,
+    ring_pin_aging_escalation_overrides: HashMap<String, bool>,
     storage: RuntimeStorage,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
@@ -234,6 +235,7 @@ impl ClientBuilder {
             dlq_retention: None,
             dlq_cleanup_batch_size: None,
             dlq_overrides: HashMap::new(),
+            ring_pin_aging_escalation_overrides: HashMap::new(),
             storage,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
@@ -946,6 +948,25 @@ impl ClientBuilder {
         self
     }
 
+    /// Turn escalated priority aging on or off for a single queue; it is on
+    /// for every queue by default.
+    ///
+    /// On queue storage, while a lane of the queue keeps queue prune from
+    /// reclaiming the oldest sealed ring slot and no claim reaches it, the
+    /// queue claims with an aging interval short enough for that lane's rows
+    /// in the slot to reach priority 1. With `enabled` false the queue always
+    /// claims with its `priority_aging_interval`. See the configuration guide
+    /// for when escalation starts and stops.
+    pub fn queue_ring_pin_aging_escalation(
+        mut self,
+        queue: impl Into<String>,
+        enabled: bool,
+    ) -> Self {
+        self.ring_pin_aging_escalation_overrides
+            .insert(queue.into(), enabled);
+        self
+    }
+
     /// Set retention for DLQ rows.
     pub fn dlq_retention(mut self, retention: Duration) -> Self {
         self.dlq_retention = Some(retention);
@@ -1189,6 +1210,7 @@ impl ClientBuilder {
             rescue_pass_budget: self.rescue_pass_budget,
             rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
+            ring_pin_aging_escalation_overrides: self.ring_pin_aging_escalation_overrides,
             ring_pin_watch: Arc::new(crate::ring_pin::RingPinWatch::default()),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
@@ -1292,6 +1314,8 @@ pub struct Client {
     rescue_pass_budget: Option<Duration>,
     rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
+    /// Queues with escalated priority aging switched on or off; the rest have it on.
+    ring_pin_aging_escalation_overrides: HashMap<String, bool>,
     /// The lanes pinning the queue ring, shared by dispatchers for aging escalation.
     ring_pin_watch: Arc<crate::ring_pin::RingPinWatch>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
@@ -1409,6 +1433,13 @@ impl Client {
     /// Create a new builder.
     pub fn builder(pool: PgPool) -> ClientBuilder {
         ClientBuilder::new(pool)
+    }
+
+    fn ring_pin_aging_escalation_enabled(&self, queue: &str) -> bool {
+        self.ring_pin_aging_escalation_overrides
+            .get(queue)
+            .copied()
+            .unwrap_or(true)
     }
 
     fn expected_queue_storage_schema(
@@ -1998,7 +2029,7 @@ impl Client {
                     // so they can hold separate bounded-claimer slots.
                     Uuid::new_v4()
                 };
-                let dispatcher = Dispatcher::with_concurrency(
+                let mut dispatcher = Dispatcher::with_concurrency(
                     queue_name.clone(),
                     self.runtime_instance_id,
                     config.clone(),
@@ -2017,12 +2048,14 @@ impl Client {
                     claimer_owner_id,
                     effective_storage.clone(),
                 )
-                .ring_pin_watch(self.ring_pin_watch.clone())
                 .abandon_grace(
                     2 * self
                         .deadline_rescue_interval
                         .unwrap_or(crate::maintenance::DEFAULT_DEADLINE_RESCUE_INTERVAL),
                 );
+                if self.ring_pin_aging_escalation_enabled(queue_name) {
+                    dispatcher = dispatcher.ring_pin_watch(self.ring_pin_watch.clone());
+                }
                 dispatcher_handles.push(tokio::spawn(async move {
                     dispatcher.run().await;
                 }));
@@ -2033,7 +2066,7 @@ impl Client {
             if self
                 .queues
                 .iter()
-                .any(|(_, config)| config.ring_pin_aging_escalation)
+                .any(|(queue, _)| self.ring_pin_aging_escalation_enabled(queue))
             {
                 // Spread runtimes across the refresh interval.
                 let start_offset = Duration::from_millis(

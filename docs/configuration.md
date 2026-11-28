@@ -229,7 +229,7 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 
 | Scope | Knobs | Notes |
 | --- | --- | --- |
-| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `ring_pin_aging_escalation`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
+| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
 | Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, and extra metadata. They do not set dispatch limits or timeouts. |
 | Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout--bounding-wait_for_callback). |
@@ -323,11 +323,29 @@ Under queue storage, strict priority on a queue whose higher priorities stay bac
 
 #### Escalation while a lane pins the queue ring
 
-Since 0.6.20, while one of a queue's lanes above priority 1 keeps prune from reclaiming the oldest ring slot, the queue's dispatchers claim with a shorter aging interval: the pinning lane's head age divided by its priority minus one, at least one second, which brings that lane's head to effective priority 1. With several pinning lanes, the shortest such interval applies. While it applies, rows of the queue older than the pinned lane's head are served oldest-first across priorities. The configured interval applies again as soon as the lane no longer pins the slot, and the escalated interval is used only when it is shorter than the configured one (or the configured one is zero).
+Since 0.6.20, a queue claims with a shorter aging interval while one of its lanes is starved and keeps prune from reclaiming the oldest ring slot. This is on by default. A lane that is merely backlogged, and is being claimed, is never escalated.
 
-It helps only when the starved head is older than the heads of the lanes above it; if a higher lane's head is older, that lane is claimed first, as under strict priority. It does not change anything for a paused queue or one no runtime serves, and rate limits, permits and `max_workers` apply as before. Each runtime that serves a queue with escalation enabled reads the pinning lanes about every 10 seconds, so escalation starts and stops within about that long, and a runtime that cannot read them claims with the configured interval. `awa.dispatch.ring_pin_escalated_claims` counts the claims that returned jobs with an escalated interval, by `awa_job_queue`.
+**When it starts.** A lane is escalated once a runtime reads it as `starved` on two consecutive reads. That needs all of:
 
-Escalation is on by default. Set `QueueConfig.ring_pin_aging_escalation` to `false` (Rust) or `"ring_pin_aging_escalation": False` (Python queue dict, `PartitionedQueue.queue_configs(ring_pin_aging_escalation=False)`) to always claim with `priority_aging_interval`. See [queue ring stops wrapping behind an unclaimed lane](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
+- the lane has pending rows in the oldest sealed ring slot, so it is in the pin that `awa.maintenance.prune.pinned_ready_age` reports
+- the queue is not paused and a live runtime on queue storage lists it
+- the lane's claim cursor did not move between two reads of the same slot at least five seconds apart
+
+Every runtime with escalation enabled reads the pin every 10 seconds, and the maintenance leader's own reads count too, so escalation starts about 10 to 20 seconds after the pin is first seen at the defaults. A lane above priority 1 is the only kind that can be escalated. A lane whose cursor moves between two reads is `advancing` and is left alone.
+
+**What interval it uses.** The age of the lane's newest row in the pinned slot, divided by its priority minus one, rounded down to a millisecond and at least one second. Every row of the lane in that slot is at least that old, so each reaches effective priority 1 and the slot drains in consecutive claims instead of one row per read. With several escalated lanes in a queue the shortest interval applies.
+
+The interval is then raised, if needed, to the age of the queue's oldest pending ready segment divided by 16,384, rounded up to a whole second. The claim computes `priority - floor(age / interval)` for every lane of the queue, and fails every claim of the queue if that passes 32,767; the floor keeps it at half of that, whatever the aging interval of the moment. A queue with a pending lane more than about 4.5 hours old therefore never claims with an interval below 2 seconds, and when the floor is above the interval the lane asks for, the lane's older rows may still wait behind newer rows of higher priority.
+
+The escalated interval is used only when it is shorter than the configured `priority_aging_interval`, or the configured interval is zero. If the floor is at or above the configured interval, the queue is not escalated.
+
+**When it stops.** The lane is escalated until it no longer pins that slot, whether or not claims have since moved its cursor, so a slot drains once started. It also stops when the queue is paused or no runtime on queue storage lists it, when the pin moves to another slot or clears, and, on a runtime that cannot read the pin, 45 seconds after its last read. The configured interval then applies again. A lane that pins a new slot has to be read as `starved` again.
+
+**What it costs.** While escalated, rows of the queue older than the pinned lane's newest row are served oldest-first across priorities, a bounded priority inversion that strict-priority queues may not want. It helps only when the starved rows are older than the heads of the lanes above them; if a higher lane's head is older, that lane is claimed first, as under strict priority. It does nothing for a paused or unserved queue, and rate limits, permits and `max_workers` apply as before. Each runtime that serves a queue with escalation enabled reads the pin every 10 seconds. While a lane pins the ring, the read is three queries: the pin itself, which probes each lane's rows in the slot by index (about 17 ms warm for 256 lanes over 2 million ready rows), whether the pinned queues are served, and the age of each queue's oldest pending segment, an index probe per lane (about 4 ms for the same lanes). `awa.dispatch.ring_pin_escalated_claims` counts the claims that returned jobs with an escalated interval, by `awa_job_queue`.
+
+No schema change. Runtimes before 0.6.20 do not escalate.
+
+To turn escalation off for a queue, call `ClientBuilder::queue_ring_pin_aging_escalation(queue, false)` (Rust), or set `"ring_pin_aging_escalation": False` in a Python queue dict or pass `ring_pin_aging_escalation=False` to `PartitionedQueue.queue_configs`. The queue then always claims with `priority_aging_interval`. See [queue ring stops wrapping behind an unclaimed lane](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
 
 There is a separate top-level `ClientBuilder::priority_aging_interval` that controls the legacy canonical-storage maintenance pass that physically rewrites stored priorities. With queue storage (the 0.6 default) it is a no-op; the per-queue setting above is the one to tune.
 

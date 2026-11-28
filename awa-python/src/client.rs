@@ -1802,10 +1802,10 @@ impl PyClient {
             if let Some(claim_batch_size) = config.claim_batch_size {
                 queue_config.claim_batch_size = claim_batch_size;
             }
-            if let Some(enabled) = config.ring_pin_aging_escalation {
-                queue_config.ring_pin_aging_escalation = enabled;
-            }
             builder = builder.queue(config.name.clone(), queue_config);
+            if let Some(enabled) = config.ring_pin_aging_escalation {
+                builder = builder.queue_ring_pin_aging_escalation(config.name.clone(), enabled);
+            }
         }
         if let Some(global_max) = global_max_workers {
             builder = builder.global_max_workers(global_max);
@@ -3526,8 +3526,8 @@ struct ParsedQueueConfig {
     /// Rust `QueueConfig` default.
     claim_batch_size: Option<usize>,
     /// Whether the queue claims with a shorter aging interval while one of
-    /// its lanes keeps the queue ring from being reclaimed. `None` keeps the
-    /// Rust `QueueConfig` default (on).
+    /// its lanes is starved and keeps the queue ring from being reclaimed.
+    /// `None` keeps the client default (on).
     ring_pin_aging_escalation: Option<bool>,
 }
 

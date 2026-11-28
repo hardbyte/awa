@@ -754,6 +754,8 @@ pub struct PendingReadyLane {
     pub head_run_at: DateTime<Utc>,
     /// How long that row has been ready, by the database clock.
     pub head_age: Duration,
+    /// How long the lane's last row in the slot has been ready.
+    pub newest_age: Duration,
 }
 
 /// A lane whose claim cursor [`QueueStorage::advance_spent_claim_heads`]
@@ -803,14 +805,19 @@ pub struct QueueRingPin {
     pub lanes: Vec<PendingReadyLane>,
 }
 
-/// Whether a queue is paused and whether a live runtime serves it. See
-/// [`QueueStorage::queue_serving_states`].
+/// Whether a queue is paused and whether a live runtime on queue storage
+/// serves it. See [`QueueStorage::queue_serving_states`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct QueueServingState {
     pub paused: bool,
     pub served: bool,
 }
+
+/// One row of the [`QueueStorage::queue_ring_pin`] read: queue, priority,
+/// enqueue shard, head `lane_seq` and `run_at`, and the ages in seconds of the
+/// head and of the newest row in the slot.
+type PendingReadyLaneRow = (String, i16, i16, i64, DateTime<Utc>, f64, f64);
 
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     if let sqlx::Error::Database(ref db_err) = err {
@@ -3920,7 +3927,8 @@ impl QueueStorage {
         self.next_stripe_probe.fetch_add(1, Ordering::Relaxed) % stripe_count
     }
 
-    fn logical_queue_name<'a>(&self, queue: &'a str) -> &'a str {
+    /// `queue` without the stripe suffix of a physical stripe queue.
+    pub fn logical_queue_name<'a>(&self, queue: &'a str) -> &'a str {
         if !self.uses_queue_striping() {
             return queue;
         }
@@ -21507,7 +21515,7 @@ impl QueueStorage {
         };
 
         let ready_child = ready_child_name(schema, slot as usize);
-        let rows: Vec<(String, i16, i16, i64, DateTime<Utc>, f64)> = sqlx::query_as(&format!(
+        let rows: Vec<PendingReadyLaneRow> = sqlx::query_as(&format!(
             r#"
             WITH claim_cursors AS MATERIALIZED (
                 SELECT
@@ -21523,7 +21531,8 @@ impl QueueStorage {
                 claims.enqueue_shard,
                 head.lane_seq,
                 head.run_at,
-                GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - head.run_at)), 0)::float8
+                GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - head.run_at)), 0)::float8,
+                GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - newest.run_at)), 0)::float8
             FROM claim_cursors AS claims
             CROSS JOIN LATERAL (
                 SELECT ready.lane_seq, ready.run_at
@@ -21535,6 +21544,15 @@ impl QueueStorage {
                 ORDER BY ready.lane_seq ASC
                 LIMIT 1
             ) AS head
+            CROSS JOIN LATERAL (
+                SELECT ready.run_at
+                FROM {ready_child} AS ready
+                WHERE ready.queue = claims.queue
+                  AND ready.priority = claims.priority
+                  AND ready.enqueue_shard = claims.enqueue_shard
+                ORDER BY ready.lane_seq DESC
+                LIMIT 1
+            ) AS newest
             ORDER BY head.run_at ASC, claims.queue, claims.priority, claims.enqueue_shard
             "#
         ))
@@ -21549,14 +21567,24 @@ impl QueueStorage {
         let lanes = rows
             .into_iter()
             .map(
-                |(queue, priority, enqueue_shard, head_lane_seq, head_run_at, age_secs)| {
+                |(
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    head_lane_seq,
+                    head_run_at,
+                    head_age_secs,
+                    newest_age_secs,
+                )| {
                     PendingReadyLane {
                         queue,
                         priority,
                         enqueue_shard,
                         head_lane_seq,
                         head_run_at,
-                        head_age: Duration::try_from_secs_f64(age_secs).unwrap_or_default(),
+                        head_age: Duration::try_from_secs_f64(head_age_secs).unwrap_or_default(),
+                        newest_age: Duration::try_from_secs_f64(newest_age_secs)
+                            .unwrap_or_default(),
                     }
                 },
             )
@@ -21568,20 +21596,12 @@ impl QueueStorage {
         }))
     }
 
-    /// Whether `lane_queue`, the queue of a ready lane, is one of the lanes
-    /// the claim path of `queue` reads: the same name, or one of its stripes.
-    pub fn queue_claims_lane(&self, queue: &str, lane_queue: &str) -> bool {
-        queue == lane_queue
-            || (self.uses_queue_striping()
-                && self
-                    .physical_queues_for_logical(queue)
-                    .iter()
-                    .any(|physical| physical == lane_queue))
-    }
-
     /// Whether each of `lane_queues`, the queues of ready lanes such as those
     /// in a [`QueueRingPin`], is paused and whether a live runtime serves it.
-    /// A stripe is read as its logical queue. One query.
+    /// A runtime serves a queue it lists while its snapshot is fresh and it
+    /// reports queue storage as its storage capability, so one still on
+    /// canonical storage, or only draining it, does not. A stripe is read as
+    /// its logical queue. One query.
     #[tracing::instrument(
         skip(self, pool, lane_queues),
         name = "queue_storage.queue_serving_states"
@@ -21612,6 +21632,7 @@ impl QueueStorage {
                     SELECT 1
                     FROM awa.runtime_instances AS runtime
                     WHERE NOT runtime.shutting_down
+                      AND runtime.storage_capability = 'queue_storage'
                       AND runtime.last_seen_at + make_interval(
                           secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
                       ) >= now()
@@ -21634,6 +21655,104 @@ impl QueueStorage {
                 by_logical
                     .get(self.logical_queue_name(queue))
                     .map(|state| (queue.clone(), *state))
+            })
+            .collect())
+    }
+
+    /// How long the oldest ready segment still pending in any lane of each
+    /// queue has been ready, by the database clock, keyed by queue without
+    /// stripe suffixes. A queue with nothing pending is absent.
+    ///
+    /// This is the age of the row the claim of the queue measures its aging
+    /// against, lane by lane: the first ready segment past the claim cursor.
+    /// An aging interval must keep it under 32,767 intervals, or the claim of
+    /// the queue fails. Probes each lane's segments by index, one lane after
+    /// another.
+    #[tracing::instrument(
+        skip(self, pool, lane_queues),
+        name = "queue_storage.oldest_pending_ready_ages"
+    )]
+    pub async fn oldest_pending_ready_ages(
+        &self,
+        pool: &PgPool,
+        lane_queues: &[String],
+    ) -> Result<HashMap<String, Duration>, AwaError> {
+        let mut logical: Vec<String> = lane_queues
+            .iter()
+            .map(|queue| self.logical_queue_name(queue).to_string())
+            .collect();
+        logical.sort_unstable();
+        logical.dedup();
+        if logical.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (logical_names, physical_names): (Vec<String>, Vec<String>) = logical
+            .iter()
+            .flat_map(|queue| {
+                self.physical_queues_for_logical(queue)
+                    .into_iter()
+                    .map(|physical| (queue.clone(), physical))
+            })
+            .unzip();
+
+        let schema = self.schema();
+        // Bounded like `queue_ring_pin`: a probe must not queue behind the
+        // exclusive lock a prune is waiting for on a segment partition.
+        let mut tx = pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        let rows: Vec<(String, f64)> = sqlx::query_as(&format!(
+            r#"
+            WITH wanted AS (
+                SELECT logical_queue, physical_queue
+                FROM unnest($1::text[], $2::text[]) AS wanted(logical_queue, physical_queue)
+            ),
+            claim_cursors AS MATERIALIZED (
+                SELECT
+                    wanted.logical_queue,
+                    heads.queue,
+                    heads.priority,
+                    heads.enqueue_shard,
+                    {schema}.sequence_next_value(heads.seq_name) AS claim_seq
+                FROM wanted
+                JOIN {schema}.queue_claim_heads AS heads
+                  ON heads.queue = wanted.physical_queue
+            )
+            SELECT
+                claims.logical_queue,
+                MAX(GREATEST(
+                    EXTRACT(EPOCH FROM (clock_timestamp() - first_segment.first_run_at)),
+                    0
+                ))::float8
+            FROM claim_cursors AS claims
+            CROSS JOIN LATERAL (
+                SELECT segment.first_run_at
+                FROM {schema}.ready_segments AS segment
+                WHERE segment.queue = claims.queue
+                  AND segment.priority = claims.priority
+                  AND segment.enqueue_shard = claims.enqueue_shard
+                  AND segment.next_lane_seq > claims.claim_seq
+                ORDER BY segment.next_lane_seq ASC
+                LIMIT 1
+            ) AS first_segment
+            GROUP BY claims.logical_queue
+            "#
+        ))
+        .bind(&logical_names)
+        .bind(&physical_names)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(queue, age_secs)| {
+                (
+                    queue,
+                    Duration::try_from_secs_f64(age_secs).unwrap_or_default(),
+                )
             })
             .collect())
     }
