@@ -358,6 +358,15 @@ test.describe("Queues page", () => {
       pauseItem.click(),
     ]);
     expect(pauseResponse.ok()).toBeTruthy();
+
+    // Its toast offers Undo, which resumes the queue.
+    const toast = page.locator("[data-sonner-toast]").filter({ hasText: 'Queue "e2e_test" paused' });
+    await expect(toast).toBeVisible();
+    const [undoResponse] = await Promise.all([
+      page.waitForResponse((r) => r.url().endsWith("/api/queues/e2e_test/resume") && r.request().method() === "POST"),
+      toast.getByRole("button", { name: "Undo" }).click(),
+    ]);
+    expect(undoResponse.ok()).toBeTruthy();
   });
 
   test("Resume executes mutation from the Actions menu", async ({ page }) => {
@@ -400,10 +409,21 @@ test.describe("Queues page", () => {
 
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
-    await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
-    await expect(dialog.getByText("Running jobs will not be affected")).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: 'Drain queue "e2e_test"?' })).toBeVisible();
+    await expect(dialog.getByText(/Running jobs are not affected/)).toBeVisible();
 
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).not.toBeVisible();
+  });
+
+  test("on a read-only server the Actions menu is disabled and says why", async ({ page }) => {
+    await page.route("**/api/capabilities", async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), read_only: true } });
+    });
+    await loadQueuesPage(page);
+    const trigger = page.getByRole("grid", { name: "Queues" }).getByRole("button", { name: "Actions for e2e_test" });
+    await expect(trigger).toBeDisabled();
+    await expect(trigger).toHaveAccessibleDescription("Read-only server — admin actions are off");
   });
 });

@@ -508,10 +508,10 @@ access with ingress policy, firewall, or private networking. It binds
 Run one `awa serve` per database (single-backend by design; `--peer` links are
 navigation only, no shared data plane). Use `--read-only` / `AWA_READ_ONLY=1`
 for incident read-outs or against a replica — mutation endpoints return 503 and
-the UI hides its buttons; read-only is auto-detected against a read-only
-connection. Set `--callback-hmac-secret` to verify callback signatures; for
-externally reachable callbacks with a private admin surface, run
-`awa callbacks serve` instead, whose router has no admin routes.
+the UI disables admin actions and says why; read-only is auto-detected against
+a read-only connection. Set `--callback-hmac-secret` to verify callback
+signatures; for externally reachable callbacks with a private admin surface,
+run `awa callbacks serve` instead, whose router has no admin routes.
 
 Managed dashboard views share a per-tab polling scheduler: at most 16 exact
 queries and two reads at once. The UI shows retained data as stale on read

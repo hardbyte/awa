@@ -145,7 +145,7 @@ test.describe("Job detail page", () => {
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
     );
 
-    await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Retry…" })).toBeVisible();
   });
 
   test("timeline renders on job detail", async ({ page }) => {
@@ -179,19 +179,23 @@ test.describe("Job detail page", () => {
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
     );
 
-    // Available jobs can be cancelled
-    const cancelBtn = page.getByRole("button", { name: "Cancel" });
+    // Available jobs can be cancelled, after confirming
+    const cancelBtn = page.getByRole("button", { name: "Cancel…" });
     await expect(cancelBtn).toBeVisible();
+    await cancelBtn.click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: /^Cancel job #\d+\?$/ })).toBeVisible();
+    await expect(dialog.getByText("It won't run. A cancelled job can be retried later.")).toBeVisible();
 
-    // Click cancel and verify mutation fires
     const [cancelResponse] = await Promise.all([
       page.waitForResponse(
         (r) => r.url().includes("/cancel") && r.request().method() === "POST"
       ),
-      cancelBtn.click(),
+      dialog.getByRole("button", { name: /^Cancel job #\d+$/ }).click(),
     ]);
 
     expect(cancelResponse.ok()).toBeTruthy();
+    await expect(dialog).toBeHidden();
   });
 
   test("retry button on failed job executes mutation", async ({ page }) => {
@@ -208,18 +212,48 @@ test.describe("Job detail page", () => {
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
     );
 
-    const retryBtn = page.getByRole("button", { name: "Retry" });
+    const retryBtn = page.getByRole("button", { name: "Retry…" });
     await expect(retryBtn).toBeVisible();
+    await retryBtn.click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByText(/happens again/)).toBeVisible();
 
-    // Click retry and verify mutation fires
     const [retryResponse] = await Promise.all([
       page.waitForResponse(
         (r) => r.url().includes("/retry") && r.request().method() === "POST"
       ),
-      retryBtn.click(),
+      dialog.getByRole("button", { name: /^Retry job #\d+$/ }).click(),
     ]);
 
     expect(retryResponse.ok()).toBeTruthy();
+  });
+
+  test("a refused cancel keeps the dialog open with the server's error", async ({ page }) => {
+    await page.route("**/api/jobs/*/cancel", (route) =>
+      route.fulfill({ status: 409, json: { error: "job is no longer cancellable" } })
+    );
+    await page.goto("/jobs/800004");
+    const cancelBtn = page.getByRole("button", { name: "Cancel…" });
+    await cancelBtn.click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: "Cancel job #800004?" })).toBeVisible();
+    await dialog.getByRole("button", { name: "Cancel job #800004" }).click();
+    await expect(dialog.getByTestId("confirm-error")).toContainText("job is no longer cancellable");
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Keep" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(cancelBtn).toBeFocused();
+  });
+
+  test("on a read-only server the actions are disabled and say why", async ({ page }) => {
+    await page.route("**/api/capabilities", async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), read_only: true } });
+    });
+    await page.goto("/jobs/800004");
+    const cancelBtn = page.getByRole("button", { name: "Cancel…" });
+    await expect(cancelBtn).toBeDisabled();
+    await expect(cancelBtn).toHaveAccessibleDescription("Read-only server — admin actions are off");
   });
 
   test("breadcrumb navigates to /jobs", async ({ page }) => {

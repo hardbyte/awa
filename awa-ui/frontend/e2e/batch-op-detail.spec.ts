@@ -87,7 +87,8 @@ test.describe("Bulk operation page", () => {
     await page.goto(`/batch-ops/${ID}`);
     await page.getByRole("button", { name: "Cancel operation" }).click();
     const dialog = page.getByRole("alertdialog");
-    await expect(dialog).toContainText("The 10 job(s) it has already changed stay changed.");
+    await expect(dialog).toContainText("The 10 of 100 job(s) it has already changed stay changed.");
+    await expect(dialog).not.toContainText("undone");
     await dialog.getByRole("button", { name: "Cancel operation" }).click();
     await expect(page.locator('[data-state="cancelling"]')).toBeVisible();
   });

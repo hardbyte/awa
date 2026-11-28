@@ -9,7 +9,8 @@ import {
   type BatchOperationPayload,
   type BatchOperationPreview,
 } from "@/lib/api";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { AdminButton } from "@/components/AdminAction";
 import {
   buildPayload,
   describeOperation,
@@ -25,17 +26,14 @@ import {
   searchFromForm,
   type BatchForm,
 } from "@/lib/batch";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Page, PageHeader } from "@/components/Page";
 import { SECTION_LABELS } from "@/lib/sections";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { formatNumber } from "@/lib/number";
 
 export function BatchOpNewPage() {
   const queryClient = useQueryClient();
-  const readOnly = useReadOnly();
   const navigate = useNavigate();
   const search = useSearch({ strict: false }) as Record<string, unknown>;
   const [form, setForm] = useState<BatchForm>(() => formFromSearch(search));
@@ -90,7 +88,6 @@ export function BatchOpNewPage() {
       toast.success(`Submitted operation ${operation.id.slice(0, 8)}`);
       void navigate({ to: "/batch-ops/$id", params: { id: operation.id } });
     },
-    onError: (error) => toast.error(error.message),
   });
 
   return (
@@ -200,22 +197,24 @@ export function BatchOpNewPage() {
           </p>
         )}
         <div className="mt-4 flex items-center gap-2">
-          <Button onPress={() => previewMutation.mutate(payload)} isDisabled={readOnly || previewMutation.isPending || !isPayloadValid}>Preview</Button>
-          <Button intent="primary" onPress={() => setConfirming(true)} isDisabled={readOnly || submitMutation.isPending || !isPayloadValid || !currentPreview}>Submit</Button>
+          <AdminButton onPress={() => previewMutation.mutate(payload)} isDisabled={previewMutation.isPending || !isPayloadValid}>Preview</AdminButton>
+          <AdminButton intent="primary" onPress={() => setConfirming(true)} isDisabled={submitMutation.isPending || !isPayloadValid || !currentPreview}>Submit…</AdminButton>
           {submitHint && (
             <span className="text-xs text-muted-fg" data-testid="batch-submit-hint">{submitHint}</span>
           )}
         </div>
       </section>
 
-      <ConfirmDialog
+      <ConfirmAction
         isOpen={confirming && currentPreview !== null}
         onOpenChange={setConfirming}
-        title="Submit batch operation"
+        tier={2}
+        intent={payload.op_kind === "discard" || payload.op_kind === "purge_dlq" ? "danger" : "primary"}
+        irreversible={payload.op_kind === "discard" || payload.op_kind === "purge_dlq"}
+        title={`Submit ${selectedKind.label.toLowerCase()} operation?`}
         description={currentPreview ? describeOperation(payload, currentPreview) : ""}
-        confirmLabel="Submit"
-        onConfirm={() => submitMutation.mutate()}
-        isPending={submitMutation.isPending}
+        confirmLabel={`Submit ${selectedKind.label.toLowerCase()}`}
+        onConfirm={() => submitMutation.mutateAsync()}
       />
     </Page>
   );

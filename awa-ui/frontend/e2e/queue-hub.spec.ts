@@ -76,7 +76,7 @@ test.describe("Queue hub", () => {
     await page.locator('[data-slot="page-header"]').getByRole("button", { name: "Drain" }).click();
     const dialog = page.getByRole("alertdialog");
     await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).not.toBeVisible();
   });
 });

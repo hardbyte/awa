@@ -16,7 +16,6 @@ import {
 } from "@/lib/api";
 import { isNarrowing } from "@/lib/batch";
 import { nextPageAnchor } from "@/lib/query";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -25,7 +24,11 @@ import { CheckIcon } from "@heroicons/react/16/solid";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { AdminButton } from "@/components/AdminAction";
+import { JobLink, KindLink } from "@/components/links";
+import { jobActionCopy, selectionCopy, selectionOutcome } from "@/lib/job-actions";
+import { selectionTier } from "@/lib/confirm";
 import {
   Table,
   TableHeader,
@@ -189,45 +192,41 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
     enabled: !stateCounts,
   });
   const counts: Partial<StateCounts> | undefined = stateCounts ?? statsQuery.data;
-  const readOnly = useReadOnly();
 
+  const finishSelection = (action: "retry" | "cancel", requested: number, changed: JobRow[]) => {
+    const outcome = selectionOutcome(action, selectedJobs, requested, changed.length);
+    setSelected(new Set());
+    void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    void queryClient.invalidateQueries({ queryKey: ["jobs-count"] });
+    void queryClient.invalidateQueries({ queryKey: ["stats"] });
+    toast.success(outcome.message, outcome.detail ? { description: outcome.detail } : undefined);
+  };
+  // Run from a confirmation dialog, which shows their errors.
   const retryMutation = useMutation({
     mutationFn: (ids: number[]) => bulkRetry(ids),
-    onSuccess: (_data, ids) => {
-      setSelected(new Set());
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      void queryClient.invalidateQueries({ queryKey: ["stats"] });
-      toast.success(`Retried ${ids.length} job(s)`);
-    },
-    onError: () => {
-      toast.error("Failed to retry jobs");
-    },
+    onSuccess: (changed, ids) => finishSelection("retry", ids.length, changed),
   });
-
   const cancelMutation = useMutation({
     mutationFn: (ids: number[]) => bulkCancel(ids),
-    onSuccess: (_data, ids) => {
-      setSelected(new Set());
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      void queryClient.invalidateQueries({ queryKey: ["stats"] });
-      toast.success(`Cancelled ${ids.length} job(s)`);
-    },
-    onError: () => {
-      toast.error("Failed to cancel jobs");
-    },
+    onSuccess: (changed, ids) => finishSelection("cancel", ids.length, changed),
   });
 
   // A malformed term is left out of the query key, so the cache can hold the
   // wider search's rows; show none of them beside the error.
   const jobs = searchError ? [] : jobsQuery.data ?? [];
-  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
-  const [showRetryWaitingConfirm, setShowRetryWaitingConfirm] = useState(false);
+  const [confirming, setConfirming] = useState<"retry" | "cancel" | null>(null);
+  const [lastConfirming, setLastConfirming] = useState<"retry" | "cancel">("retry");
+  const confirm = (action: "retry" | "cancel") => {
+    setLastConfirming(action);
+    setConfirming(action);
+  };
 
   // Compute which selected jobs are retryable vs cancellable. Dead-lettered
   // jobs are retried through the DLQ page; the job endpoints skip them.
-  const { retryableIds, waitingRetryCount, autoRetryingCount, cancellableIds } = useMemo(() => {
+  const { selectedJobs, retryableIds, waitingRetryCount, autoRetryingCount, cancellableIds } = useMemo(() => {
     const selectedJobs = jobs.filter((j) => selected.has(j.id) && !j.dlq);
     return {
+      selectedJobs,
       retryableIds: selectedJobs
         .filter((j) => RETRYABLE_STATES.has(j.state))
         .map((j) => j.id),
@@ -364,16 +363,15 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
             <span>A tag containing a comma can't be carried into a batch operation.</span>
           )}
           {batchEligible && !tagWithComma && (
-            <Button
+            <AdminButton
               size="sm"
               intent="outline"
-              isDisabled={readOnly}
               onPress={() =>
                 void navigate({ to: "/batch-ops/new", search: batchSearch })
               }
             >
               Change priority or queue of matching jobs
-            </Button>
+            </AdminButton>
           )}
         </div>
       )}
@@ -383,27 +381,25 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
         <div className="flex items-center gap-3 rounded-lg bg-muted p-3">
           <span className="text-sm font-medium">{selected.size} selected</span>
           <Badge intent="warning">Updates paused</Badge>
-          <Button
+          <AdminButton
             intent="primary"
             size="sm"
-            onPress={() =>
-              waitingRetryCount > 0
-                ? setShowRetryWaitingConfirm(true)
-                : retryMutation.mutate(retryableIds)
-            }
-            isDisabled={readOnly || retryMutation.isPending || retryableIds.length === 0}
+            onPress={() => confirm("retry")}
+            isDisabled={retryMutation.isPending || retryableIds.length === 0}
+            disabledReason="None of the selected jobs is failed, cancelled or waiting"
           >
-            Retry{retryableIds.length > 0 ? ` (${retryableIds.length})` : ""}
-          </Button>
-          <Button
+            Retry{retryableIds.length > 0 ? ` (${retryableIds.length})…` : ""}
+          </AdminButton>
+          <AdminButton
             intent="outline"
             size="sm"
             className="text-danger"
-            onPress={() => setShowCancelConfirm(true)}
-            isDisabled={readOnly || cancelMutation.isPending || cancellableIds.length === 0}
+            onPress={() => confirm("cancel")}
+            isDisabled={cancelMutation.isPending || cancellableIds.length === 0}
+            disabledReason="All the selected jobs have already finished"
           >
-            Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})` : ""}
-          </Button>
+            Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})…` : ""}
+          </AdminButton>
           {autoRetryingCount > 0 && (
             <span className="text-xs text-muted-fg" data-testid="bulk-retry-hint">
               {autoRetryingCount} retryable job(s) already retry automatically
@@ -684,27 +680,62 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
         </div>
       </div>
 
-      <ConfirmDialog
-        isOpen={showCancelConfirm}
-        onOpenChange={setShowCancelConfirm}
-        title={`Cancel ${cancellableIds.length} job(s)`}
-        description={`This will cancel ${cancellableIds.length} non-terminal job(s). Running jobs will be marked as cancelled. This action cannot be undone.`}
-        confirmLabel="Cancel jobs"
-        confirmIntent="danger"
-        onConfirm={() => cancelMutation.mutate(cancellableIds)}
-        isPending={cancelMutation.isPending}
+      <SelectionConfirm
+        action={lastConfirming}
+        isOpen={confirming !== null}
+        onOpenChange={(open) => !open && setConfirming(null)}
+        jobs={jobs.filter((job) => (lastConfirming === "retry" ? retryableIds : cancellableIds).includes(job.id))}
+        waiting={waitingRetryCount}
+        onConfirm={(ids) => (lastConfirming === "retry" ? retryMutation.mutateAsync(ids) : cancelMutation.mutateAsync(ids))}
       />
-
-      <ConfirmDialog
-        isOpen={showRetryWaitingConfirm}
-        onOpenChange={setShowRetryWaitingConfirm}
-        title={`Retry ${retryableIds.length} job(s)`}
-        description={`${waitingRetryCount} of these job(s) are waiting for an external callback. Retrying runs them again from the first attempt and discards the pending callback, so work their handlers already started may happen twice.`}
-        confirmLabel="Retry jobs"
-        onConfirm={() => retryMutation.mutate(retryableIds)}
-        isPending={retryMutation.isPending}
-      />
-
     </div>
+  );
+}
+
+const SELECTION_PREVIEW_ROWS = 10;
+
+/** Confirms Retry or Cancel on selected rows: one job by name, several with a list of them. */
+function SelectionConfirm({
+  action,
+  isOpen,
+  onOpenChange,
+  jobs,
+  waiting,
+  onConfirm,
+}: {
+  action: "retry" | "cancel";
+  isOpen: boolean;
+  onOpenChange: (open: boolean) => void;
+  jobs: JobRow[];
+  waiting: number;
+  onConfirm: (ids: number[]) => Promise<unknown>;
+}) {
+  const tier = selectionTier(jobs.length);
+  const only = jobs.length === 1 ? jobs[0] : undefined;
+  const copy = only ? jobActionCopy(only, action) : selectionCopy(action, jobs.length, waiting);
+  const shown = jobs.slice(0, SELECTION_PREVIEW_ROWS);
+  return (
+    <ConfirmAction
+      isOpen={isOpen}
+      onOpenChange={onOpenChange}
+      tier={tier}
+      {...copy}
+      onConfirm={() => onConfirm(jobs.map((job) => job.id))}
+    >
+      {tier === 2 && (
+        <ul className="divide-y rounded-md border text-sm" aria-label="Selected jobs" data-testid="selection-preview">
+          {shown.map((job) => (
+            <li key={job.id} className="flex items-center gap-3 px-3 py-1.5">
+              <JobLink id={job.id} />
+              <KindLink kind={job.kind} descriptor={job.kind_descriptor} className="min-w-0 truncate" />
+              <span className="ml-auto"><StateBadge state={job.state} /></span>
+            </li>
+          ))}
+          {jobs.length > shown.length && (
+            <li className="px-3 py-1.5 text-muted-fg">and {(jobs.length - shown.length).toLocaleString()} more</li>
+          )}
+        </ul>
+      )}
+    </ConfirmAction>
   );
 }

@@ -50,8 +50,8 @@ test.describe("DLQ page", () => {
   });
 
   for (const { button, endpoint, opKind, confirm, verb } of [
-    { button: /Retry matching/, endpoint: "/api/dlq/retry-matching", opKind: "retry_from_dlq", confirm: "Retry", verb: "retry" },
-    { button: /Purge matching/, endpoint: "/api/dlq/purge-matching", opKind: "purge_dlq", confirm: "Purge", verb: "purge" },
+    { button: /Retry matching/, endpoint: "/api/dlq/retry-matching", opKind: "retry_from_dlq", confirm: "Retry matching dead letters", verb: "retry" },
+    { button: /Purge matching/, endpoint: "/api/dlq/purge-matching", opKind: "purge_dlq", confirm: "Purge matching dead letters", verb: "purge" },
   ]) {
     test(`${verb} matching submits a batch operation and links to it`, async ({ page }) => {
       const id = "0b2c4d6e-0000-4000-8000-000000000000";
@@ -109,5 +109,42 @@ test.describe("DLQ page", () => {
     await expect(chip).toHaveAttribute("aria-pressed", "true");
     await chip.click();
     await expect(page).toHaveURL(/\/dlq$/);
+  });
+});
+
+test.describe("Dead letter page", () => {
+  test("Retry quotes the dead-letter reason and Purge says it can't be undone", async ({ page }) => {
+    const posts: string[] = [];
+    page.on("request", (r) => {
+      if (r.method() !== "GET" && r.url().includes("/api/dlq/600001")) posts.push(r.url());
+    });
+    await page.goto("/dlq/600001");
+    await page.getByRole("button", { name: "Retry…" }).click();
+    let dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: "Retry dead letter #600001?" })).toBeVisible();
+    await expect(dialog).toContainText("manual_test");
+    await expect(dialog).not.toContainText("undone");
+    await dialog.getByRole("button", { name: "Keep" }).click();
+    await expect(dialog).toBeHidden();
+
+    await page.getByRole("button", { name: "Purge…" }).click();
+    dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: "Purge dead letter #600001?" })).toBeVisible();
+    await expect(dialog).toContainText("This can't be undone.");
+    await dialog.getByRole("button", { name: "Keep" }).click();
+    expect(posts).toEqual([]);
+  });
+
+  test("on a read-only server Retry and Purge are disabled and say why", async ({ page }) => {
+    await page.route("**/api/capabilities", async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), read_only: true } });
+    });
+    await page.goto("/dlq/600001");
+    for (const name of ["Retry…", "Purge…"]) {
+      const button = page.getByRole("button", { name });
+      await expect(button).toBeDisabled();
+      await expect(button).toHaveAccessibleDescription("Read-only server — admin actions are off");
+    }
   });
 });

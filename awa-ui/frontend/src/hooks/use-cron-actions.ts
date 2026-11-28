@@ -10,6 +10,13 @@ import {
   type CronOwnerAction,
 } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
+import { toastWithUndo } from "@/lib/undo-toast";
+
+interface Target {
+  name: string;
+  /** Set when this undoes the other action, so its toast offers no Undo. */
+  isUndo?: boolean;
+}
 
 /** Pause, resume, trigger and ownership changes for schedules, shared by
  * the schedule list and a schedule's page. */
@@ -30,25 +37,26 @@ export function useCronActions() {
         },
       });
     },
-    onError: (error) => toast.error(`Failed to trigger: ${error.message}`),
   });
 
   const pause = useMutation({
-    mutationFn: (name: string) => pauseCronJob(name, "ui"),
-    onSuccess: (_data, name) => {
+    mutationFn: ({ name }: Target) => pauseCronJob(name, "ui"),
+    onSuccess: (_data, { name, isUndo }) => {
       void invalidateCron();
-      toast.success(`Paused "${name}"`);
+      if (isUndo) toast.success(`Schedule "${name}" paused again`);
+      else toastWithUndo(`Schedule "${name}" paused`, () => resume.mutate({ name, isUndo: true }));
     },
-    onError: (error) => toast.error(`Failed to pause: ${error.message}`),
+    onError: (error, { name }) => toast.error(`Couldn't pause schedule "${name}": ${error.message}`),
   });
 
   const resume = useMutation({
-    mutationFn: (name: string) => resumeCronJob(name),
-    onSuccess: (_data, name) => {
+    mutationFn: ({ name }: Target) => resumeCronJob(name),
+    onSuccess: (_data, { name, isUndo }) => {
       void invalidateCron();
-      toast.success(`Resumed "${name}"`);
+      if (isUndo) toast.success(`Schedule "${name}" resumed again`);
+      else toastWithUndo(`Schedule "${name}" resumed`, () => pause.mutate({ name, isUndo: true }));
     },
-    onError: (error) => toast.error(`Failed to resume: ${error.message}`),
+    onError: (error, { name }) => toast.error(`Couldn't resume schedule "${name}": ${error.message}`),
   });
 
   // An owner action is previewed first; the plan it returns is applied on

@@ -1,20 +1,16 @@
 import { useState } from "react";
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useQueueHub } from "@/hooks/use-queue-hub";
-import { useReadOnly } from "@/hooks/use-read-only";
-import { drainQueue, pauseQueue, resumeQueue } from "@/lib/api";
+import { useQueueActions } from "@/hooks/use-queue-actions";
 import { SECTION_LABELS } from "@/lib/sections";
-import { formatNumber } from "@/lib/number";
 import { Page, PageHeader } from "@/components/Page";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { AdminButton } from "@/components/AdminAction";
+import { DrainDialog } from "@/components/DrainDialog";
 import { JobsList } from "@/components/JobsList";
 import { DlqList } from "@/components/DlqList";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { Tab, TabList, TabPanel, TabPanels, Tabs } from "@/components/ui/tabs";
-import { toast } from "@/components/ui/toast";
 
 const TABS = [
   { id: "overview", label: "Overview", suffix: "" },
@@ -27,40 +23,10 @@ const TABS = [
 export function QueueHubLayout() {
   const { name, queueQuery, queue, runtime } = useQueueHub();
   const pathname = useRouterState({ select: (state) => state.location.pathname });
-  const queryClient = useQueryClient();
-  const readOnly = useReadOnly();
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
-  const invalidateQueue = () => {
-    void queryClient.invalidateQueries({ queryKey: ["queue", name] });
-    void queryClient.invalidateQueries({ queryKey: ["queues"] });
-  };
-  const pauseMutation = useMutation({
-    mutationFn: () => pauseQueue(name, "ui"),
-    onSuccess: () => {
-      invalidateQueue();
-      toast.success(`Queue "${name}" paused`);
-    },
-    onError: (error) => toast.error(`Failed to pause queue: ${error.message}`),
-  });
-  const resumeMutation = useMutation({
-    mutationFn: () => resumeQueue(name),
-    onSuccess: () => {
-      invalidateQueue();
-      toast.success(`Queue "${name}" resumed`);
-    },
-    onError: (error) => toast.error(`Failed to resume queue: ${error.message}`),
-  });
-  const drainMutation = useMutation({
-    mutationFn: () => drainQueue(name),
-    onSuccess: (result) => {
-      setShowDrainConfirm(false);
-      invalidateQueue();
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${name}" drained: ${formatNumber(result.drained)} job(s) cancelled`);
-    },
-    onError: (error) => toast.error(`Failed to drain queue: ${error.message}`),
-  });
+  const actions = useQueueActions();
+  const toggling = actions.pause.isPending || actions.resume.isPending;
 
   const notFound = (
     <ResourceNotFound
@@ -113,23 +79,23 @@ export function QueueHubLayout() {
         actions={
           <>
             {queue.paused ? (
-              <Button intent="outline" size="sm" onPress={() => resumeMutation.mutate()} isDisabled={readOnly || resumeMutation.isPending}>
+              <AdminButton intent="outline" size="sm" onPress={() => actions.resume.mutate({ queue: name })} isDisabled={toggling}>
                 Resume
-              </Button>
+              </AdminButton>
             ) : (
-              <Button intent="outline" size="sm" onPress={() => pauseMutation.mutate()} isDisabled={readOnly || pauseMutation.isPending}>
+              <AdminButton intent="outline" size="sm" onPress={() => actions.pause.mutate({ queue: name })} isDisabled={toggling}>
                 Pause
-              </Button>
+              </AdminButton>
             )}
-            <Button
+            <AdminButton
               intent="outline"
               size="sm"
               className="text-danger"
               onPress={() => setShowDrainConfirm(true)}
-              isDisabled={readOnly || drainMutation.isPending}
+              isDisabled={actions.drain.isPending}
             >
               Drain
-            </Button>
+            </AdminButton>
           </>
         }
         description={queue.description || undefined}
@@ -152,16 +118,7 @@ export function QueueHubLayout() {
         </TabPanels>
       </Tabs>
 
-      <ConfirmDialog
-        isOpen={showDrainConfirm}
-        onOpenChange={setShowDrainConfirm}
-        onConfirm={() => drainMutation.mutate()}
-        title={`Drain queue "${queue.queue}"`}
-        description={`Cancel all available, scheduled, retryable and waiting jobs in "${queue.queue}". Running jobs are not affected.`}
-        confirmLabel="Drain queue"
-        confirmIntent="danger"
-        isPending={drainMutation.isPending}
-      />
+      <DrainDialog queue={queue.queue} isOpen={showDrainConfirm} onOpenChange={setShowDrainConfirm} drain={actions.drain} />
     </Page>
   );
 }

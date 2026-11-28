@@ -12,11 +12,11 @@ import {
   bulkPurgeDlq,
 } from "@/lib/api";
 import type { BatchOperation, DlqRow, ListDlqParams } from "@/lib/api";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { AdminButton } from "@/components/AdminAction";
 import {
   Table,
   TableHeader,
@@ -65,7 +65,6 @@ export function DlqList({ lockedFilter }: DlqListProps) {
   const navigate = useNavigate();
   const filters = useDlqFilters();
   const queryClient = useQueryClient();
-  const readOnly = useReadOnly();
 
   const searchFilters = { ...parseSearch(filters.search), ...lockedFilter };
   // A term that doesn't parse is left out of a request, so it would widen
@@ -111,7 +110,6 @@ export function DlqList({ lockedFilter }: DlqListProps) {
         created_at_lt: toRfc3339(searchFilters.createdLt),
       }),
     onSuccess: onSubmitted,
-    onError: (error) => toast.error(`Failed to submit the DLQ retry: ${error.message}`),
   });
 
   const purgeFilterMutation = useMutation({
@@ -125,7 +123,6 @@ export function DlqList({ lockedFilter }: DlqListProps) {
         created_at_lt: toRfc3339(searchFilters.createdLt),
       }),
     onSuccess: onSubmitted,
-    onError: (error) => toast.error(`Failed to submit the DLQ purge: ${error.message}`),
   });
 
   const [showRetryConfirm, setShowRetryConfirm] = useState(false);
@@ -174,16 +171,16 @@ export function DlqList({ lockedFilter }: DlqListProps) {
         )}
       />
 
-      {hasActiveFilter && !readOnly && (
+      {hasActiveFilter && (
         <div className="flex gap-2">
-          <Button
+          <AdminButton
             size="xs"
             onPress={() => setShowRetryConfirm(true)}
             isDisabled={retryFilterMutation.isPending || !!searchError || listUnavailable}
           >
             Retry matching ({rows.length}+)
-          </Button>
-          <Button
+          </AdminButton>
+          <AdminButton
             intent="outline"
             size="xs"
             className="text-danger"
@@ -191,7 +188,7 @@ export function DlqList({ lockedFilter }: DlqListProps) {
             isDisabled={purgeFilterMutation.isPending || !!searchError || listUnavailable}
           >
             Purge matching
-          </Button>
+          </AdminButton>
         </div>
       )}
 
@@ -285,24 +282,26 @@ export function DlqList({ lockedFilter }: DlqListProps) {
         </div>
       )}
 
-      <ConfirmDialog
+      <ConfirmAction
         isOpen={showRetryConfirm}
         onOpenChange={setShowRetryConfirm}
-        title="Retry DLQ rows"
-        description="This submits a batch operation that retries every DLQ row matching the current filter, resetting each to a fresh runnable job. The maintenance leader applies it a chunk at a time."
-        confirmLabel="Retry"
-        confirmIntent="primary"
-        onConfirm={() => retryFilterMutation.mutate()}
+        tier={2}
+        title="Retry the matching dead letters?"
+        description="Submits a bulk operation that moves every dead letter matching the current filter back to its queue to run again, so their handlers' side effects happen again. The maintenance leader applies it a chunk at a time."
+        confirmLabel="Retry matching dead letters"
+        onConfirm={() => retryFilterMutation.mutateAsync()}
       />
 
-      <ConfirmDialog
+      <ConfirmAction
         isOpen={showPurgeConfirm}
         onOpenChange={setShowPurgeConfirm}
-        title="Purge DLQ rows"
-        description="This submits a batch operation that permanently deletes every DLQ row matching the current filter. The maintenance leader applies it a chunk at a time."
-        confirmLabel="Purge"
-        confirmIntent="danger"
-        onConfirm={() => purgeFilterMutation.mutate()}
+        tier={2}
+        intent="danger"
+        irreversible
+        title="Purge the matching dead letters?"
+        description="Submits a bulk operation that deletes every dead letter matching the current filter. The maintenance leader applies it a chunk at a time."
+        confirmLabel="Purge matching dead letters"
+        onConfirm={() => purgeFilterMutation.mutateAsync()}
       />
     </div>
   );

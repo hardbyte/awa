@@ -181,7 +181,7 @@ The shared `/jobs/:id` detail page also carries DLQ metadata when a job has alre
 
 **URL-driven state:** All filters live in URL search params (`/jobs?state=failed&kind=send_email`). Back/forward and bookmarks work naturally.
 
-**Bulk operations:** Select jobs via checkboxes → action toolbar appears with count and Retry/Cancel buttons. Destructive operations (cancel, drain) require a confirmation dialog.
+**Confirming actions:** Confirmation scales with what an action can break. Pausing or resuming a queue or schedule takes one click and its toast offers Undo. An action on one job with side effects (Retry, Cancel, retrying or purging a dead letter, triggering a paused schedule, cancelling a bulk operation) opens a dialog that names the object and the risk. Acting on several selected jobs lists them in the dialog. A dialog's confirm button names the action ("Cancel job #918"), its dismiss button is "Keep", it stays open until the server answers and shows the server's error in place, and it says "This can't be undone" only when that is true.
 
 **Jump to:** ⌘K (Ctrl+K elsewhere) or the header's "Jump to…" button opens a palette that goes to a job by id (a dead-lettered one opens its DLQ row), a queue, job kind or schedule by name or display name, a bulk operation by id or its first eight characters, a jobs search (`kind:send_email`, or `tenant:acme` as a tag), or any page. It loads names when it opens and doesn't poll.
 
@@ -189,7 +189,7 @@ The shared `/jobs/:id` detail page also carries DLQ metadata when a job has alre
 
 **Responsive:** Desktop table layouts, mobile card layouts. Nav collapses to a hamburger menu on small screens.
 
-**Read-only detection:** When connected to a read replica, write actions are automatically hidden.
+**Read-only:** When the server is read-only (a read replica, or `--read-only`), admin actions stay in place but disabled, each giving the reason "Read-only server — admin actions are off" on hover and to assistive technology.
 
 ## Development
 

@@ -437,20 +437,46 @@ test.describe("Bulk actions", () => {
     await selectAll.click({ force: true });
 
     // Cancel button should be enabled (available jobs are cancellable)
-    const cancelBtn = page.getByRole("button", { name: /^Cancel \(\d+\)$/ });
+    const cancelBtn = page.getByRole("button", { name: /^Cancel \(\d+\)…$/ });
     await expect(cancelBtn).toBeVisible();
     await expect(cancelBtn).toBeEnabled();
+    const count = Number((await cancelBtn.textContent())?.match(/\((\d+)\)/)?.[1]);
 
     await cancelBtn.click();
 
-    // Confirmation dialog should appear
+    // Several jobs: the dialog counts and lists them, and says nothing it can't keep
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
-    await expect(dialog.getByText("This action cannot be undone.", { exact: true })).toBeVisible();
+    if (count > 1) {
+      await expect(dialog.getByRole("heading", { name: `Cancel ${count} jobs?` })).toBeVisible();
+      await expect(dialog.getByTestId("selection-preview").getByRole("listitem").first()).toBeVisible();
+      await expect(dialog.getByRole("button", { name: `Cancel ${count} jobs` })).toBeVisible();
+    } else {
+      await expect(dialog.getByRole("heading", { name: /^Cancel job #\d+\?$/ })).toBeVisible();
+    }
+    await expect(dialog.getByText(/undone/)).toHaveCount(0);
 
     // Close dialog without confirming
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).not.toBeVisible();
+    await expect(cancelBtn).toBeFocused();
+  });
+
+  test("bulk retry reports what the server changed", async ({ page }) => {
+    await page.route("**/api/jobs/bulk-retry", (route) => route.fulfill({ json: [] }));
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.url().includes("state=failed") && r.ok()),
+      page.goto("/jobs?state=failed&q=queue%3Ae2e_test"),
+    ]);
+    const jobTable = page.getByRole("grid", { name: "Jobs" });
+    await jobTable.getByRole("checkbox").nth(1).click({ force: true });
+    await page.getByRole("button", { name: /^Retry \(1\)…$/ }).click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog.getByRole("heading", { name: /^Retry job #\d+\?$/ })).toBeVisible();
+    await dialog.getByRole("button", { name: /^Retry job #\d+$/ }).click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByText("Retried 0 of 1 selected job(s)")).toBeVisible();
+    await expect(page.getByText("Skipped: 1 changed state before the retry reached them.")).toBeVisible();
   });
 });
 

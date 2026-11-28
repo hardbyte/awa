@@ -1,10 +1,8 @@
 import { useState } from "react";
 import { useParams } from "@tanstack/react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useManagedQuery } from "@/hooks/use-managed-query";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { useNow } from "@/hooks/use-now";
-import { cancelBatchOperation, fetchBatchOperation, type BatchOperation } from "@/lib/api";
+import { fetchBatchOperation, type BatchOperation } from "@/lib/api";
 import {
   actsOnDlq,
   batchOutcome,
@@ -24,10 +22,10 @@ import { Page, PageHeader } from "@/components/Page";
 import { BatchStateBadge } from "@/components/StateBadge";
 import { FilterLink, InstanceLink } from "@/components/links";
 import { Time } from "@/components/Time";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { CancelOperationDialog } from "@/components/CancelOperationDialog";
+import { AdminButton } from "@/components/AdminAction";
 import { CopyButton } from "@/components/CopyButton";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   DescriptionDetails,
@@ -36,7 +34,6 @@ import {
 } from "@/components/ui/description-list";
 import { ProgressBar, ProgressBarHeader, ProgressBarTrack, ProgressBarValue } from "@/components/ui/progress-bar";
 import { Label } from "@/components/ui/field";
-import { toast } from "@/components/ui/toast";
 
 /** The API answers an unknown or malformed id with 400 rather than 404. */
 function isMissingOperation(error: unknown): boolean {
@@ -109,8 +106,6 @@ function Outcome({ operation }: { operation: BatchOperation }) {
 export function BatchOpDetailPage() {
   const { id = "" } = useParams({ strict: false }) as { id?: string };
   const validId = isBatchOperationId(id);
-  const queryClient = useQueryClient();
-  const readOnly = useReadOnly();
   const now = useNow();
   const [confirmCancel, setConfirmCancel] = useState(false);
 
@@ -120,17 +115,6 @@ export function BatchOpDetailPage() {
     enabled: validId,
   });
   const operation = opQuery.data;
-
-  const cancelMutation = useMutation({
-    mutationFn: () => cancelBatchOperation(id),
-    onSuccess: () => {
-      setConfirmCancel(false);
-      void queryClient.invalidateQueries({ queryKey: ["batch-op", id] });
-      void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
-      toast.success("Cancellation requested");
-    },
-    onError: (error) => toast.error(`Failed to cancel: ${error.message}`),
-  });
 
   const notFound = (
     <ResourceNotFound
@@ -176,15 +160,9 @@ export function BatchOpDetailPage() {
         status={<BatchStateBadge state={operation.state} tone={operation.state === "completed" && operation.processed === 0 && operation.skipped > 0 ? "retryable" : undefined} />}
         actions={
           isCancellable(operation.state) && (
-            <Button
-              intent="outline"
-              size="sm"
-              className="text-danger"
-              onPress={() => setConfirmCancel(true)}
-              isDisabled={readOnly || cancelMutation.isPending}
-            >
-              Cancel operation
-            </Button>
+            <AdminButton intent="outline" size="sm" className="text-danger" onPress={() => setConfirmCancel(true)}>
+              Cancel operation…
+            </AdminButton>
           )
         }
         description={
@@ -262,16 +240,7 @@ export function BatchOpDetailPage() {
         </CardContent>
       </Card>
 
-      <ConfirmDialog
-        isOpen={confirmCancel}
-        onOpenChange={setConfirmCancel}
-        title="Cancel this operation?"
-        description={`It stops before the next chunk. The ${formatNumber(operation.processed)} job(s) it has already changed stay changed.`}
-        confirmLabel="Cancel operation"
-        confirmIntent="danger"
-        onConfirm={() => cancelMutation.mutate()}
-        isPending={cancelMutation.isPending}
-      />
+      <CancelOperationDialog operation={operation} isOpen={confirmCancel} onOpenChange={setConfirmCancel} />
     </Page>
   );
 }

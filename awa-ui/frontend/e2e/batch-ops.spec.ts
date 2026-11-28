@@ -293,7 +293,7 @@ test.describe("Bulk operations form", () => {
     await expect(dialog).toContainText(
       "Set priority to 1 on at least 10,000 scheduled jobs with kind e2e_job."
     );
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).toHaveCount(0);
     expect(submits).toEqual([]);
   });
@@ -342,8 +342,11 @@ test.describe("Bulk operations history", () => {
 
     await page.goto("/batch-ops");
     await expect(page.getByRole("gridcell", { name: "Running" })).toBeVisible();
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expect(page.getByText("Cancellation requested")).toBeVisible();
+    await page.getByRole("button", { name: "Cancel operation 11111111" }).click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog).toContainText("The 3 of 10 job(s) it has already changed stay changed.");
+    await dialog.getByRole("button", { name: "Cancel operation 11111111" }).click();
+    await expect(page.getByText("Cancellation of operation 11111111 requested")).toBeVisible();
     await expect(page.getByRole("gridcell", { name: "Cancelling" })).toBeVisible();
   });
 

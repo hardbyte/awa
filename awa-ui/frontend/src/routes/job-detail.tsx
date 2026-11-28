@@ -7,14 +7,12 @@ import {
 } from "@tanstack/react-query";
 import { useParams, useNavigate } from "@tanstack/react-router";
 import { fetchJob, retryJob, cancelJob } from "@/lib/api";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Page, PageHeader } from "@/components/Page";
 import { KindLink, QueueLink, ScheduleLink, TagChip } from "@/components/links";
 import { SECTION_LABELS } from "@/lib/sections";
-import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import {
   DescriptionList,
@@ -28,7 +26,10 @@ import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { AdminButton } from "@/components/AdminAction";
+import { jobActionCopy } from "@/lib/job-actions";
+import { jobStateMeta } from "@/lib/states";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 
 function hasMetadata(job: JobRow): boolean {
@@ -65,9 +66,13 @@ export function JobDetailPage() {
   const { id } = useParams({ strict: false });
   const jobId = Number(id);
   const queryClient = useQueryClient();
-  const readOnly = useReadOnly();
   const navigate = useNavigate();
-  const [confirmRetryWaiting, setConfirmRetryWaiting] = useState(false);
+  const [confirming, setConfirming] = useState<"retry" | "cancel" | null>(null);
+  const [lastConfirming, setLastConfirming] = useState<"retry" | "cancel">("retry");
+  const confirm = (action: "retry" | "cancel") => {
+    setLastConfirming(action);
+    setConfirming(action);
+  };
 
   const jobQuery = useManagedQuery<JobRow>({
     queryKey: ["job", jobId],
@@ -88,27 +93,23 @@ export function JobDetailPage() {
     }
   }, [jobQuery.data?.dlq, jobId, navigate]);
 
+  const invalidateJob = () => {
+    void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+    void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+  };
+  // Run from a confirmation dialog, which shows their errors.
   const retryMutation = useMutation({
     mutationFn: () => retryJob(jobId),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success("Job retried");
-    },
-    onError: () => {
-      toast.error("Failed to retry job");
+    onSuccess: (job) => {
+      invalidateJob();
+      toast.success(`Job #${jobId} retried; now ${jobStateMeta(job.state).label.toLowerCase()}`);
     },
   });
-
   const cancelMutation = useMutation({
     mutationFn: () => cancelJob(jobId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success("Job cancelled");
-    },
-    onError: () => {
-      toast.error("Failed to cancel job");
+      invalidateJob();
+      toast.success(`Job #${jobId} cancelled`);
     },
   });
 
@@ -165,29 +166,25 @@ export function JobDetailPage() {
       {/* Actions */}
       <div className="flex flex-wrap items-center gap-2">
         {canRetry && (
-          <Button
+          <AdminButton
             intent={job.state === "waiting_external" ? "outline" : "primary"}
             size="sm"
-            onPress={() =>
-              job.state === "waiting_external"
-                ? setConfirmRetryWaiting(true)
-                : retryMutation.mutate()
-            }
-            isDisabled={readOnly || retryMutation.isPending}
+            onPress={() => confirm("retry")}
+            isDisabled={retryMutation.isPending}
           >
-            {job.state === "waiting_external" ? "Restart…" : "Retry"}
-          </Button>
+            {job.state === "waiting_external" ? "Restart…" : "Retry…"}
+          </AdminButton>
         )}
         {canCancel && (
-          <Button
+          <AdminButton
             intent="outline"
             size="sm"
             className="text-danger"
-            onPress={() => cancelMutation.mutate()}
-            isDisabled={readOnly || cancelMutation.isPending}
+            onPress={() => confirm("cancel")}
+            isDisabled={cancelMutation.isPending}
           >
-            Cancel
-          </Button>
+            Cancel…
+          </AdminButton>
         )}
         {job.state === "retryable" && (
           <span className="text-sm text-muted-fg" data-testid="retryable-hint">
@@ -198,14 +195,12 @@ export function JobDetailPage() {
         )}
       </div>
 
-      <ConfirmDialog
-        isOpen={confirmRetryWaiting}
-        onOpenChange={setConfirmRetryWaiting}
-        title={`Restart job #${job.id}?`}
-        description="This job is waiting for an external callback. Restarting runs it again from the first attempt and discards the pending callback, so work the handler already started (a payment, an email, a request) may happen twice. To finish it instead, resolve the callback; to stop it, cancel it."
-        confirmLabel="Restart job"
-        onConfirm={() => retryMutation.mutate()}
-        isPending={retryMutation.isPending}
+      <ConfirmAction
+        isOpen={confirming !== null}
+        onOpenChange={(open) => !open && setConfirming(null)}
+        tier={1}
+        {...jobActionCopy(job, lastConfirming)}
+        onConfirm={() => (lastConfirming === "retry" ? retryMutation.mutateAsync() : cancelMutation.mutateAsync())}
       />
 
       {/* Properties */}

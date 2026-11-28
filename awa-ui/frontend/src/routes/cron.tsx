@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useManagedQuery } from "@/hooks/use-managed-query";
-import { useReadOnly } from "@/hooks/use-read-only";
+import { AdminButton, useAdminGate } from "@/components/AdminAction";
+import { CronControls } from "@/components/CronControls";
 import { useNow } from "@/hooks/use-now";
 import { useCronActions } from "@/hooks/use-cron-actions";
 import {
@@ -18,7 +19,6 @@ import { CronPlanNotice } from "@/components/CronPlanNotice";
 import { KindLink, QueueLink, ScheduleLink } from "@/components/links";
 import { Time } from "@/components/Time";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import {
   Table,
   TableBody,
@@ -61,7 +61,7 @@ export function CronSchedule({ cron }: { cron: Pick<CronJobRow, "cron_expr" | "t
 }
 
 export function CronPage() {
-  const readOnly = useReadOnly();
+  const gate = useAdminGate();
   const nowMs = useNow();
   const actions = useCronActions();
 
@@ -85,7 +85,6 @@ export function CronPage() {
   const [expectedOwner, setExpectedOwner] = useState("");
 
   const cronJobs = cronQuery.data ?? [];
-  const toggling = actions.pause.isPending || actions.resume.isPending;
 
   return (
     <Page className="space-y-4">
@@ -102,29 +101,29 @@ export function CronPage() {
             {plan.blocking_instances.length > 0 && <p>Unsupported instances: {plan.blocking_instances.join(", ")}</p>}
             {plan.retirements.length > 0 && <p>Would retire: {plan.retirements.join(", ")}</p>}
             {plan.declarations.map((d) => <p key={d.instance_id} className="break-all">{d.instance_id} · revision {d.revision} · manifest {d.desired_hash} · expires {d.expires_at}</p>)}
-            {!readOnly && <div className="flex gap-2">
-              <Button intent="outline" size="xs" onPress={() => actions.previewOwner({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</Button>
-              <Button intent="outline" size="xs" onPress={() => actions.previewOwner({ action: "restore_owner", owner_id: plan.owner_id })}>Preview owner restoration</Button>
-            </div>}
+            <div className="flex gap-2">
+              <AdminButton intent="outline" size="xs" onPress={() => actions.previewOwner({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</AdminButton>
+              <AdminButton intent="outline" size="xs" onPress={() => actions.previewOwner({ action: "restore_owner", owner_id: plan.owner_id })}>Preview owner restoration</AdminButton>
+            </div>
           </div>
         </details>
       ))}
       {reconciliation.isError && <p className="text-sm text-danger-subtle-fg" role="alert">Unable to load reconciliation status.</p>}
-      {!readOnly && <details className="rounded-lg border p-3">
+      <details className="rounded-lg border p-3">
         <summary className="cursor-pointer">Adopt or transfer a schedule</summary>
         <div className="mt-2 flex flex-wrap gap-2">
           <input aria-label="Schedule name" placeholder="Schedule name" className="rounded border p-2" value={adoptName} onChange={(e) => setAdoptName(e.target.value)} />
           <input aria-label="New owner" placeholder="New owner" className="rounded border p-2" value={adoptOwner} onChange={(e) => setAdoptOwner(e.target.value)} />
           <input aria-label="Expected current owner" placeholder="Current owner (blank if unowned)" className="rounded border p-2" value={expectedOwner} onChange={(e) => setExpectedOwner(e.target.value)} />
-          <Button isDisabled={!adoptName || !adoptOwner || actions.owner.isPending} onPress={() => actions.previewOwner({ action: "adopt", name: adoptName, owner_id: adoptOwner, expected_owner: expectedOwner || null })}>Preview</Button>
+          <AdminButton isDisabled={!adoptName || !adoptOwner || actions.owner.isPending} onPress={() => actions.previewOwner({ action: "adopt", name: adoptName, owner_id: adoptOwner, expected_owner: expectedOwner || null })}>Preview</AdminButton>
         </div>
-      </details>}
+      </details>
       {actions.plan && (
         <CronPlanNotice
           plan={actions.plan}
           onApply={actions.applyPlan}
           onCancel={actions.clearPlan}
-          isDisabled={readOnly || actions.owner.isPending}
+          isDisabled={gate.disabled || actions.owner.isPending}
         />
       )}
 
@@ -185,23 +184,10 @@ export function CronPage() {
                 </TableCell>
                 <TableCell>
                   <div className="flex flex-wrap gap-1">
-                    {isPaused ? (
-                      <Button intent="outline" size="xs" onPress={() => actions.resume.mutate(cron.name)} isDisabled={readOnly || toggling || isRetired}>
-                        Resume
-                      </Button>
-                    ) : (
-                      <Button intent="outline" size="xs" onPress={() => actions.pause.mutate(cron.name)} isDisabled={readOnly || toggling || isRetired}>
-                        Pause
-                      </Button>
-                    )}
-                    <Button intent="outline" size="xs" onPress={() => actions.trigger.mutate(cron.name)} isDisabled={readOnly || actions.trigger.isPending || isRetired}>
-                      Trigger now
-                    </Button>
-                    {!readOnly && (
-                      <Button intent="outline" size="xs" isDisabled={actions.owner.isPending} onPress={() => actions.previewOwner({ action: isRetired ? "restore" : "retire", name: cron.name })}>
-                        {isRetired ? "Restore" : "Retire"}
-                      </Button>
-                    )}
+                    <CronControls cron={cron} actions={actions} size="xs" />
+                    <AdminButton intent="outline" size="xs" isDisabled={actions.owner.isPending} onPress={() => actions.previewOwner({ action: isRetired ? "restore" : "retire", name: cron.name })}>
+                      {isRetired ? "Restore" : "Retire"}
+                    </AdminButton>
                   </div>
                 </TableCell>
               </TableRow>

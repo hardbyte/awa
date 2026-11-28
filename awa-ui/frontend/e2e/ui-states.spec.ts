@@ -246,7 +246,7 @@ test.describe("Job retry safety", () => {
     await page.getByRole("button", { name: "Restart…" }).click();
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toContainText("may happen twice");
-    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await dialog.getByRole("button", { name: "Keep" }).click();
     expect(retried).toBe(0);
 
     await page.getByRole("button", { name: "Restart…" }).click();

@@ -1,23 +1,16 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useState } from "react";
-import {
-  useMutation,
-  useQueryClient,
-} from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import {
   fetchQueues,
   fetchQueueRuntime,
-  pauseQueue,
-  resumeQueue,
-  drainQueue,
 } from "@/lib/api";
-import { useReadOnly } from "@/hooks/use-read-only";
-import { toast } from "@/components/ui/toast";
+import { useQueueActions } from "@/hooks/use-queue-actions";
+import { AdminButton, DisabledReason, useAdminGate } from "@/components/AdminAction";
+import { DrainDialog } from "@/components/DrainDialog";
 import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { Menu, MenuContent, MenuItem, MenuTrigger } from "@/components/ui/menu";
 import {
   Table,
@@ -27,7 +20,6 @@ import {
   TableCell,
   TableColumn,
 } from "@/components/ui/table";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
 import { dlqDepthQuery } from "@/lib/shared-queries";
 import { formatNumber } from "@/lib/number";
@@ -55,8 +47,13 @@ function DlqCount({ queue, counts }: { queue: string; counts: Map<string, number
 }
 
 export function QueuesPage() {
-  const queryClient = useQueryClient();
   const [drainTarget, setDrainTarget] = useState<string | null>(null);
+  // Kept while the dialog animates out, so its title doesn't go blank.
+  const [lastDrainTarget, setLastDrainTarget] = useState("");
+  const openDrain = (queue: string) => {
+    setLastDrainTarget(queue);
+    setDrainTarget(queue);
+  };
 
   const queuesQuery = useManagedQuery<QueueStats[]>({
     queryKey: ["queues"],
@@ -67,41 +64,9 @@ export function QueuesPage() {
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
   });
-  const readOnly = useReadOnly();
 
-  const pauseMutation = useMutation({
-    mutationFn: (queue: string) => pauseQueue(queue, "ui"),
-    onSuccess: (_data, queue) => {
-      void queryClient.invalidateQueries({ queryKey: ["queues"] });
-      toast.success(`Queue "${queue}" paused`);
-    },
-    onError: () => {
-      toast.error("Failed to pause queue");
-    },
-  });
-
-  const resumeMutation = useMutation({
-    mutationFn: (queue: string) => resumeQueue(queue),
-    onSuccess: (_data, queue) => {
-      void queryClient.invalidateQueries({ queryKey: ["queues"] });
-      toast.success(`Queue "${queue}" resumed`);
-    },
-    onError: () => {
-      toast.error("Failed to resume queue");
-    },
-  });
-
-  const drainMutation = useMutation({
-    mutationFn: (queue: string) => drainQueue(queue),
-    onSuccess: (result, queue) => {
-      void queryClient.invalidateQueries({ queryKey: ["queues"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${queue}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
-    },
-    onError: () => {
-      toast.error("Failed to drain queue");
-    },
-  });
+  const actions = useQueueActions();
+  const gate = useAdminGate();
 
   const depthQuery = useManagedQuery(dlqDepthQuery);
   const dlqByQueue = depthQuery.isError
@@ -246,33 +211,17 @@ export function QueuesPage() {
               </div>
               <div className="mt-3 flex gap-2">
                 {q.paused ? (
-                  <Button
-                    intent="outline"
-                    size="xs"
-                    onPress={() => resumeMutation.mutate(q.queue)}
-                    isDisabled={readOnly}
-                  >
+                  <AdminButton intent="outline" size="xs" onPress={() => actions.resume.mutate({ queue: q.queue })}>
                     Resume
-                  </Button>
+                  </AdminButton>
                 ) : (
-                  <Button
-                    intent="outline"
-                    size="xs"
-                    onPress={() => pauseMutation.mutate(q.queue)}
-                    isDisabled={readOnly}
-                  >
+                  <AdminButton intent="outline" size="xs" onPress={() => actions.pause.mutate({ queue: q.queue })}>
                     Pause
-                  </Button>
+                  </AdminButton>
                 )}
-                <Button
-                  intent="outline"
-                  size="xs"
-                  className="text-danger"
-                  onPress={() => setDrainTarget(q.queue)}
-                  isDisabled={readOnly}
-                >
+                <AdminButton intent="outline" size="xs" className="text-danger" onPress={() => openDrain(q.queue)}>
                   Drain
-                </Button>
+                </AdminButton>
               </div>
               </div>
             );
@@ -430,9 +379,12 @@ export function QueuesPage() {
                   </TableCell>
                   <TableCell>
                     <div className="flex justify-end">
+                      <DisabledReason reason={gate.reason}>
+                      {(describedBy) => (
                       <Menu>
                         <MenuTrigger
-                          isDisabled={readOnly}
+                          isDisabled={gate.disabled}
+                          aria-describedby={describedBy}
                           aria-label={`Actions for ${q.queue}`}
                           className="inline-flex size-7 items-center justify-center rounded text-muted-fg hover:bg-muted hover:text-fg disabled:opacity-40"
                         >
@@ -447,22 +399,24 @@ export function QueuesPage() {
                         </MenuTrigger>
                         <MenuContent placement="bottom end">
                           {q.paused ? (
-                            <MenuItem onAction={() => resumeMutation.mutate(q.queue)}>
+                            <MenuItem onAction={() => actions.resume.mutate({ queue: q.queue })}>
                               Resume queue
                             </MenuItem>
                           ) : (
-                            <MenuItem onAction={() => pauseMutation.mutate(q.queue)}>
+                            <MenuItem onAction={() => actions.pause.mutate({ queue: q.queue })}>
                               Pause queue
                             </MenuItem>
                           )}
                           <MenuItem
                             intent="danger"
-                            onAction={() => setDrainTarget(q.queue)}
+                            onAction={() => openDrain(q.queue)}
                           >
                             Drain queue…
                           </MenuItem>
                         </MenuContent>
                       </Menu>
+                      )}
+                      </DisabledReason>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -471,19 +425,13 @@ export function QueuesPage() {
         </TableBody>
       </Table>
 
-      <ConfirmDialog
+      <DrainDialog
+        queue={drainTarget ?? lastDrainTarget}
         isOpen={drainTarget !== null}
         onOpenChange={(open) => {
           if (!open) setDrainTarget(null);
         }}
-        title={`Drain queue "${drainTarget}"`}
-        description="This will cancel all available, scheduled, retryable, and waiting_external jobs in this queue. Running jobs will not be affected."
-        confirmLabel="Drain queue"
-        confirmIntent="danger"
-        onConfirm={() => {
-          if (drainTarget) drainMutation.mutate(drainTarget);
-        }}
-        isPending={drainMutation.isPending}
+        drain={actions.drain}
       />
     </Page>
   );

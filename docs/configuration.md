@@ -846,7 +846,7 @@ If you're connecting to a read replica, increase `--cache-ttl` to reduce load. T
 
 ### Read-only mode
 
-`awa serve` disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. `/api/capabilities` reports `read_only: true` and the frontend hides the corresponding buttons. Mutation requests against a read-only server return `503 Service Unavailable` with a clear error body.
+`awa serve` disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. `/api/capabilities` reports `read_only: true` and the frontend shows the corresponding actions disabled, with the reason. Mutation requests against a read-only server return `503 Service Unavailable` with a clear error body.
 
 There are two ways to opt in:
 

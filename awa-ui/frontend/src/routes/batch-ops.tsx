@@ -1,17 +1,17 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
 import { Time } from "@/components/Time";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { cancelBatchOperation } from "@/lib/api";
+import { useState } from "react";
+import type { BatchOperation } from "@/lib/api";
 import { ListState } from "@/components/ListState";
 import { batchOpsQuery, BATCH_OPS_LIST_LIMIT } from "@/lib/shared-queries";
 import { BatchStateBadge } from "@/components/StateBadge";
 import { BatchOpLink } from "@/components/links";
 import { changedNothing, isCancellable, operationLabel, progressText } from "@/lib/batch";
-import { useReadOnly } from "@/hooks/use-read-only";
-import { toast } from "@/components/ui/toast";
+import { AdminButton } from "@/components/AdminAction";
+import { CancelOperationDialog } from "@/components/CancelOperationDialog";
 import { Page, PageHeader } from "@/components/Page";
-import { Button, buttonStyles } from "@/components/ui/button";
+import { buttonStyles } from "@/components/ui/button";
 import {
   Table,
   TableHeader,
@@ -23,19 +23,10 @@ import {
 import { formatNumber } from "@/lib/number";
 
 export function BatchOpsPage() {
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const readOnly = useReadOnly();
   const operationsQuery = useManagedQuery(batchOpsQuery);
 
-  const cancelMutation = useMutation({
-    mutationFn: (id: string) => cancelBatchOperation(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
-      toast.success("Cancellation requested");
-    },
-    onError: (error) => toast.error(error.message),
-  });
+  const [cancelling, setCancelling] = useState<BatchOperation | null>(null);
 
   const operations = operationsQuery.data ?? [];
 
@@ -105,7 +96,9 @@ export function BatchOpsPage() {
               <TableCell><Time value={operation.submitted_at} /></TableCell>
               <TableCell>
                 {isCancellable(operation.state) ? (
-                  <Button size="sm" intent="outline" onPress={() => cancelMutation.mutate(operation.id)} isDisabled={readOnly || cancelMutation.isPending}>Cancel</Button>
+                  <AdminButton size="sm" intent="outline" onPress={() => setCancelling(operation)} aria-label={`Cancel operation ${operation.id.slice(0, 8)}`}>
+                    Cancel…
+                  </AdminButton>
                 ) : null}
               </TableCell>
             </TableRow>
@@ -117,6 +110,11 @@ export function BatchOpsPage() {
           Showing the {BATCH_OPS_LIST_LIMIT} most recent operations.
         </p>
       )}
+      <CancelOperationDialog
+        operation={cancelling}
+        isOpen={cancelling !== null}
+        onOpenChange={(open) => !open && setCancelling(null)}
+      />
     </Page>
   );
 }

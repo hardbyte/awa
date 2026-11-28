@@ -1,6 +1,7 @@
 import { useParams } from "@tanstack/react-router";
 import { useManagedQuery } from "@/hooks/use-managed-query";
-import { useReadOnly } from "@/hooks/use-read-only";
+import { AdminButton, useAdminGate } from "@/components/AdminAction";
+import { CronControls } from "@/components/CronControls";
 import { useNow } from "@/hooks/use-now";
 import { useCronActions } from "@/hooks/use-cron-actions";
 import { fetchCronJobs, fetchQueues, type CronJobRow, type QueueOverview } from "@/lib/api";
@@ -12,7 +13,6 @@ import { FilterLink, KindLink, QueueLink, TagChip } from "@/components/links";
 import { JsonView } from "@/components/JsonView";
 import { Time } from "@/components/Time";
 import { ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   DescriptionDetails,
@@ -27,7 +27,7 @@ function hasEntries(value: unknown): boolean {
 
 export function CronDetailPage() {
   const { name = "" } = useParams({ strict: false }) as { name?: string };
-  const readOnly = useReadOnly();
+  const gate = useAdminGate();
   const nowMs = useNow();
   const actions = useCronActions();
 
@@ -61,7 +61,6 @@ export function CronDetailPage() {
   const isPaused = cron.paused_at != null;
   const isRetired = cron.retired_at != null;
   const queuePaused = (queuesQuery.data ?? []).some((q) => q.queue === cron.queue && q.paused);
-  const toggling = actions.pause.isPending || actions.resume.isPending;
 
   return (
     <Page width="readable">
@@ -70,20 +69,7 @@ export function CronDetailPage() {
         title={cron.name}
         status={<CronStatusBadges cron={cron} queuePaused={queuePaused} nowMs={nowMs} />}
         actions={
-          <>
-            {isPaused ? (
-              <Button intent="outline" size="sm" onPress={() => actions.resume.mutate(cron.name)} isDisabled={readOnly || toggling || isRetired}>
-                Resume
-              </Button>
-            ) : (
-              <Button intent="outline" size="sm" onPress={() => actions.pause.mutate(cron.name)} isDisabled={readOnly || toggling || isRetired}>
-                Pause
-              </Button>
-            )}
-            <Button intent="outline" size="sm" onPress={() => actions.trigger.mutate(cron.name)} isDisabled={readOnly || actions.trigger.isPending || isRetired}>
-              Trigger now
-            </Button>
-          </>
+          <CronControls cron={cron} actions={actions} size="sm" />
         }
       />
 
@@ -198,22 +184,20 @@ export function CronDetailPage() {
               </>
             )}
           </DescriptionList>
-          {!readOnly && (
-            <Button
-              intent="outline"
-              size="sm"
-              isDisabled={actions.owner.isPending}
-              onPress={() => actions.previewOwner({ action: isRetired ? "restore" : "retire", name: cron.name })}
-            >
-              {isRetired ? "Preview restore" : "Preview retirement"}
-            </Button>
-          )}
+          <AdminButton
+            intent="outline"
+            size="sm"
+            isDisabled={actions.owner.isPending}
+            onPress={() => actions.previewOwner({ action: isRetired ? "restore" : "retire", name: cron.name })}
+          >
+            {isRetired ? "Preview restore" : "Preview retirement"}
+          </AdminButton>
           {actions.plan && (
             <CronPlanNotice
               plan={actions.plan}
               onApply={actions.applyPlan}
               onCancel={actions.clearPlan}
-              isDisabled={readOnly || actions.owner.isPending}
+              isDisabled={gate.disabled || actions.owner.isPending}
             />
           )}
         </CardContent>
