@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
   effectiveEngine,
@@ -27,9 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
 import {
-  formatDateTime,
   formatSnapshotInterval,
   instanceLabel,
   LoopStatus,
@@ -378,11 +377,11 @@ export function RuntimePage() {
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                     <span className="text-muted-fg">Snapshot</span>
-                    <span>{timeAgo(instance.last_seen_at)}</span>
+                    <Time value={instance.last_seen_at} />
                     <span className="text-muted-fg">Interval</span>
                     <span>{formatSnapshotInterval(instance.snapshot_interval_ms)}</span>
                     <span className="text-muted-fg">Started</span>
-                    <span>{timeAgo(instance.started_at)}</span>
+                    <Time value={instance.started_at} />
                     <span className="text-muted-fg">DB</span>
                     <span>{instance.postgres_connected ? "Connected" : "Disconnected"}</span>
                     <span className="text-muted-fg">Global max</span>
@@ -473,15 +472,15 @@ export function RuntimePage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div>{timeAgo(instance.last_seen_at)}</div>
+                      <div><Time value={instance.last_seen_at} /></div>
                       <div className="text-xs text-muted-fg">
                         every {formatSnapshotInterval(instance.snapshot_interval_ms)}
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div>{timeAgo(instance.started_at)}</div>
+                      <div><Time value={instance.started_at} /></div>
                       <div className="text-xs text-muted-fg">
-                        {formatDateTime(instance.started_at)}
+                        <Time value={instance.started_at} format="absolute" />
                       </div>
                     </TableCell>
                     <TableCell>

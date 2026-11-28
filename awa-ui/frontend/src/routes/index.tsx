@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { Link, useNavigate } from "@tanstack/react-router";
 import {
   fetchStats,
@@ -25,7 +26,6 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
-import { timeAgo } from "@/lib/time";
 import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
 
 /** Background tint per state for counter cards */
@@ -250,7 +250,7 @@ export function DashboardPage() {
                       )}
                     </div>
                     <div className="mt-1 text-xs text-muted-fg">
-                      {instance.queues.length} queue(s) · seen {timeAgo(instance.last_seen_at)}
+                      {instance.queues.length} queue(s) · seen <Time value={instance.last_seen_at} />
                     </div>
                   </div>
                 );
@@ -325,7 +325,7 @@ export function DashboardPage() {
                       <TableCell className="text-right tabular-nums">
                         {instance.queues.length}
                       </TableCell>
-                      <TableCell>{timeAgo(instance.last_seen_at)}</TableCell>
+                      <TableCell><Time value={instance.last_seen_at} /></TableCell>
                     </TableRow>
                   );
                 })}
@@ -516,7 +516,7 @@ export function DashboardPage() {
                       </TableCell>
                       <TableCell>
                         {job.finalized_at
-                          ? timeAgo(job.finalized_at)
+                          ? <Time value={job.finalized_at} />
                           : "-"}
                       </TableCell>
                       <TableCell className="max-w-[300px] truncate text-danger">

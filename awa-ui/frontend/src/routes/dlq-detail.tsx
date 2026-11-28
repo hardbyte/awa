@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import {
   useMutation,
   useQueryClient,
@@ -22,7 +23,6 @@ import {
 import { JsonView } from "@/components/JsonView";
 import { OutputCard } from "@/components/OutputCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { timeAgo } from "@/lib/time";
 
 export function DlqDetailPage() {
   const { id } = useParams({ strict: false });
@@ -137,7 +137,7 @@ export function DlqDetailPage() {
             <DescriptionDetails>{row.dlq_reason}</DescriptionDetails>
             <DescriptionTerm>DLQ'd</DescriptionTerm>
             <DescriptionDetails>
-              {new Date(row.dlq_at).toISOString()} ({timeAgo(row.dlq_at)})
+              <Time value={row.dlq_at} />
             </DescriptionDetails>
             <DescriptionTerm>Attempts</DescriptionTerm>
             <DescriptionDetails>
@@ -148,12 +148,12 @@ export function DlqDetailPage() {
               {row.original_run_lease}
             </DescriptionDetails>
             <DescriptionTerm>Created</DescriptionTerm>
-            <DescriptionDetails>{timeAgo(row.created_at)}</DescriptionDetails>
+            <DescriptionDetails><Time value={row.created_at} /></DescriptionDetails>
             {row.finalized_at && (
               <>
                 <DescriptionTerm>Finalized</DescriptionTerm>
                 <DescriptionDetails>
-                  {timeAgo(row.finalized_at)}
+                  <Time value={row.finalized_at} />
                 </DescriptionDetails>
               </>
             )}

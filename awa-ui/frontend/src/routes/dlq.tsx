@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import {
   useMutation,
   useQueryClient,
@@ -27,7 +28,6 @@ import {
   TableCell,
   TableColumn,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
 import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
@@ -274,7 +274,7 @@ export function DlqPage() {
               <TableCell>
                 {row.attempt} / {row.max_attempts}
               </TableCell>
-              <TableCell>{timeAgo(row.dlq_at)}</TableCell>
+              <TableCell><Time value={row.dlq_at} /></TableCell>
             </TableRow>
           ))}
         </TableBody>

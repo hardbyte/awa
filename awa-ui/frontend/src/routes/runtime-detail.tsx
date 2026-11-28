@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { Link, useParams } from "@tanstack/react-router";
 import { fetchRuntime } from "@/lib/api";
 import type { RuntimeInstance, RuntimeOverview } from "@/lib/api";
@@ -20,9 +21,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
 import {
-  formatDateTime,
   formatSnapshotInterval,
   instanceLabel,
   LoopBadge,
@@ -138,13 +137,13 @@ export function RuntimeInstancePage() {
 
             <DescriptionTerm>Snapshot</DescriptionTerm>
             <DescriptionDetails>
-              {timeAgo(instance.last_seen_at)} (every{" "}
+              <Time value={instance.last_seen_at} /> (every{" "}
               {formatSnapshotInterval(instance.snapshot_interval_ms)})
             </DescriptionDetails>
 
             <DescriptionTerm>Started</DescriptionTerm>
             <DescriptionDetails>
-              {formatDateTime(instance.started_at)}
+              <Time value={instance.started_at} format="absolute" />
             </DescriptionDetails>
 
             <DescriptionTerm>Hostname</DescriptionTerm>

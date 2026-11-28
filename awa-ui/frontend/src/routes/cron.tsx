@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { fetchCronReconciliation, cronOwnerAction, type CronActionPlan, type CronOwnerAction } from "../lib/api";
 import { useMemo, useState } from "react";
 import {
@@ -21,7 +22,7 @@ import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
 import { ListState } from "@/components/ListState";
 import { JsonView } from "@/components/JsonView";
-import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
+import { formatInTimezone } from "@/lib/time";
 
 export function CronPage() {
   const queryClient = useQueryClient();
@@ -231,17 +232,10 @@ export function CronPage() {
 
                     <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
                       {cj.next_fire_at && !isPaused && !isRetired && (
-                        <span
-                          className="text-success"
-                          title={formatInTimezone(cj.next_fire_at, cj.timezone)}
-                        >
-                          {timeUntil(cj.next_fire_at)}
-                        </span>
+                        <Time value={cj.next_fire_at} format="relative" className="text-success" />
                       )}
                       {cj.last_enqueued_at ? (
-                        <span title={new Date(cj.last_enqueued_at).toLocaleString()}>
-                          {timeAgo(cj.last_enqueued_at)}
-                        </span>
+                        <Time value={cj.last_enqueued_at} />
                       ) : (
                         "Never run"
                       )}
@@ -299,7 +293,7 @@ export function CronPage() {
                           <>
                             {" "}
                             <span className="text-muted-fg">
-                              since {new Date(cj.paused_at).toLocaleString()}
+                              since <Time value={cj.paused_at} />
                             </span>
                           </>
                         )}
@@ -379,16 +373,16 @@ export function CronPage() {
                         <dd className="font-medium">
                           {formatInTimezone(cj.next_fire_at, cj.timezone)}
                           <span className="ml-2 text-muted-fg font-normal">
-                            ({timeUntil(cj.next_fire_at)})
+                            (<Time value={cj.next_fire_at} format="relative" />)
                           </span>
                         </dd>
                       </div>
                     )}
 
                     <div className="text-xs text-muted-fg">
-                      Created {new Date(cj.created_at).toLocaleString()}
+                      Created <Time value={cj.created_at} />
                       {" · "}
-                      Updated {new Date(cj.updated_at).toLocaleString()}
+                      Updated <Time value={cj.updated_at} />
                     </div>
                   </div>
                 )}

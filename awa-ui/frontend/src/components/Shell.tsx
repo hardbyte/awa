@@ -9,6 +9,7 @@ import {
 } from "react-aria-components";
 import { useIsFetching, useQuery } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
+import { useTimeZone } from "@/hooks/use-time-zone";
 import {
   fetchCapabilities,
   fetchRuntime,
@@ -144,6 +145,22 @@ function ThemeToggle() {
       {theme === "light" && <SunIcon />}
       {theme === "dark" && <MoonIcon />}
       {theme === "system" && <MonitorIcon />}
+    </Button>
+  );
+}
+
+/** Switches every timestamp between the browser's zone and UTC. */
+function TimeZoneToggle() {
+  const [tz, setTz] = useTimeZone();
+  return (
+    <Button
+      intent="plain"
+      size="sm"
+      aria-label={tz === "UTC" ? "Times in UTC; show local time" : "Times in local time; show UTC"}
+      onPress={() => setTz(tz === "UTC" ? "local" : "UTC")}
+      className="px-2 text-xs font-medium tabular-nums"
+    >
+      {tz === "UTC" ? "UTC" : "Local"}
     </Button>
   );
 }
@@ -515,6 +532,7 @@ export function Shell() {
           <div className="flex-1" />
           <div className="flex items-center gap-1">
             <RefreshControl />
+            <TimeZoneToggle />
             <ThemeToggle />
           </div>
         </header>

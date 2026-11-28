@@ -9,6 +9,7 @@
 
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "./StateBadge";
+import { Time } from "./Time";
 
 interface TimelineEvent {
   timestamp: string;
@@ -132,9 +133,11 @@ export function JobTimeline({ job }: { job: JobRow }) {
               <div className="flex flex-wrap items-baseline gap-2">
                 <span className="text-sm font-medium">{event.label}</span>
                 {event.state && <StateBadge state={event.state} />}
-                <time className="ml-auto text-xs tabular-nums text-muted-fg">
-                  {new Date(event.timestamp).toLocaleString()}
-                </time>
+                <Time
+                  value={event.timestamp}
+                  format="absolute"
+                  className="ml-auto text-xs tabular-nums text-muted-fg"
+                />
               </div>
               {event.detail && (
                 <p className="mt-1 text-sm text-danger">{event.detail}</p>

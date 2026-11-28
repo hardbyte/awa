@@ -1,13 +1,6 @@
 import type { QueueRuntimeConfigSnapshot, RuntimeInstance } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 
-export function formatDateTime(value: string): string {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value));
-}
-
 export function formatSnapshotInterval(ms: number): string {
   if (ms < 1_000) return `${ms}ms`;
   if (ms % 1_000 === 0) return `${ms / 1_000}s`;

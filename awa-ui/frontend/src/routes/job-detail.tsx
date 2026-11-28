@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { useEffect, useState } from "react";
 import {
   useMutation,
@@ -26,7 +27,6 @@ import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { timeUntil } from "@/lib/time";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 
 function hasMetadata(job: JobRow): boolean {
@@ -194,7 +194,7 @@ export function JobDetailPage() {
         {job.state === "retryable" && (
           <span className="text-sm text-muted-fg" data-testid="retryable-hint">
             Retries automatically{" "}
-            {new Date(job.run_at).getTime() > Date.now() ? timeUntil(job.run_at) : "shortly"}.
+            {new Date(job.run_at).getTime() > Date.now() ? <Time value={job.run_at} format="relative" /> : "shortly"}.
             Manual retry is for failed or cancelled jobs.
           </span>
         )}
@@ -249,14 +249,14 @@ export function JobDetailPage() {
 
         <DescriptionTerm>Created</DescriptionTerm>
         <DescriptionDetails>
-          {new Date(job.created_at).toLocaleString()}
+          <Time value={job.created_at} />
         </DescriptionDetails>
 
         {job.attempted_at && (
           <>
             <DescriptionTerm>Last attempt</DescriptionTerm>
             <DescriptionDetails>
-              {new Date(job.attempted_at).toLocaleString()}
+              <Time value={job.attempted_at} />
             </DescriptionDetails>
           </>
         )}
@@ -265,7 +265,7 @@ export function JobDetailPage() {
           <>
             <DescriptionTerm>Finalized</DescriptionTerm>
             <DescriptionDetails>
-              {new Date(job.finalized_at).toLocaleString()}
+              <Time value={job.finalized_at} />
             </DescriptionDetails>
           </>
         )}
@@ -357,7 +357,7 @@ export function JobDetailPage() {
                 <>
                   <DescriptionTerm>Timeout</DescriptionTerm>
                   <DescriptionDetails>
-                    {new Date(job.callback_timeout_at).toLocaleString()}
+                    <Time value={job.callback_timeout_at} />
                     {job.state === "waiting_external" &&
                       new Date(job.callback_timeout_at) < new Date() && (
                         <Badge intent="danger" className="ml-2">

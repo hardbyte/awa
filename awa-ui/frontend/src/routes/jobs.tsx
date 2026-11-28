@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import {
   useMutation,
   useQueryClient,
@@ -36,7 +37,6 @@ import {
   TableCell,
   TableColumn,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
 import {
   DEFAULT_PAGE_SIZE,
   PAGE_SIZES,
@@ -56,15 +56,15 @@ const STATES = [
   "waiting_external",
 ] as const;
 
-/** Show the most relevant timestamp based on job state */
+/** The most relevant timestamp for the job's state. */
 function contextualTime(job: { state: string; created_at: string; attempted_at: string | null; finalized_at: string | null }): string {
   if (job.finalized_at && ["completed", "failed", "cancelled"].includes(job.state)) {
-    return timeAgo(job.finalized_at);
+    return job.finalized_at;
   }
   if (job.attempted_at && ["running", "waiting_external"].includes(job.state)) {
-    return timeAgo(job.attempted_at);
+    return job.attempted_at;
   }
-  return timeAgo(job.created_at);
+  return job.created_at;
 }
 
 /** Label for contextual time column header */
@@ -553,7 +553,7 @@ export function JobsPage() {
                   <span>{queueLabel(job)}</span>
                   {job.queue_descriptor?.display_name && <span>{job.queue}</span>}
                   <span>{job.attempt}/{job.max_attempts}</span>
-                  <span>{contextualTime(job)}</span>
+                  <Time value={contextualTime(job)} />
                 </div>
                 {job.kind_descriptor?.description && (
                   <p className="mt-1 text-xs text-muted-fg">
@@ -697,7 +697,7 @@ export function JobsPage() {
                 )}
               </TableCell>
               <TableCell className="text-muted-fg">
-                {contextualTime(job)}
+                <Time value={contextualTime(job)} />
               </TableCell>
             </TableRow>
           ))}

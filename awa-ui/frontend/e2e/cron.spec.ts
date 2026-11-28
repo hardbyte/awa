@@ -161,7 +161,7 @@ test.describe("Cron page", () => {
     }
 
     await expect(firstCronSummary(page, cronJobs[0].name)).toContainText(
-      /in \d+[smhd]|overdue/,
+      /in \d+[smhd]|\d+[smhd] ago|just now/,
     );
   });
 

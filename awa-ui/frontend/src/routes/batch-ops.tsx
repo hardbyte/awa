@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { useMemo, useState } from "react";
 import { useSearch } from "@tanstack/react-router";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -32,7 +33,7 @@ import {
   TableCell,
   TableColumn,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
+import { formatNumber } from "@/lib/number";
 
 /** A completed operation that matched rows but changed none of them. */
 function changedNothing(operation: BatchOperation): boolean {
@@ -50,8 +51,8 @@ function stateTone(operation: BatchOperation): "success" | "warning" | "danger" 
 function progressText(operation: BatchOperation): string {
   const total = operation.total_matched ?? 0;
   const accounted = operation.processed + operation.skipped + operation.errored;
-  if (total === 0) return accounted.toLocaleString();
-  return `${accounted.toLocaleString()}/${total.toLocaleString()}`;
+  if (total === 0) return formatNumber(accounted);
+  return `${formatNumber(accounted)}/${formatNumber(total)}`;
 }
 
 function parsePriority(value: string): number | null {
@@ -410,7 +411,7 @@ export function BatchOpsPage() {
         {currentCount && (
           <p className="mt-2 text-sm" data-testid="batch-preview-count">
             {currentCount.kind === "at_least" ? "At least " : ""}
-            {currentCount.value.toLocaleString()} eligible job(s) would change.
+            {formatNumber(currentCount.value)} eligible job(s) would change.
           </p>
         )}
         <div className="mt-4 flex items-center gap-2">
@@ -473,10 +474,10 @@ export function BatchOpsPage() {
                 )}
               </TableCell>
               <TableCell className="tabular-nums">{progressText(operation)}</TableCell>
-              <TableCell className="tabular-nums">{operation.processed.toLocaleString()}</TableCell>
-              <TableCell className="tabular-nums">{operation.skipped.toLocaleString()}</TableCell>
-              <TableCell className="tabular-nums">{operation.errored.toLocaleString()}</TableCell>
-              <TableCell>{timeAgo(operation.submitted_at)}</TableCell>
+              <TableCell className="tabular-nums">{formatNumber(operation.processed)}</TableCell>
+              <TableCell className="tabular-nums">{formatNumber(operation.skipped)}</TableCell>
+              <TableCell className="tabular-nums">{formatNumber(operation.errored)}</TableCell>
+              <TableCell><Time value={operation.submitted_at} /></TableCell>
               <TableCell>
                 {operation.state === "pending" || operation.state === "scanning" || operation.state === "running" ? (
                   <Button size="sm" intent="outline" onPress={() => cancelMutation.mutate(operation.id)} isDisabled={readOnly || cancelMutation.isPending}>Cancel</Button>
