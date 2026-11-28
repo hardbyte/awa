@@ -12,6 +12,40 @@ async function failApi(page: Page, pattern: string) {
   );
 }
 
+function job(overrides: Record<string, unknown> = {}) {
+  const now = new Date().toISOString();
+  return {
+    id: 990001,
+    kind: "e2e_job",
+    queue: "e2e_test",
+    args: {},
+    state: "available",
+    priority: 2,
+    attempt: 1,
+    max_attempts: 5,
+    run_at: now,
+    heartbeat_at: null,
+    deadline_at: null,
+    attempted_at: now,
+    finalized_at: null,
+    created_at: now,
+    errors: null,
+    metadata: {},
+    tags: [],
+    progress: null,
+    callback_id: null,
+    callback_timeout_at: null,
+    callback_filter: null,
+    callback_on_complete: null,
+    callback_on_fail: null,
+    callback_transform: null,
+    original_priority: 2,
+    queue_descriptor: null,
+    kind_descriptor: null,
+    ...overrides,
+  };
+}
+
 function batchOperation(overrides: Record<string, unknown> = {}) {
   const now = new Date().toISOString();
   return {
@@ -177,4 +211,41 @@ test.describe("Not-found detail pages", () => {
       await expect(page).toHaveURL(new RegExp(`${path.split("/")[1]}$`));
     });
   }
+});
+
+test.describe("Job retry safety", () => {
+  test("a waiting job is restarted only after a confirmation naming the risk", async ({ page }) => {
+    let retried = 0;
+    await page.route("**/api/jobs/990001", (route) =>
+      route.fulfill({
+        json: job({ state: "waiting_external", callback_id: "11111111-1111-4111-8111-111111111111" }),
+      })
+    );
+    await page.route("**/api/jobs/990001/retry", (route) => {
+      retried++;
+      return route.fulfill({ json: job() });
+    });
+    await page.goto("/jobs/990001");
+    await expect(page.getByRole("button", { name: "Retry", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "Restart…" }).click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog).toContainText("may happen twice");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    expect(retried).toBe(0);
+
+    await page.getByRole("button", { name: "Restart…" }).click();
+    await page.getByRole("alertdialog").getByRole("button", { name: "Restart job" }).click();
+    await expect.poll(() => retried).toBe(1);
+  });
+
+  test("a retryable job says why it has no Retry button", async ({ page }) => {
+    await page.route("**/api/jobs/990001", (route) =>
+      route.fulfill({
+        json: job({ state: "retryable", run_at: new Date(Date.now() + 5 * 60_000).toISOString() }),
+      })
+    );
+    await page.goto("/jobs/990001");
+    await expect(page.getByTestId("retryable-hint")).toContainText("Retries automatically in");
+    await expect(page.getByRole("button", { name: "Retry", exact: true })).toHaveCount(0);
+  });
 });

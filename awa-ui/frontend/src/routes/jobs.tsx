@@ -177,6 +177,7 @@ export function JobsPage() {
 
   const jobs = jobsQuery.data ?? [];
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showRetryWaitingConfirm, setShowRetryWaitingConfirm] = useState(false);
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
   // Queue context: when filtering by a single queue, show queue actions
@@ -223,12 +224,14 @@ export function JobsPage() {
     });
 
   // Compute which selected jobs are retryable vs cancellable
-  const { retryableIds, cancellableIds } = useMemo(() => {
+  const { retryableIds, waitingRetryCount, autoRetryingCount, cancellableIds } = useMemo(() => {
     const selectedJobs = jobs.filter((j) => selected.has(j.id));
     return {
       retryableIds: selectedJobs
         .filter((j) => RETRYABLE_STATES.has(j.state))
         .map((j) => j.id),
+      waitingRetryCount: selectedJobs.filter((j) => j.state === "waiting_external").length,
+      autoRetryingCount: selectedJobs.filter((j) => j.state === "retryable").length,
       cancellableIds: selectedJobs
         .filter((j) => !TERMINAL_STATES.has(j.state))
         .map((j) => j.id),
@@ -396,7 +399,11 @@ export function JobsPage() {
           <Button
             intent="primary"
             size="sm"
-            onPress={() => retryMutation.mutate(retryableIds)}
+            onPress={() =>
+              waitingRetryCount > 0
+                ? setShowRetryWaitingConfirm(true)
+                : retryMutation.mutate(retryableIds)
+            }
             isDisabled={readOnly || retryMutation.isPending || retryableIds.length === 0}
           >
             Retry{retryableIds.length > 0 ? ` (${retryableIds.length})` : ""}
@@ -410,6 +417,12 @@ export function JobsPage() {
           >
             Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})` : ""}
           </Button>
+          {autoRetryingCount > 0 && (
+            <span className="text-xs text-muted-fg" data-testid="bulk-retry-hint">
+              {autoRetryingCount} retryable job(s) already retry automatically
+              and are not retried here.
+            </span>
+          )}
         </div>
       )}
 
@@ -684,6 +697,16 @@ export function JobsPage() {
         confirmIntent="danger"
         onConfirm={() => cancelMutation.mutate(cancellableIds)}
         isPending={cancelMutation.isPending}
+      />
+
+      <ConfirmDialog
+        isOpen={showRetryWaitingConfirm}
+        onOpenChange={setShowRetryWaitingConfirm}
+        title={`Retry ${retryableIds.length} job(s)`}
+        description={`${waitingRetryCount} of these job(s) are waiting for an external callback. Retrying runs them again from the first attempt and discards the pending callback, so work their handlers already started may happen twice.`}
+        confirmLabel="Retry jobs"
+        onConfirm={() => retryMutation.mutate(retryableIds)}
+        isPending={retryMutation.isPending}
       />
 
       {activeQueue && (
