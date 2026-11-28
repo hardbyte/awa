@@ -226,15 +226,17 @@ describe("bulkTier", () => {
     expect(bulkTier("purge_dlq", { kind: "exact", value: 2 })).toBe(3);
   });
 
-  it("asks to type for a cancel at the threshold or of an unbounded count", () => {
-    expect(bulkTier("cancel", { kind: "exact", value: TYPE_TO_CONFIRM_MIN_JOBS - 1 })).toBe(2);
-    expect(bulkTier("cancel", { kind: "exact", value: TYPE_TO_CONFIRM_MIN_JOBS })).toBe(3);
-    expect(bulkTier("cancel", { kind: "at_least", value: 10 })).toBe(3);
-    expect(bulkTier("cancel", undefined)).toBe(3);
+  it("asks to type for a cancel or retry at the threshold or of an unbounded count", () => {
+    for (const kind of ["cancel", "retry", "retry_from_dlq"] as const) {
+      expect(bulkTier(kind, { kind: "exact", value: TYPE_TO_CONFIRM_MIN_JOBS - 1 })).toBe(2);
+      expect(bulkTier(kind, { kind: "exact", value: TYPE_TO_CONFIRM_MIN_JOBS })).toBe(3);
+      expect(bulkTier(kind, { kind: "at_least", value: 10 })).toBe(3);
+      expect(bulkTier(kind, undefined)).toBe(3);
+    }
   });
 
-  it("keeps reversible actions at tier 2", () => {
-    for (const kind of ["retry", "set_priority", "move_queue", "move_to_dlq", "retry_from_dlq"] as const) {
+  it("keeps actions that run no handler at tier 2", () => {
+    for (const kind of ["set_priority", "move_queue", "move_to_dlq"] as const) {
       expect(bulkTier(kind, { kind: "at_least", value: 100_000 })).toBe(2);
     }
   });

@@ -52,8 +52,8 @@ export const BATCH_FAILURE_WINDOW_MS = 24 * 3600_000;
 /** A schedule whose next fire is this far in the past reads as overdue. */
 export const CRON_OVERDUE_GRACE_MS = 60_000;
 
-/** A cancel over this many jobs, or over a count the server could only bound
- * from below, asks the user to type the count to confirm. */
+/** A bulk cancel or retry over this many jobs, or over a count the server
+ * could only bound from below, asks the user to type the count to confirm. */
 export const TYPE_TO_CONFIRM_MIN_JOBS = 1_000;
 
 /** Rows of a bulk action's preview sample shown in its dialog. */

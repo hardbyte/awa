@@ -314,6 +314,21 @@ test.describe("Bulk operations form", () => {
     await expect(confirm).toBeEnabled();
   });
 
+  test("retrying an at-least count asks for the count to be typed", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({ json: { total_matched: { kind: "at_least", value: 10000 }, sample: [] } })
+    );
+    await page.goto("/batch-ops/new?op=retry&kind=e2e_job");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Submit" }).click();
+    const dialog = page.getByRole("alertdialog");
+    const confirm = dialog.getByRole("button", { name: /^Retry at least 10,000/ });
+    await expect(confirm).toBeDisabled();
+    await dialog.getByRole("textbox", { name: /Type 10000/ }).fill("10000");
+    await expect(confirm).toBeEnabled();
+  });
+
   test("a created date that doesn't parse blocks preview and submit", async ({ page }) => {
     await stubSharedApi(page, []);
     await page.goto("/batch-ops?queue=e2e_test");

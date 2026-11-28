@@ -18,10 +18,17 @@ export function selectionTier(count: number): ConfirmTier {
 }
 
 
+/** Kinds that take tier 3 from `TYPE_TO_CONFIRM_MIN_JOBS` jobs: a cancel stops
+ * work, and a retry runs handlers again, repeating their side effects. */
+const TIER_3_AT_SCALE: ReadonlySet<BatchOperationKind> = new Set(["cancel", "retry", "retry_from_dlq"]);
+
 /** Tier for a bulk operation over a filter, given what its preview matched. */
 export function bulkTier(opKind: BatchOperationKind, count: JobCount | undefined): ConfirmTier {
   if (opKind === "discard" || opKind === "purge_dlq") return 3;
-  if (opKind === "cancel" && (!count || count.kind === "at_least" || count.value >= TYPE_TO_CONFIRM_MIN_JOBS)) {
+  if (
+    TIER_3_AT_SCALE.has(opKind) &&
+    (!count || count.kind === "at_least" || count.value >= TYPE_TO_CONFIRM_MIN_JOBS)
+  ) {
     return 3;
   }
   return 2;
