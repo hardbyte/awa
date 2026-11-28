@@ -12,7 +12,8 @@ import { toWireFilter } from "@/lib/api";
 
 describe("formatDuration", () => {
   it("formats seconds as a compact duration", () => {
-    expect(formatDuration(0.4)).toBe("0s");
+    expect(formatDuration(0.4)).toBe("<1s");
+    expect(formatDuration(0)).toBe("0s");
     expect(formatDuration(59.9)).toBe("59s");
     expect(formatDuration(1524.7)).toBe("25m 24s");
     expect(formatDuration(7200)).toBe("2h");
