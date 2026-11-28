@@ -32,16 +32,22 @@ test.describe("Kinds page", () => {
     await expect(legacyRow.getByText("Not declared", { exact: true })).toBeVisible();
   });
 
-  test("clicking a kind navigates to jobs with kind filter", async ({ page }) => {
+  test("clicking a kind opens its page", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/kinds") && r.ok()),
       page.goto("/kinds"),
     ]);
 
-    await page.getByRole("link", { name: "E2E Job" }).click();
-    await page.waitForURL(/\/jobs/);
-    expect(page.url()).toContain("kind");
-    expect(page.url()).toContain("e2e_job");
+    await page.getByRole("grid", { name: "Job kinds" }).getByRole("link", { name: "E2E Job" }).click();
+    await expect(page).toHaveURL(/\/kinds\/e2e_job$/);
+    await expect(page.getByRole("heading", { level: 1, name: "E2E Job" })).toBeVisible();
+  });
+
+  test("the jobs link beside a kind opens its jobs", async ({ page }) => {
+    await page.goto("/kinds");
+    await page.getByRole("grid", { name: "Job kinds" }).getByRole("link", { name: "Jobs of kind e2e_job" }).click();
+    await page.waitForURL(/\/jobs\?/);
+    expect(new URL(page.url()).searchParams.get("q")).toBe("kind:e2e_job");
   });
 
   test("route-mocked stale and drift badges render", async ({ page }) => {

@@ -37,7 +37,7 @@ export function pageTitle(pathname: string): string {
     case "queues":
       return detail ? `Queue ${detail}` : "Queues";
     case "kinds":
-      return "Job kinds";
+      return detail ? `Job kind ${detail}` : "Job kinds";
     case "runtime":
       return detail ? "Fleet instance" : "Fleet";
     case "cron":

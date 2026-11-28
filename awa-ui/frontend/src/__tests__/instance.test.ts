@@ -31,6 +31,7 @@ describe("documentTitle", () => {
     expect(documentTitle("/queues/email%20out", null)).toBe("Queue email out · AWA");
     expect(documentTitle("/batch-ops/", null)).toBe("Bulk operations · AWA");
     expect(documentTitle("/batch-ops/new", null)).toBe("New operation · AWA");
+    expect(documentTitle("/kinds/send_email", null)).toBe("Job kind send_email · AWA");
     expect(documentTitle("/batch-ops/11111111-1111-4111-8111-111111111111", null)).toBe("Operation 11111111 · AWA");
     expect(documentTitle("/nope", null)).toBe("Not found · AWA");
   });

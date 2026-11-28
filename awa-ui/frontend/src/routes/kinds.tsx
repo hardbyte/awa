@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { FilterLink, KindLink } from "@/components/links";
 import { fetchKinds } from "@/lib/api";
 import type { JobKindOverview } from "@/lib/api";
 import { Page, PageHeader } from "@/components/Page";
@@ -15,13 +15,6 @@ import {
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
 import { JsonView } from "@/components/JsonView";
-
-function kindLabel(kind: JobKindOverview): string {
-  // Treat empty display_name the same as missing — the contract is
-  // "display name if set, otherwise the raw key". `??` alone would let
-  // `display_name: ""` render a blank label.
-  return kind.display_name?.trim() ? kind.display_name : kind.kind;
-}
 
 // The output type the kind declares, with its JSON Schema behind a toggle
 // when the runtime published one.
@@ -84,13 +77,10 @@ export function KindsPage() {
             <div key={kind.kind} className="rounded-lg border p-4">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <Link
-                    to="/jobs"
-                    search={{ q: `kind:${kind.kind}` }}
-                    className="font-medium text-primary no-underline hover:underline"
-                  >
-                    {kindLabel(kind)}
-                  </Link>
+                  <KindLink kind={kind.kind} descriptor={kind} className="font-medium" />
+                  <FilterLink filter={{ kind: kind.kind }} className="ml-2 text-xs" aria-label={`Jobs of kind ${kind.kind}`}>
+                    jobs
+                  </FilterLink>
                   {kind.display_name && (
                     <div className="text-xs text-muted-fg">{kind.kind}</div>
                   )}
@@ -172,13 +162,10 @@ export function KindsPage() {
               <TableRow key={kind.kind} id={kind.kind}>
                 <TableCell className="font-medium">
                   <div>
-                    <Link
-                      to="/jobs"
-                      search={{ q: `kind:${kind.kind}` }}
-                      className="text-primary no-underline hover:underline"
-                    >
-                      {kindLabel(kind)}
-                    </Link>
+                    <KindLink kind={kind.kind} descriptor={kind} />
+                    <FilterLink filter={{ kind: kind.kind }} className="ml-2 text-xs font-normal" aria-label={`Jobs of kind ${kind.kind}`}>
+                      jobs
+                    </FilterLink>
                     {kind.display_name?.trim() && (
                       <div className="text-xs font-normal text-muted-fg">{kind.kind}</div>
                     )}

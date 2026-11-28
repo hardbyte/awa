@@ -46,8 +46,8 @@ export function KindLink({
   const label = displayName(kind, descriptor);
   return (
     <Link
-      to="/jobs"
-      search={{ q: `kind:${kind}` }}
+      to="/kinds/$kind"
+      params={{ kind }}
       className={`${entityLinkClass} ${className}`}
       title={label === kind ? undefined : kind}
     >
@@ -137,13 +137,14 @@ export function FilterLink({
   state,
   className = "",
   children,
-}: EntityLinkProps & { to?: "/jobs" | "/dlq"; filter: SearchFilters; state?: string }) {
+  "aria-label": ariaLabel,
+}: EntityLinkProps & { to?: "/jobs" | "/dlq"; filter: SearchFilters; state?: string; "aria-label"?: string }) {
   const q = buildSearch(filter);
   const search: Record<string, string> = {};
   if (state && to === "/jobs") search.state = state;
   if (q) search.q = q;
   return (
-    <Link to={to} search={search} className={`${entityLinkClass} ${className}`}>
+    <Link to={to} search={search} className={`${entityLinkClass} ${className}`} aria-label={ariaLabel}>
       {children}
     </Link>
   );

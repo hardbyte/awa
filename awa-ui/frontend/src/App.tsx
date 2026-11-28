@@ -14,6 +14,7 @@ import { DashboardPage } from "./routes/index";
 import { JobsPage } from "./routes/jobs";
 import { JobDetailPage } from "./routes/job-detail";
 import { KindsPage } from "./routes/kinds";
+import { KindDetailPage } from "./routes/kind-detail";
 import { QueuesPage } from "./routes/queues";
 import { QueueDetailPage } from "./routes/queue-detail";
 import { CronPage } from "./routes/cron";
@@ -55,6 +56,12 @@ const kindsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/kinds",
   component: KindsPage,
+});
+
+const kindDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/kinds/$kind",
+  component: KindDetailPage,
 });
 
 const queuesRoute = createRoute({
@@ -129,6 +136,7 @@ const routeTree = rootRoute.addChildren([
   jobsRoute,
   jobDetailRoute,
   kindsRoute,
+  kindDetailRoute,
   queuesRoute,
   queueDetailRoute,
   runtimeRoute,
