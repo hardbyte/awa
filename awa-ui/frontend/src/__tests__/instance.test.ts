@@ -6,6 +6,7 @@ import {
   faviconSvg,
   instanceTitle,
   normalizeInstanceColor,
+  pageTitle,
 } from "@/lib/instance";
 
 describe("instanceTitle", () => {
@@ -71,5 +72,16 @@ describe("favicon", () => {
     const uri = faviconDataUri("#0ea5e9");
     expect(uri.startsWith("data:image/svg+xml,")).toBe(true);
     expect(decodeURIComponent(uri)).toContain("#0ea5e9");
+  });
+});
+
+describe("pageTitle", () => {
+  it("names detail pages from the decoded segment", () => {
+    expect(pageTitle("/queues/email%20high")).toBe("Queue email high");
+    expect(pageTitle("/jobs/42")).toBe("Job #42");
+  });
+
+  it("keeps a malformed escape as written instead of throwing", () => {
+    expect(pageTitle("/queues/%")).toBe("Queue %");
   });
 });

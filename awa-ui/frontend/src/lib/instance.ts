@@ -14,10 +14,18 @@ export function instanceTitle(name: string | null | undefined): string {
   return trimmed ? `${trimmed} — AWA` : "AWA";
 }
 
+function safeDecode(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 /** Page name for a route path, used in the browser tab title. */
 export function pageTitle(pathname: string): string {
   const [section, id] = pathname.replace(/^\/+|\/+$/g, "").split("/");
-  const detail = id ? decodeURIComponent(id) : null;
+  const detail = id ? safeDecode(id) : null;
   switch (section) {
     case "":
     case undefined:
