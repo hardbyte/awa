@@ -365,14 +365,15 @@ export function liveFailedCount(failed: number, deadLetters: number | null | und
 
 /**
  * Queues with something to look at, most pressing first. `liveFailed` is the
- * queue's failed jobs less its dead letters, or all its failed jobs when the
- * dead-letter depth is unknown.
+ * queue's failed jobs less its dead letters, and null when the dead-letter
+ * depth is unknown, since the server's `failed` includes dead letters. Such a
+ * queue is still ranked by all its failed jobs.
  */
 export function queuesNeedingAttention(
   queues: QueueOverview[],
   dlqDepth: DlqDepthResponse | undefined,
   limit: number
-): (QueueOverview & { deadLetters: number | null; liveFailed: number })[] {
+): (QueueOverview & { deadLetters: number | null; liveFailed: number | null })[] {
   const dlq = new Map((dlqDepth?.by_queue ?? []).map((row) => [row.queue, row.count]));
   const score = (q: QueueOverview) =>
     liveFailedCount(q.failed, dlq.get(q.queue)) * 3 +
@@ -384,7 +385,7 @@ export function queuesNeedingAttention(
     .map((q) => ({
       ...q,
       deadLetters: dlqDepth ? dlq.get(q.queue) ?? 0 : null,
-      liveFailed: liveFailedCount(q.failed, dlq.get(q.queue)),
+      liveFailed: dlqDepth ? liveFailedCount(q.failed, dlq.get(q.queue)) : null,
       score: score(q),
     }))
     .filter((q) => q.score > 0)

@@ -70,7 +70,13 @@ export function QueueOverviewTab() {
   const depthQuery = useManagedQuery(dlqDepthQuery);
   if (!queue) return null;
 
-  const dlqRows = depthQuery.data?.by_queue.find((entry) => entry.queue === name)?.count ?? 0;
+  // Null until the dead-letter depth loads, and while its read fails: the
+  // queue's failed count includes dead letters, so it can't be shown as live
+  // failures without it.
+  const dlqRows =
+    depthQuery.data && !depthQuery.isError
+      ? depthQuery.data.by_queue.find((entry) => entry.queue === name)?.count ?? 0
+      : null;
   const lag =
     queue.lag_seconds == null ? "—" : queue.lag_seconds < 10 ? `${queue.lag_seconds.toFixed(1)}s` : formatDuration(queue.lag_seconds);
 
@@ -113,8 +119,16 @@ export function QueueOverviewTab() {
           name={name}
           testId="queue-stat-failed"
           label="Failed"
-          value={formatNumber(liveFailedCount(queue.failed, dlqRows))}
-          hint={dlqRows > 0 ? "not counting dead letters" : undefined}
+          value={dlqRows === null ? "—" : formatNumber(liveFailedCount(queue.failed, dlqRows))}
+          hint={
+            dlqRows === null
+              ? depthQuery.isError
+                ? `Failed to load dead letters: ${depthQuery.error.message}`
+                : "waiting for the dead-letter count"
+              : dlqRows > 0
+                ? "not counting dead letters"
+                : undefined
+          }
           to={{ tab: "jobs", state: "failed", liveOnly: true }}
         />
         <Stat name={name} testId="queue-stat-waiting" label="Waiting for callback" value={formatNumber(queue.waiting_external)} to={{ tab: "jobs", state: "waiting_external" }} />
@@ -122,7 +136,7 @@ export function QueueOverviewTab() {
         <Stat name={name} testId="queue-stat-completed" label="Completed / hour" value={formatNumber(queue.completed_last_hour)} />
       </div>
 
-      {dlqRows > 0 && (
+      {dlqRows !== null && dlqRows > 0 && (
         <p className="text-sm" data-testid="queue-dlq-rows">
           <Link to="/queues/$name/dlq" params={{ name }} className="text-primary no-underline hover:underline">
             {formatNumber(dlqRows)} dead-lettered job(s)

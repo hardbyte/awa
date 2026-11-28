@@ -63,12 +63,13 @@ function QueueStatusBadges({ queue, runtime }: { queue: QueueStats; runtime: Que
   );
 }
 
-/** The one fact a phone card leads with. */
-function queueWhy(q: QueueStats, deadLetters: number): string {
-  const failed = liveFailedCount(q.failed, deadLetters);
+/** The one fact a phone card leads with. `deadLetters` is null when the
+ * dead-letter depth is unknown, which leaves the live failed count unknown. */
+function queueWhy(q: QueueStats, deadLetters: number | null): string {
+  const failed = deadLetters === null ? null : liveFailedCount(q.failed, deadLetters);
   const parts = [
-    failed > 0 && `${formatNumber(failed)} failed`,
-    deadLetters > 0 && `${formatNumber(deadLetters)} dead letters`,
+    failed === null ? q.failed > 0 && "failed: —" : failed > 0 && `${formatNumber(failed)} failed`,
+    deadLetters !== null && deadLetters > 0 && `${formatNumber(deadLetters)} dead letters`,
     q.retryable > 0 && `${formatNumber(q.retryable)} retrying`,
     q.available > 0 &&
       `${formatNumber(q.available)} ready${q.lag_seconds !== null ? `, oldest ${formatDuration(q.lag_seconds)}` : ""}`,
@@ -99,9 +100,15 @@ export function QueuesPage() {
   const gate = useAdminGate();
 
   const depthQuery = useManagedQuery(dlqDepthQuery);
-  const dlqByQueue = depthQuery.isError
-    ? null
-    : new Map((depthQuery.data?.by_queue ?? []).map((entry) => [entry.queue, entry.count]));
+  // Null until the dead-letter depth loads, and while its read fails: the
+  // server's failed counts include dead letters, so they can't be shown as
+  // live failures without it.
+  const dlqByQueue = depthQuery.data && !depthQuery.isError
+    ? new Map(depthQuery.data.by_queue.map((entry) => [entry.queue, entry.count]))
+    : null;
+  const failedUnknownReason = depthQuery.isError
+    ? `Failed to load dead letters: ${depthQuery.error.message}`
+    : "Waiting for the dead-letter count";
 
   const queues = queuesQuery.data ?? [];
   const runtimeByQueue = new Map<string, QueueRuntimeSummary>(
@@ -148,6 +155,11 @@ export function QueuesPage() {
   return (
     <Page className="space-y-4">
       <PageHeader title="Queues" />
+      {depthQuery.isError && (
+        <p className="text-sm text-warning-subtle-fg" role="alert" data-testid="queues-dlq-error">
+          Failed and dead-letter counts are unknown: {failedUnknownReason}.
+        </p>
+      )}
 
       <RowCards
         label="Queues"
@@ -162,7 +174,7 @@ export function QueuesPage() {
         }
         items={queues.map((q) => {
           const runtime = runtimeByQueue.get(q.queue);
-          const deadLetters = dlqByQueue?.get(q.queue) ?? 0;
+          const deadLetters = dlqByQueue ? dlqByQueue.get(q.queue) ?? 0 : null;
           return {
             key: q.queue,
             title: queueLabel(q),
@@ -224,7 +236,7 @@ export function QueuesPage() {
         >
           {queues.map((q) => {
               const runtime = runtimeByQueue.get(q.queue);
-              const failed = liveFailedCount(q.failed, dlqByQueue?.get(q.queue));
+              const failed = dlqByQueue ? liveFailedCount(q.failed, dlqByQueue.get(q.queue)) : null;
               return (
                 <TableRow key={q.queue} id={q.queue}>
                   <TableCell className="max-w-[13rem] font-medium">
@@ -267,9 +279,13 @@ export function QueuesPage() {
                     {formatNumber(q.retryable)}
                   </TableCell>
                   <TableCell
-                    className={`text-right tabular-nums ${failed === 0 ? "text-muted-fg" : "text-danger-subtle-fg"}`}
+                    className={`text-right tabular-nums ${failed === null || failed === 0 ? "text-muted-fg" : "text-danger-subtle-fg"}`}
                   >
-                    {formatNumber(failed)}
+                    {failed === null ? (
+                      <span title={failedUnknownReason} data-testid="queue-failed-unknown">—</span>
+                    ) : (
+                      formatNumber(failed)
+                    )}
                   </TableCell>
                   <TableCell className="text-right tabular-nums">
                     <DlqCount queue={q.queue} counts={dlqByQueue} />

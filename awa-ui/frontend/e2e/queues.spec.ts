@@ -457,4 +457,17 @@ test.describe("Queues page", () => {
     await expect(table.getByRole("row", { name: /told/ }).getByText("Paused 25m ago by ops", { exact: true })).toBeVisible();
     await expect(table.getByRole("row", { name: /older/ }).getByText("Paused", { exact: true })).toBeVisible();
   });
+
+  test("failed counts are a dash with the error while the dead-letter count can't load", async ({ page }) => {
+    await page.route("**/api/queues", (route) => route.fulfill({ json: [mockQueue({ failed: 5 })] }));
+    await page.route("**/api/queues/runtime", (route) => route.fulfill({ json: [] }));
+    await page.route("**/api/dlq/depth", (route) => route.fulfill({ status: 500, json: { error: "depth unavailable" } }));
+    await page.goto("/queues");
+    await expect(page.getByTestId("queues-dlq-error")).toContainText("Failed to load dead letters: depth unavailable");
+    const row = page.getByRole("grid", { name: "Queues" }).getByRole("row", { name: /mock_queue/ });
+    const unknown = row.getByTestId("queue-failed-unknown");
+    await expect(unknown).toHaveText("—");
+    await expect(unknown).toHaveAttribute("title", /depth unavailable/);
+    await expect(row.getByRole("gridcell", { name: "5", exact: true })).toHaveCount(0);
+  });
 });

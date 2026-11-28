@@ -449,9 +449,17 @@ describe("queuesNeedingAttention", () => {
     ]);
   });
 
-  it("keeps every failure as live when the dead-letter depth is unknown", () => {
-    const [row] = queuesNeedingAttention([queue({ queue: "a", failed: 4 })], undefined, 5);
-    expect(row).toMatchObject({ liveFailed: 4, deadLetters: null });
+  it("leaves live failures unknown, but still ranks by failures, when the dead-letter depth is unknown", () => {
+    // The server's failed count includes dead letters, so it isn't live failures.
+    const result = queuesNeedingAttention(
+      [queue({ queue: "a", failed: 4 }), queue({ queue: "b", retryable: 1 })],
+      undefined,
+      5
+    );
+    expect(result.map((q) => [q.queue, q.liveFailed, q.deadLetters])).toEqual([
+      ["a", null, null],
+      ["b", null, null],
+    ]);
   });
 });
 

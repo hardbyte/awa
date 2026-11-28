@@ -207,6 +207,18 @@ test.describe("Overview", () => {
     await expect(table.getByText("Paused 25m ago by ops", { exact: true })).toBeVisible();
   });
 
+  test("queues needing attention show failed as a dash while the dead-letter count can't load", async ({ page }) => {
+    await mockOverview(page, BUSY);
+    await page.route("**/api/dlq/depth", (route) => route.fulfill({ status: 500, json: { error: "depth unavailable" } }));
+    await page.goto("/");
+    const table = page.getByRole("grid", { name: "Queues needing attention" });
+    const billing = table.getByRole("row").filter({ hasText: "billing" });
+    // The server's 5 failed include its dead letters, so it isn't shown as live failures.
+    await expect(billing.getByRole("gridcell")).toHaveText(["4", "2s", "7", "—", "—"]);
+    await expect(billing.getByTestId("queue-failed-unknown")).toHaveAttribute("title", /depth unavailable/);
+    await expect(page.getByTestId("queues-attention-dlq-error")).toContainText("Failed to load dead letters: depth unavailable");
+  });
+
   test("queues needing attention leave quiet queues out", async ({ page }) => {
     await mockOverview(page, BUSY);
     await page.goto("/");

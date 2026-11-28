@@ -105,4 +105,12 @@ test.describe("Queue hub", () => {
     await expect(page.getByText('Drained queue "e2e_test": 3 job(s) cancelled')).toBeVisible();
     expect(drains).toBe(1);
   });
+
+  test("the Failed figure is a dash with the error while the dead-letter count can't load", async ({ page }) => {
+    await page.route("**/api/dlq/depth", (route) => route.fulfill({ status: 500, json: { error: "depth unavailable" } }));
+    await page.goto("/queues/e2e_test");
+    const failed = page.getByTestId("queue-stat-failed");
+    await expect(failed.getByRole("link")).toHaveText("—");
+    await expect(failed).toContainText("Failed to load dead letters: depth unavailable");
+  });
 });
