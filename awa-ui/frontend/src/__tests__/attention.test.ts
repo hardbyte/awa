@@ -464,28 +464,34 @@ describe("liveFailedCount", () => {
 const input = (): AttentionInput => ({ now: NOW });
 
 /** Two hours of one-minute buckets ending with the minute of NOW, with the
- * given per-minute counts in each hour, covered from the first bucket unless
- * `coveredSince` says otherwise. */
+ * given per-minute counts in each hour. The terminal series is covered from
+ * `coveredSince` and dead letters from `deadLetteredSince`, each the first
+ * bucket unless given; a series is null before its coverage. */
 function outcomes(
   previous: { completed?: number; failed?: number; dead_lettered?: number },
   current: { completed?: number; failed?: number; dead_lettered?: number },
   coveredSince?: number,
+  deadLetteredSince?: number,
 ): JobOutcomes {
   const first = NOW - 119 * 60_000;
+  const terminal = coveredSince ?? first;
+  const dead = deadLetteredSince ?? first;
   const buckets = Array.from({ length: 120 }, (_, n) => {
     const counts = n < 60 ? previous : current;
+    const at = first + n * 60_000;
+    const covered = at >= terminal;
     return {
-      bucket: new Date(first + n * 60_000).toISOString(),
-      completed: counts.completed ?? 0,
-      failed: counts.failed ?? 0,
-      cancelled: 0,
-      dead_lettered: counts.dead_lettered ?? 0,
+      bucket: new Date(at).toISOString(),
+      completed: covered ? counts.completed ?? 0 : null,
+      failed: covered ? counts.failed ?? 0 : null,
+      cancelled: covered ? 0 : null,
+      dead_lettered: at >= dead ? counts.dead_lettered ?? 0 : null,
     };
   });
-  const covered = coveredSince ?? first;
   return {
-    covered_since: new Date(covered).toISOString(),
-    buckets: buckets.filter((b) => Date.parse(b.bucket) >= covered),
+    covered_since: new Date(terminal).toISOString(),
+    dead_lettered_covered_since: new Date(dead).toISOString(),
+    buckets: buckets.filter((b) => Date.parse(b.bucket) >= Math.min(terminal, dead)),
   };
 }
 
@@ -499,20 +505,37 @@ describe("outcomeTrends", () => {
     expect(trends.deadLetteredLastHour).toBe(120);
   });
 
-  it("leaves out an hour the counts do not cover, never reading missing buckets as zero", () => {
-    // Covered from halfway through the previous hour.
-    const half = outcomes({ failed: 1 }, { completed: 1 }, NOW - 89 * 60_000);
+  it("leaves out an hour a series does not cover, never reading null buckets as zero", () => {
+    // Both series covered from halfway through the previous hour.
+    const half = outcomes({ failed: 1 }, { completed: 1 }, NOW - 89 * 60_000, NOW - 89 * 60_000);
     expect(outcomeTrends(half, 60)).toEqual({ failureRate: null, deadLetteredLastHour: 0 });
-    // Covered from inside the last hour.
-    const recent = outcomes({ failed: 1 }, { dead_lettered: 1 }, NOW - 30 * 60_000);
+    // Both covered from inside the last hour.
+    const recent = outcomes({ failed: 1 }, { dead_lettered: 1 }, NOW - 30 * 60_000, NOW - 30 * 60_000);
     expect(outcomeTrends(recent, 60)).toEqual({ failureRate: null, deadLetteredLastHour: null });
+  });
+
+  it("uses each series' own coverage", () => {
+    // Terminal rows pruned to the last few minutes, dead letters covered throughout.
+    const busy = outcomes({ dead_lettered: 1 }, { completed: 5, dead_lettered: 2 }, NOW - 5 * 60_000);
+    expect(outcomeTrends(busy, 60)).toEqual({ failureRate: null, deadLetteredLastHour: 120 });
+    // Dead letters covered only recently, the terminal series throughout.
+    const fresh = outcomes({ completed: 1 }, { completed: 1, dead_lettered: 1 }, undefined, NOW - 10 * 60_000);
+    const trends = outcomeTrends(fresh, 60);
+    expect(trends.deadLetteredLastHour).toBeNull();
+    expect(trends.failureRate?.current).toEqual({ finished: 60, failed: 0, rate: 0 });
+  });
+
+  it("keeps dead letters out of the failure rate", () => {
+    const trends = outcomeTrends(outcomes({ completed: 1 }, { completed: 1, dead_lettered: 5 }), 60);
+    expect(trends.failureRate?.current).toEqual({ finished: 60, failed: 0, rate: 0 });
   });
 
   it("is empty without outcomes or buckets, as from an older server", () => {
     const empty = { failureRate: null, deadLetteredLastHour: null };
     expect(outcomeTrends(null, 60)).toEqual(empty);
     expect(outcomeTrends(undefined, 60)).toEqual(empty);
-    expect(outcomeTrends({ covered_since: new Date(NOW).toISOString(), buckets: [] }, 60)).toEqual(empty);
+    const at = new Date(NOW).toISOString();
+    expect(outcomeTrends({ covered_since: at, dead_lettered_covered_since: at, buckets: [] }, 60)).toEqual(empty);
   });
 
   it("has no rate for an hour in which no job finished", () => {

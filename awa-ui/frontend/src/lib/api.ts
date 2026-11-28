@@ -209,21 +209,24 @@ export interface TimeseriesBucket {
   count: number;
 }
 
-/** Jobs that reached each terminal outcome within one bucket. */
+/** Jobs that reached each terminal outcome within one bucket; null where
+ * the bucket starts before that series' coverage (unknown, not zero). */
 export interface OutcomeBucket {
   /** The bucket's start. */
   bucket: string;
-  completed: number;
-  failed: number;
-  cancelled: number;
-  dead_lettered: number;
+  completed: number | null;
+  failed: number | null;
+  cancelled: number | null;
+  dead_lettered: number | null;
 }
 
 /** `GET /api/stats/outcomes`. */
 export interface JobOutcomes {
-  /** The earliest time the counts are complete from; no bucket starts before it. */
+  /** The earliest time the completed, failed and cancelled counts are complete from. */
   covered_since: string;
-  /** Oldest first; the last holds the current time. */
+  /** The earliest time the dead-lettered counts are complete from. */
+  dead_lettered_covered_since: string;
+  /** Oldest first, from the earlier coverage time; the last holds the current time. */
   buckets: OutcomeBucket[];
 }
 

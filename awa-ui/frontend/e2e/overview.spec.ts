@@ -79,24 +79,33 @@ interface HourCounts {
 
 /**
  * The Overview's outcome read: two hours of one-minute buckets ending with
- * the current minute, `previous` and `current` per minute in each hour,
- * covered from `coveredMinutesAgo` (default: the whole window).
+ * the current minute, `previous` and `current` per minute in each hour. The
+ * terminal series is covered from `coveredMinutesAgo` and dead letters from
+ * `deadLetteredMinutesAgo` (default: the whole window); a series is null
+ * before its coverage.
  */
-function outcomes(previous: HourCounts, current: HourCounts, coveredMinutesAgo = 119) {
+function outcomes(previous: HourCounts, current: HourCounts, coveredMinutesAgo = 119, deadLetteredMinutesAgo = 119) {
   const minute = Math.floor(Date.now() / 60_000) * 60_000;
   const first = minute - 119 * 60_000;
-  const coveredSince = minute - coveredMinutesAgo * 60_000;
+  const terminal = minute - coveredMinutesAgo * 60_000;
+  const dead = minute - deadLetteredMinutesAgo * 60_000;
   const buckets = Array.from({ length: 120 }, (_, n) => {
     const counts = n < 60 ? previous : current;
+    const at = first + n * 60_000;
+    const covered = at >= terminal;
     return {
-      bucket: new Date(first + n * 60_000).toISOString(),
-      completed: counts.completed ?? 0,
-      failed: counts.failed ?? 0,
-      cancelled: 0,
-      dead_lettered: counts.dead_lettered ?? 0,
+      bucket: new Date(at).toISOString(),
+      completed: covered ? counts.completed ?? 0 : null,
+      failed: covered ? counts.failed ?? 0 : null,
+      cancelled: covered ? 0 : null,
+      dead_lettered: at >= dead ? counts.dead_lettered ?? 0 : null,
     };
-  }).filter((bucket) => Date.parse(bucket.bucket) >= coveredSince);
-  return { covered_since: new Date(coveredSince).toISOString(), buckets };
+  }).filter((bucket) => Date.parse(bucket.bucket) >= Math.min(terminal, dead));
+  return {
+    covered_since: new Date(terminal).toISOString(),
+    dead_lettered_covered_since: new Date(dead).toISOString(),
+    buckets,
+  };
 }
 
 const HEALTHY_RUNTIME = {
@@ -237,8 +246,8 @@ test.describe("Overview", () => {
   });
 
   test("outcomes covering less than the window leave the hours they miss alone", async ({ page }) => {
-    // Covered for the last 45 minutes only: neither hour is complete.
-    await mockOverview(page, { ...BUSY, outcomes: outcomes({ failed: 5 }, { completed: 1, dead_lettered: 1 }, 45) });
+    // Both series covered for the last 45 minutes only: neither hour is complete.
+    await mockOverview(page, { ...BUSY, outcomes: outcomes({ failed: 5 }, { completed: 1, dead_lettered: 1 }, 45, 45) });
     await page.goto("/");
     await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
     await expect(page.getByTestId("failure-rate")).toHaveCount(0);
@@ -246,9 +255,18 @@ test.describe("Overview", () => {
     await expect(page.locator("[data-id='jobs:failure-rate']")).toHaveCount(0);
 
     // Covered for the last 90 minutes: the dead letters' hour is, the rate's two are not.
-    await mockOverview(page, { ...BUSY, outcomes: outcomes({ failed: 5 }, { completed: 1 }, 90) });
+    await mockOverview(page, { ...BUSY, outcomes: outcomes({ failed: 5 }, { completed: 1 }, 90, 90) });
     await page.reload();
     await expect(page.getByTestId("dead-letter-trend")).toHaveText("none added in the last hour");
+    await expect(page.getByTestId("failure-rate")).toHaveCount(0);
+  });
+
+  test("dead letters keep their own coverage when ring prune shortens the terminal one", async ({ page }) => {
+    // Queue storage under load: terminal rows cover five minutes, dead letters the window.
+    await mockOverview(page, { ...BUSY, outcomes: outcomes({ dead_lettered: 1 }, { completed: 9, failed: 3, dead_lettered: 2 }, 5) });
+    await page.goto("/");
+    await expect(page.getByTestId("dead-letter-trend")).toHaveText("+120 in the last hour");
+    await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
     await expect(page.getByTestId("failure-rate")).toHaveCount(0);
   });
 

@@ -91,36 +91,35 @@ const HOUR_MS = 3600_000;
 
 /**
  * Hourly figures from outcome buckets. The hours end with the newest bucket.
- * An hour counts only when `covered_since` reaches back to its start: the
- * server leaves out buckets it cannot count completely, and a missing bucket
- * is not a zero.
+ * Each series counts for an hour only when its own coverage reaches back to
+ * the hour's start: the server reports a bucket it cannot count completely
+ * as null, which is not a zero. Dead letters stay out of the failure rate.
  */
 export function outcomeTrends(outcomes: JobOutcomes | null | undefined, bucketSeconds: number): OutcomeTrends {
   const none = { failureRate: null, deadLetteredLastHour: null };
   const newest = outcomes?.buckets[outcomes.buckets.length - 1];
   if (!outcomes || !newest) return none;
   const end = Date.parse(newest.bucket) + bucketSeconds * 1000;
-  const coveredSince = Date.parse(outcomes.covered_since);
-  const hour = (start: number) => {
-    let finished = 0;
-    let failed = 0;
-    let deadLettered = 0;
-    for (const bucket of outcomes.buckets) {
-      const at = Date.parse(bucket.bucket);
-      if (at < start || at >= start + HOUR_MS) continue;
-      finished += bucket.completed + bucket.failed;
-      failed += bucket.failed;
-      deadLettered += bucket.dead_lettered;
-    }
-    return { finished, failed, rate: finished > 0 ? failed / finished : null, deadLettered };
+  const sum = (start: number, series: (bucket: JobOutcomes["buckets"][number]) => number | null) =>
+    outcomes.buckets
+      .filter((bucket) => {
+        const at = Date.parse(bucket.bucket);
+        return at >= start && at < start + HOUR_MS;
+      })
+      .reduce((total, bucket) => total + (series(bucket) ?? 0), 0);
+  const hour = (start: number): HourOutcomes => {
+    const failed = sum(start, (b) => b.failed);
+    const finished = failed + sum(start, (b) => b.completed);
+    return { finished, failed, rate: finished > 0 ? failed / finished : null };
   };
-  const covers = (start: number) => coveredSince <= start;
-  const current = hour(end - HOUR_MS);
-  const previous = hour(end - 2 * HOUR_MS);
-  const strip = ({ deadLettered: _deadLettered, ...figures }: ReturnType<typeof hour>) => figures;
+  const terminalSince = Date.parse(outcomes.covered_since);
+  const deadLetteredSince = Date.parse(outcomes.dead_lettered_covered_since);
+  const lastHour = end - HOUR_MS;
+  const previousHour = end - 2 * HOUR_MS;
   return {
-    failureRate: covers(end - 2 * HOUR_MS) ? { current: strip(current), previous: strip(previous) } : null,
-    deadLetteredLastHour: covers(end - HOUR_MS) ? current.deadLettered : null,
+    failureRate:
+      terminalSince <= previousHour ? { current: hour(lastHour), previous: hour(previousHour) } : null,
+    deadLetteredLastHour: deadLetteredSince <= lastHour ? sum(lastHour, (b) => b.dead_lettered) : null,
   };
 }
 
