@@ -100,6 +100,10 @@ export function CommandPalette() {
         inputValue={input}
         onInputChange={setInput}
         filter={() => true}
+        // Closing while the open animation still runs, as choosing an entry
+        // right after typing does, can leave the overlay stuck on screen.
+        className="animate-none!"
+        overlay={{ className: "animate-none!" }}
         isPending={queues.isFetching || kinds.isFetching || schedules.isFetching}
       >
         <CommandMenuSearch placeholder="Job id, queue, kind, schedule, tag:… or page" />

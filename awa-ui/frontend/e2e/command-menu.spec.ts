@@ -42,7 +42,6 @@ test.describe("Jump to (command palette)", () => {
     await trigger.click();
     const dialog = page.getByRole("dialog", { name: "Jump to" });
     await expect(dialog.getByRole("searchbox")).toBeFocused();
-    await expect(page.locator("[data-entering]")).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
     await expect(trigger).toBeFocused();
