@@ -447,6 +447,31 @@ test.describe("Job errors", () => {
     await expect(table).toContainText("Gave up");
   });
 
+  test("a failed job says how long its last attempt ran; a cancelled one does not", async ({ page }) => {
+    const errors = [{ error: "TimeoutError: slow", attempt: 1, at: "2026-11-28T10:00:30Z" }];
+    let state = "failed";
+    await page.route("**/api/jobs/990002", (route) =>
+      route.fulfill({
+        json: mockJob({
+          state,
+          attempt: 1,
+          max_attempts: 3,
+          errors,
+          attempted_at: "2026-11-28T10:00:00Z",
+          // A cancel an hour later, while the job waited for its retry.
+          finalized_at: state === "failed" ? "2026-11-28T10:00:30Z" : "2026-11-28T11:00:00Z",
+        }),
+      })
+    );
+    await page.goto("/jobs/990002");
+    await expect(page.getByTestId("latest-error")).toContainText("the last attempt ran 30s");
+
+    state = "cancelled";
+    await page.reload();
+    await expect(page.getByTestId("latest-error")).toContainText("TimeoutError");
+    await expect(page.getByTestId("latest-error")).not.toContainText("the last attempt ran");
+  });
+
   test("the dead letter page uses the same error card", async ({ page }) => {
     await page.goto("/dlq/600001");
     const block = page.getByTestId("error-block");

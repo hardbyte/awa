@@ -337,9 +337,9 @@ export function JobDetailPage() {
         errors={job.errors}
         jobState={job.state}
         lastAttempt={
-          job.state === "failed" || job.state === "cancelled"
-            ? { startedAt: job.attempted_at, finishedAt: job.finalized_at }
-            : undefined
+          // A cancel can land while the job waits for a retry, so only a
+          // failed job's finalized_at is known to end its last attempt.
+          job.state === "failed" ? { startedAt: job.attempted_at, finishedAt: job.finalized_at } : undefined
         }
       />
 
