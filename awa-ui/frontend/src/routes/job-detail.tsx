@@ -27,6 +27,7 @@ import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
 import { ErrorBlock } from "@/components/ErrorBlock";
+import { JobStateSummary } from "@/components/JobStateSummary";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { AdminButton } from "@/components/AdminAction";
 import { jobActionCopy } from "@/lib/job-actions";
@@ -163,6 +164,7 @@ export function JobDetailPage() {
         }
         description={job.kind_descriptor?.description?.trim() || undefined}
       />
+      <JobStateSummary job={job} />
 
       {/* Actions */}
       <div className="flex flex-wrap items-center gap-2">
@@ -204,8 +206,31 @@ export function JobDetailPage() {
         onConfirm={() => (lastConfirming === "retry" ? retryMutation.mutateAsync() : cancelMutation.mutateAsync())}
       />
 
-      {/* Properties */}
+      {/* Properties: where the job stands first, what it is next, who owns it last */}
       <DescriptionList>
+        <DescriptionTerm>Attempt</DescriptionTerm>
+        <DescriptionDetails>
+          {job.attempt} / {job.max_attempts}
+        </DescriptionDetails>
+
+        {job.attempted_at && (
+          <>
+            <DescriptionTerm>Last attempt</DescriptionTerm>
+            <DescriptionDetails>
+              <Time value={job.attempted_at} />
+            </DescriptionDetails>
+          </>
+        )}
+
+        {job.finalized_at && (
+          <>
+            <DescriptionTerm>Finalized</DescriptionTerm>
+            <DescriptionDetails>
+              <Time value={job.finalized_at} />
+            </DescriptionDetails>
+          </>
+        )}
+
         <DescriptionTerm>Queue</DescriptionTerm>
         <DescriptionDetails>
           <QueueLink queue={job.queue} descriptor={job.queue_descriptor} />
@@ -240,33 +265,10 @@ export function JobDetailPage() {
           )}
         </DescriptionDetails>
 
-        <DescriptionTerm>Attempt</DescriptionTerm>
-        <DescriptionDetails>
-          {job.attempt} / {job.max_attempts}
-        </DescriptionDetails>
-
         <DescriptionTerm>Created</DescriptionTerm>
         <DescriptionDetails>
           <Time value={job.created_at} />
         </DescriptionDetails>
-
-        {job.attempted_at && (
-          <>
-            <DescriptionTerm>Last attempt</DescriptionTerm>
-            <DescriptionDetails>
-              <Time value={job.attempted_at} />
-            </DescriptionDetails>
-          </>
-        )}
-
-        {job.finalized_at && (
-          <>
-            <DescriptionTerm>Finalized</DescriptionTerm>
-            <DescriptionDetails>
-              <Time value={job.finalized_at} />
-            </DescriptionDetails>
-          </>
-        )}
 
         {job.tags.length > 0 && (
           <>
@@ -304,6 +306,24 @@ export function JobDetailPage() {
           </>
         )}
       </DescriptionList>
+
+      <details className="rounded-lg border px-4 py-2 text-sm" data-testid="job-technical">
+        <summary className="cursor-pointer text-muted-fg">Technical details</summary>
+        <DescriptionList className="mt-2">
+          {job.run_lease != null && (
+            <>
+              <DescriptionTerm>Attempt lease</DescriptionTerm>
+              <DescriptionDetails className="font-mono">#{job.run_lease}</DescriptionDetails>
+            </>
+          )}
+          <DescriptionTerm>Run at</DescriptionTerm>
+          <DescriptionDetails><Time value={job.run_at} /></DescriptionDetails>
+          <DescriptionTerm>Heartbeat</DescriptionTerm>
+          <DescriptionDetails><Time value={job.heartbeat_at} fallback="None" /></DescriptionDetails>
+          <DescriptionTerm>Deadline</DescriptionTerm>
+          <DescriptionDetails><Time value={job.deadline_at} fallback="None" /></DescriptionDetails>
+        </DescriptionList>
+      </details>
 
       {/* Timeline */}
       <Card>

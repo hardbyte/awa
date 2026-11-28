@@ -23,6 +23,7 @@ import {
 import { JsonView } from "@/components/JsonView";
 import { OutputCard } from "@/components/OutputCard";
 import { ErrorBlock } from "@/components/ErrorBlock";
+import { JobStateSummary } from "@/components/JobStateSummary";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { AdminButton } from "@/components/AdminAction";
 import { jobStateMeta } from "@/lib/states";
@@ -120,6 +121,7 @@ export function DlqDetailPage() {
           </div>
         }
       />
+      <JobStateSummary job={{ ...row, state: "dead_lettered" }} />
 
       <Card>
         <CardHeader>

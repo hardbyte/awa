@@ -456,3 +456,50 @@ test.describe("Job errors", () => {
     await expect(block.getByRole("table")).toHaveCount(0);
   });
 });
+
+test.describe("Job state summary", () => {
+  test("a running job shows how long it has run, its heartbeat, deadline and progress", async ({ page }) => {
+    // The seeded running job's lease can lapse before this runs, so serve one.
+    const at = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
+    await page.route("**/api/jobs/990005", (route) =>
+      route.fulfill({
+        json: mockJob({
+          id: 990005, state: "running", attempt: 1, finalized_at: null, attempted_at: at(-125),
+          heartbeat_at: at(-3), deadline_at: at(1800), progress: { percent: 40 },
+        }),
+      })
+    );
+    await page.goto("/jobs/990005");
+    const summary = page.getByTestId("job-summary");
+    await expect(summary).toHaveAttribute("data-state", "running");
+    await expect(summary).toContainText(/Running for 2m \d+s/);
+    await expect(summary.locator('[data-fact="heartbeat"]')).toHaveText(/^heartbeat \d+s ago$/);
+    await expect(summary.locator('[data-fact="deadline"]')).toHaveText(/^deadline in (29m|30m)/);
+    await expect(summary.locator('[data-fact="progress"]')).toHaveText("40% done");
+  });
+
+  test("a completed job shows how long it took", async ({ page }) => {
+    await page.goto("/jobs/800002");
+    await expect(page.getByTestId("job-summary").locator('[data-fact="took"]')).toHaveText(/^Took \d/);
+  });
+
+  test("a running job without a heartbeat says it's a short-job claim", async ({ page }) => {
+    const started = new Date(Date.now() - 30_000).toISOString();
+    await page.route("**/api/jobs/990003", (route) =>
+      route.fulfill({ json: mockJob({ id: 990003, state: "running", attempt: 1, attempted_at: started, finalized_at: null, heartbeat_at: null }) })
+    );
+    await page.goto("/jobs/990003");
+    await expect(page.getByTestId("job-summary")).toContainText("no heartbeat yet (short-job claim)");
+  });
+
+  test("the attempt lease is in the technical details", async ({ page }) => {
+    await page.route("**/api/jobs/990004", (route) =>
+      route.fulfill({ json: mockJob({ id: 990004, run_lease: 7 }) })
+    );
+    await page.goto("/jobs/990004");
+    const details = page.getByTestId("job-technical");
+    await expect(details.getByText("#7")).toBeHidden();
+    await details.getByText("Technical details").click();
+    await expect(details.getByText("#7")).toBeVisible();
+  });
+});

@@ -11,6 +11,8 @@ export interface JobRow {
   priority: number;
   attempt: number;
   max_attempts: number;
+  /** The attempt's lease number; absent from servers that don't send it. */
+  run_lease?: number;
   run_at: string;
   heartbeat_at: string | null;
   deadline_at: string | null;
