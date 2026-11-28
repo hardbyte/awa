@@ -4696,6 +4696,295 @@ async fn test_spent_claim_advance_crosses_rolled_back_reservations() {
     assert_queue_prune_reclaims(&store, &pool, 0).await;
 }
 
+/// Enqueue `count` jobs on one lane in batches of 1,000; returns their ids in
+/// lane order.
+async fn enqueue_lane_in_batches(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    count: usize,
+) -> Vec<i64> {
+    for start in (0..count).step_by(1_000) {
+        let params: Vec<_> = (start..count.min(start + 1_000))
+            .map(|n| {
+                insert::params_with(
+                    &CompleteJob { id: n as i64 },
+                    InsertOpts {
+                        queue: queue.to_string(),
+                        priority,
+                        ..Default::default()
+                    },
+                )
+                .expect("build insert params")
+            })
+            .collect();
+        store
+            .enqueue_params_batch(pool, &params)
+            .await
+            .expect("enqueue batch");
+    }
+    sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {}.ready_entries
+         WHERE queue = $1 AND priority = $2 ORDER BY lane_seq",
+        store.schema()
+    ))
+    .bind(queue)
+    .bind(priority)
+    .fetch_all(pool)
+    .await
+    .expect("read lane job ids")
+}
+
+/// Cancel `job_ids` newest first, `chunk_size` per call. The tombstones land
+/// behind the lane's claim cursor, which only follows the call that cancels
+/// the lane's first job.
+async fn cancel_newest_first(pool: &sqlx::PgPool, job_ids: &[i64], chunk_size: usize) {
+    for chunk in job_ids.rchunks(chunk_size) {
+        let cancelled = admin::bulk_cancel(pool, chunk).await.expect("bulk cancel");
+        assert_eq!(cancelled.len(), chunk.len());
+    }
+}
+
+/// #800: one time-budgeted read steps over a cancelled lane that the
+/// four-window read needs many calls for, so the lane stops pinning the
+/// ring after one maintenance read, not one per 4,000 positions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pin_budgeted_advance_releases_a_large_cancelled_lane() {
+    const JOBS: usize = 20_000;
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_budget_large").await;
+    let queue = "qs_advance_budget_large";
+
+    let jobs = enqueue_lane_in_batches(&pool, &store, queue, 2, JOBS).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    cancel_newest_first(&pool, &jobs, 1_000).await;
+    let end = first_lane_seqs(&pool, &store, &jobs[JOBS - 1..]).await[0] + 1;
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read queue ring pin")
+        .expect("the cancelled lane pins slot 0");
+
+    let outcome = store
+        .advance_spent_claim_heads_within(&pool, &pin.lanes, Duration::from_secs(60))
+        .await
+        .expect("advance spent claim heads");
+    assert!(outcome.failed.is_empty(), "no lane fails: {outcome:?}");
+    assert!(!outcome.budget_exhausted);
+    assert_eq!(outcome.advanced.len(), 1);
+    assert!(
+        outcome.windows > 4 * 4,
+        "{} windows ran in one read; a read of four windows would have needed {} reads",
+        outcome.windows,
+        outcome.windows.div_ceil(4)
+    );
+    assert_eq!(claim_cursor(&pool, &store, queue, 2).await, end);
+    assert!(store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read queue ring pin")
+        .is_none());
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
+/// #800: a read that runs out of budget reports it, always runs one window,
+/// and the following reads finish the lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pin_advance_budget_bounds_a_read() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_budget_bound").await;
+    let queue = "qs_advance_budget_bound";
+
+    let jobs = enqueue_lane_in_batches(&pool, &store, queue, 2, 3_000).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    cancel_newest_first(&pool, &jobs, 1_000).await;
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+    let end = first_lane_seqs(&pool, &store, &jobs[2_999..]).await[0] + 1;
+    let expected_reads = ((end - start) as usize).div_ceil(1_000);
+    assert!(expected_reads >= 2);
+
+    let mut reads = 0;
+    while let Some(pin) = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read queue ring pin")
+    {
+        let outcome = store
+            .advance_spent_claim_heads_within(&pool, &pin.lanes, Duration::ZERO)
+            .await
+            .expect("advance spent claim heads");
+        reads += 1;
+        assert_eq!(outcome.windows, 1, "a zero budget still runs one window");
+        assert_eq!(
+            outcome.budget_exhausted,
+            claim_cursor(&pool, &store, queue, 2).await < end,
+            "the read reports spent rows left behind"
+        );
+        assert!(reads <= expected_reads, "each read moves a full window");
+    }
+    assert_eq!(reads, expected_reads);
+}
+
+/// #800: the advance stops at the first window that reaches a row that can
+/// still be claimed, and a lane whose head is live costs no window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pin_advance_stops_at_a_live_row() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_stops_early").await;
+    let queue = "qs_advance_stops_early";
+
+    let jobs = enqueue_lane_in_batches(&pool, &store, queue, 2, 3_000).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    cancel_newest_first(&pool, &jobs[..1_800], 500).await;
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+    let live = first_lane_seqs(&pool, &store, &jobs[1_800..1_801]).await[0];
+    assert_eq!(live - start, 1_500);
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read queue ring pin")
+        .expect("the lane pins slot 0");
+
+    let outcome = store
+        .advance_spent_claim_heads_within(&pool, &pin.lanes, Duration::from_secs(60))
+        .await
+        .expect("advance spent claim heads");
+    assert_eq!(
+        outcome.windows, 2,
+        "a full window, then one that meets a live row"
+    );
+    assert!(!outcome.budget_exhausted);
+    assert_eq!(claim_cursor(&pool, &store, queue, 2).await, live);
+
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read queue ring pin")
+        .expect("the live rows still pin slot 0");
+    let outcome = store
+        .advance_spent_claim_heads_within(&pool, &pin.lanes, Duration::from_secs(60))
+        .await
+        .expect("advance spent claim heads");
+    assert_eq!(outcome.windows, 0);
+    assert!(outcome.advanced.is_empty());
+    assert_eq!(claim_cursor(&pool, &store, queue, 2).await, live);
+}
+
+/// #800, run by hand: how long a leader takes to release the queue ring after
+/// a large lane is cancelled newest first, and how long a claim on a second,
+/// released lane takes while the advance runs. `AWA_MEASURE_LANE_JOBS` sets
+/// the lane size (default 200,000) and `AWA_MEASURE_ROTATE_MS` the queue
+/// rotation interval (default 1,000).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement: run by hand with --ignored --nocapture"]
+async fn measure_queue_ring_release_after_cancelling_a_large_lane() {
+    let jobs_wanted: usize = std::env::var("AWA_MEASURE_LANE_JOBS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200_000);
+    let rotate = Duration::from_millis(
+        std::env::var("AWA_MEASURE_ROTATE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_000),
+    );
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_release_measure";
+    let claim_queue = "qs_ring_release_measure_claims";
+    let store_config = ring_pin_store_config("awa_qs_ring_release_measure");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    let jobs = enqueue_lane_in_batches(&pool, &store, queue, 2, jobs_wanted).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("measure"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+    let client = ring_pin_client_rotating_every(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 1,
+            poll_interval: Duration::from_millis(25),
+            ..QueueConfig::default()
+        },
+        store_config,
+        CompleteWorker,
+        rotate,
+    );
+    client.start().await.expect("start client");
+
+    let cancel_started = Instant::now();
+    cancel_newest_first(&pool, &jobs, 1_000).await;
+    eprintln!(
+        "[release-measure] jobs={jobs_wanted} cancelled_in={:?}",
+        cancel_started.elapsed()
+    );
+    let cancelled_at = Instant::now();
+    let mut claim_latencies = Vec::new();
+    let released_after = loop {
+        let pin = store.queue_ring_pin(&pool).await.expect("read pin");
+        if pin.is_none() {
+            break cancelled_at.elapsed();
+        }
+        // Claim latency on a lane that is not pinned. The insert is outside
+        // the timed window, and so is any lookup of the new job.
+        let params = [insert::params_with(
+            &CompleteJob { id: -1 },
+            InsertOpts {
+                queue: claim_queue.to_string(),
+                priority: 2,
+                ..Default::default()
+            },
+        )
+        .expect("build probe insert params")];
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("enqueue probe job");
+        let enqueued = Instant::now();
+        loop {
+            let claimed = store
+                .claim_runtime_batch(&pool, claim_queue, 1, Duration::from_secs(60))
+                .await
+                .expect("claim");
+            if !claimed.is_empty() {
+                break;
+            }
+            assert!(
+                enqueued.elapsed() < Duration::from_secs(30),
+                "the unpinned lane's job is claimed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        claim_latencies.push(enqueued.elapsed());
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1_800),
+            "the ring is released"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    claim_latencies.sort();
+    let percentile = |fraction: f64| {
+        claim_latencies
+            .get(
+                ((claim_latencies.len() as f64 * fraction) as usize)
+                    .min(claim_latencies.len().saturating_sub(1)),
+            )
+            .copied()
+    };
+    eprintln!(
+        "[release-measure] jobs={jobs_wanted} rotate={rotate:?} released_after={released_after:?} \
+         claim_probes={} claim_p50={:?} claim_p95={:?} claim_max={:?}",
+        claim_latencies.len(),
+        percentile(0.5),
+        percentile(0.95),
+        claim_latencies.last()
+    );
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
 /// #779 cost check, run by hand: the advance's probe and window statements on
 /// a lane whose backlog is spread over many ready segments, and a claim on a
 /// lane whose claim head another transaction holds. Prints timings.

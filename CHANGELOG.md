@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Changed
+
+- **A cancelled or moved lane releases the queue ring in seconds, not minutes (#800).** The maintenance leader stepped a pinning lane's claim cursor over at most 4,000 positions per read, and reads ran when queue prune was skipped or at least every 15 seconds while prune backed off, so a large lane was released at about 500 rows per second. Each read now keeps advancing a lane, 1,000 positions per short transaction as before, for up to 400 ms, or half the queue rotation interval if that is shorter, stops at the first window that reaches a row that can still be claimed, and when it used the whole budget and moved a cursor the next read runs on the next queue rotation tick. Reads run only on rotation ticks, so the advance gets at most that budget per rotation interval: at a 60 s interval, 400 ms per minute. Queue prune keeps its own backoff, so it does not retry its `ACCESS EXCLUSIVE` request more often. In a 200,000-job lane cancelled newest first, with a 1 s queue rotation interval, the ring was released 530 s after the cancel finished, and now 10 to 25 s after it. `QueueStorage::advance_spent_claim_heads_within` is the time-budgeted call; `advance_spent_claim_heads` is unchanged.
+
 ### Fixed
 
 - **Admin UI: the phone navigation drawer opens.** Below 768px, which includes a desktop browser at 200% zoom, the drawer closed in the same moment it opened, so no page could be reached from the navigation. It now opens, and closes once a page is chosen. At that width wide tables scroll inside their own frame instead of widening the page.
