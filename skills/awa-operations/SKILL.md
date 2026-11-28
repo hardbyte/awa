@@ -283,6 +283,9 @@ awa batch-ops cancel <id>
   page (`/batch-ops/<id>`) or with `awa batch-ops get`. Nothing changes until a worker's
   maintenance leader runs it. `awa dlq retry-bulk` and `purge` submit the same
   operations.
+- `GET /api/batch-ops` returns the newest 50; page back with the last row's
+  `before_submitted_at` and `before_id`. `GET /api/batch-ops/<id>` answers 404
+  for an unknown or malformed id.
 - An item whose row another transaction holds stays pending and is retried on
   a later chunk; one whose retry hits a unique key held by a newer job is
   recorded `errored` and the rest proceed.
@@ -521,6 +524,11 @@ list; filtered counts refresh on filter change or explicit refresh, not every
 poll. A pill in the header says how old the page's data is and turns amber
 while some reads fail and red when every read does; the reconciliation interval
 is a scheduling policy, not a data-age SLO. Other processes and workers are observed through ordinary timed reads.
+A paused queue shows when and by whom it was paused (`paused_at`, `paused_by`
+on `/api/queues`). Failed counts differ by view: a queue's `failed` includes
+its dead letters, so the UI subtracts the DLQ depth and shows "—" while that
+depth is unknown; a kind's `failed` on `/api/kinds` already excludes them and
+`dead_lettered` is reported beside it.
 See [admin observation](../../docs/admin-observation.md) for cache metadata and
 the remaining strict-read/server-deadline validation requirements.
 
