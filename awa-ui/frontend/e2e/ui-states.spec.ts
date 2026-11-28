@@ -233,6 +233,24 @@ test.describe("Not-found detail pages", () => {
   }
 });
 
+test.describe("Detail pages after the resource is removed", () => {
+  test("a job page shows not-found once a later read answers 404", async ({ page }) => {
+    let gone = false;
+    await page.route("**/api/jobs/990002", (route) =>
+      gone
+        ? route.fulfill({ status: 404, json: { error: "job 990002 not found" } })
+        : route.fulfill({ json: job({ id: 990002 }) })
+    );
+    await page.goto("/jobs/990002");
+    await expect(page.getByRole("heading", { name: /990002/ })).toBeVisible();
+    gone = true;
+    const notFound = page.getByTestId("resource-not-found");
+    await expect(notFound.getByRole("heading", { name: "Job #990002 not found" })).toBeVisible({
+      timeout: 15_000,
+    });
+  });
+});
+
 test.describe("Job retry safety", () => {
   test("a waiting job is restarted only after a confirmation naming the risk", async ({ page }) => {
     let retried = 0;

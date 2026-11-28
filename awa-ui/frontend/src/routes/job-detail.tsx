@@ -121,7 +121,7 @@ export function JobDetailPage() {
       />
     );
   }
-  if (!jobQuery.data) {
+  if (!jobQuery.data || isNotFoundError(jobQuery.error)) {
     return (
       <ResourceNotFound
         title={`Job #${id} not found`}

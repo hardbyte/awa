@@ -82,7 +82,7 @@ export function DlqDetailPage() {
     );
   }
   const row = rowQuery.data;
-  if (!row) {
+  if (!row || isNotFoundError(rowQuery.error)) {
     return (
       <ResourceNotFound
         title={`DLQ row #${jobId} not found`}

@@ -116,7 +116,7 @@ export function QueueDetailPage() {
       />
     );
   }
-  if (!queueQuery.data) {
+  if (!queueQuery.data || isNotFoundError(queueQuery.error)) {
     return queueNotFound;
   }
 
