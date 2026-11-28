@@ -463,6 +463,9 @@ export function bulkCancel(ids: number[]): Promise<JobRow[]> {
 export function fetchBatchOperations(params: {
   state?: string;
   limit?: number;
+  /** With `before_id`, a keyset cursor: the last row's `submitted_at`. */
+  before_submitted_at?: string;
+  before_id?: string;
 } = {}): Promise<BatchOperation[]> {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {

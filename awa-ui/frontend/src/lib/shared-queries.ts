@@ -12,5 +12,13 @@ export const batchOpsQuery = {
   queryFn: () => fetchBatchOperations({ limit: BATCH_OPS_LIST_LIMIT }),
 } as const;
 
+/** A page of operations older than `cursor`, the last row of the page before. */
+export function olderBatchOpsQuery(cursor: { before_submitted_at: string; before_id: string }) {
+  return {
+    queryKey: ["batch-ops", cursor],
+    queryFn: () => fetchBatchOperations({ limit: BATCH_OPS_LIST_LIMIT, ...cursor }),
+  } as const;
+}
+
 /** Operation states that still change jobs or are about to. */
 export const ACTIVE_BATCH_STATES = new Set(["pending", "scanning", "running", "cancelling"]);

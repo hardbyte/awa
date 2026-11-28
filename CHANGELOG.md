@@ -196,7 +196,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `pruned`, `noop`, `blocked`, `skipped_active` and `already_pruned`. See
   [Configuration](docs/configuration.md#what-the-knobs-mean).
 
-- **HTTP: `GET /api/batch-ops` pages past its newest operations.** `before_submitted_at` and `before_id`, the last row's `submitted_at` and `id`, return the operations submitted before it in the list's newest-first `(submitted_at, id)` order; a malformed value, or one without the other, is a 400.
+- **HTTP: `GET /api/batch-ops` pages past its newest operations.** `before_submitted_at` and `before_id`, the last row's `submitted_at` and `id`, return the operations submitted before it in the list's newest-first `(submitted_at, id)` order; a malformed value, or one without the other, is a 400. The admin UI's Bulk operations page shows 50 at a time with Older and Newest buttons, where it showed only the latest 50.
 
 - **HTTP: `GET /api/queues` and `/api/queues/{name}` return `paused_at` and `paused_by`** for a paused queue, null while it isn't paused. **`GET /api/kinds` returns per-kind `available`, `retryable`, `running`, `failed` and `dead_lettered` counts and `queues`,** the sorted queues `queue_count` counts. A kind's `failed` leaves dead letters out, which `dead_lettered` counts, where a queue's `failed` includes them; `running` leaves out jobs waiting for a callback. On queue storage the counts come from the per-kind, per-queue pass `/api/kinds` already made. `QueueOverview` and `JobKindOverview` gain the same fields in Rust.
 
