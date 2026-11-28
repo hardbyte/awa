@@ -202,10 +202,37 @@ export interface CronJobRow {
 
 export type StateCounts = Record<string, number>;
 
+/** @deprecated The shape of the deprecated `GET /api/stats/timeseries`. */
 export interface TimeseriesBucket {
   bucket: string;
   state: string;
   count: number;
+}
+
+/** Jobs that reached each terminal outcome within one bucket. */
+export interface OutcomeBucket {
+  /** The bucket's start. */
+  bucket: string;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  dead_lettered: number;
+}
+
+/** `GET /api/stats/outcomes`. */
+export interface JobOutcomes {
+  /** The earliest time the counts are complete from; no bucket starts before it. */
+  covered_since: string;
+  /** Oldest first; the last holds the current time. */
+  buckets: OutcomeBucket[];
+}
+
+export interface OutcomeParams {
+  minutes: number;
+  /** Bucket width in seconds: 60, 300, 900 or 3600. */
+  bucketSeconds: number;
+  queue?: string;
+  kind?: string;
 }
 
 /** A named link to a peer Awa UI serving a different database. */
@@ -690,6 +717,20 @@ export function fetchCapabilities(): Promise<Capabilities> {
   return pending;
 }
 
+/** Terminal outcomes over time; null from a server without the endpoint. */
+export async function fetchOutcomes(params: OutcomeParams): Promise<JobOutcomes | null> {
+  const search = new URLSearchParams({ minutes: String(params.minutes), bucket: `${params.bucketSeconds}s` });
+  if (params.queue) search.set("queue", params.queue);
+  if (params.kind) search.set("kind", params.kind);
+  const res = await fetch(apiPath(`/stats/outcomes?${search}`), {
+    headers: { "Content-Type": "application/json" }, credentials: "same-origin", cache: "no-store",
+    redirect: "error", signal: currentReadSignal(),
+  });
+  if (res.status === 404) return null;
+  return checkedJson<JobOutcomes>(res);
+}
+
+/** @deprecated `GET /api/stats/timeseries` is deprecated; use {@link fetchOutcomes}. */
 export function fetchTimeseries(
   minutes?: number
 ): Promise<TimeseriesBucket[]> {

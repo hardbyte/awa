@@ -67,6 +67,36 @@ interface Fixture {
   dlq: { total: number; by_queue: { queue: string; count: number }[] };
   failed: unknown[];
   running: unknown[];
+  /** `GET /api/stats/outcomes`; absent answers 404, as a server without the endpoint does. */
+  outcomes?: unknown;
+}
+
+interface HourCounts {
+  completed?: number;
+  failed?: number;
+  dead_lettered?: number;
+}
+
+/**
+ * The Overview's outcome read: two hours of one-minute buckets ending with
+ * the current minute, `previous` and `current` per minute in each hour,
+ * covered from `coveredMinutesAgo` (default: the whole window).
+ */
+function outcomes(previous: HourCounts, current: HourCounts, coveredMinutesAgo = 119) {
+  const minute = Math.floor(Date.now() / 60_000) * 60_000;
+  const first = minute - 119 * 60_000;
+  const coveredSince = minute - coveredMinutesAgo * 60_000;
+  const buckets = Array.from({ length: 120 }, (_, n) => {
+    const counts = n < 60 ? previous : current;
+    return {
+      bucket: new Date(first + n * 60_000).toISOString(),
+      completed: counts.completed ?? 0,
+      failed: counts.failed ?? 0,
+      cancelled: 0,
+      dead_lettered: counts.dead_lettered ?? 0,
+    };
+  }).filter((bucket) => Date.parse(bucket.bucket) >= coveredSince);
+  return { covered_since: new Date(coveredSince).toISOString(), buckets };
 }
 
 const HEALTHY_RUNTIME = {
@@ -122,6 +152,10 @@ async function mockOverview(page: Page, fixture: Fixture) {
         return route.fulfill(json([]));
       case "/api/jobs":
         return route.fulfill(json(url.searchParams.get("state") === "running" ? fixture.running : fixture.failed));
+      case "/api/stats/outcomes":
+        return fixture.outcomes === undefined
+          ? route.fulfill({ status: 404, contentType: "text/plain", body: "Not Found" })
+          : route.fulfill(json(fixture.outcomes));
       default:
         return route.fallback();
     }
@@ -161,6 +195,61 @@ test.describe("Overview", () => {
     await expect(page.getByTestId("deferred-line")).toContainText("3,108 scheduled · 35 waiting for callback");
     await expect(page.getByTestId("fleet-line")).toContainText("1/1 healthy · leader worker-a");
     await expect(page.locator("section[aria-label='Health']")).not.toContainText("3,108");
+  });
+
+  test("an older server without outcomes keeps the strip as it was", async ({ page }) => {
+    let outcomeReads = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/stats/outcomes") outcomeReads++;
+    });
+    await mockOverview(page, BUSY);
+    await page.goto("/");
+    await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
+    await expect(page.getByTestId("failure-rate")).toHaveCount(0);
+    await expect(page.getByTestId("tile-dead-letters")).toContainText("most in billing (2)");
+    await expect(page.getByTestId("dead-letter-trend")).toHaveCount(0);
+    await expect(page.getByTestId("attention-failed-checks")).toHaveCount(0);
+    // The 404 stops the read rather than polling it.
+    await page.waitForTimeout(7_000);
+    expect(outcomeReads).toBe(1);
+  });
+
+  test("outcomes give the failure rate of both hours and the dead letters added", async ({ page }) => {
+    await mockOverview(page, {
+      ...BUSY,
+      outcomes: outcomes({ completed: 99, failed: 1 }, { completed: 8, failed: 2, dead_lettered: 1 }),
+    });
+    await page.goto("/");
+    const failed = page.getByTestId("tile-failed");
+    await expect(failed.getByTestId("tile-value")).toHaveText("3");
+    await expect(failed.getByTestId("failure-rate")).toHaveText("20% failed in the last hour1% the hour before");
+    await expect(failed).not.toContainText("completed in the last hour");
+    const dead = page.getByTestId("tile-dead-letters");
+    await expect(dead.getByTestId("dead-letter-trend")).toHaveText("+60 in the last hour");
+    await expect(dead).toContainText("most in billing (2)");
+
+    const item = page.locator("[data-testid='attention-item'][data-id='jobs:failure-rate']");
+    await expect(item).toHaveAttribute("data-severity", "warning");
+    await expect(item).toContainText("Failure rate rose to 20% in the last hour");
+    await expect(item).toContainText("120 of 600 finished jobs failed, against 1% the hour before");
+    await item.getByRole("link").click();
+    await expect(page).toHaveURL(/\/jobs\?state=failed$/);
+  });
+
+  test("outcomes covering less than the window leave the hours they miss alone", async ({ page }) => {
+    // Covered for the last 45 minutes only: neither hour is complete.
+    await mockOverview(page, { ...BUSY, outcomes: outcomes({ failed: 5 }, { completed: 1, dead_lettered: 1 }, 45) });
+    await page.goto("/");
+    await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
+    await expect(page.getByTestId("failure-rate")).toHaveCount(0);
+    await expect(page.getByTestId("dead-letter-trend")).toHaveCount(0);
+    await expect(page.locator("[data-id='jobs:failure-rate']")).toHaveCount(0);
+
+    // Covered for the last 90 minutes: the dead letters' hour is, the rate's two are not.
+    await mockOverview(page, { ...BUSY, outcomes: outcomes({ failed: 5 }, { completed: 1 }, 90) });
+    await page.reload();
+    await expect(page.getByTestId("dead-letter-trend")).toHaveText("none added in the last hour");
+    await expect(page.getByTestId("failure-rate")).toHaveCount(0);
   });
 
   test("a failed read shows a dash and the error, never zero", async ({ page }) => {

@@ -58,3 +58,12 @@ export const TYPE_TO_CONFIRM_MIN_JOBS = 1_000;
 
 /** Rows of a bulk action's preview sample shown in its dialog. */
 export const BULK_SAMPLE_ROWS = 8;
+
+/** The window the Overview reads outcomes over: the last hour and the one
+ * before it, in one-minute buckets. */
+export const OVERVIEW_OUTCOMES = { minutes: 120, bucketSeconds: 60 } as const;
+
+/** A failure rate needs attention when, over the last hour, at least
+ * `minFailed` jobs failed, at least `minRate` of finished jobs failed, and
+ * the rate is at least `factor` times the previous hour's. */
+export const FAILURE_RATE_ATTENTION = { minFailed: 20, minRate: 0.05, factor: 2 } as const;

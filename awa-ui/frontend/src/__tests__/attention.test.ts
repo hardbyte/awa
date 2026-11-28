@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
   attentionItems,
+  failureRateRising,
   healthFigures,
   isStuck,
   liveFailedCount,
+  outcomeTrends,
   queuesNeedingAttention,
   type AttentionInput,
 } from "@/lib/attention";
-import { OVERVIEW_FAILED_SAMPLE, OVERVIEW_RUNNING_SAMPLE } from "@/lib/constants";
+import { FAILURE_RATE_ATTENTION, OVERVIEW_FAILED_SAMPLE, OVERVIEW_RUNNING_SAMPLE } from "@/lib/constants";
+import { formatPercent } from "@/lib/number";
 import type {
   BatchOperation,
   CronJobRow,
+  JobOutcomes,
   JobRow,
   QueueOverview,
   RuntimeInstance,
@@ -453,5 +457,134 @@ describe("liveFailedCount", () => {
     expect(liveFailedCount(2, 5)).toBe(0);
     expect(liveFailedCount(4, undefined)).toBe(4);
     expect(liveFailedCount(4, null)).toBe(4);
+  });
+});
+
+/** An Overview input with nothing loaded but the time. */
+const input = (): AttentionInput => ({ now: NOW });
+
+/** Two hours of one-minute buckets ending with the minute of NOW, with the
+ * given per-minute counts in each hour, covered from the first bucket unless
+ * `coveredSince` says otherwise. */
+function outcomes(
+  previous: { completed?: number; failed?: number; dead_lettered?: number },
+  current: { completed?: number; failed?: number; dead_lettered?: number },
+  coveredSince?: number,
+): JobOutcomes {
+  const first = NOW - 119 * 60_000;
+  const buckets = Array.from({ length: 120 }, (_, n) => {
+    const counts = n < 60 ? previous : current;
+    return {
+      bucket: new Date(first + n * 60_000).toISOString(),
+      completed: counts.completed ?? 0,
+      failed: counts.failed ?? 0,
+      cancelled: 0,
+      dead_lettered: counts.dead_lettered ?? 0,
+    };
+  });
+  const covered = coveredSince ?? first;
+  return {
+    covered_since: new Date(covered).toISOString(),
+    buckets: buckets.filter((b) => Date.parse(b.bucket) >= covered),
+  };
+}
+
+describe("outcomeTrends", () => {
+  it("compares the last hour's failed share with the hour before's", () => {
+    const trends = outcomeTrends(outcomes({ completed: 9, failed: 1 }, { completed: 3, failed: 1, dead_lettered: 2 }), 60);
+    expect(trends.failureRate).toEqual({
+      current: { finished: 240, failed: 60, rate: 0.25 },
+      previous: { finished: 600, failed: 60, rate: 0.1 },
+    });
+    expect(trends.deadLetteredLastHour).toBe(120);
+  });
+
+  it("leaves out an hour the counts do not cover, never reading missing buckets as zero", () => {
+    // Covered from halfway through the previous hour.
+    const half = outcomes({ failed: 1 }, { completed: 1 }, NOW - 89 * 60_000);
+    expect(outcomeTrends(half, 60)).toEqual({ failureRate: null, deadLetteredLastHour: 0 });
+    // Covered from inside the last hour.
+    const recent = outcomes({ failed: 1 }, { dead_lettered: 1 }, NOW - 30 * 60_000);
+    expect(outcomeTrends(recent, 60)).toEqual({ failureRate: null, deadLetteredLastHour: null });
+  });
+
+  it("is empty without outcomes or buckets, as from an older server", () => {
+    const empty = { failureRate: null, deadLetteredLastHour: null };
+    expect(outcomeTrends(null, 60)).toEqual(empty);
+    expect(outcomeTrends(undefined, 60)).toEqual(empty);
+    expect(outcomeTrends({ covered_since: new Date(NOW).toISOString(), buckets: [] }, 60)).toEqual(empty);
+  });
+
+  it("has no rate for an hour in which no job finished", () => {
+    const trends = outcomeTrends(outcomes({}, { failed: 1 }), 60);
+    expect(trends.failureRate?.previous).toEqual({ finished: 0, failed: 0, rate: null });
+    expect(trends.failureRate?.current.rate).toBe(1);
+  });
+});
+
+describe("failureRateRising", () => {
+  const trend = (current: [number, number], previous: [number, number]) => ({
+    current: { finished: current[1], failed: current[0], rate: current[1] ? current[0] / current[1] : null },
+    previous: { finished: previous[1], failed: previous[0], rate: previous[1] ? previous[0] / previous[1] : null },
+  });
+  const { minFailed, minRate, factor } = FAILURE_RATE_ATTENTION;
+
+  it("needs enough failures, a high enough rate and a sharp enough rise", () => {
+    expect(failureRateRising(trend([40, 400], [5, 500]))).toBe(true);
+    // Rate just at both thresholds.
+    expect(failureRateRising(trend([minFailed, minFailed / minRate], [1, (factor * minFailed) / minRate]))).toBe(true);
+    // Too few failures, however high the rate.
+    expect(failureRateRising(trend([minFailed - 1, minFailed], [0, 100]))).toBe(false);
+    // A low rate, however sharp the rise.
+    expect(failureRateRising(trend([30, 1000], [1, 1000]))).toBe(false);
+    // High but steady.
+    expect(failureRateRising(trend([60, 400], [40, 400]))).toBe(false);
+  });
+
+  it("does not compare against an hour with no finished jobs or an uncovered one", () => {
+    expect(failureRateRising(trend([50, 100], [0, 0]))).toBe(false);
+    expect(failureRateRising(null)).toBe(false);
+  });
+});
+
+describe("failure rate in the Overview", () => {
+  it("raises a warning when the failure rate rises sharply, linking to failed jobs", () => {
+    const items = attentionItems({ ...input(), outcomes: outcomes({ completed: 99, failed: 1 }, { completed: 8, failed: 2 }) });
+    const item = items.find((i) => i.id === "jobs:failure-rate");
+    expect(item).toEqual({
+      id: "jobs:failure-rate",
+      severity: "warning",
+      title: "Failure rate rose to 20% in the last hour",
+      detail: "120 of 600 finished jobs failed, against 1% the hour before",
+      target: { to: "/jobs", search: { state: "failed" } },
+    });
+  });
+
+  it("stays quiet for a steady rate, an uncovered hour or an older server", () => {
+    const steady = outcomes({ completed: 8, failed: 2 }, { completed: 8, failed: 2 });
+    const uncovered = outcomes({ completed: 99, failed: 1 }, { completed: 8, failed: 2 }, NOW - 60 * 60_000);
+    for (const value of [steady, uncovered, null]) {
+      expect(attentionItems({ ...input(), outcomes: value }).map((i) => i.id)).not.toContain("jobs:failure-rate");
+    }
+  });
+
+  it("gives the strip both hours' rates and the dead letters added in the last hour", () => {
+    const figures = healthFigures({ ...input(), outcomes: outcomes({ completed: 1 }, { completed: 3, failed: 1, dead_lettered: 1 }) });
+    expect(figures.failureRate?.current.rate).toBe(0.25);
+    expect(figures.failureRate?.previous.rate).toBe(0);
+    expect(figures.deadLetteredLastHour).toBe(60);
+    expect(healthFigures(input())).toMatchObject({ failureRate: null, deadLetteredLastHour: null });
+  });
+});
+
+describe("formatPercent", () => {
+  it("keeps one decimal below ten percent", () => {
+    expect(formatPercent(0)).toBe("0%");
+    expect(formatPercent(0.0004)).toBe("<0.1%");
+    expect(formatPercent(0.004)).toBe("0.4%");
+    expect(formatPercent(0.01)).toBe("1%");
+    expect(formatPercent(0.025)).toBe("2.5%");
+    expect(formatPercent(0.384)).toBe("38%");
+    expect(formatPercent(1)).toBe("100%");
   });
 });

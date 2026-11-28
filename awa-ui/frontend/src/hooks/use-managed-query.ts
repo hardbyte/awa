@@ -11,7 +11,7 @@ function policy(key: QueryKey) {
   }
   return {
     cached: ["queues", "queue-runtime", "runtime", "storage", "stats"].includes(name) && key[1] !== "timeseries",
-    manualOnly: name === "jobs-count", stalesCounts: ["jobs", "job", "dlq", "dlq-job"].includes(name), stopAfterNull: name === "storage",
+    manualOnly: name === "jobs-count", stalesCounts: ["jobs", "job", "dlq", "dlq-job"].includes(name), stopAfterNull: name === "storage" || (name === "stats" && key[1] === "outcomes"),
     intervalMs: ["job", "batch-op"].includes(name) ? 2000 : name === "dlq-job" ? 10_000 : undefined,
   };
 }
