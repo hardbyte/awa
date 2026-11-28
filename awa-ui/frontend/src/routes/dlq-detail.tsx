@@ -7,6 +7,7 @@ import { useParams, useNavigate, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { fetchDlqJob, retryDlqJob, purgeDlqJob } from "@/lib/api";
 import type { DlqRow } from "@/lib/api";
+import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
@@ -68,25 +69,26 @@ export function DlqDetailPage() {
   if (rowQuery.isLoading) {
     return <p className="p-4 text-sm">Loading…</p>;
   }
-  if (rowQuery.error && rowQuery.data === undefined) {
+  if (rowQuery.data === undefined && rowQuery.error && !isNotFoundError(rowQuery.error)) {
     return (
-      <p className="p-4 text-sm text-danger">
-        Error: {String(rowQuery.error)}
-      </p>
+      <ResourceLoadError
+        noun={`DLQ row #${jobId}`}
+        error={rowQuery.error}
+        onRetry={() => void rowQuery.refetch()}
+        backTo="/dlq"
+        backLabel="Back to DLQ"
+      />
     );
   }
   const row = rowQuery.data;
   if (!row) {
     return (
-      <div className="p-4 space-y-3">
-        <Heading>DLQ row #{jobId}</Heading>
-        <p className="text-muted-fg">
-          Not found — this row may have been retried or purged.
-        </p>
-        <Link to="/dlq" className="underline">
-          Back to DLQ
-        </Link>
-      </div>
+      <ResourceNotFound
+        title={`DLQ row #${jobId} not found`}
+        reason="This row may have been retried or purged."
+        backTo="/dlq"
+        backLabel="Back to DLQ"
+      />
     );
   }
 

@@ -1,22 +1,18 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
-import { useMemo } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import {
   fetchStats,
   fetchQueues,
   fetchJobs,
   fetchRuntime,
-  fetchTimeseries,
 } from "@/lib/api";
 import type {
   StateCounts,
   QueueStats,
   JobRow,
   RuntimeOverview,
-  TimeseriesBucket,
 } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { Sparkline } from "@/components/Sparkline";
 import { Heading } from "@/components/ui/heading";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -38,7 +34,7 @@ const STATE_CARD_BG: Record<string, string> = {
   running: "bg-success-subtle",
   failed: "bg-danger-subtle",
   scheduled: "bg-secondary/50",
-  waiting_external: "bg-[oklch(0.87_0.07_280)]/30",
+  waiting_external: "bg-[oklch(0.87_0.07_280)]/30 dark:bg-[oklch(0.55_0.15_280)]/15",
 };
 
 /** Headline metrics — includes deferred and callback-blocked work */
@@ -51,46 +47,6 @@ export function DashboardPage() {
     queryKey: ["stats"],
     queryFn: fetchStats,
   });
-
-  // Timeseries powers the inline sparklines on the state counter cards.
-  // Returns an empty array on pre-v10 deployments / seed-free databases, in
-  // which case Sparkline renders an empty slot of its reserved size so the
-  // card layout doesn't jump.
-  const timeseriesQuery = useManagedQuery<TimeseriesBucket[]>({
-    queryKey: ["stats", "timeseries", 60],
-    queryFn: () => fetchTimeseries(60),
-  });
-
-  /** Pivot the flat timeseries response into a per-state numeric series
-   * suitable for <Sparkline data={...} />. Missing buckets are filled as 0. */
-  const seriesByState = useMemo(() => {
-    const buckets = timeseriesQuery.data ?? [];
-    const byBucket = new Map<string, Map<string, number>>();
-    const ordered: string[] = [];
-    for (const point of buckets) {
-      if (!byBucket.has(point.bucket)) {
-        byBucket.set(point.bucket, new Map());
-        ordered.push(point.bucket);
-      }
-      byBucket.get(point.bucket)!.set(point.state, point.count);
-    }
-    ordered.sort();
-    const result: Record<string, number[]> = {};
-    for (const bucket of ordered) {
-      const stateMap = byBucket.get(bucket)!;
-      for (const state of stateMap.keys()) {
-        if (!result[state]) result[state] = [];
-      }
-    }
-    for (const bucket of ordered) {
-      const stateMap = byBucket.get(bucket)!;
-      for (const state of Object.keys(result)) {
-        const series = result[state];
-        if (series) series.push(stateMap.get(state) ?? 0);
-      }
-    }
-    return result;
-  }, [timeseriesQuery.data]);
 
   const queuesQuery = useManagedQuery<QueueStats[]>({
     queryKey: ["queues"],
@@ -136,7 +92,6 @@ export function DashboardPage() {
         {COUNTER_KEYS.map((key) => {
           const count = statsQuery.data?.[key];
           const bg = STATE_CARD_BG[key] ?? "";
-          const series = seriesByState[key] ?? [];
           return (
             <Link
               key={key}
@@ -151,19 +106,14 @@ export function DashboardPage() {
                   <div className="text-3xl font-bold tabular-nums">
                     {statsQuery.isLoading ? (
                       <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
-                    ) : (
+                    ) : statsQuery.data ? (
                       (count ?? 0).toLocaleString()
+                    ) : (
+                      <span className="text-muted-fg" aria-label="Count unavailable">—</span>
                     )}
                   </div>
                   <div className="mt-1.5 flex items-center justify-center gap-2">
                     <StateBadge state={key} />
-                    <Sparkline
-                      data={series}
-                      width={48}
-                      height={14}
-                      className="text-primary/70"
-                      label={`${key} trend over the last hour`}
-                    />
                   </div>
                 </CardContent>
               </Card>
@@ -179,7 +129,7 @@ export function DashboardPage() {
                 ) : completedPerHour != null ? (
                   completedPerHour.toLocaleString()
                 ) : (
-                  "—"
+                  <span className="text-muted-fg" aria-label="Count unavailable">—</span>
                 )}
               </div>
               <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
@@ -187,6 +137,12 @@ export function DashboardPage() {
           </Card>
         </Link>
       </div>
+
+      {statsQuery.isError && (
+        <p className="text-sm text-danger-subtle-fg" role="alert" data-testid="stats-error">
+          Failed to load job counts: {statsQuery.error.message}
+        </p>
+      )}
 
       {/* Total jobs count */}
       {totalJobs != null && (
@@ -246,7 +202,7 @@ export function DashboardPage() {
           {/* Mobile runtime cards */}
           {(runtimeQuery.data?.instances.length ?? 0) === 0 ? (
             <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {runtimeQuery.isLoading
                 ? "Loading runtime…"
@@ -303,7 +259,7 @@ export function DashboardPage() {
           )}
 
           {/* Desktop runtime table */}
-          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+          <Table bleed aria-label="Runtime instances" className="hidden sm:block">
             <TableHeader>
               <TableColumn isRowHeader>Instance</TableColumn>
               <TableColumn>Health</TableColumn>
@@ -400,13 +356,13 @@ export function DashboardPage() {
               <TableColumn className="text-right">Failed</TableColumn>
               <TableColumn className="text-right">Waiting</TableColumn>
               <TableColumn className="text-right">Completed/hr</TableColumn>
-              <TableColumn className="text-right">Lag (s)</TableColumn>
+              <TableColumn className="text-right">Lag</TableColumn>
               <TableColumn>Status</TableColumn>
             </TableHeader>
             <TableBody
               renderEmptyState={() => (
                 <div
-                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
                 >
                   {queuesQuery.isLoading
                     ? "Loading queues…"
@@ -515,7 +471,7 @@ export function DashboardPage() {
             <TableBody
               renderEmptyState={() => (
                 <div
-                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
                 >
                   {failedQuery.isLoading
                     ? "Loading failures…"

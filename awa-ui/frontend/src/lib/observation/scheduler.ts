@@ -21,6 +21,8 @@ export interface Demand {
   paused?: boolean;
   intervalMs?: number;
   stopAfterNull?: boolean;
+  /** Whether the view still holds data from an earlier read (e.g. in a shared query cache). */
+  retained?: () => boolean;
   run: (signal: AbortSignal) => Promise<unknown>;
   stale: (stale: boolean) => void;
 }
@@ -39,6 +41,10 @@ interface Entry {
   blocked: boolean;
   absent: boolean;
   error: boolean;
+  /** At least one read has succeeded, so a later failure leaves data retained. */
+  loaded: boolean;
+  /** The last failure was a 404: the view shows not-found, not a failure. */
+  missing: boolean;
 }
 
 /** Whether a failed read would fail the same way if repeated, so the view
@@ -110,7 +116,7 @@ export class RefreshScheduler {
       if (this.entries.size >= this.policy.maxKeys) throw new CapacityError(`At most ${this.policy.maxKeys} active observation keys are allowed`);
       entry = { observers: new Map(), dirty: true, pendingSince: null, during: false, manual: !!demand.manualOnly,
         running: null, lastStart: -Infinity, nextAllowed: 0, nextPoll: Infinity, nextReconcile: null,
-        failures: 0, blocked: false, absent: false, error: false };
+        failures: 0, blocked: false, absent: false, error: false, loaded: false, missing: false };
       this.entries.set(demand.id, entry);
     }
     const token = Symbol(); const observer = { ...demand }; let attached = true;
@@ -171,11 +177,16 @@ export class RefreshScheduler {
   }
   readStatus() {
     if (this.rejected) return `${this.rejected} view(s) rejected at the ${this.policy.maxKeys}-key limit; close a view to retry`;
-    const entries = [...this.entries.values()].filter(entry => !entry.absent);
-    const failed = entries.filter(entry => entry.error).length;
+    const entries = [...this.entries.values()].filter(entry => !entry.absent && !(entry.error && entry.missing && !entry.loaded));
+    const failed = entries.filter(entry => entry.error);
+    const retained = failed.filter(entry => entry.loaded).length;
+    const unloaded = failed.length - retained;
     const stale = entries.filter(entry => entry.dirty || entry.running || entry.during).length;
-    return failed ? `${failed} view(s) failed to refresh; retained data is stale`
-      : stale ? `${stale} view(s) awaiting authoritative refresh` : "";
+    if (failed.length) {
+      return [retained ? `${retained} view(s) failed to refresh; retained data is stale` : "",
+        unloaded ? `${unloaded} view(s) failed to load` : ""].filter(Boolean).join("; ");
+    }
+    return stale ? `${stale} view(s) awaiting authoritative refresh` : "";
   }
   private eligible(entry: Entry) {
     const debounce = entry.manual || entry.pendingSince === null ? -Infinity : entry.pendingSince + Math.min(this.policy.debounceMs, this.policy.maxDebounceMs);
@@ -208,7 +219,7 @@ export class RefreshScheduler {
       entry.lastStart = this.now(); entry.nextPoll = entry.lastStart + this.cadence(entry); this.active++;
       void boundedRead(controller, this.policy.readTimeoutMs, () => demand.run(controller.signal)).then(value => {
         if (controller.signal.aborted || this.entries.get(id) !== entry) return;
-        entry.dirty = entry.during; entry.error = false; entry.failures = 0;
+        entry.dirty = entry.during; entry.error = false; entry.missing = false; entry.loaded = true; entry.failures = 0;
         if (demand.stopAfterNull && value === null) { entry.absent = true; entry.blocked = true; }
         entry.nextReconcile = this.automatic(entry) ? this.watchdog() : null;
         entry.nextPoll = this.now() + this.cadence(entry);
@@ -217,7 +228,8 @@ export class RefreshScheduler {
         if (this.entries.get(id) !== entry) return;
         entry.dirty = true;
         if (!controller.signal.aborted || error instanceof ReadTimeoutError) {
-          this.failure(error); entry.error = true;
+          this.failure(error); entry.error = true; entry.loaded ||= !!demand.retained?.();
+          entry.missing = error instanceof HttpError && error.status === 404;
           entry.blocked = refusesRepeat(error);
           this.syncWatchdog(entry);
           entry.manual ||= !!demand.manualOnly;

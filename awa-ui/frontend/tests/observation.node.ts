@@ -328,3 +328,26 @@ test("scheduled job reads mark manual counts stale without fetching them", async
   now = 5100; scheduler.tick(); await settle(); assert.equal(counts, 1);
   scheduler.mark("count", true); scheduler.tick(); await settle(); assert.equal(stale, false); assert.equal(counts, 2);
 });
+
+test("read status separates failed first loads, stale retained data and not-found", async () => {
+  let fail = false; let now = 0;
+  const scheduler = new RefreshScheduler({}, () => now); scheduler.setReady(true);
+  scheduler.attach(demand("missing", async () => { throw new HttpError("job not found", 404); }));
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.readStatus(), "");
+  scheduler.attach(demand("down", async () => { throw new HttpError("unavailable", 500); }));
+  scheduler.attach(demand("flaky", async () => { if (fail) throw new HttpError("unavailable", 500); }));
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.readStatus(), "1 view(s) failed to load");
+  fail = true; now = 120_000; scheduler.mark("flaky", true); scheduler.tick(); await settle();
+  assert.equal(scheduler.readStatus(), "1 view(s) failed to refresh; retained data is stale; 1 view(s) failed to load");
+  scheduler.setVisible(false); await settle();
+});
+
+test("a replacement entry whose view still holds cached data reports a stale refresh, not a failed load", async () => {
+  const scheduler = new RefreshScheduler({}, () => 0); scheduler.setReady(true);
+  scheduler.attach(demand("runtime", async () => { throw new HttpError("unavailable", 500); }, { retained: () => true }));
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.readStatus(), "1 view(s) failed to refresh; retained data is stale");
+  scheduler.setVisible(false); await settle();
+});

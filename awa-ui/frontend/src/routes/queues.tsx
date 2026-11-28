@@ -74,10 +74,10 @@ export function QueuesPage() {
 
   const drainMutation = useMutation({
     mutationFn: (queue: string) => drainQueue(queue),
-    onSuccess: () => {
+    onSuccess: (result, queue) => {
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue drained`);
+      toast.success(`Queue "${queue}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
     },
     onError: () => {
       toast.error("Failed to drain queue");
@@ -133,7 +133,7 @@ export function QueuesPage() {
       {/* Mobile card layout */}
       {queues.length === 0 ? (
         <div
-          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
         >
           {queuesQuery.isLoading
             ? "Loading queues…"
@@ -202,7 +202,7 @@ export function QueuesPage() {
                   </>
                 )}
                 <span className="text-muted-fg">Lag</span>
-                <span><LagValue seconds={q.lag_seconds} /> s</span>
+                <span><LagValue seconds={q.lag_seconds} /></span>
                 <span className="text-muted-fg">Capacity</span>
                 <span>{capacityLabel(runtime)}</span>
                 <span className="text-muted-fg">Rate limit</span>
@@ -214,7 +214,7 @@ export function QueuesPage() {
                 {runtime?.config_mismatch && (
                   <>
                     <span className="text-muted-fg">Config</span>
-                    <span className="text-warning-fg">Mismatch</span>
+                    <span className="text-warning-subtle-fg">Mismatch</span>
                   </>
                 )}
               </div>
@@ -255,7 +255,7 @@ export function QueuesPage() {
       )}
 
       {/* Desktop table layout */}
-      <Table aria-label="Queues" className="hidden sm:table">
+      <Table aria-label="Queues" className="hidden sm:block">
         <TableHeader>
           <TableColumn isRowHeader>Queue</TableColumn>
           <TableColumn className="text-right">Queued</TableColumn>
@@ -270,7 +270,7 @@ export function QueuesPage() {
         <TableBody
           renderEmptyState={() => (
             <div
-              className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {queuesQuery.isLoading
                 ? "Loading queues…"
@@ -309,7 +309,7 @@ export function QueuesPage() {
                       {q.waiting_external > 0 && (
                         <div className="mt-0.5 text-xs text-muted-fg">
                           {q.waiting_external.toLocaleString()} waiting · lag{" "}
-                          <LagValue seconds={q.lag_seconds} /> s
+                          <LagValue seconds={q.lag_seconds} />
                         </div>
                       )}
                       {descriptorSyncLabel(q) && (
@@ -335,7 +335,7 @@ export function QueuesPage() {
                   </TableCell>
                   <TableCell
                     className={`text-right tabular-nums ${
-                      q.retryable === 0 ? "text-muted-fg/60" : "text-warning-fg"
+                      q.retryable === 0 ? "text-muted-fg/60" : "text-warning-subtle-fg"
                     }`}
                   >
                     {q.retryable.toLocaleString()}
@@ -370,7 +370,7 @@ export function QueuesPage() {
                       {runtime && (
                         <div className="text-xs text-muted-fg">
                           {runtime.config_mismatch ? (
-                            <span className="text-warning-fg">Config mismatch</span>
+                            <span className="text-warning-subtle-fg">Config mismatch</span>
                           ) : (
                             `${runtimeHealthLabel(runtime)} healthy`
                           )}

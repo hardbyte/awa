@@ -27,6 +27,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
 import type { QueueRuntimeSummary } from "@/lib/api";
 import { timeAgo } from "@/lib/time";
+import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import {
   dlqPolicyIntent,
   dlqPolicyLabel,
@@ -76,29 +77,43 @@ export function QueueDetailPage() {
 
   const drainMutation = useMutation({
     mutationFn: () => drainQueue(queueName),
-    onSuccess: () => {
+    onSuccess: (result) => {
       setShowDrainConfirm(false);
       void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${queueName}" drained`);
+      toast.success(`Queue "${queueName}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
     },
     onError: () => toast.error("Failed to drain queue"),
   });
 
+  const queueNotFound = (
+    <ResourceNotFound
+      title={`Queue "${queueName}" not found`}
+      reason="No jobs or configuration exist for this queue name."
+      backTo="/queues"
+      backLabel="Back to queues"
+    />
+  );
   if (!queueName) {
-    return <p className="text-sm text-muted-fg">Queue not found.</p>;
+    return queueNotFound;
   }
   if (queueQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading...</p>;
   }
-  if (queueQuery.error && queueQuery.data === undefined) {
+  if (queueQuery.data === undefined && queueQuery.error && !isNotFoundError(queueQuery.error)) {
     return (
-      <p className="text-sm text-danger">Error: {String(queueQuery.error)}</p>
+      <ResourceLoadError
+        noun={`queue "${queueName}"`}
+        error={queueQuery.error}
+        onRetry={() => void queueQuery.refetch()}
+        backTo="/queues"
+        backLabel="Back to queues"
+      />
     );
   }
   if (!queueQuery.data) {
-    return <p className="text-sm text-muted-fg">Queue not found.</p>;
+    return queueNotFound;
   }
 
   const queue = queueQuery.data;
@@ -286,7 +301,7 @@ export function QueueDetailPage() {
 
             <DescriptionTerm>Lag</DescriptionTerm>
             <DescriptionDetails>
-              <LagValue seconds={queue.lag_seconds} /> s
+              <LagValue seconds={queue.lag_seconds} />
             </DescriptionDetails>
           </DescriptionList>
         </CardContent>

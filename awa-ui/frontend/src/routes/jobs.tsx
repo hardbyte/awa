@@ -203,6 +203,7 @@ export function JobsPage() {
   // wider search's rows; show none of them beside the error.
   const jobs = searchError ? [] : jobsQuery.data ?? [];
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showRetryWaitingConfirm, setShowRetryWaitingConfirm] = useState(false);
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
   // Queue context: when filtering by a single queue, show queue actions
@@ -237,22 +238,24 @@ export function JobsPage() {
   });
   const drainQueueMutation = useMutation({
     mutationFn: () => drainQueue(activeQueue!),
-    onSuccess: () => {
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${activeQueue}" drained`);
+      toast.success(`Queue "${activeQueue}" drained: ${result.drained.toLocaleString()} job(s) cancelled`);
     },
     onError: () => toast.error("Failed to drain queue"),
   });
 
   // Compute which selected jobs are retryable vs cancellable. Dead-lettered
   // jobs are retried through the DLQ page; the job endpoints skip them.
-  const { retryableIds, cancellableIds } = useMemo(() => {
+  const { retryableIds, waitingRetryCount, autoRetryingCount, cancellableIds } = useMemo(() => {
     const selectedJobs = jobs.filter((j) => selected.has(j.id) && !j.dlq);
     return {
       retryableIds: selectedJobs
         .filter((j) => RETRYABLE_STATES.has(j.state))
         .map((j) => j.id),
+      waitingRetryCount: selectedJobs.filter((j) => j.state === "waiting_external").length,
+      autoRetryingCount: selectedJobs.filter((j) => j.state === "retryable").length,
       cancellableIds: selectedJobs
         .filter((j) => !TERMINAL_STATES.has(j.state))
         .map((j) => j.id),
@@ -459,7 +462,11 @@ export function JobsPage() {
           <Button
             intent="primary"
             size="sm"
-            onPress={() => retryMutation.mutate(retryableIds)}
+            onPress={() =>
+              waitingRetryCount > 0
+                ? setShowRetryWaitingConfirm(true)
+                : retryMutation.mutate(retryableIds)
+            }
             isDisabled={readOnly || retryMutation.isPending || retryableIds.length === 0}
           >
             Retry{retryableIds.length > 0 ? ` (${retryableIds.length})` : ""}
@@ -473,6 +480,12 @@ export function JobsPage() {
           >
             Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})` : ""}
           </Button>
+          {autoRetryingCount > 0 && (
+            <span className="text-xs text-muted-fg" data-testid="bulk-retry-hint">
+              {autoRetryingCount} retryable job(s) already retry automatically
+              and are not retried here.
+            </span>
+          )}
         </div>
       )}
 
@@ -482,7 +495,7 @@ export function JobsPage() {
           <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
         )}
         {!jobsQuery.isLoading && jobsQuery.isError && (
-          <p className="py-8 text-center text-sm text-danger-fg">
+          <p className="py-8 text-center text-sm text-danger-subtle-fg">
             Failed to load jobs: {jobsQuery.error.message}
           </p>
         )}
@@ -524,7 +537,7 @@ export function JobsPage() {
                 <div className="flex items-center gap-2">
                   <span className="font-medium">
                     {jobKindLabel(job)}
-                    <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                    <span className="ml-1.5 text-xs text-muted-fg">#{job.id}</span>
                   </span>
                   <StateBadge state={job.state} />
                   {(job.priority !== 2 || job.original_priority !== job.priority) && (
@@ -580,7 +593,7 @@ export function JobsPage() {
             setSelected(new Set(keys as Set<number>));
           }
         }}
-        className="hidden sm:table"
+        className="hidden sm:block"
       >
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>
@@ -602,7 +615,7 @@ export function JobsPage() {
             }
             if (jobsQuery.isError) {
               return (
-                <div className="flex h-32 items-center justify-center text-sm text-danger-fg">
+                <div className="flex h-32 items-center justify-center text-sm text-danger-subtle-fg">
                   Failed to load jobs: {jobsQuery.error.message}
                 </div>
               );
@@ -631,7 +644,7 @@ export function JobsPage() {
               <TableCell className="font-medium">
                 <div>
                   <div>{jobKindLabel(job)}
-                <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                <span className="ml-1.5 text-xs text-muted-fg">#{job.id}</span>
                   </div>
                   {job.kind_descriptor?.display_name && (
                     <div className="text-xs font-normal text-muted-fg">{job.kind}</div>
@@ -659,7 +672,7 @@ export function JobsPage() {
                 ) : job.original_priority !== 2 ? (
                   <span className="text-muted-fg">2 <span className="text-[10px]">(was {job.original_priority})</span></span>
                 ) : (
-                  <span className="text-muted-fg/40">2</span>
+                  <span className="text-muted-fg">2</span>
                 )}
               </TableCell>
               <TableCell className="text-right tabular-nums">
@@ -756,6 +769,16 @@ export function JobsPage() {
         confirmIntent="danger"
         onConfirm={() => cancelMutation.mutate(cancellableIds)}
         isPending={cancelMutation.isPending}
+      />
+
+      <ConfirmDialog
+        isOpen={showRetryWaitingConfirm}
+        onOpenChange={setShowRetryWaitingConfirm}
+        title={`Retry ${retryableIds.length} job(s)`}
+        description={`${waitingRetryCount} of these job(s) are waiting for an external callback. Retrying runs them again from the first attempt and discards the pending callback, so work their handlers already started may happen twice.`}
+        confirmLabel="Retry jobs"
+        onConfirm={() => retryMutation.mutate(retryableIds)}
+        isPending={retryMutation.isPending}
       />
 
       {activeQueue && (

@@ -19,6 +19,7 @@ import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
+import { ListState } from "@/components/ListState";
 import { JsonView } from "@/components/JsonView";
 import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
 
@@ -124,7 +125,7 @@ export function CronPage() {
           </div>
         </details>
       ))}
-      {reconciliation.isError && <p className="text-danger">Unable to load reconciliation status.</p>}
+      {reconciliation.isError && <p className="text-sm text-danger-subtle-fg" role="alert">Unable to load reconciliation status.</p>}
       {!readOnly && <details className="rounded-lg border p-3">
         <summary className="cursor-pointer">Adopt or transfer a schedule</summary>
         <div className="mt-2 flex flex-wrap gap-2">
@@ -395,10 +396,15 @@ export function CronPage() {
             );
           })}
         </div>
-      ) : cronQuery.isLoading ? (
-        <p className="text-sm text-muted-fg">Loading...</p>
       ) : (
-        <p className="text-sm text-muted-fg">No cron schedules found.</p>
+        <ListState
+          className="rounded-lg border"
+          isLoading={cronQuery.isLoading}
+          error={cronQuery.isError ? cronQuery.error : null}
+          onRetry={() => void cronQuery.refetch()}
+          noun="cron schedules"
+          empty="No cron schedules found."
+        />
       )}
     </div>
   );
