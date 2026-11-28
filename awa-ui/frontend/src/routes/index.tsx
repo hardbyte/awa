@@ -50,7 +50,7 @@ import { Badge } from "@/components/ui/badge";
 import { QueueLink, entityLinkClass } from "@/components/links";
 import { Time } from "@/components/Time";
 
-const FAILED_SAMPLE = { state: "failed", limit: OVERVIEW_FAILED_SAMPLE } as const;
+const FAILED_SAMPLE = { state: "failed", dead_lettered: false, limit: OVERVIEW_FAILED_SAMPLE } as const;
 const RUNNING_SAMPLE = { state: "running", limit: OVERVIEW_RUNNING_SAMPLE } as const;
 
 type Tone = "neutral" | "warning" | "danger";
@@ -252,8 +252,8 @@ export function DashboardPage() {
           link={{ to: "/jobs", search: { state: "running" } }}
         >
           {figures.stuck &&
-            (stats?.running !== undefined && stats.running > figures.stuck.sampled
-              ? `in the ${formatNumber(figures.stuck.sampled)} newest of ${formatNumber(stats.running)} running`
+            (figures.stuck.sampled >= OVERVIEW_RUNNING_SAMPLE
+              ? `in the ${formatNumber(figures.stuck.sampled)} newest running jobs`
               : `of ${plural(figures.stuck.sampled, "running job")}`)}
         </HealthTile>
         <HealthTile

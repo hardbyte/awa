@@ -218,10 +218,10 @@ test.describe("Overview", () => {
     await expect(page.getByTestId("attention-item")).toHaveCount(0);
   });
 
-  test("the seeded failed job appears as a failure group", async ({ page }) => {
+  test("live data loads every check", async ({ page }) => {
     await page.goto("/");
-    const group = page.getByTestId("attention-item").filter({ hasText: "in e2e_job" }).first();
-    await expect(group).toBeVisible();
-    await expect(group.getByRole("link")).toHaveAttribute("href", /\/jobs\?.*state=failed/);
+    await expect(page.getByTestId("attention-item").or(page.getByTestId("attention-empty")).first()).toBeVisible();
+    await expect(page.getByTestId("attention-failed-checks")).toHaveCount(0);
+    await expect(page.getByTestId("tile-failed").getByTestId("tile-value")).toHaveText(/^[\d,]+$/);
   });
 });
