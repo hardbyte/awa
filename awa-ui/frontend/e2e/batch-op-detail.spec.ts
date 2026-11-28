@@ -72,10 +72,10 @@ test.describe("Bulk operation page", () => {
       route.request().method() === "GET" ? route.fulfill({ json: op }) : route.fallback()
     );
     await page.goto(`/batch-ops/${ID}`);
-    await expect(page.getByRole("link", { name: "Open matching jobs" })).toHaveAttribute(
-      "href",
-      /\/jobs\?state=failed&q=kind%3Ae2e_job&dead_lettered=false$/
-    );
+    const link = page.getByRole("link", { name: "Open matching jobs" });
+    await expect(link).toHaveAttribute("href", /^\/jobs\?/);
+    const search = new URL((await link.getAttribute("href"))!, "http://x").searchParams;
+    expect(Object.fromEntries(search)).toEqual({ state: "failed", q: "kind:e2e_job", dead_lettered: "false" });
 
     op = operation({ op_kind: "retry", filter: { kind: "e2e_job" } });
     await page.reload();
