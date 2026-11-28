@@ -55,15 +55,17 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 ```
 GET  /api/stats                         Job counts by state
 GET  /api/stats/outcomes?minutes=60&bucket=60s&queue=&kind=
-                                        { covered_since, buckets: [{ bucket, completed, failed,
-                                        cancelled, dead_lettered }] }: jobs reaching each terminal
-                                        outcome per bucket, by when they reached it. `minutes` is
-                                        1 to 1440 and a whole number of buckets; `bucket` is 60s,
-                                        300s, 900s or 3600s. Buckets are aligned to the Unix epoch,
-                                        oldest first, the last holding the current time; empty ones
-                                        are zeros. Counts come from retained terminal rows, so no
-                                        bucket before `covered_since` is returned (see below).
-                                        Retries are not counted. Unknown or empty parameters are a 400.
+                                        { covered_since, dead_lettered_covered_since, buckets: [{ bucket,
+                                        completed, failed, cancelled, dead_lettered }] }: jobs reaching
+                                        each terminal outcome per bucket, by when they reached it.
+                                        `minutes` is 1 to 1440 and a whole number of buckets; `bucket`
+                                        is 60s, 300s, 900s or 3600s. Buckets are aligned to the Unix
+                                        epoch, oldest first, the last holding the current time, and
+                                        start at the earlier of the two coverage times. Completed,
+                                        failed and cancelled are null before `covered_since`, dead
+                                        letters before `dead_lettered_covered_since` (see below);
+                                        covered empty buckets are zeros. Retries are not counted.
+                                        Unknown or empty parameters are a 400.
 GET  /api/stats/timeseries?minutes=60   Deprecated: jobs by creation minute and current state.
                                         Unused by the UI; use /api/stats/outcomes.
 
@@ -122,7 +124,7 @@ POST /api/callbacks/:callback_id/heartbeat
 GET  /api/capabilities                  Feature flags / read-only detection
 ```
 
-`GET /api/stats/outcomes` counts the terminal rows the database still holds. On queue storage those are `done_entries` and completion batches, bucketed by `finalized_at`, and dead letters by `dlq_at`. Queue-ring prune reclaims terminal rows a generation at a time, so `covered_since` is the time the generation after the oldest sealed one opened (from the queue ring's rotation ledger), or the window start if that is later: every job enqueued and finished since then is counted. A job enqueued before it and finished after it can be missing, since it belonged to a generation prune may have reclaimed. On the canonical engine the counts come from `awa.jobs_hot`, which cleanup trims only past its retention (24 hours for completed jobs by default), and `covered_since` is the window start; dead letters exist only on queue storage. The response is cached server-side for the dashboard cache TTL, per parameter set. A server without the endpoint answers 404.
+`GET /api/stats/outcomes` counts the terminal rows the database still holds. On queue storage those are `done_entries` and completion batches, bucketed by `finalized_at`, and dead letters by `dlq_at`. Queue-ring prune reclaims terminal rows a generation at a time, so `covered_since` is the time the generation after the oldest sealed one opened (from the queue ring's rotation ledger), or the window start if that is later: every job enqueued and finished since then is counted. A job enqueued before it and finished after it can be missing, since it belonged to a generation prune may have reclaimed. Ring prune does not touch dead letters; DLQ cleanup removes them past a retention the database does not record (30 days by default, configurable per queue). So `dead_lettered_covered_since` is the later of the window start and the oldest dead letter retained on the queue (or on any queue, without a `queue` filter): a retention shorter than the window shows there, and a queue's first dead letter within the window reads as the start of its coverage. On the canonical engine the counts come from `awa.jobs_hot`, which cleanup trims only past its retention (24 hours for completed jobs by default), both coverage times are the window start, and dead letters, which exist only on queue storage, are zero. The response is cached server-side for the dashboard cache TTL, per parameter set. A server without the endpoint answers 404.
 
 ## Pages
 

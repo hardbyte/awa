@@ -1,6 +1,6 @@
 //! `GET /api/stats/outcomes` on both engines: bucket boundaries, the queue
-//! and kind filters, `covered_since` after queue-ring prune, and parameter
-//! validation.
+//! and kind filters, `covered_since` after queue-ring prune, the dead-letter
+//! series' own coverage, and parameter validation.
 
 use awa_model::queue_storage::{PruneOutcome, QueueStorage, RotateOutcome};
 use awa_testing::setup::TestDatabase;
@@ -15,38 +15,67 @@ use tower::util::ServiceExt;
 #[derive(Debug, Deserialize)]
 struct Outcomes {
     covered_since: DateTime<Utc>,
+    dead_lettered_covered_since: DateTime<Utc>,
     buckets: Vec<Bucket>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 struct Bucket {
     bucket: DateTime<Utc>,
-    completed: i64,
-    failed: i64,
-    cancelled: i64,
-    dead_lettered: i64,
+    completed: Option<i64>,
+    failed: Option<i64>,
+    cancelled: Option<i64>,
+    dead_lettered: Option<i64>,
 }
 
 impl Bucket {
+    /// Every series' count, for a bucket both coverages include.
     fn counts(&self) -> (i64, i64, i64, i64) {
         (
-            self.completed,
-            self.failed,
-            self.cancelled,
-            self.dead_lettered,
+            self.completed.expect("completed covered"),
+            self.failed.expect("failed covered"),
+            self.cancelled.expect("cancelled covered"),
+            self.dead_lettered.expect("dead_lettered covered"),
         )
     }
 }
 
+/// Each series summed over the buckets it covers.
 fn totals(outcomes: &Outcomes) -> (i64, i64, i64, i64) {
     outcomes.buckets.iter().fold((0, 0, 0, 0), |sum, b| {
         (
-            sum.0 + b.completed,
-            sum.1 + b.failed,
-            sum.2 + b.cancelled,
-            sum.3 + b.dead_lettered,
+            sum.0 + b.completed.unwrap_or(0),
+            sum.1 + b.failed.unwrap_or(0),
+            sum.2 + b.cancelled.unwrap_or(0),
+            sum.3 + b.dead_lettered.unwrap_or(0),
         )
     })
+}
+
+/// The shape every response keeps: buckets from the earlier coverage time
+/// on, each series counted exactly in the buckets its coverage includes.
+fn assert_coverage(uri: &str, outcomes: &Outcomes) {
+    let first = outcomes
+        .covered_since
+        .min(outcomes.dead_lettered_covered_since);
+    if let Some(bucket) = outcomes.buckets.first() {
+        assert!(bucket.bucket >= first, "{uri}: bucket before coverage");
+        assert!(
+            bucket.bucket - first < TimeDelta::seconds(3600),
+            "{uri}: covered buckets left out"
+        );
+    }
+    for bucket in &outcomes.buckets {
+        let terminal = bucket.bucket >= outcomes.covered_since;
+        for value in [bucket.completed, bucket.failed, bucket.cancelled] {
+            assert_eq!(value.is_some(), terminal, "{uri}: {bucket:?}");
+        }
+        assert_eq!(
+            bucket.dead_lettered.is_some(),
+            bucket.bucket >= outcomes.dead_lettered_covered_since,
+            "{uri}: {bucket:?}"
+        );
+    }
 }
 
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
@@ -68,7 +97,9 @@ async fn outcomes(app: &axum::Router, uri: &str) -> Outcomes {
         "{uri}: {}",
         String::from_utf8_lossy(&body)
     );
-    serde_json::from_slice(&body).unwrap()
+    let outcomes = serde_json::from_slice(&body).unwrap();
+    assert_coverage(uri, &outcomes);
+    outcomes
 }
 
 async fn insert(pool: &PgPool, kind: &str, queue: &str, count: usize) -> Vec<i64> {
@@ -291,6 +322,17 @@ async fn queue_storage_counts_every_terminal_source_and_filter() {
     let pool = db.pool().clone();
     let app = awa_ui::router(pool.clone(), Duration::ZERO).await.unwrap();
 
+    // A dead letter on each queue from before the window, so dead-letter
+    // coverage spans the window.
+    for queue in ["qs_a", "qs_b"] {
+        insert(&pool, "old", queue, 1).await;
+        work_queue(&pool, &store, queue, 0, 0, 1).await;
+    }
+    sqlx::query("UPDATE awa.dlq_entries SET dlq_at = now() - interval '3 hours'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
     insert(&pool, "send", "qs_a", 6).await;
     work_queue(&pool, &store, "qs_a", 3, 2, 1).await;
     insert(&pool, "sync", "qs_b", 4).await;
@@ -342,7 +384,7 @@ async fn queue_storage_counts_every_terminal_source_and_filter() {
                 start(0) - micro,
             ),
             (
-                "UPDATE awa.dlq_entries SET dlq_at = $1 WHERE queue = 'qs_b'",
+                "UPDATE awa.dlq_entries SET dlq_at = $1 WHERE queue = 'qs_b' AND kind <> 'old'",
                 start(4),
             ),
         ] {
@@ -399,13 +441,20 @@ async fn queue_storage_covered_since_follows_ring_prune() {
     let opened = queue_rotated_at(&pool, 1).await;
     let pruned = outcomes(&app, uri).await;
     assert_eq!(pruned.covered_since, opened);
-    assert!(pruned.buckets.iter().all(|b| b.bucket >= opened));
+    // No dead letter is retained, so that series covers the window, and
+    // every terminal count before the horizon is unknown, not zero.
+    assert_eq!(pruned.dead_lettered_covered_since, pruned.buckets[0].bucket);
+    assert_eq!(pruned.buckets.len(), 60);
+    assert!(pruned
+        .buckets
+        .iter()
+        .filter(|b| b.bucket < opened)
+        .all(|b| b.completed.is_none() && b.dead_lettered == Some(0)));
     assert_eq!(totals(&pruned), (0, 0, 0, 0));
 
-    // Work in generation 1 is counted from the horizon on, and no bucket
-    // before it is reported, as zeros or otherwise.
-    insert(&pool, "send", "ring_q", 2).await;
-    work_queue(&pool, &store, "ring_q", 1, 0, 1).await;
+    // Work in generation 1 is counted from the horizon on.
+    insert(&pool, "send", "ring_q", 1).await;
+    work_queue(&pool, &store, "ring_q", 1, 0, 0).await;
     sqlx::query(
         "UPDATE awa.queue_ring_rotations SET rotated_at = now() - interval '20 minutes' \
          WHERE generation = 1",
@@ -416,16 +465,79 @@ async fn queue_storage_covered_since_follows_ring_prune() {
     let opened = queue_rotated_at(&pool, 1).await;
     let after = outcomes(&app, uri).await;
     assert_eq!(after.covered_since, opened);
-    let first = after.buckets.first().expect("buckets after the horizon");
-    assert!(first.bucket >= opened);
-    assert!(first.bucket - opened < TimeDelta::seconds(60));
-    assert!((19..=20).contains(&after.buckets.len()));
-    assert_eq!(totals(&after), (1, 0, 0, 1));
+    let terminal: Vec<_> = after
+        .buckets
+        .iter()
+        .filter(|b| b.completed.is_some())
+        .collect();
+    assert!(terminal[0].bucket - opened < TimeDelta::seconds(60));
+    assert!((19..=20).contains(&terminal.len()));
+    assert_eq!(totals(&after), (1, 0, 0, 0));
+}
 
-    // A window that ends before the horizon reaches back no further than it.
-    let wider = outcomes(&app, "/api/stats/outcomes?minutes=120&bucket=900s").await;
-    assert!(wider.buckets.iter().all(|b| b.bucket >= opened));
-    assert_eq!(wider.covered_since, opened);
+#[tokio::test]
+async fn queue_storage_dead_letters_keep_their_own_coverage() {
+    let (db, store) = queue_storage().await;
+    let pool = db.pool().clone();
+    let app = awa_ui::router(pool.clone(), Duration::ZERO).await.unwrap();
+    let uri = "/api/stats/outcomes?minutes=60&bucket=60s";
+
+    insert(&pool, "send", "dl_q", 5).await;
+    work_queue(&pool, &store, "dl_q", 2, 0, 3).await;
+    // Ring prune reclaims the completions, not the dead letters.
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { generation: 1, .. }
+    ));
+    assert!(matches!(
+        store.prune_oldest(&pool, Duration::ZERO).await.unwrap(),
+        PruneOutcome::Pruned { generation: 0, .. }
+    ));
+    let job_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT job_id FROM awa.dlq_entries ORDER BY job_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let backdate = |id: i64, interval: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE awa.dlq_entries SET dlq_at = now() - interval '{interval}' WHERE job_id = $1"
+            )))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    backdate(job_ids[0], "50 minutes").await;
+    backdate(job_ids[1], "10 minutes").await;
+
+    // The oldest retained dead letter bounds the series: an earlier bucket
+    // could have held dead letters that DLQ cleanup has since removed.
+    let oldest: DateTime<Utc> = sqlx::query_scalar("SELECT min(dlq_at) FROM awa.dlq_entries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let opened = queue_rotated_at(&pool, 1).await;
+    let result = outcomes(&app, uri).await;
+    assert_eq!(result.covered_since, opened);
+    assert_eq!(result.dead_lettered_covered_since, oldest);
+    assert!(result.buckets[0].bucket - oldest < TimeDelta::seconds(60));
+    // The oldest's own bucket starts before it, so only the other two count.
+    assert_eq!(totals(&result), (0, 0, 0, 2));
+    assert!(result.buckets.len() >= 49);
+
+    // A dead letter older than the window leaves the whole window covered.
+    backdate(job_ids[0], "3 hours").await;
+    let result = outcomes(&app, uri).await;
+    assert_eq!(result.buckets.len(), 60);
+    assert_eq!(result.dead_lettered_covered_since, result.buckets[0].bucket);
+    assert_eq!(totals(&result), (0, 0, 0, 2));
+    // Per queue as well; another queue's dead letters do not bound it.
+    let other = outcomes(&app, &format!("{uri}&queue=other_q")).await;
+    assert_eq!(other.dead_lettered_covered_since, other.buckets[0].bucket);
+    assert_eq!(totals(&other), (0, 0, 0, 0));
 }
 
 /// Reads of `awa.jobs_hot` by the backend of `pool`, which must have a single
