@@ -2832,6 +2832,12 @@
 <td>A job transition never waits on another transaction's coordination work, and coordination that changes nothing writes nothing and, in steady state, locks nothing: hot-path triggers write only append-only marks, wake-ups are coalesced and sent after commit, and coordination state is written only on change. Supersedes 045. Amends 033's grant-close wake-up. Wake-ups from caller-owned transactions (with #342, 0.8) and adaptive backoff are proposed.</td>
 <td></td>
 </tr>
+<tr>
+<td style="text-align: right;">054</td>
+<td><a href="054-claim-target-bound/">A claim reads its target slot only below the next segment of another slot</a></td>
+<td>The claim re-resolves its target after the head lock and bounds every read of the slot at the first segment of another slot, so the cursor never passes an unclaimed row whatever the lane's layout and however a mover changes it. Prerequisite for moving rows between slots (#779).</td>
+<td><span class="awa-status awa-status--accepted">Accepted</span></td>
+</tr>
 </tbody>
 </table>
 <h2 id="correctness-evidence">Correctness evidence<a class="headerlink" href="#correctness-evidence" title="Permanent link">&para;</a></h2>

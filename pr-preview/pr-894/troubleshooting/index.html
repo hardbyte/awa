@@ -3900,7 +3900,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li><code>awa.maintenance.prune.attempts</code> for the queue ring reports <code>skipped_active</code> with reason <code>queue.pending_ready</code>, and once rotation reaches the same slot <code>awa.maintenance.rotate.attempts</code> reports <code>skipped_busy</code> with blocker <code>queue.ready_rows</code></li>
 <li><code>awa.ring.generation</code> for the queue ring stops advancing</li>
 <li>the current slot's <code>ready_entries_*</code>, <code>done_entries_*</code>, <code>ready_segments_*</code> and <code>ready_claim_attempt_batches_*</code> partitions grow at the cluster's enqueue rate, for every queue</li>
-<li>since 0.6.18, <code>awa.maintenance.prune.pinned_ready_age</code> reports the lane responsible, and the maintenance leader logs <code>Queue ring prune is pinned by unclaimed ready rows</code> with its <code>queue</code>, <code>priority</code>, <code>enqueue_shard</code> and <code>oldest_ready_age_secs</code>; the warning also carries <code>cause</code>, why that oldest lane is not being claimed (below)</li>
+<li>since 0.6.18, <code>awa.maintenance.prune.pinned_ready_age</code> reports the lane responsible, and the maintenance leader logs <code>Queue ring prune is pinned by unclaimed ready rows</code> with its <code>queue</code>, <code>priority</code>, <code>enqueue_shard</code> and <code>oldest_ready_age_secs</code></li>
 </ul>
 <p>Queue prune truncates the oldest sealed slot only once every lane's ready rows in it are behind that lane's claim cursor, and rotation cannot reuse a slot until prune has truncated it. A lane that nobody claims therefore holds the oldest slot, and with it storage reclamation for the whole ring, until it is claimed. The usual causes are:</p>
 <ul>
@@ -3908,45 +3908,13 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>a queue no running worker serves, such as a deployment scaled to zero, or one rate-limited far below its arrival rate</li>
 <li>a lower priority under strict priority (<code>priority_aging_interval</code> of zero) while a higher priority of the same queue stays backlogged</li>
 </ul>
-<p>The warning's <code>cause</code> field says which:</p>
-<table>
-<thead>
-<tr>
-<th><code>cause</code></th>
-<th>Meaning</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>paused</code></td>
-<td>the lane's queue is paused (<code>awa.queue_meta.paused</code>)</td>
-</tr>
-<tr>
-<td><code>no_runtime</code></td>
-<td>the queue is not paused, but no live runtime lists it among the queues it serves</td>
-</tr>
-<tr>
-<td><code>advancing</code></td>
-<td>a runtime serves the queue and the lane's claim cursor moved since the previous read: it is being claimed, more slowly than rows arrive or the ring rotates</td>
-</tr>
-<tr>
-<td><code>starved</code></td>
-<td>a runtime serves the queue and the cursor has not moved: a higher priority is taking every claim, or the queue is rate limited or out of workers</td>
-</tr>
-<tr>
-<td><code>unknown</code></td>
-<td>the cause could not be read</td>
-</tr>
-</tbody>
-</table>
-<p>A <code>starved</code> lane of a queue that has priority aging off or long is claimed without operator action: while a lane above priority 1 pins the slot, the queue claims with an aging interval short enough for that lane's head to reach priority 1 (see <a href="../configuration/#escalation-while-a-lane-pins-the-queue-ring">escalation while a lane pins the queue ring</a>). <code>awa.dispatch.ring_pin_escalated_claims</code> shows when it is active. It does not help when a higher lane's head is older than the starved one's, when the queue is paused or unserved, or on a queue with <code>ring_pin_aging_escalation</code> off, and a 0.6 runtime does not escalate.</p>
 <p>A claim on the lane releases the slot:</p>
 <ul>
-<li>on a queue with strict priority, set a non-zero <code>priority_aging_interval</code>; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed. Escalation does this for the pinning lane on its own</li>
+<li>on a queue with strict priority, set a non-zero <code>priority_aging_interval</code>; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed, which is the fastest fix for a starved lane</li>
 <li>resume a paused queue</li>
 <li>start workers for the queue, or raise its rate limit</li>
 </ul>
-<p>Since 0.6.18, so does making the stuck jobs unclaimable, in any order and through any command: move them to another queue (<code>move_queue</code>), change their priority (<code>set_priority</code>), or cancel them (<code>cancel</code>, <code>cancel_tx</code>, <code>bulk_cancel</code>, <code>drain_queue</code>). Those tombstone the old ready rows without always moving the lane's claim cursor past them. When the leader reads the lanes pinning the slot, after a prune that skips it and at least every 15 seconds while prune backs off, it moves the claim cursor of each pinning lane whose first pending row is tombstoned or already claimed over those rows, up to the lane's first row that can still be claimed. Once the lane no longer pins the slot, the leader logs <code>Queue ring prune is no longer pinned by this lane</code> with the lane's <code>queue</code>, <code>priority</code>, <code>enqueue_shard</code> and the cursor's <code>from_lane_seq</code> and <code>to_lane_seq</code>, and queue prune retries on the next queue rotation tick. Each read keeps stepping a lane over 1,000 positions at a time, one short transaction each, for up to 400 ms. A read that used all of that and moved a cursor is followed by another on the next queue rotation tick, so a long run of moved or cancelled rows takes a few reads in a row, not one per 15 seconds. A lane with a live first row is left to its claimers. <code>awa.maintenance.prune.claim_cursor_advances</code> counts the advances by lane, with <code>awa_ring_outcome</code> <code>advanced</code>, or <code>failed</code> for a lane the leader could not advance; it then logs <code>Failed to advance the claim cursor of a lane pinning the queue ring</code> at warn, at most every 5 minutes, and moves on to the other lanes. Before 0.6.18, only cancelling in lane order released the slot: <code>drain_queue</code>, one <code>bulk_cancel</code> of all the lane's waiting jobs, or <code>cancel</code> one job at a time in enqueue order.</p>
+<p>Since 0.6.18, so does making the stuck jobs unclaimable, in any order and through any command: move them to another queue (<code>move_queue</code>), change their priority (<code>set_priority</code>), or cancel them (<code>cancel</code>, <code>cancel_tx</code>, <code>bulk_cancel</code>, <code>drain_queue</code>). Those tombstone the old ready rows without always moving the lane's claim cursor past them. When the leader reads the lanes pinning the slot, after a prune that skips it and at least every 15 seconds while prune backs off, it moves the claim cursor of each pinning lane whose first pending row is tombstoned or already claimed over those rows, up to the lane's first row that can still be claimed. Once the lane no longer pins the slot, the leader logs <code>Queue ring prune is no longer pinned by this lane</code> with the lane's <code>queue</code>, <code>priority</code>, <code>enqueue_shard</code> and the cursor's <code>from_lane_seq</code> and <code>to_lane_seq</code>, and queue prune retries on the next queue rotation tick. Each read keeps stepping a lane over 1,000 positions at a time, one short transaction each, for up to 400 ms, or half the queue rotation interval if that is shorter. A read that used all of that and moved a cursor is followed by another on the next queue rotation tick, not 15 seconds later. Reads run only on rotation ticks, so the advance gets at most that budget per rotation interval: about 400 ms of every second at a 1 s interval, and 400 ms per minute at a 60 s interval. A long run of moved or cancelled rows takes a few reads in a row, and at a long rotation interval it takes correspondingly longer. The default ring cadence decides when a slot seals, not how often the leader ticks, so once a slot is sealed the advance runs at this pace under it too; the 1 s figures assume a 1 s <code>queue_rotate_interval</code>, as the tests using <code>RingRotationCadence::EAGER</code> do. A lane with a live first row is left to its claimers. <code>awa.maintenance.prune.claim_cursor_advances</code> counts the advances by lane, with <code>awa_ring_outcome</code> <code>advanced</code>, or <code>failed</code> for a lane the leader could not advance; it then logs <code>Failed to advance the claim cursor of a lane pinning the queue ring</code> at warn, at most every 5 minutes, and moves on to the other lanes. Before 0.6.18, only cancelling in lane order released the slot: <code>drain_queue</code>, one <code>bulk_cancel</code> of all the lane's waiting jobs, or <code>cancel</code> one job at a time in enqueue order.</p>
 <p>The advance runs in short transactions that never wait for a lane a claim, cancel or move is using, or for a table prune holds; such a lane is retried on the next read. Each transaction takes <code>ACCESS SHARE</code> on every partition of the ready, segment, tombstone and claim-attempt tables: four locks per queue slot plus the parents, about 70 on the default 16-slot ring, plus their indexes. Without lease-claim receipts it also locks every partition of <code>leases</code> and <code>done_entries</code>. Those come out of the shared lock table that <code>max_locks_per_transaction</code> sizes, as a claim's do; the default leaves room for them.</p>
 <p><code>awa.maintenance.prune.pinned_ready_age</code> is a gauge of the age of each pinning lane's first pending row, by <code>awa_job_queue</code>, <code>awa_job_priority</code> and <code>awa_queue_enqueue_shard</code>. The leader updates it when queue prune runs and, while a lane pins the slot, at least every 15 seconds or queue rotation tick, whichever is longer, even while prune backs off; it sets a lane to <code>0</code> once it stops pinning the slot or the runtime loses leadership. A short-lived value is normal while a backlog drains through a full ring. Alert when a lane stays old:</p>
 <div class="language-yaml highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alert</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AwaQueueRingPinnedByLane</span>

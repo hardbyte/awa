@@ -234,7 +234,7 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 
 | Scope | Knobs | Notes |
 | --- | --- | --- |
-| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `ring_pin_aging_escalation`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy, applied by each worker process: `max_workers` and `rate_limit` limit one process, not the fleet. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
+| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy, applied by each worker process: `max_workers` and `rate_limit` limit one process, not the fleet. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
 | Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, extra metadata and the declared [output type](../job-output/index.md#typed-outputs). They do not set dispatch limits or timeouts. |
 | Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout). |
@@ -325,14 +325,6 @@ Aging is computed at claim time on queue-storage runtimes: ready rows keep their
 The admin UI shows the priority on the current job snapshot and, when `_awa_original_priority` is present, the original enqueue priority as `(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or `priority_aging_interval_ms: 0` (Python) to disable escalation entirely (strict static priority).
 
 Under queue storage, strict priority on a queue whose higher priorities stay backlogged leaves its lower-priority rows unclaimed, and unclaimed rows keep queue prune from reclaiming the oldest ring slot for every queue. Keep aging on for queues that mix priorities under sustained backlog; see [queue ring stops wrapping behind an unclaimed lane](../troubleshooting/index.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
-
-#### Escalation while a lane pins the queue ring
-
-While one of a queue's lanes above priority 1 keeps prune from reclaiming the oldest ring slot, the queue's dispatchers claim with a shorter aging interval: the pinning lane's head age divided by its priority minus one, at least one second, which brings that lane's head to effective priority 1. With several pinning lanes, the shortest such interval applies. While it applies, rows of the queue older than the pinned lane's head are served oldest-first across priorities. The configured interval applies again as soon as the lane no longer pins the slot, and the escalated interval is used only when it is shorter than the configured one (or the configured one is zero).
-
-It helps only when the starved head is older than the heads of the lanes above it; if a higher lane's head is older, that lane is claimed first, as under strict priority. It does not change anything for a paused queue or one no runtime serves, and rate limits, permits and `max_workers` apply as before. Each runtime that serves a queue with escalation enabled reads the pinning lanes about every 10 seconds, so escalation starts and stops within about that long, and a runtime that cannot read them claims with the configured interval. `awa.dispatch.ring_pin_escalated_claims` counts the claims that returned jobs with an escalated interval, by `awa_job_queue`.
-
-Escalation is on by default. Set `QueueConfig.ring_pin_aging_escalation` to `false` (Rust) or `"ring_pin_aging_escalation": False` (Python queue dict, `PartitionedQueue.queue_configs(ring_pin_aging_escalation=False)`) to always claim with `priority_aging_interval`. See [queue ring stops wrapping behind an unclaimed lane](../troubleshooting/index.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
 
 There is a separate top-level `ClientBuilder::priority_aging_interval` that controls the legacy canonical-storage maintenance pass that physically rewrites stored priorities. With queue storage (the 0.6 default) it is a no-op; the per-queue setting above is the one to tune.
 
