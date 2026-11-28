@@ -38,7 +38,7 @@ const STATE_CARD_BG: Record<string, string> = {
   running: "bg-success-subtle",
   failed: "bg-danger-subtle",
   scheduled: "bg-secondary/50",
-  waiting_external: "bg-[oklch(0.87_0.07_280)]/30",
+  waiting_external: "bg-[oklch(0.87_0.07_280)]/30 dark:bg-[oklch(0.55_0.15_280)]/15",
 };
 
 /** Headline metrics — includes deferred and callback-blocked work */
@@ -246,7 +246,7 @@ export function DashboardPage() {
           {/* Mobile runtime cards */}
           {(runtimeQuery.data?.instances.length ?? 0) === 0 ? (
             <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {runtimeQuery.isLoading
                 ? "Loading runtime…"
@@ -406,7 +406,7 @@ export function DashboardPage() {
             <TableBody
               renderEmptyState={() => (
                 <div
-                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
                 >
                   {queuesQuery.isLoading
                     ? "Loading queues…"
@@ -515,7 +515,7 @@ export function DashboardPage() {
             <TableBody
               renderEmptyState={() => (
                 <div
-                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
                 >
                   {failedQuery.isLoading
                     ? "Loading failures…"

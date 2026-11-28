@@ -133,7 +133,7 @@ export function QueuesPage() {
       {/* Mobile card layout */}
       {queues.length === 0 ? (
         <div
-          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
         >
           {queuesQuery.isLoading
             ? "Loading queues…"
@@ -214,7 +214,7 @@ export function QueuesPage() {
                 {runtime?.config_mismatch && (
                   <>
                     <span className="text-muted-fg">Config</span>
-                    <span className="text-warning-fg">Mismatch</span>
+                    <span className="text-warning-subtle-fg">Mismatch</span>
                   </>
                 )}
               </div>
@@ -270,7 +270,7 @@ export function QueuesPage() {
         <TableBody
           renderEmptyState={() => (
             <div
-              className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {queuesQuery.isLoading
                 ? "Loading queues…"
@@ -335,7 +335,7 @@ export function QueuesPage() {
                   </TableCell>
                   <TableCell
                     className={`text-right tabular-nums ${
-                      q.retryable === 0 ? "text-muted-fg/60" : "text-warning-fg"
+                      q.retryable === 0 ? "text-muted-fg/60" : "text-warning-subtle-fg"
                     }`}
                   >
                     {q.retryable.toLocaleString()}
@@ -370,7 +370,7 @@ export function QueuesPage() {
                       {runtime && (
                         <div className="text-xs text-muted-fg">
                           {runtime.config_mismatch ? (
-                            <span className="text-warning-fg">Config mismatch</span>
+                            <span className="text-warning-subtle-fg">Config mismatch</span>
                           ) : (
                             `${runtimeHealthLabel(runtime)} healthy`
                           )}

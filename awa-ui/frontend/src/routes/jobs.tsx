@@ -482,7 +482,7 @@ export function JobsPage() {
           <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
         )}
         {!jobsQuery.isLoading && jobsQuery.isError && (
-          <p className="py-8 text-center text-sm text-danger-fg">
+          <p className="py-8 text-center text-sm text-danger-subtle-fg">
             Failed to load jobs: {jobsQuery.error.message}
           </p>
         )}
@@ -524,7 +524,7 @@ export function JobsPage() {
                 <div className="flex items-center gap-2">
                   <span className="font-medium">
                     {jobKindLabel(job)}
-                    <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                    <span className="ml-1.5 text-xs text-muted-fg">#{job.id}</span>
                   </span>
                   <StateBadge state={job.state} />
                   {(job.priority !== 2 || job.original_priority !== job.priority) && (
@@ -602,7 +602,7 @@ export function JobsPage() {
             }
             if (jobsQuery.isError) {
               return (
-                <div className="flex h-32 items-center justify-center text-sm text-danger-fg">
+                <div className="flex h-32 items-center justify-center text-sm text-danger-subtle-fg">
                   Failed to load jobs: {jobsQuery.error.message}
                 </div>
               );
@@ -631,7 +631,7 @@ export function JobsPage() {
               <TableCell className="font-medium">
                 <div>
                   <div>{jobKindLabel(job)}
-                <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                <span className="ml-1.5 text-xs text-muted-fg">#{job.id}</span>
                   </div>
                   {job.kind_descriptor?.display_name && (
                     <div className="text-xs font-normal text-muted-fg">{job.kind}</div>
@@ -659,7 +659,7 @@ export function JobsPage() {
                 ) : job.original_priority !== 2 ? (
                   <span className="text-muted-fg">2 <span className="text-[10px]">(was {job.original_priority})</span></span>
                 ) : (
-                  <span className="text-muted-fg/40">2</span>
+                  <span className="text-muted-fg">2</span>
                 )}
               </TableCell>
               <TableCell className="text-right tabular-nums">

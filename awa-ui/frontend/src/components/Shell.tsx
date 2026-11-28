@@ -512,7 +512,7 @@ export function Shell() {
           <div className="text-xs text-muted-fg">Polling; scheduled reconciliation maximum: {observationPolicy.reconcileMaxMs / 1000}s.</div>
           {readStatus && <div role="status" className="text-sm text-muted-fg">{readStatus}</div>}
           {showReadOnlyBanner && (
-            <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-fg">
+            <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-subtle-fg">
               Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
             </div>
           )}

@@ -337,7 +337,7 @@ export function RuntimePage() {
         <CardContent>
           {visibleInstances.length === 0 ? (
             <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {runtimeQuery.isLoading
                 ? "Loading instances…"
@@ -415,7 +415,7 @@ export function RuntimePage() {
                 }
                 if (runtimeQuery.isError) {
                   return (
-                    <div className="p-6 text-center text-sm text-danger-fg">
+                    <div className="p-6 text-center text-sm text-danger-subtle-fg">
                       Failed to load runtime snapshots.
                     </div>
                   );
@@ -538,7 +538,7 @@ export function RuntimePage() {
         <CardContent>
           {queues.length === 0 ? (
             <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queueRuntimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queueRuntimeQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {queueRuntimeQuery.isLoading
                 ? "Loading queue runtime…"

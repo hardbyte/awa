@@ -70,7 +70,7 @@ export function KindsPage() {
 
       {kinds.length === 0 ? (
         <div
-          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
         >
           {kindsQuery.isLoading
             ? "Loading job kinds…"
@@ -158,7 +158,7 @@ export function KindsPage() {
         <TableBody
           renderEmptyState={() => (
             <div
-              className={`p-6 text-center text-sm ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`p-6 text-center text-sm ${kindsQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
             >
               {kindsQuery.isLoading
                 ? "Loading job kinds…"
