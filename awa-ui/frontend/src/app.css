@@ -72,6 +72,31 @@ If you want to use the typography plugin (prose), uncomment the line below.
   --color-sidebar: var(--sidebar);
   --color-sidebar-fg: var(--sidebar-fg);
 
+  --color-state-available: var(--state-available);
+  --color-state-available-subtle: var(--state-available-subtle);
+  --color-state-available-fg: var(--state-available-fg);
+  --color-state-running: var(--state-running);
+  --color-state-running-subtle: var(--state-running-subtle);
+  --color-state-running-fg: var(--state-running-fg);
+  --color-state-completed: var(--state-completed);
+  --color-state-completed-subtle: var(--state-completed-subtle);
+  --color-state-completed-fg: var(--state-completed-fg);
+  --color-state-retryable: var(--state-retryable);
+  --color-state-retryable-subtle: var(--state-retryable-subtle);
+  --color-state-retryable-fg: var(--state-retryable-fg);
+  --color-state-failed: var(--state-failed);
+  --color-state-failed-subtle: var(--state-failed-subtle);
+  --color-state-failed-fg: var(--state-failed-fg);
+  --color-state-cancelled: var(--state-cancelled);
+  --color-state-cancelled-subtle: var(--state-cancelled-subtle);
+  --color-state-cancelled-fg: var(--state-cancelled-fg);
+  --color-state-scheduled: var(--state-scheduled);
+  --color-state-scheduled-subtle: var(--state-scheduled-subtle);
+  --color-state-scheduled-fg: var(--state-scheduled-fg);
+  --color-state-waiting: var(--state-waiting);
+  --color-state-waiting-subtle: var(--state-waiting-subtle);
+  --color-state-waiting-fg: var(--state-waiting-fg);
+
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
@@ -161,6 +186,33 @@ If you want to use the typography plugin (prose), uncomment the line below.
   --sidebar-border: oklch(0.901 0.006 286.286);
   --sidebar-ring: oklch(0.546 0.245 262.881);
 
+
+  /* Job state palette: solid for dots, subtle for surfaces, fg for text. */
+  --state-available: var(--color-blue-600);
+  --state-available-subtle: theme('color-blue-500/15%');
+  --state-available-fg: var(--color-blue-700);
+  --state-running: var(--color-teal-600);
+  --state-running-subtle: theme('color-teal-500/15%');
+  --state-running-fg: var(--color-teal-800);
+  --state-completed: var(--color-emerald-600);
+  --state-completed-subtle: theme('color-emerald-500/15%');
+  --state-completed-fg: var(--color-emerald-800);
+  --state-retryable: var(--color-amber-500);
+  --state-retryable-subtle: theme('color-amber-400/25%');
+  --state-retryable-fg: var(--color-amber-800);
+  --state-failed: var(--color-red-600);
+  --state-failed-subtle: theme('color-red-500/15%');
+  --state-failed-fg: var(--color-red-700);
+  --state-cancelled: var(--color-zinc-400);
+  --state-cancelled-subtle: theme('color-zinc-500/15%');
+  --state-cancelled-fg: var(--color-zinc-700);
+  --state-scheduled: var(--color-slate-400);
+  --state-scheduled-subtle: theme('color-slate-500/12%');
+  --state-scheduled-fg: var(--color-slate-700);
+  --state-waiting: var(--color-violet-600);
+  --state-waiting-subtle: theme('color-violet-500/15%');
+  --state-waiting-fg: var(--color-violet-700);
+
   --chart-1: oklch(0.546 0.245 262.881);
   --chart-2: oklch(0.623 0.214 259.815);
   --chart-3: oklch(0.707 0.165 254.624);
@@ -240,6 +292,33 @@ If you want to use the typography plugin (prose), uncomment the line below.
   --sidebar-border: oklch(0.274 0.006 286.033);
   --sidebar-ring: oklch(0.546 0.245 262.881);
 
+
+  /* Job state palette: solid for dots, subtle for surfaces, fg for text. */
+  --state-available: var(--color-blue-500);
+  --state-available-subtle: theme('color-blue-500/20%');
+  --state-available-fg: var(--color-blue-300);
+  --state-running: var(--color-teal-500);
+  --state-running-subtle: theme('color-teal-500/20%');
+  --state-running-fg: var(--color-teal-300);
+  --state-completed: var(--color-emerald-500);
+  --state-completed-subtle: theme('color-emerald-500/20%');
+  --state-completed-fg: var(--color-emerald-300);
+  --state-retryable: var(--color-amber-400);
+  --state-retryable-subtle: theme('color-amber-400/20%');
+  --state-retryable-fg: var(--color-amber-300);
+  --state-failed: var(--color-red-500);
+  --state-failed-subtle: theme('color-red-500/20%');
+  --state-failed-fg: var(--color-red-300);
+  --state-cancelled: var(--color-zinc-500);
+  --state-cancelled-subtle: theme('color-zinc-400/15%');
+  --state-cancelled-fg: var(--color-zinc-300);
+  --state-scheduled: var(--color-slate-500);
+  --state-scheduled-subtle: theme('color-slate-400/15%');
+  --state-scheduled-fg: var(--color-slate-300);
+  --state-waiting: var(--color-violet-500);
+  --state-waiting-subtle: theme('color-violet-500/25%');
+  --state-waiting-fg: var(--color-violet-300);
+
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.623 0.214 259.815);
   --chart-3: oklch(0.707 0.165 254.624);
@@ -306,4 +385,16 @@ If you want to use the typography plugin (prose), uncomment the line below.
 .react-aria-DropIndicator[data-drop-target] {
   outline: 1px solid var(--primary);
   transform: translateZ(0);
+}
+
+/* Motion stops for people who ask for less of it: spinners, pulses and transitions settle at once. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

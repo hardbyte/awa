@@ -277,10 +277,10 @@ awa batch-ops cancel <id>
   `retry_from_dlq`, `purge_dlq`, plus `set_priority` and `move_queue`. Each
   accepts only the states it can act on; `retry_from_dlq` and `purge_dlq` act
   on DLQ rows only.
-- The admin UI's DLQ "retry/purge all matching" buttons and
+- The admin UI's Dead letters "retry/purge all matching" buttons and
   `POST /api/dlq/retry-matching` / `/purge-matching` submit a `retry_from_dlq`
-  / `purge_dlq` operation and answer `202` with it; follow it on the Batch
-  Operations page or with `awa batch-ops get`. Nothing changes until a worker's
+  / `purge_dlq` operation and answer `202` with it; follow it on its operation
+  page (`/batch-ops/<id>`) or with `awa batch-ops get`. Nothing changes until a worker's
   maintenance leader runs it. `awa dlq retry-bulk` and `purge` submit the same
   operations.
 - An item whose row another transaction holds stays pending and is retried on
@@ -508,18 +508,19 @@ access with ingress policy, firewall, or private networking. It binds
 Run one `awa serve` per database (single-backend by design; `--peer` links are
 navigation only, no shared data plane). Use `--read-only` / `AWA_READ_ONLY=1`
 for incident read-outs or against a replica — mutation endpoints return 503 and
-the UI hides its buttons; read-only is auto-detected against a read-only
-connection. Set `--callback-hmac-secret` to verify callback signatures; for
-externally reachable callbacks with a private admin surface, run
-`awa callbacks serve` instead, whose router has no admin routes.
+the UI disables admin actions and says why; read-only is auto-detected against
+a read-only connection. Set `--callback-hmac-secret` to verify callback
+signatures; for externally reachable callbacks with a private admin surface,
+run `awa callbacks serve` instead, whose router has no admin routes.
 
 Managed dashboard views share a per-tab polling scheduler: at most 16 exact
 queries and two reads at once. The UI shows retained data as stale on read
 failure; authentication failures stop retries until an explicit refresh. Hidden
 tabs pause reads and resume with one paced refresh. Selecting jobs pauses that
 list; filtered counts refresh on filter change or explicit refresh, not every
-poll. The displayed reconciliation bound is a scheduling policy, not a data-age
-SLO. Other processes and workers are observed through ordinary timed reads.
+poll. A pill in the header says how old the page's data is and turns amber
+while some reads fail and red when every read does; the reconciliation interval
+is a scheduling policy, not a data-age SLO. Other processes and workers are observed through ordinary timed reads.
 See [admin observation](../../docs/admin-observation.md) for cache metadata and
 the remaining strict-read/server-deadline validation requirements.
 

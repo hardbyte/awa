@@ -1,17 +1,18 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { useEffect, useState } from "react";
 import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useParams, Link, useNavigate } from "@tanstack/react-router";
+import { useParams, useNavigate } from "@tanstack/react-router";
 import { fetchJob, retryJob, cancelJob } from "@/lib/api";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { Heading } from "@/components/ui/heading";
-import { Button } from "@/components/ui/button";
+import { Page, PageHeader } from "@/components/Page";
+import { KindLink, QueueLink, ScheduleLink, TagChip } from "@/components/links";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import {
   DescriptionList,
@@ -25,8 +26,12 @@ import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { timeUntil } from "@/lib/time";
+import { ErrorBlock } from "@/components/ErrorBlock";
+import { JobStateSummary } from "@/components/JobStateSummary";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { AdminButton } from "@/components/AdminAction";
+import { jobActionCopy } from "@/lib/job-actions";
+import { jobStateMeta } from "@/lib/states";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 
 function hasMetadata(job: JobRow): boolean {
@@ -47,21 +52,29 @@ function descriptorLabel(
   return displayName?.trim() ? displayName : fallback;
 }
 
-function jobKindLabel(job: JobRow): string {
-  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
+/** The schedule that enqueued a job, from the metadata cron fires record. */
+function scheduleOrigin(metadata: unknown): { name: string; manual: boolean } | null {
+  if (!metadata || typeof metadata !== "object") return null;
+  const fields = metadata as Record<string, unknown>;
+  if (typeof fields.cron_name !== "string" || !fields.cron_name) return null;
+  return { name: fields.cron_name, manual: fields.triggered_manually === true };
 }
 
-function queueLabel(job: JobRow): string {
-  return descriptorLabel(job.queue_descriptor?.display_name, job.queue);
+function jobKindLabel(job: JobRow): string {
+  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
 }
 
 export function JobDetailPage() {
   const { id } = useParams({ strict: false });
   const jobId = Number(id);
   const queryClient = useQueryClient();
-  const readOnly = useReadOnly();
   const navigate = useNavigate();
-  const [confirmRetryWaiting, setConfirmRetryWaiting] = useState(false);
+  const [confirming, setConfirming] = useState<"retry" | "cancel" | null>(null);
+  const [lastConfirming, setLastConfirming] = useState<"retry" | "cancel">("retry");
+  const confirm = (action: "retry" | "cancel") => {
+    setLastConfirming(action);
+    setConfirming(action);
+  };
 
   const jobQuery = useManagedQuery<JobRow>({
     queryKey: ["job", jobId],
@@ -82,27 +95,31 @@ export function JobDetailPage() {
     }
   }, [jobQuery.data?.dlq, jobId, navigate]);
 
+  const invalidateJob = () => {
+    void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+    void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+  };
+  // Run from a confirmation dialog, which shows their errors.
   const retryMutation = useMutation({
     mutationFn: () => retryJob(jobId),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success("Job retried");
-    },
-    onError: () => {
-      toast.error("Failed to retry job");
+    onSuccess: (job) => {
+      invalidateJob();
+      if (job === null) {
+        toast.info(`Job #${jobId} can no longer be retried; nothing changed`);
+        return;
+      }
+      toast.success(`Job #${jobId} retried; now ${jobStateMeta(job.state).label.toLowerCase()}`);
     },
   });
-
   const cancelMutation = useMutation({
     mutationFn: () => cancelJob(jobId),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success("Job cancelled");
-    },
-    onError: () => {
-      toast.error("Failed to cancel job");
+    onSuccess: (job) => {
+      invalidateJob();
+      if (job === null) {
+        toast.info(`Job #${jobId} can no longer be cancelled; nothing changed`);
+        return;
+      }
+      toast.success(`Job #${jobId} cancelled`);
     },
   });
 
@@ -136,91 +153,95 @@ export function JobDetailPage() {
     job.state
   );
   const canCancel = !["completed", "failed", "cancelled"].includes(job.state);
+  const cronOrigin = scheduleOrigin(job.metadata);
 
   return (
-    <div className="space-y-6">
+    <Page width="readable">
       {jobQuery.isRetainedNotFound && <p role="status">Last observed job shown. The latest read reports that this job was not found.</p>}
-      {/* Back link */}
-      <Link
-        to="/jobs"
-        className="text-sm text-muted-fg no-underline hover:text-fg"
-      >
-        &larr; Back to jobs
-      </Link>
-
-      <div className="flex flex-wrap items-center gap-4">
-        <Heading level={2}>
-          Job #{job.id} &mdash; {jobKindLabel(job)}
-        </Heading>
-        {job.kind_descriptor?.display_name?.trim() && (
-          <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
-        )}
-        <StateBadge state={job.state} />
-      </div>
-
-      {job.kind_descriptor?.description?.trim() && (
-        <p className="max-w-3xl text-sm text-muted-fg">
-          {job.kind_descriptor.description}
-        </p>
-      )}
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/jobs"], href: "/jobs" }]}
+        crumbLabel={`#${job.id}`}
+        title={<>Job #{job.id} &mdash; {jobKindLabel(job)}</>}
+        status={
+          <>
+            {job.kind_descriptor?.display_name?.trim() && (
+              <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
+            )}
+            <StateBadge state={job.state} />
+          </>
+        }
+        description={job.kind_descriptor?.description?.trim() || undefined}
+      />
+      <JobStateSummary job={job} />
 
       {/* Actions */}
       <div className="flex flex-wrap items-center gap-2">
         {canRetry && (
-          <Button
+          <AdminButton
             intent={job.state === "waiting_external" ? "outline" : "primary"}
             size="sm"
-            onPress={() =>
-              job.state === "waiting_external"
-                ? setConfirmRetryWaiting(true)
-                : retryMutation.mutate()
-            }
-            isDisabled={readOnly || retryMutation.isPending}
+            onPress={() => confirm("retry")}
+            isDisabled={retryMutation.isPending}
           >
-            {job.state === "waiting_external" ? "Restart…" : "Retry"}
-          </Button>
+            {job.state === "waiting_external" ? "Restart…" : "Retry…"}
+          </AdminButton>
         )}
         {canCancel && (
-          <Button
+          <AdminButton
             intent="outline"
             size="sm"
             className="text-danger"
-            onPress={() => cancelMutation.mutate()}
-            isDisabled={readOnly || cancelMutation.isPending}
+            onPress={() => confirm("cancel")}
+            isDisabled={cancelMutation.isPending}
           >
-            Cancel
-          </Button>
+            Cancel…
+          </AdminButton>
         )}
         {job.state === "retryable" && (
           <span className="text-sm text-muted-fg" data-testid="retryable-hint">
             Retries automatically{" "}
-            {new Date(job.run_at).getTime() > Date.now() ? timeUntil(job.run_at) : "shortly"}.
+            {new Date(job.run_at).getTime() > Date.now() ? <Time value={job.run_at} format="relative" /> : "shortly"}.
             Manual retry is for failed or cancelled jobs.
           </span>
         )}
       </div>
 
-      <ConfirmDialog
-        isOpen={confirmRetryWaiting}
-        onOpenChange={setConfirmRetryWaiting}
-        title={`Restart job #${job.id}?`}
-        description="This job is waiting for an external callback. Restarting runs it again from the first attempt and discards the pending callback, so work the handler already started (a payment, an email, a request) may happen twice. To finish it instead, resolve the callback; to stop it, cancel it."
-        confirmLabel="Restart job"
-        onConfirm={() => retryMutation.mutate()}
-        isPending={retryMutation.isPending}
+      <ConfirmAction
+        isOpen={confirming !== null}
+        onOpenChange={(open) => !open && setConfirming(null)}
+        tier={1}
+        {...jobActionCopy(job, lastConfirming)}
+        onConfirm={() => (lastConfirming === "retry" ? retryMutation.mutateAsync() : cancelMutation.mutateAsync())}
       />
 
-      {/* Properties */}
+      {/* Properties: where the job stands first, what it is next, who owns it last */}
       <DescriptionList>
+        <DescriptionTerm>Attempt</DescriptionTerm>
+        <DescriptionDetails>
+          {job.attempt} / {job.max_attempts}
+        </DescriptionDetails>
+
+        {job.attempted_at && (
+          <>
+            <DescriptionTerm>Last attempt</DescriptionTerm>
+            <DescriptionDetails>
+              <Time value={job.attempted_at} />
+            </DescriptionDetails>
+          </>
+        )}
+
+        {job.finalized_at && (
+          <>
+            <DescriptionTerm>Finalized</DescriptionTerm>
+            <DescriptionDetails>
+              <Time value={job.finalized_at} />
+            </DescriptionDetails>
+          </>
+        )}
+
         <DescriptionTerm>Queue</DescriptionTerm>
         <DescriptionDetails>
-          <Link
-            to="/queues/$name"
-            params={{ name: job.queue }}
-            className="text-primary no-underline hover:underline"
-          >
-            {queueLabel(job)}
-          </Link>
+          <QueueLink queue={job.queue} descriptor={job.queue_descriptor} />
           {job.queue_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.queue}</span>
           )}
@@ -228,11 +249,21 @@ export function JobDetailPage() {
 
         <DescriptionTerm>Kind</DescriptionTerm>
         <DescriptionDetails>
-          {jobKindLabel(job)}
+          <KindLink kind={job.kind} descriptor={job.kind_descriptor} />
           {job.kind_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.kind}</span>
           )}
         </DescriptionDetails>
+
+        {cronOrigin && (
+          <>
+            <DescriptionTerm>Created by</DescriptionTerm>
+            <DescriptionDetails data-testid="job-cron-origin">
+              Schedule <ScheduleLink name={cronOrigin.name} />
+              {cronOrigin.manual && <span className="text-muted-fg"> (manual trigger)</span>}
+            </DescriptionDetails>
+          </>
+        )}
 
         <DescriptionTerm>Priority</DescriptionTerm>
         <DescriptionDetails>
@@ -242,33 +273,10 @@ export function JobDetailPage() {
           )}
         </DescriptionDetails>
 
-        <DescriptionTerm>Attempt</DescriptionTerm>
-        <DescriptionDetails>
-          {job.attempt} / {job.max_attempts}
-        </DescriptionDetails>
-
         <DescriptionTerm>Created</DescriptionTerm>
         <DescriptionDetails>
-          {new Date(job.created_at).toLocaleString()}
+          <Time value={job.created_at} />
         </DescriptionDetails>
-
-        {job.attempted_at && (
-          <>
-            <DescriptionTerm>Last attempt</DescriptionTerm>
-            <DescriptionDetails>
-              {new Date(job.attempted_at).toLocaleString()}
-            </DescriptionDetails>
-          </>
-        )}
-
-        {job.finalized_at && (
-          <>
-            <DescriptionTerm>Finalized</DescriptionTerm>
-            <DescriptionDetails>
-              {new Date(job.finalized_at).toLocaleString()}
-            </DescriptionDetails>
-          </>
-        )}
 
         {job.tags.length > 0 && (
           <>
@@ -276,9 +284,7 @@ export function JobDetailPage() {
             <DescriptionDetails>
               <div className="flex flex-wrap gap-1">
                 {job.tags.map((tag) => (
-                  <Badge key={tag} intent="secondary">
-                    {tag}
-                  </Badge>
+                  <TagChip key={tag} tag={tag} />
                 ))}
               </div>
             </DescriptionDetails>
@@ -308,6 +314,34 @@ export function JobDetailPage() {
           </>
         )}
       </DescriptionList>
+
+      <details className="rounded-lg border px-4 py-2 text-sm" data-testid="job-technical">
+        <summary className="cursor-pointer text-muted-fg">Technical details</summary>
+        <DescriptionList className="mt-2">
+          {job.run_lease != null && (
+            <>
+              <DescriptionTerm>Attempt lease</DescriptionTerm>
+              <DescriptionDetails className="font-mono">#{job.run_lease}</DescriptionDetails>
+            </>
+          )}
+          <DescriptionTerm>Run at</DescriptionTerm>
+          <DescriptionDetails><Time value={job.run_at} /></DescriptionDetails>
+          <DescriptionTerm>Heartbeat</DescriptionTerm>
+          <DescriptionDetails><Time value={job.heartbeat_at} fallback="None" /></DescriptionDetails>
+          <DescriptionTerm>Deadline</DescriptionTerm>
+          <DescriptionDetails><Time value={job.deadline_at} fallback="None" /></DescriptionDetails>
+        </DescriptionList>
+      </details>
+
+      <ErrorBlock
+        errors={job.errors}
+        jobState={job.state}
+        lastAttempt={
+          // A cancel can land while the job waits for a retry, so only a
+          // failed job's finalized_at is known to end its last attempt.
+          job.state === "failed" ? { startedAt: job.attempted_at, finishedAt: job.finalized_at } : undefined
+        }
+      />
 
       {/* Timeline */}
       <Card>
@@ -357,7 +391,7 @@ export function JobDetailPage() {
                 <>
                   <DescriptionTerm>Timeout</DescriptionTerm>
                   <DescriptionDetails>
-                    {new Date(job.callback_timeout_at).toLocaleString()}
+                    <Time value={job.callback_timeout_at} />
                     {job.state === "waiting_external" &&
                       new Date(job.callback_timeout_at) < new Date() && (
                         <Badge intent="danger" className="ml-2">
@@ -469,25 +503,6 @@ export function JobDetailPage() {
         </Card>
       )}
 
-      {/* Errors */}
-      {job.errors && job.errors.length > 0 && (
-        <Card>
-          <CardHeader
-            title={`Errors (${job.errors.length})`}
-            className="text-danger"
-          />
-          <CardContent className="space-y-2">
-            {[...job.errors].reverse().map((err, i) => (
-              <div
-                key={i}
-                className="rounded-md border-l-[3px] border-danger bg-danger-subtle p-1"
-              >
-                <JsonView data={err} />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      )}
-    </div>
+    </Page>
   );
 }

@@ -1,82 +1,118 @@
 import { test, expect } from "@playwright/test";
 
+const NAV: { testId: string; label: string; url: RegExp; heading: string }[] = [
+  { testId: "nav-jobs", label: "Jobs", url: /\/jobs$/, heading: "Jobs" },
+  { testId: "nav-dlq", label: "Dead letters", url: /\/dlq$/, heading: "Dead letters" },
+  { testId: "nav-queues", label: "Queues", url: /\/queues$/, heading: "Queues" },
+  { testId: "nav-kinds", label: "Job kinds", url: /\/kinds$/, heading: "Job kinds" },
+  { testId: "nav-cron", label: "Schedules", url: /\/cron$/, heading: "Schedules" },
+  { testId: "nav-runtime", label: "Fleet", url: /\/runtime$/, heading: "Fleet" },
+  { testId: "nav-batch-ops", label: "Bulk operations", url: /\/batch-ops$/, heading: "Bulk operations" },
+  { testId: "nav-overview", label: "Overview", url: /\/$/, heading: "Overview" },
+];
+
 test.describe("Shell navigation", () => {
-  test("all nav links work: Dashboard, Jobs, Kinds, Queues, Runtime, Cron", async ({
-    page,
-  }) => {
+  test("the sidebar groups pages under Investigate, Configure and Operate", async ({ page }) => {
     await page.goto("/");
-
-    // Scope link lookups to the sidebar so we don't match content links.
-    const nav = page.locator('[data-slot="sidebar-section"]').first();
-
-    // Click Jobs nav link
-    await nav.getByRole("link", { name: "Jobs" }).click();
-    await expect(page).toHaveURL(/\/jobs/);
-    await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible();
-
-    // Click Kinds nav link
-    await nav.getByRole("link", { name: "Kinds" }).click();
-    await expect(page).toHaveURL(/\/kinds/);
-    await expect(page.getByRole("heading", { name: "Job Kinds" })).toBeVisible();
-
-    // Click Queues nav link
-    await nav.getByRole("link", { name: "Queues" }).click();
-    await expect(page).toHaveURL(/\/queues/);
-    await expect(page.getByRole("heading", { name: "Queues" })).toBeVisible();
-
-    // Click Runtime nav link
-    await nav.getByRole("link", { name: "Runtime" }).click();
-    await expect(page).toHaveURL(/\/runtime/);
-    await expect(page.getByRole("heading", { name: "Runtime" })).toBeVisible();
-
-    // Click Cron nav link (use exact match to avoid matching queue names like "cron_...")
-    await nav.getByRole("link", { name: "Cron", exact: true }).click();
-    await expect(page).toHaveURL(/\/cron/);
-    await expect(
-      page.getByRole("heading", { name: "Cron Schedules" })
-    ).toBeVisible();
-
-    // Click Dashboard nav link
-    await nav.getByRole("link", { name: "Dashboard" }).click();
-    await expect(page).toHaveURL(/\/$/);
-    await expect(
-      page.getByRole("heading", { name: "Dashboard" })
-    ).toBeVisible();
+    const nav = page.getByRole("navigation", { name: "Primary" });
+    for (const group of ["Investigate", "Configure", "Operate"]) {
+      await expect(nav.getByText(group, { exact: true })).toBeVisible();
+    }
   });
 
-  test("logo links to dashboard", async ({ page }) => {
+  test("all nav links work", async ({ page }) => {
+    await page.goto("/");
+    const nav = page.getByRole("navigation", { name: "Primary" });
+    for (const item of NAV) {
+      const link = nav.getByTestId(item.testId);
+      await expect(link).toContainText(item.label);
+      await link.click();
+      await expect(page).toHaveURL(item.url);
+      await expect(page.getByRole("heading", { level: 1, name: item.heading, exact: true })).toBeVisible();
+    }
+  });
+
+  test("logo links to the overview", async ({ page }) => {
     await page.goto("/jobs");
 
-    // The logo is wrapped in an <a> with href="/". There are two (desktop + mobile),
-    // so use .first() to target the desktop navbar version.
     const logoLink = page.locator('a[href="/"]').filter({ hasText: "AWA" }).first();
     await expect(logoLink).toBeVisible();
 
     await logoLink.click();
     await expect(page).toHaveURL(/\/$/);
-    await expect(
-      page.getByRole("heading", { name: "Dashboard" })
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   });
 
   test("current page is highlighted in nav", async ({ page }) => {
-    // Go to Jobs page
     await page.goto("/jobs");
+    const nav = page.getByRole("navigation", { name: "Primary" });
 
-    // The Jobs nav item should be marked as current
-    const jobsLink = page.getByRole("link", { name: "Jobs" }).first();
-    await expect(jobsLink).toHaveAttribute("aria-current", "page");
+    await expect(nav.getByTestId("nav-jobs")).toHaveAttribute("aria-current", "page");
+    await expect(nav.getByTestId("nav-overview")).not.toHaveAttribute("aria-current", "page");
 
-    // Dashboard should NOT be marked as current
-    const dashboardLink = page
-      .getByRole("link", { name: "Dashboard" })
-      .first();
-    await expect(dashboardLink).not.toHaveAttribute("aria-current", "page");
+    await nav.getByTestId("nav-queues").click();
+    await expect(nav.getByTestId("nav-queues")).toHaveAttribute("aria-current", "page");
+  });
 
-    // Navigate to Queues and verify
-    await page.getByRole("link", { name: "Queues" }).click();
-    const queuesLink = page.getByRole("link", { name: "Queues" }).first();
-    await expect(queuesLink).toHaveAttribute("aria-current", "page");
+  test("Dead letters badge shows the depth and hides on error", async ({ page }) => {
+    let fail = false;
+    await page.route("**/api/dlq/depth", (route) =>
+      fail
+        ? route.fulfill({ status: 500, json: { error: "boom" } })
+        : route.fulfill({ json: { total: 1234, by_queue: [{ queue: "e2e_dlq", count: 1234 }] } })
+    );
+    await page.goto("/jobs");
+    const badge = page.getByTestId("nav-dlq").locator('[data-slot="sidebar-badge"]');
+    await expect(badge).toHaveText((1234).toLocaleString("en-US"));
+
+    fail = true;
+    await page.reload();
+    await expect(page.getByTestId("nav-dlq")).toBeVisible();
+    await expect(page.getByTestId("nav-dlq").locator('[data-slot="sidebar-badge"]')).toHaveCount(0);
+  });
+
+  test("Bulk operations badge counts only active operations", async ({ page }) => {
+    const op = (id: string, state: string) => ({
+      id, op_kind: "retry", filter: { kind: "e2e_job" }, spec: {}, state, submitted_by: "ui",
+      submitted_at: new Date().toISOString(), started_at: null, finalized_at: null, cursor: null,
+      total_matched: 10, processed: 0, skipped: 0, errored: 0, last_error: null,
+      runner_instance: null, retention_until: null, updated_at: new Date().toISOString(),
+    });
+    await page.route("**/api/batch-ops?*", (route) =>
+      route.fulfill({
+        json: [
+          op("11111111-1111-4111-8111-111111111111", "running"),
+          op("22222222-2222-4222-8222-222222222222", "pending"),
+          op("33333333-3333-4333-8333-333333333333", "completed"),
+        ],
+      })
+    );
+    await page.goto("/jobs");
+    await expect(page.getByTestId("nav-batch-ops").locator('[data-slot="sidebar-badge"]')).toHaveText("2");
+  });
+  test("Fleet badge counts unhealthy live instances, not stale ones", async ({ page }) => {
+    const instance = (id: string, stale: boolean, healthy: boolean) => ({
+      instance_id: id, hostname: "host", pid: 1, version: "0.7.0", storage_capability: "queue_storage",
+      started_at: new Date().toISOString(), last_seen_at: new Date().toISOString(), snapshot_interval_ms: 10000,
+      stale, healthy, postgres_connected: true, poll_loop_alive: healthy, heartbeat_alive: true,
+      maintenance_alive: true, shutting_down: false, leader: false, global_max_workers: null,
+      queues: [], queue_descriptor_hashes: {}, job_kind_descriptor_hashes: {},
+    });
+    await page.route("**/api/runtime", (route) =>
+      route.fulfill({
+        json: {
+          total_instances: 4, live_instances: 3, stale_instances: 1, healthy_instances: 2, leader_instances: 1,
+          instances: [
+            instance("a", false, true),
+            instance("b", false, true),
+            instance("c", false, false),
+            instance("d", true, false),
+          ],
+        },
+      })
+    );
+    await page.goto("/jobs");
+    await expect(page.getByTestId("nav-runtime").locator('[data-slot="sidebar-badge"]')).toHaveText("1");
   });
 });
 

@@ -1,6 +1,6 @@
-import { refreshAll, getReadStatus, subscribeReadStatus, observationPolicy } from "@/lib/observation/coordinator";
+import { refreshAll } from "@/lib/observation/coordinator";
 import { useManagedQuery } from "@/hooks/use-managed-query";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useState } from "react";
 import { Outlet, useRouter, useRouterState, useNavigate } from "@tanstack/react-router";
 import { isExternalHref } from "@/lib/base-path";
 import {
@@ -9,6 +9,7 @@ import {
 } from "react-aria-components";
 import { useIsFetching, useQuery } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
+import { useTimeZone } from "@/hooks/use-time-zone";
 import {
   fetchCapabilities,
   fetchRuntime,
@@ -22,6 +23,10 @@ import {
   normalizeInstanceColor,
 } from "@/lib/instance";
 import { Button } from "@/components/ui/button";
+import { CommandPalette } from "@/components/CommandPalette";
+import { DimWhenUnreachable, FreshnessPill } from "@/components/FreshnessPill";
+import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
+import { ACTIVE_BATCH_STATES, batchOpsQuery, dlqDepthQuery } from "@/lib/shared-queries";
 import {
   Sidebar,
   SidebarContent,
@@ -148,6 +153,22 @@ function ThemeToggle() {
   );
 }
 
+/** Switches every timestamp between the browser's zone and UTC. */
+function TimeZoneToggle() {
+  const [tz, setTz] = useTimeZone();
+  return (
+    <Button
+      intent="plain"
+      size="sm"
+      aria-label={tz === "UTC" ? "Times in UTC; show local time" : "Times in local time; show UTC"}
+      onPress={() => setTz(tz === "UTC" ? "local" : "UTC")}
+      className="px-2 text-xs font-medium tabular-nums"
+    >
+      {tz === "UTC" ? "UTC" : "Local"}
+    </Button>
+  );
+}
+
 /** Refresh button with live indicator — click to force refresh all queries */
 function RefreshControl() {
   const isFetching = useIsFetching();
@@ -175,10 +196,7 @@ function RefreshControl() {
       </svg>
       {/* Live indicator dot */}
       {fetching && (
-        <span className="absolute -right-0.5 -top-0.5 flex size-2">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-50" />
-          <span className="relative inline-flex size-2 rounded-full bg-primary" />
-        </span>
+        <span className="absolute -right-0.5 -top-0.5 inline-flex size-2 rounded-full bg-primary" />
       )}
     </Button>
   );
@@ -282,10 +300,7 @@ function ClusterStatusChip({
   const workerLabel = `${summary.liveCount} live ${summary.liveCount === 1 ? "worker" : "workers"}`;
   return (
     <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs">
-      <span className="relative flex size-2">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
-        <span className="relative inline-flex size-2 rounded-full bg-primary" />
-      </span>
+      <span className="inline-flex size-2 shrink-0 rounded-full bg-primary" aria-hidden="true" />
       <span className="flex flex-col">
         <span className="font-medium text-fg">{workerLabel}</span>
         {summary.engineLabel && (
@@ -350,16 +365,42 @@ const IconBatchOps = () => (
   </svg>
 );
 
-const NAV_ITEMS = [
-  { to: "/", label: "Dashboard", Icon: IconDashboard },
-  { to: "/jobs", label: "Jobs", Icon: IconJobs },
-  { to: "/dlq", label: "Dead letters", Icon: IconDeadLetters },
-  { to: "/kinds", label: "Kinds", Icon: IconKinds },
-  { to: "/queues", label: "Queues", Icon: IconQueues },
-  { to: "/runtime", label: "Runtime", Icon: IconRuntime },
-  { to: "/cron", label: "Cron", Icon: IconCron },
-  { to: "/batch-ops", label: "Batch Ops", Icon: IconBatchOps },
-] as const;
+interface NavItem {
+  to: "/" | ListRoute;
+  label: string;
+  Icon: () => React.JSX.Element;
+}
+
+const NAV_GROUPS: { label?: string; items: NavItem[] }[] = [
+  { items: [{ to: "/", label: "Overview", Icon: IconDashboard }] },
+  {
+    label: "Investigate",
+    items: [
+      { to: "/jobs", label: SECTION_LABELS["/jobs"], Icon: IconJobs },
+      { to: "/dlq", label: SECTION_LABELS["/dlq"], Icon: IconDeadLetters },
+    ],
+  },
+  {
+    label: "Configure",
+    items: [
+      { to: "/queues", label: SECTION_LABELS["/queues"], Icon: IconQueues },
+      { to: "/kinds", label: SECTION_LABELS["/kinds"], Icon: IconKinds },
+      { to: "/cron", label: SECTION_LABELS["/cron"], Icon: IconCron },
+    ],
+  },
+  {
+    label: "Operate",
+    items: [
+      { to: "/runtime", label: SECTION_LABELS["/runtime"], Icon: IconRuntime },
+      { to: "/batch-ops", label: SECTION_LABELS["/batch-ops"], Icon: IconBatchOps },
+    ],
+  },
+];
+
+/** A count for a nav badge, or undefined to show none (zero or unknown). */
+function badgeCount(value: number | undefined): string | undefined {
+  return value !== undefined && value > 0 ? value.toLocaleString() : undefined;
+}
 
 export function Shell() {
   const router = useRouter();
@@ -381,7 +422,6 @@ export function Shell() {
     enabled: false, refetchOnWindowFocus: false, refetchOnReconnect: false, retry: false,
     staleTime: 60_000,
   });
-  const readStatus = useSyncExternalStore(subscribeReadStatus, getReadStatus, getReadStatus);
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
   // Instance identity (#437): the UI is single-backend by design; when the
@@ -417,6 +457,20 @@ export function Shell() {
     retry: false,
   });
 
+  // Nav badges. Each shares its key with the page that lists the same data,
+  // and shows nothing on error or zero rather than a misleading count.
+  const dlqDepth = useManagedQuery(dlqDepthQuery);
+  const batchOps = useManagedQuery(batchOpsQuery);
+  const navBadges: Partial<Record<NavItem["to"], string>> = {
+    "/dlq": dlqDepth.isError ? undefined : badgeCount(dlqDepth.data?.total),
+    "/runtime": runtimeQuery.isError
+      ? undefined
+      : badgeCount(runtimeQuery.data && runtimeQuery.data.live_instances - runtimeQuery.data.healthy_instances),
+    "/batch-ops": batchOps.isError
+      ? undefined
+      : badgeCount(batchOps.data?.filter((op) => ACTIVE_BATCH_STATES.has(op.state)).length),
+  };
+
   function isActive(to: string): boolean {
     if (to === "/") return currentPath === "/";
     return currentPath.startsWith(to);
@@ -434,6 +488,16 @@ export function Shell() {
       onOpenChange={setSidebarOpen}
       style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}
     >
+      <a
+        href="#content"
+        className="sr-only z-50 rounded-md bg-bg px-3 py-2 text-sm font-medium text-fg shadow focus:not-sr-only focus:fixed focus:left-2 focus:top-2"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById("content")?.focus();
+        }}
+      >
+        Skip to content
+      </a>
       <CloseMobileOnNavigate path={currentPath} />
       <Sidebar collapsible="dock">
         <SidebarHeader>
@@ -448,19 +512,25 @@ export function Shell() {
           </AriaLink>
         </SidebarHeader>
         <SidebarContent>
-          <SidebarSection title="Navigation">
-            {NAV_ITEMS.map((item) => (
-              <SidebarItem
-                key={item.to}
-                href={item.to}
-                isCurrent={isActive(item.to)}
-                tooltip={item.label}
-              >
-                <item.Icon />
-                <SidebarLabel>{item.label}</SidebarLabel>
-              </SidebarItem>
+          <nav aria-label="Primary">
+            {NAV_GROUPS.map((group, index) => (
+              <SidebarSection key={group.label ?? index} {...(group.label ? { label: group.label } : {})}>
+                {group.items.map((item) => (
+                  <SidebarItem
+                    key={item.to}
+                    href={item.to}
+                    isCurrent={isActive(item.to)}
+                    tooltip={item.label}
+                    badge={navBadges[item.to]}
+                    data-testid={`nav-${item.to === "/" ? "overview" : item.to.slice(1)}`}
+                  >
+                    <item.Icon />
+                    <SidebarLabel>{item.label}</SidebarLabel>
+                  </SidebarItem>
+                ))}
+              </SidebarSection>
             ))}
-          </SidebarSection>
+          </nav>
         </SidebarContent>
         <SidebarFooter>
           <div className="group-data-[collapsible=dock]:hidden">
@@ -514,20 +584,23 @@ export function Shell() {
           )}
           <div className="flex-1" />
           <div className="flex items-center gap-1">
+            <FreshnessPill />
+            <CommandPalette />
             <RefreshControl />
+            <TimeZoneToggle />
             <ThemeToggle />
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-          <div className="text-xs text-muted-fg">Polling; scheduled reconciliation maximum: {observationPolicy.reconcileMaxMs / 1000}s.</div>
-          {readStatus && <div role="status" className="text-sm text-muted-fg">{readStatus}</div>}
+        <main id="content" tabIndex={-1} className="w-full px-4 py-6 outline-none sm:px-6 lg:px-8">
           {showReadOnlyBanner && (
             <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-subtle-fg">
               Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
             </div>
           )}
-          <Outlet />
+          <DimWhenUnreachable>
+            <Outlet />
+          </DimWhenUnreachable>
         </main>
       </SidebarInset>
     </SidebarProvider>

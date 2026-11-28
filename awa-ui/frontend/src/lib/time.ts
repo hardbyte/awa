@@ -48,6 +48,7 @@ export function durationSince(dateStr: string, nowMs: number = Date.now()): stri
  * the next non-zero one: "45s", "25m 25s", "2h 14m", "3d 4h".
  */
 export function formatDuration(seconds: number): string {
+  if (seconds > 0 && seconds < 1) return "<1s";
   const totalSeconds = Math.max(0, Math.floor(seconds));
   if (totalSeconds < 60) return `${totalSeconds}s`;
   const totalMinutes = Math.floor(totalSeconds / 60);
@@ -64,6 +65,57 @@ export function formatDuration(seconds: number): string {
   const hours = totalHours % 24;
   return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
 }
+
+/** Compact duration between two timestamps, "—" when either is missing. */
+export function durationBetween(
+  start: string | null | undefined,
+  end: string | null | undefined
+): string {
+  if (!start || !end) return "—";
+  const startMs = new Date(start).getTime();
+  const endMs = new Date(end).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return "—";
+  return formatDuration((endMs - startMs) / 1000);
+}
+
+/** "3m ago" for the past, "in 3m" for the future. */
+export function formatRelative(dateStr: string, nowMs: number = Date.now()): string {
+  const deltaSeconds = (new Date(dateStr).getTime() - nowMs) / 1000;
+  if (!Number.isFinite(deltaSeconds)) return "—";
+  if (Math.abs(deltaSeconds) < 1) return "just now";
+  const amount = formatDuration(Math.abs(deltaSeconds)).split(" ")[0];
+  return deltaSeconds < 0 ? `${amount} ago` : `in ${amount}`;
+}
+
+/** "local" follows the browser; anything else is an IANA zone such as "UTC". */
+export type TimeZonePreference = "local" | "UTC";
+
+/**
+ * A full timestamp with its zone, e.g. "28 Nov 2026, 14:03:05 UTC". `tz` is
+ * "local", "UTC" or any IANA zone name.
+ */
+export function formatAbsolute(dateStr: string, tz: string = "local"): string {
+  const date = new Date(dateStr);
+  if (!Number.isFinite(date.getTime())) return "—";
+  const options: Intl.DateTimeFormatOptions = {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  };
+  try {
+    return date.toLocaleString(undefined, tz === "local" ? options : { ...options, timeZone: tz });
+  } catch {
+    return date.toLocaleString(undefined, options);
+  }
+}
+
+/** Shown relative within this window, absolute beyond it. */
+export const RELATIVE_WINDOW_MS = 24 * 3600_000;
 
 /** Format a UTC timestamp in a specific IANA timezone */
 export function formatInTimezone(dateStr: string, timezone: string): string {

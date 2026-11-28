@@ -1,17 +1,18 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useParams, useNavigate, Link } from "@tanstack/react-router";
+import { useParams, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { fetchDlqJob, retryDlqJob, purgeDlqJob } from "@/lib/api";
 import type { DlqRow } from "@/lib/api";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
-import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import { Heading } from "@/components/ui/heading";
-import { Button } from "@/components/ui/button";
+import { Page, PageHeader } from "@/components/Page";
+import { KindLink, QueueLink, TagChip } from "@/components/links";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import {
@@ -21,16 +22,23 @@ import {
 } from "@/components/ui/description-list";
 import { JsonView } from "@/components/JsonView";
 import { OutputCard } from "@/components/OutputCard";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { timeAgo } from "@/lib/time";
+import { ErrorBlock } from "@/components/ErrorBlock";
+import { JobStateSummary } from "@/components/JobStateSummary";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { AdminButton } from "@/components/AdminAction";
+import { jobStateMeta } from "@/lib/states";
 
 export function DlqDetailPage() {
   const { id } = useParams({ strict: false });
   const jobId = Number(id);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const readOnly = useReadOnly();
-  const [showPurge, setShowPurge] = useState(false);
+  const [confirming, setConfirming] = useState<"retry" | "purge" | null>(null);
+  const [lastConfirming, setLastConfirming] = useState<"retry" | "purge">("retry");
+  const confirm = (action: "retry" | "purge") => {
+    setLastConfirming(action);
+    setConfirming(action);
+  };
 
   const rowQuery = useManagedQuery<DlqRow | null>({
     queryKey: ["dlq-job", jobId],
@@ -45,14 +53,13 @@ export function DlqDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       if (revived) {
-        toast.success(`Retried — job now ${revived.state}`);
+        toast.success(`Dead letter #${jobId} retried; job now ${jobStateMeta(revived.state).label.toLowerCase()}`);
         void navigate({ to: "/jobs/$id", params: { id: String(revived.id) } });
       } else {
-        toast.info("DLQ row was already gone");
+        toast.info(`Dead letter #${jobId} was already gone`);
         void navigate({ to: "/dlq" });
       }
     },
-    onError: () => toast.error("Failed to retry from DLQ"),
   });
 
   const purgeMutation = useMutation({
@@ -60,10 +67,9 @@ export function DlqDetailPage() {
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: ["dlq"] });
       void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
-      toast.success(res.count > 0 ? "DLQ row purged" : "Already purged");
+      toast.success(res.count > 0 ? `Dead letter #${jobId} purged` : `Dead letter #${jobId} was already purged`);
       void navigate({ to: "/dlq" });
     },
-    onError: () => toast.error("Failed to purge DLQ row"),
   });
 
   if (rowQuery.isLoading) {
@@ -72,11 +78,11 @@ export function DlqDetailPage() {
   if (rowQuery.data === undefined && rowQuery.error && !isNotFoundError(rowQuery.error)) {
     return (
       <ResourceLoadError
-        noun={`DLQ row #${jobId}`}
+        noun={`dead letter #${jobId}`}
         error={rowQuery.error}
         onRetry={() => void rowQuery.refetch()}
         backTo="/dlq"
-        backLabel="Back to DLQ"
+        backLabel="Back to dead letters"
       />
     );
   }
@@ -84,60 +90,70 @@ export function DlqDetailPage() {
   if (!row) {
     return (
       <ResourceNotFound
-        title={`DLQ row #${jobId} not found`}
+        title={`Dead letter #${jobId} not found`}
         reason="This row may have been retried or purged."
         backTo="/dlq"
-        backLabel="Back to DLQ"
+        backLabel="Back to dead letters"
       />
     );
   }
 
   return (
-    <div className="space-y-4 p-4">
-      <div className="flex items-center justify-between gap-2">
-        <Heading>
-          <Link to="/dlq" className="text-muted-fg hover:underline">
-            DLQ
-          </Link>{" "}
-          / #{row.id}
-        </Heading>
-        {!readOnly && (
+    <Page width="readable" className="space-y-4">
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/dlq"], href: "/dlq" }]}
+        crumbLabel={`#${row.id}`}
+        title={`Dead letter #${row.id}`}
+        actions={
           <div className="flex gap-2">
-            <Button
-              size="xs"
-              onPress={() => retryMutation.mutate()}
-              isDisabled={retryMutation.isPending}
-            >
-              Retry
-            </Button>
-            <Button
+            <AdminButton size="sm" onPress={() => confirm("retry")} isDisabled={retryMutation.isPending}>
+              Retry…
+            </AdminButton>
+            <AdminButton
               intent="outline"
-              size="xs"
+              size="sm"
               className="text-danger"
-              onPress={() => setShowPurge(true)}
+              onPress={() => confirm("purge")}
               isDisabled={purgeMutation.isPending}
             >
-              Purge
-            </Button>
+              Purge…
+            </AdminButton>
           </div>
-        )}
-      </div>
+        }
+      />
+      <JobStateSummary job={{ ...row, state: "dead_lettered" }} />
 
       <Card>
         <CardHeader>
           <div className="flex gap-2">
-            <Badge intent="danger">dlq</Badge>
-            <Badge intent="secondary">{row.kind}</Badge>
-            <Badge intent="secondary">{row.queue}</Badge>
+            <Badge intent="danger">Dead-lettered</Badge>
           </div>
         </CardHeader>
         <CardContent>
           <DescriptionList>
+            <DescriptionTerm>Kind</DescriptionTerm>
+            <DescriptionDetails>
+              <KindLink kind={row.kind} descriptor={row.kind_descriptor} />
+            </DescriptionDetails>
+            <DescriptionTerm>Queue</DescriptionTerm>
+            <DescriptionDetails>
+              <QueueLink queue={row.queue} descriptor={row.queue_descriptor} />
+            </DescriptionDetails>
+            {row.tags.length > 0 && (
+              <>
+                <DescriptionTerm>Tags</DescriptionTerm>
+                <DescriptionDetails>
+                  <div className="flex flex-wrap gap-1">
+                    {row.tags.map((tag) => <TagChip key={tag} tag={tag} to="/dlq" />)}
+                  </div>
+                </DescriptionDetails>
+              </>
+            )}
             <DescriptionTerm>Reason</DescriptionTerm>
             <DescriptionDetails>{row.dlq_reason}</DescriptionDetails>
             <DescriptionTerm>DLQ'd</DescriptionTerm>
             <DescriptionDetails>
-              {new Date(row.dlq_at).toISOString()} ({timeAgo(row.dlq_at)})
+              <Time value={row.dlq_at} />
             </DescriptionDetails>
             <DescriptionTerm>Attempts</DescriptionTerm>
             <DescriptionDetails>
@@ -148,12 +164,12 @@ export function DlqDetailPage() {
               {row.original_run_lease}
             </DescriptionDetails>
             <DescriptionTerm>Created</DescriptionTerm>
-            <DescriptionDetails>{timeAgo(row.created_at)}</DescriptionDetails>
+            <DescriptionDetails><Time value={row.created_at} /></DescriptionDetails>
             {row.finalized_at && (
               <>
                 <DescriptionTerm>Finalized</DescriptionTerm>
                 <DescriptionDetails>
-                  {timeAgo(row.finalized_at)}
+                  <Time value={row.finalized_at} />
                 </DescriptionDetails>
               </>
             )}
@@ -171,14 +187,11 @@ export function DlqDetailPage() {
       {/* The dead-lettered attempt's output, if a failed attempt recorded one (ADR-048) */}
       <OutputCard output={row.output} errors={row.errors} />
 
-      {row.errors && row.errors.length > 0 && (
-        <Card>
-          <CardHeader>Error history ({row.errors.length})</CardHeader>
-          <CardContent>
-            <JsonView data={row.errors} />
-          </CardContent>
-        </Card>
-      )}
+      <ErrorBlock
+        errors={row.errors}
+        jobState="dead_lettered"
+        lastAttempt={{ startedAt: row.attempted_at, finishedAt: row.finalized_at }}
+      />
 
       {row.progress != null && (
         <Card>
@@ -189,15 +202,35 @@ export function DlqDetailPage() {
         </Card>
       )}
 
-      <ConfirmDialog
-        isOpen={showPurge}
-        onOpenChange={setShowPurge}
-        title="Purge DLQ row"
-        description={`Permanently delete DLQ row #${row.id}.`}
-        confirmLabel="Purge"
-        confirmIntent="danger"
-        onConfirm={() => purgeMutation.mutate()}
-      />
-    </div>
+      {lastConfirming === "retry" ? (
+        <ConfirmAction
+          isOpen={confirming === "retry"}
+          onOpenChange={(open) => !open && setConfirming(null)}
+          tier={1}
+          title={`Retry dead letter #${row.id}?`}
+          description={
+            <>
+              It was dead-lettered with the reason <q className="font-medium text-fg">{row.dlq_reason}</q>. Retrying
+              moves this {row.kind} job back to <code>{row.queue}</code> to run again, so its handler's side effects
+              happen again. Retry only once whatever that reason describes is fixed.
+            </>
+          }
+          confirmLabel={`Retry dead letter #${row.id}`}
+          onConfirm={() => retryMutation.mutateAsync()}
+        />
+      ) : (
+        <ConfirmAction
+          isOpen={confirming === "purge"}
+          onOpenChange={(open) => !open && setConfirming(null)}
+          tier={1}
+          intent="danger"
+          irreversible
+          title={`Purge dead letter #${row.id}?`}
+          description={`Deletes this ${row.kind} job and its arguments, errors and output for good.`}
+          confirmLabel={`Purge dead letter #${row.id}`}
+          onConfirm={() => purgeMutation.mutateAsync()}
+        />
+      )}
+    </Page>
   );
 }

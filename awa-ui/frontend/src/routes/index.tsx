@@ -1,534 +1,435 @@
-import { useManagedQuery } from "@/hooks/use-managed-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, type LinkProps } from "@tanstack/react-router";
 import {
-  fetchStats,
-  fetchQueues,
+  CheckCircleIcon,
+  ExclamationTriangleIcon,
+  InformationCircleIcon,
+  XCircleIcon,
+} from "@heroicons/react/16/solid";
+import { useManagedQuery } from "@/hooks/use-managed-query";
+import { useNow } from "@/hooks/use-now";
+import {
+  fetchCronJobs,
   fetchJobs,
+  fetchQueueRuntime,
+  fetchQueues,
   fetchRuntime,
+  fetchStats,
+  type CronJobRow,
+  type JobRow,
+  type QueueOverview,
+  type QueueRuntimeSummary,
+  type RuntimeOverview,
+  type StateCounts,
 } from "@/lib/api";
-import type {
-  StateCounts,
-  QueueStats,
-  JobRow,
-  RuntimeOverview,
-} from "@/lib/api";
-import { StateBadge } from "@/components/StateBadge";
-import { Heading } from "@/components/ui/heading";
+import {
+  attentionItems,
+  healthFigures,
+  liveFailedCount,
+  queuesNeedingAttention,
+  type AttentionItem,
+  type AttentionSeverity,
+} from "@/lib/attention";
+import { batchOpsQuery, dlqDepthQuery } from "@/lib/shared-queries";
+import {
+  OVERVIEW_FAILED_SAMPLE,
+  OVERVIEW_QUEUE_LIMIT,
+  OVERVIEW_RUNNING_SAMPLE,
+} from "@/lib/constants";
+import { formatDuration, formatRelative } from "@/lib/time";
+import { formatNumber, plural } from "@/lib/number";
+import { Page, PageHeader } from "@/components/Page";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Table,
-  TableHeader,
   TableBody,
-  TableRow,
   TableCell,
   TableColumn,
+  TableHeader,
+  TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { LagValue } from "@/components/LagValue";
-import { timeAgo } from "@/lib/time";
-import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
+import { QueueLink, entityLinkClass } from "@/components/links";
+import { Time } from "@/components/Time";
 
-/** Background tint per state for counter cards */
-const STATE_CARD_BG: Record<string, string> = {
-  available: "bg-info-subtle",
-  running: "bg-success-subtle",
-  failed: "bg-danger-subtle",
-  scheduled: "bg-secondary/50",
-  waiting_external: "bg-[oklch(0.87_0.07_280)]/30 dark:bg-[oklch(0.55_0.15_280)]/15",
+const FAILED_SAMPLE = { state: "failed", dead_lettered: false, limit: OVERVIEW_FAILED_SAMPLE } as const;
+const RUNNING_SAMPLE = { state: "running", limit: OVERVIEW_RUNNING_SAMPLE } as const;
+
+type Tone = "neutral" | "warning" | "danger";
+
+const TONE_FIGURE: Record<Tone, string> = {
+  neutral: "text-fg",
+  warning: "text-warning-subtle-fg",
+  danger: "text-danger-subtle-fg",
 };
 
-/** Headline metrics — includes deferred and callback-blocked work */
-const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_external"] as const;
+interface TileProps {
+  label: string;
+  /** The figure; undefined while loading. */
+  value: number | undefined;
+  error?: Error | null;
+  tone?: Tone;
+  link: LinkProps;
+  testId: string;
+  children?: React.ReactNode;
+}
+
+/** One figure of the health strip, linking to the jobs behind it. */
+function HealthTile({ label, value, error, tone = "neutral", link, testId, children }: TileProps) {
+  return (
+    <Link
+      {...link}
+      className="rounded-lg border bg-bg p-4 no-underline outline-hidden transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring"
+      data-testid={testId}
+    >
+      <div className="text-xs font-medium text-muted-fg">{label}</div>
+      <div
+        className={`mt-1 text-2xl font-semibold tabular-nums ${error ? "text-muted-fg" : TONE_FIGURE[tone]}`}
+        data-testid="tile-value"
+      >
+        {error ? (
+          <span className="inline-flex items-center gap-1.5" title={error.message}>
+            —
+            <ExclamationTriangleIcon className="size-4 text-warning-subtle-fg" aria-hidden="true" />
+          </span>
+        ) : value === undefined ? (
+          <span className="inline-block h-8 w-14 animate-pulse rounded bg-muted" aria-label="Loading" />
+        ) : (
+          formatNumber(value)
+        )}
+      </div>
+      <div className="mt-1 min-h-5 text-xs text-muted-fg">
+        {error ? <span role="alert">Failed to load: {error.message}</span> : children}
+      </div>
+    </Link>
+  );
+}
+
+const SEVERITY_ICON: Record<AttentionSeverity, { Icon: typeof XCircleIcon; className: string; label: string }> = {
+  action: { Icon: XCircleIcon, className: "text-danger-subtle-fg", label: "Needs action" },
+  warning: { Icon: ExclamationTriangleIcon, className: "text-warning-subtle-fg", label: "Warning" },
+  notice: { Icon: InformationCircleIcon, className: "text-muted-fg", label: "Notice" },
+};
+
+function AttentionRow({ item }: { item: AttentionItem }) {
+  const { Icon, className, label } = SEVERITY_ICON[item.severity];
+  return (
+    <li className="flex gap-3 px-(--gutter) py-3" data-testid="attention-item" data-severity={item.severity} data-id={item.id}>
+      <Icon className={`mt-1 size-4 shrink-0 ${className}`} aria-label={label} role="img" />
+      <div className="min-w-0">
+        <Link {...(item.target as LinkProps)} className={`${entityLinkClass} font-medium`}>
+          {item.title}
+        </Link>
+        {item.detail && (
+          <div className="truncate text-sm text-muted-fg" title={item.detail}>
+            {item.detail}
+          </div>
+        )}
+      </div>
+    </li>
+  );
+}
 
 export function DashboardPage() {
-  const navigate = useNavigate();
-
-  const statsQuery = useManagedQuery<StateCounts>({
-    queryKey: ["stats"],
-    queryFn: fetchStats,
+  const now = useNow();
+  const statsQuery = useManagedQuery<StateCounts>({ queryKey: ["stats"], queryFn: fetchStats });
+  const queuesQuery = useManagedQuery<QueueOverview[]>({ queryKey: ["queues"], queryFn: fetchQueues });
+  const queueRuntimeQuery = useManagedQuery<QueueRuntimeSummary[]>({
+    queryKey: ["queue-runtime"],
+    queryFn: fetchQueueRuntime,
   });
-
-  const queuesQuery = useManagedQuery<QueueStats[]>({
-    queryKey: ["queues"],
-    queryFn: fetchQueues,
-  });
-
+  const runtimeQuery = useManagedQuery<RuntimeOverview>({ queryKey: ["runtime"], queryFn: fetchRuntime });
+  const dlqQuery = useManagedQuery(dlqDepthQuery);
+  const batchQuery = useManagedQuery(batchOpsQuery);
+  const cronQuery = useManagedQuery<CronJobRow[]>({ queryKey: ["cron"], queryFn: fetchCronJobs });
   const failedQuery = useManagedQuery<JobRow[]>({
-    queryKey: ["jobs", { state: "failed", limit: 10 }],
-    queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
+    queryKey: ["jobs", FAILED_SAMPLE],
+    queryFn: () => fetchJobs(FAILED_SAMPLE),
+  });
+  const runningQuery = useManagedQuery<JobRow[]>({
+    queryKey: ["jobs", RUNNING_SAMPLE],
+    queryFn: () => fetchJobs(RUNNING_SAMPLE),
   });
 
-  const runtimeQuery = useManagedQuery<RuntimeOverview>({
-    queryKey: ["runtime"],
-    queryFn: fetchRuntime,
-  });
+  const input = {
+    now,
+    queues: queuesQuery.data,
+    queueRuntime: queueRuntimeQuery.data,
+    runtime: runtimeQuery.data,
+    dlqDepth: dlqQuery.data,
+    batchOps: batchQuery.data,
+    cron: cronQuery.data,
+    failedJobs: failedQuery.data,
+    runningJobs: runningQuery.data,
+  };
+  const figures = healthFigures(input);
+  const items = attentionItems(input);
+  const checks: [string, { isError: boolean; isLoading: boolean }][] = [
+    ["queues", queuesQuery],
+    ["queue configs", queueRuntimeQuery],
+    ["fleet", runtimeQuery],
+    ["dead letters", dlqQuery],
+    ["bulk operations", batchQuery],
+    ["schedules", cronQuery],
+    ["failed jobs", failedQuery],
+    ["running jobs", runningQuery],
+  ];
+  const failedChecks = checks.filter(([, q]) => q.isError).map(([name]) => name);
+  const loadingChecks = checks.some(([, q]) => q.isLoading);
+  const checkedAt = Math.max(queuesQuery.dataUpdatedAt, runtimeQuery.dataUpdatedAt, failedQuery.dataUpdatedAt);
 
-  const completedPerHour = queuesQuery.data
-    ? queuesQuery.data.reduce((sum, q) => sum + q.completed_last_hour, 0)
-    : null;
-
-  const totalJobs = statsQuery.data
-    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
-    : null;
-
-  // Sort queues by visible workload so deferred-heavy queues stay prominent.
+  const stats = statsQuery.data;
+  const runtime = runtimeQuery.data;
+  const leader = runtime?.instances.find((i) => i.leader && !i.stale);
+  const nextFire = (cronQuery.data ?? [])
+    .filter((c) => !c.paused_at && !c.retired_at && c.next_fire_at)
+    .map((c) => c.next_fire_at!)
+    .sort()[0];
   const topQueues = queuesQuery.data
-    ? [...queuesQuery.data]
-        .sort(
-          (a, b) => b.total_queued + b.failed - (a.total_queued + a.failed)
-        )
-        .slice(0, DASHBOARD_QUEUE_LIMIT)
+    ? queuesNeedingAttention(queuesQuery.data, dlqQuery.data, OVERVIEW_QUEUE_LIMIT)
     : [];
-
-  const hasMoreQueues =
-    queuesQuery.data && queuesQuery.data.length > DASHBOARD_QUEUE_LIMIT;
+  const statsError = statsQuery.isError ? statsQuery.error : null;
+  // Dead letters have their own tile, so the Failed tile counts the rest.
+  const liveFailed =
+    stats && dlqQuery.data ? liveFailedCount(stats.failed ?? 0, dlqQuery.data.total) : undefined;
 
   return (
-    <div className="space-y-6">
-      <Heading level={2}>Dashboard</Heading>
+    <Page>
+      <PageHeader title="Overview" />
 
-      {/* Headline counter cards */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        {COUNTER_KEYS.map((key) => {
-          const count = statsQuery.data?.[key];
-          const bg = STATE_CARD_BG[key] ?? "";
-          return (
-            <Link
-              key={key}
-              to="/jobs"
-              search={{ state: key }}
-              className="no-underline"
-            >
-              <Card
-                className={`text-center transition-colors hover:opacity-80 ${bg}`}
-              >
-                <CardContent className="py-4">
-                  <div className="text-3xl font-bold tabular-nums">
-                    {statsQuery.isLoading ? (
-                      <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
-                    ) : statsQuery.data ? (
-                      (count ?? 0).toLocaleString()
-                    ) : (
-                      <span className="text-muted-fg" aria-label="Count unavailable">—</span>
-                    )}
-                  </div>
-                  <div className="mt-1.5 flex items-center justify-center gap-2">
-                    <StateBadge state={key} />
-                  </div>
-                </CardContent>
-              </Card>
-            </Link>
-          );
-        })}
-        <Link to="/jobs" search={{ state: "completed" }} className="no-underline">
-          <Card className="bg-success-subtle/50 text-center transition-colors hover:opacity-80">
-            <CardContent className="py-4">
-              <div className="text-3xl font-bold tabular-nums">
-                {queuesQuery.isLoading ? (
-                  <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
-                ) : completedPerHour != null ? (
-                  completedPerHour.toLocaleString()
-                ) : (
-                  <span className="text-muted-fg" aria-label="Count unavailable">—</span>
-                )}
-              </div>
-              <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
-            </CardContent>
-          </Card>
-        </Link>
+      <section aria-label="Health" className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <HealthTile
+          label="Ready"
+          testId="tile-ready"
+          value={figures.ready ?? undefined}
+          error={queuesQuery.isError ? queuesQuery.error : null}
+          link={{ to: "/jobs", search: { state: "available" } }}
+        >
+          {figures.oldestReady
+            ? `oldest ${formatDuration(figures.oldestReady.seconds)} in ${figures.oldestReady.queue}`
+            : "nothing waiting"}
+          {figures.pausedReady && figures.pausedReady.jobs > 0 && (
+            <div>
+              +{formatNumber(figures.pausedReady.jobs)} held in {plural(figures.pausedReady.queues, "paused queue")}
+            </div>
+          )}
+        </HealthTile>
+        <HealthTile
+          label="Retrying"
+          testId="tile-retrying"
+          value={stats ? stats.retryable ?? 0 : undefined}
+          error={statsError}
+          link={{ to: "/jobs", search: { state: "retryable" } }}
+        >
+          {figures.topRetrying
+            ? `most in ${figures.topRetrying.queue} (${formatNumber(figures.topRetrying.count)})`
+            : "no retries pending"}
+        </HealthTile>
+        <HealthTile
+          label="Failed"
+          testId="tile-failed"
+          value={liveFailed}
+          error={statsError ?? (dlqQuery.isError ? dlqQuery.error : null)}
+          tone={(liveFailed ?? 0) > 0 ? "danger" : "neutral"}
+          link={{ to: "/jobs", search: { state: "failed", dead_lettered: false } }}
+        >
+          {figures.completedLastHour !== null &&
+            `${formatNumber(figures.completedLastHour)} completed in the last hour`}
+        </HealthTile>
+        <HealthTile
+          label="Dead letters"
+          testId="tile-dead-letters"
+          value={dlqQuery.data?.total}
+          error={dlqQuery.isError ? dlqQuery.error : null}
+          tone={(dlqQuery.data?.total ?? 0) > 0 ? "warning" : "neutral"}
+          link={{ to: "/dlq" }}
+        >
+          {figures.topDeadLetters
+            ? `most in ${figures.topDeadLetters.queue} (${formatNumber(figures.topDeadLetters.count)})`
+            : "none"}
+        </HealthTile>
+        <HealthTile
+          label="Stuck running"
+          testId="tile-stuck"
+          value={figures.stuck?.count}
+          error={runningQuery.isError ? runningQuery.error : null}
+          tone={(figures.stuck?.count ?? 0) > 0 ? "danger" : "neutral"}
+          link={{ to: "/jobs", search: { state: "running" } }}
+        >
+          {figures.stuck &&
+            (figures.stuck.sampled >= OVERVIEW_RUNNING_SAMPLE
+              ? `in the ${formatNumber(figures.stuck.sampled)} newest running jobs`
+              : `of ${plural(figures.stuck.sampled, "running job")}`)}
+        </HealthTile>
+        <HealthTile
+          label="Bulk operations"
+          testId="tile-bulk"
+          value={figures.activeBatchOps ?? undefined}
+          error={batchQuery.isError ? batchQuery.error : null}
+          link={{ to: "/batch-ops" }}
+        >
+          {figures.latestFailedBatchOp ? (
+            <span className="line-clamp-2 text-danger-subtle-fg" title={figures.latestFailedBatchOp.last_error ?? undefined}>
+              last failed: {figures.latestFailedBatchOp.last_error ?? "no error recorded"}
+            </span>
+          ) : (
+            "in flight"
+          )}
+        </HealthTile>
+      </section>
+
+      <div className="flex flex-col gap-1 text-sm text-muted-fg sm:flex-row sm:flex-wrap sm:gap-x-6">
+        <p data-testid="fleet-line">
+          <Link to="/runtime" className={entityLinkClass}>
+            Fleet
+          </Link>
+          :{" "}
+          {runtimeQuery.isError
+            ? "failed to load"
+            : runtime
+              ? [
+                  `${runtime.healthy_instances}/${runtime.live_instances} healthy`,
+                  leader ? `leader ${leader.hostname ?? `pid ${leader.pid}`}` : "no leader",
+                  runtime.stale_instances > 0 ? `${runtime.stale_instances} stale` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")
+              : "…"}
+        </p>
+        <p data-testid="deferred-line">
+          Not yet due:{" "}
+          {statsError
+            ? "failed to load"
+            : stats
+              ? [
+                  `${formatNumber(stats.scheduled ?? 0)} scheduled`,
+                  `${formatNumber(stats.waiting_external ?? 0)} waiting for callback`,
+                  nextFire ? `next schedule fires ${formatRelative(nextFire, now)}` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")
+              : "…"}
+        </p>
       </div>
 
-      {statsQuery.isError && (
-        <p className="text-sm text-danger-subtle-fg" role="alert" data-testid="stats-error">
-          Failed to load job counts: {statsQuery.error.message}
-        </p>
-      )}
+      <Card className="[--gutter:--spacing(4)] sm:[--gutter:--spacing(6)]">
+        <CardHeader title="Needs attention" description={items.length > 0 ? plural(items.length, "item") : undefined} />
+        <CardContent className="px-0">
+          {items.length > 0 ? (
+            <ul className="divide-y border-t" aria-label="Needs attention">
+              {items.map((item) => (
+                <AttentionRow key={item.id} item={item} />
+              ))}
+            </ul>
+          ) : loadingChecks ? (
+            <p className="px-(--gutter) text-sm text-muted-fg">Checking…</p>
+          ) : (
+            <p className="flex items-center gap-2 px-(--gutter) text-sm text-muted-fg" data-testid="attention-empty">
+              <CheckCircleIcon className="size-4 text-success" aria-hidden="true" />
+              <span>
+                Nothing needs attention
+                {checkedAt > 0 && (
+                  <>
+                    {" "}· checked <Time value={new Date(checkedAt).toISOString()} />
+                  </>
+                )}
+                {figures.stuck && figures.stuck.sampled >= OVERVIEW_RUNNING_SAMPLE && (
+                  <span className="block" data-testid="attention-stuck-sample">
+                    Stuck jobs were looked for among the {formatNumber(figures.stuck.sampled)} newest running jobs only.
+                  </span>
+                )}
+              </span>
+            </p>
+          )}
+          {failedChecks.length > 0 && (
+            <p
+              className="mt-3 px-(--gutter) text-sm text-warning-subtle-fg"
+              role="alert"
+              data-testid="attention-failed-checks"
+            >
+              Not checked because their reads failed: {failedChecks.join(", ")}.
+            </p>
+          )}
+        </CardContent>
+      </Card>
 
-      {/* Total jobs count */}
-      {totalJobs != null && (
-        <p className="text-sm text-muted-fg">
-          {totalJobs.toLocaleString()} total jobs across{" "}
-          {queuesQuery.data?.length ?? 0} queues
-        </p>
-      )}
-
-      <Card>
-        <CardHeader
-          title="Runtime"
-          description={
-            runtimeQuery.data && runtimeQuery.data.instances.length > 0
-              ? `${runtimeQuery.data.instances.length} instance(s) · snapshots every ${
-                  (runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 10000) >= 1000
-                    ? `${Math.round((runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 10000) / 1000)}s`
-                    : `${runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 0}ms`
-                }`
-              : "Worker instances, leader health, and current runtime topology"
-          }
-        >
+      <Card className="[--gutter:--spacing(4)] sm:[--gutter:--spacing(6)]">
+        <CardHeader title="Queues needing attention">
           <CardAction>
-            <Link to="/runtime" className="text-sm text-primary no-underline hover:underline">
-              Open runtime
+            <Link to="/queues" className={`${entityLinkClass} text-sm`}>
+              All queues →
             </Link>
           </CardAction>
         </CardHeader>
         <CardContent>
-          <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Live</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.live_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Healthy</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.healthy_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Leader</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.leader_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Stale</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.stale_instances ?? "—"}
-              </div>
-            </div>
-          </div>
-
-          {/* Mobile runtime cards */}
-          {(runtimeQuery.data?.instances.length ?? 0) === 0 ? (
-            <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
-            >
-              {runtimeQuery.isLoading
-                ? "Loading runtime…"
-                : runtimeQuery.isError
-                  ? "Failed to load runtime data."
-                  : "No runtime snapshots yet. Start a worker to populate this view."}
-            </div>
+          {queuesQuery.isError ? (
+            <p className="text-sm text-danger-subtle-fg" role="alert">
+              Failed to load queues: {queuesQuery.error.message}
+            </p>
+          ) : queuesQuery.isLoading ? (
+            <p className="text-sm text-muted-fg">Loading queues…</p>
+          ) : topQueues.length === 0 ? (
+            <p className="text-sm text-muted-fg" data-testid="queues-attention-empty">
+              No queue has failures, retries, dead letters or held work.
+            </p>
           ) : (
-            <div className="space-y-2 sm:hidden">
-              {runtimeQuery.data!.instances.map((instance) => {
-                const label = instance.hostname ?? `pid ${instance.pid}`;
-                const healthLabel = instance.stale
-                  ? "Stale"
-                  : instance.healthy
-                    ? "Healthy"
-                    : "Degraded";
-                const healthIntent = instance.stale
-                  ? ("warning" as const)
-                  : instance.healthy
-                    ? ("success" as const)
-                    : ("danger" as const);
-                return (
-                  <div key={instance.instance_id} className="rounded-lg border p-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <span className="font-medium">{label}</span>
-                        <span className="ml-2 text-xs text-muted-fg">
-                          {instance.version}
-                        </span>
-                      </div>
-                      <Badge intent={healthIntent}>{healthLabel}</Badge>
+            <>
+              <ul className="divide-y sm:hidden" aria-label="Queues needing attention">
+                {topQueues.map((q) => (
+                  <li key={q.queue} className="py-3">
+                    <div className="flex items-center gap-2">
+                      <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
+                      {q.paused && <Badge intent="warning">Paused</Badge>}
                     </div>
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      <Badge intent={instance.poll_loop_alive ? "success" : "danger"}>
-                        poll
-                      </Badge>
-                      <Badge intent={instance.heartbeat_alive ? "success" : "danger"}>
-                        hb
-                      </Badge>
-                      <Badge intent={instance.maintenance_alive ? "success" : "danger"}>
-                        maint
-                      </Badge>
-                      {instance.leader && (
-                        <Badge intent="primary">Leader</Badge>
-                      )}
+                    <div className="mt-1 text-sm text-muted-fg">
+                      {[
+                        q.available > 0 && `${formatNumber(q.available)} ready`,
+                        q.retryable > 0 && `${formatNumber(q.retryable)} retrying`,
+                        q.liveFailed > 0 && `${formatNumber(q.liveFailed)} failed`,
+                        (q.deadLetters ?? 0) > 0 && plural(q.deadLetters!, "dead letter"),
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
                     </div>
-                    <div className="mt-1 text-xs text-muted-fg">
-                      {instance.queues.length} queue(s) · seen {timeAgo(instance.last_seen_at)}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Desktop runtime table */}
-          <Table bleed aria-label="Runtime instances" className="hidden sm:block">
-            <TableHeader>
-              <TableColumn isRowHeader>Instance</TableColumn>
-              <TableColumn>Health</TableColumn>
-              <TableColumn>Loops</TableColumn>
-              <TableColumn>Role</TableColumn>
-              <TableColumn className="text-right">Queues</TableColumn>
-              <TableColumn>Seen</TableColumn>
-            </TableHeader>
-            <TableBody
-              renderEmptyState={() => (
-                <div className="p-6 text-center text-sm text-muted-fg">
-                  {runtimeQuery.isLoading
-                    ? "Loading runtime…"
-                    : runtimeQuery.isError
-                      ? "Failed to load runtime data."
-                      : "No runtime snapshots yet. Start a worker to populate this view."}
-                </div>
-              )}
-            >
-              {(runtimeQuery.data?.instances ?? []).map((instance) => {
-                  const label = instance.hostname ?? `pid ${instance.pid}`;
-                  const healthLabel = instance.stale
-                    ? "Stale"
-                    : instance.healthy
-                      ? "Healthy"
-                      : "Degraded";
-                  const healthIntent = instance.stale
-                    ? "warning"
-                    : instance.healthy
-                      ? "success"
-                      : "danger";
-                  return (
-                    <TableRow key={instance.instance_id} id={instance.instance_id}>
-                      <TableCell className="font-medium">
-                        <div>{label}</div>
-                        <div className="text-xs text-muted-fg">
-                          {instance.version} · pid {instance.pid}
-                        </div>
-                      </TableCell>
+                  </li>
+                ))}
+              </ul>
+              <Table bleed aria-label="Queues needing attention" className="hidden sm:block">
+                <TableHeader>
+                  <TableColumn isRowHeader>Queue</TableColumn>
+                  <TableColumn className="text-right">Ready</TableColumn>
+                  <TableColumn className="text-right">Oldest ready</TableColumn>
+                  <TableColumn className="text-right">Retrying</TableColumn>
+                  <TableColumn className="text-right">Failed</TableColumn>
+                  <TableColumn className="text-right">Dead letters</TableColumn>
+                </TableHeader>
+                <TableBody>
+                  {topQueues.map((q) => (
+                    <TableRow key={q.queue} id={q.queue}>
                       <TableCell>
-                        <Badge intent={healthIntent}>{healthLabel}</Badge>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-wrap gap-1">
-                          <Badge intent={instance.poll_loop_alive ? "success" : "danger"}>
-                            poll
-                          </Badge>
-                          <Badge intent={instance.heartbeat_alive ? "success" : "danger"}>
-                            heartbeat
-                          </Badge>
-                          <Badge intent={instance.maintenance_alive ? "success" : "danger"}>
-                            maintenance
-                          </Badge>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        {instance.leader ? (
-                          <Badge intent="primary">Leader</Badge>
-                        ) : (
-                          <span className="text-sm text-muted-fg">Worker</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {instance.queues.length}
-                      </TableCell>
-                      <TableCell>{timeAgo(instance.last_seen_at)}</TableCell>
-                    </TableRow>
-                  );
-                })}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-
-      {/* Queue summary — top N by activity */}
-      <Card>
-        <CardHeader
-          title="Queues"
-          description={
-            hasMoreQueues
-              ? `Showing top ${DASHBOARD_QUEUE_LIMIT} by activity`
-              : undefined
-          }
-        />
-        <CardContent>
-          <Table bleed aria-label="Queue summary">
-            <TableHeader>
-              <TableColumn isRowHeader>Queue</TableColumn>
-              <TableColumn className="text-right">Total queued</TableColumn>
-              <TableColumn className="text-right">Scheduled</TableColumn>
-              <TableColumn className="text-right">Available</TableColumn>
-              <TableColumn className="text-right">Retryable</TableColumn>
-              <TableColumn className="text-right">Running</TableColumn>
-              <TableColumn className="text-right">Failed</TableColumn>
-              <TableColumn className="text-right">Waiting</TableColumn>
-              <TableColumn className="text-right">Completed/hr</TableColumn>
-              <TableColumn className="text-right">Lag</TableColumn>
-              <TableColumn>Status</TableColumn>
-            </TableHeader>
-            <TableBody
-              renderEmptyState={() => (
-                <div
-                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
-                >
-                  {queuesQuery.isLoading
-                    ? "Loading queues…"
-                    : queuesQuery.isError
-                      ? "Failed to load queues."
-                      : "No queues found."}
-                </div>
-              )}
-            >
-              {topQueues.map((q) => (
-                    <TableRow
-                      key={q.queue}
-                      id={q.queue}
-                      className="cursor-pointer"
-                      onAction={() =>
-                        void navigate({
-                          to: "/jobs",
-                          search: { q: `queue:${q.queue}` },
-                        })
-                      }
-                    >
-                      <TableCell className="font-medium">
-                        <div>
-                          <Link
-                            to="/queues/$name"
-                            params={{ name: q.queue }}
-                            className="text-primary no-underline hover:underline"
-                          >
-                            {q.display_name ?? q.queue}
-                          </Link>
-                          {q.display_name && (
-                            <div className="text-xs font-normal text-muted-fg">
-                              {q.queue}
-                            </div>
-                          )}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.total_queued.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.scheduled.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.available.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.retryable.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.running.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        <span className={q.failed > 0 ? "text-danger" : ""}>
-                          {q.failed.toLocaleString()}
+                        <span className="inline-flex items-center gap-2">
+                          <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
+                          {q.paused && <Badge intent="warning">Paused</Badge>}
                         </span>
                       </TableCell>
+                      <TableCell className="text-right tabular-nums">{formatNumber(q.available)}</TableCell>
                       <TableCell className="text-right tabular-nums">
-                        {q.waiting_external > 0
-                          ? q.waiting_external.toLocaleString()
-                          : "-"}
+                        {q.available > 0 && q.lag_seconds !== null ? formatDuration(q.lag_seconds) : "—"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{formatNumber(q.retryable)}</TableCell>
+                      <TableCell className={`text-right tabular-nums ${q.liveFailed > 0 ? "text-danger-subtle-fg" : ""}`}>
+                        {formatNumber(q.liveFailed)}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
-                        {q.completed_last_hour.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        <LagValue seconds={q.lag_seconds} />
-                      </TableCell>
-                      <TableCell>
-                        {q.paused ? (
-                          <Badge intent="warning">Paused</Badge>
-                        ) : (
-                          <Badge intent="success">Active</Badge>
-                        )}
+                        {q.deadLetters === null ? "—" : formatNumber(q.deadLetters)}
                       </TableCell>
                     </TableRow>
                   ))}
-            </TableBody>
-          </Table>
-          {hasMoreQueues && topQueues.length > 0 && (
-            <div className="px-4 py-3">
-              <Link
-                to="/queues"
-                className="text-sm text-primary no-underline hover:underline"
-              >
-                View all {queuesQuery.data?.length} queues &rarr;
-              </Link>
-            </div>
+                </TableBody>
+              </Table>
+            </>
           )}
         </CardContent>
       </Card>
-
-      {/* Recent failures */}
-      <Card>
-        <CardHeader title="Recent Failures" />
-        <CardContent>
-          <Table bleed aria-label="Recent failures">
-            <TableHeader>
-              <TableColumn isRowHeader>ID</TableColumn>
-              <TableColumn>Kind</TableColumn>
-              <TableColumn>Queue</TableColumn>
-              <TableColumn className="text-right">Attempt</TableColumn>
-              <TableColumn>Failed</TableColumn>
-              <TableColumn>Error</TableColumn>
-            </TableHeader>
-            <TableBody
-              renderEmptyState={() => (
-                <div
-                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
-                >
-                  {failedQuery.isLoading
-                    ? "Loading failures…"
-                    : failedQuery.isError
-                      ? "Failed to load recent failures."
-                      : "No recent failures."}
-                </div>
-              )}
-            >
-              {(failedQuery.data ?? []).map((job) => {
-                  const lastErr =
-                    job.errors && job.errors.length > 0
-                      ? job.errors[job.errors.length - 1]
-                      : null;
-                  const errMsg =
-                    lastErr &&
-                    typeof lastErr === "object" &&
-                    lastErr !== null
-                      ? String(
-                          (lastErr as Record<string, unknown>)["error"] ?? ""
-                        )
-                      : "";
-                  return (
-                    <TableRow
-                      key={job.id}
-                      id={job.id}
-                      className="cursor-pointer"
-                      onAction={() =>
-                        void navigate({
-                          to: "/jobs/$id",
-                          params: { id: String(job.id) },
-                        })
-                      }
-                    >
-                      <TableCell className="font-mono text-primary">
-                        {job.id}
-                      </TableCell>
-                      <TableCell>{job.kind}</TableCell>
-                      <TableCell>{job.queue}</TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {job.attempt}/{job.max_attempts}
-                      </TableCell>
-                      <TableCell>
-                        {job.finalized_at
-                          ? timeAgo(job.finalized_at)
-                          : "-"}
-                      </TableCell>
-                      <TableCell className="max-w-[300px] truncate text-danger">
-                        {errMsg || "-"}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-    </div>
+    </Page>
   );
 }

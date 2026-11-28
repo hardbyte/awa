@@ -9,6 +9,9 @@
 
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "./StateBadge";
+import { Time } from "./Time";
+import { jobStateMeta, TONE_DOT } from "@/lib/states";
+import { errorSummary, parseErrorEntry } from "@/lib/errors";
 
 interface TimelineEvent {
   timestamp: string;
@@ -27,25 +30,32 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
     label: "Created",
   });
 
-  // Error history — each entry in errors[] has a timestamp and attempt number
-  if (job.errors && job.errors.length > 0) {
-    for (const err of job.errors) {
-      if (err && typeof err === "object" && err !== null) {
-        const e = err as Record<string, unknown>;
-        const at = typeof e.at === "string" ? e.at : undefined;
-        const error = typeof e.error === "string" ? e.error : undefined;
-        const attempt = typeof e.attempt === "number" ? e.attempt : undefined;
-        if (at) {
-          events.push({
-            timestamp: at,
-            label: attempt != null ? `Attempt ${attempt} failed` : "Error",
-            state: "failed",
-            detail: error,
-            isError: true,
-          });
-        }
-      }
+  // Consecutive identical errors share one line; the Errors card has each one.
+  let run: { first: number | null; last: number | null; summary: string; event: TimelineEvent } | null = null;
+  for (const entry of job.errors ?? []) {
+    const error = parseErrorEntry(entry);
+    if (!error.at) continue;
+    const summary = errorSummary(error);
+    const continues =
+      run !== null &&
+      run.summary === summary &&
+      error.attempt !== null &&
+      run.last !== null &&
+      error.attempt === run.last + 1;
+    if (continues && run) {
+      run.last = error.attempt;
+      run.event.label = `Attempts ${run.first}–${run.last} failed`;
+      continue;
     }
+    const event: TimelineEvent = {
+      timestamp: error.at,
+      label: error.attempt !== null ? `Attempt ${error.attempt} failed` : "Error",
+      state: "failed",
+      detail: summary || undefined,
+      isError: true,
+    };
+    events.push(event);
+    run = { first: error.attempt, last: error.attempt, summary, event };
   }
 
   // Attempt started — shown whenever attempted_at exists
@@ -87,16 +97,6 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
   return events;
 }
 
-const STATE_DOT_COLOR: Record<string, string> = {
-  available: "bg-info",
-  scheduled: "bg-secondary-fg/30",
-  running: "bg-success",
-  completed: "bg-success",
-  retryable: "bg-warning",
-  failed: "bg-danger",
-  cancelled: "bg-muted-fg/40",
-  waiting_external: "bg-[oklch(0.45_0.15_280)]",
-};
 
 export function JobTimeline({ job }: { job: JobRow }) {
   const events = buildTimeline(job);
@@ -108,7 +108,7 @@ export function JobTimeline({ job }: { job: JobRow }) {
       {events.map((event, i) => {
         const isLast = i === events.length - 1;
         const dotColor = event.state
-          ? STATE_DOT_COLOR[event.state] ?? "bg-muted-fg/30"
+          ? TONE_DOT[jobStateMeta(event.state).tone]
           : "bg-muted-fg/30";
 
         return (
@@ -132,12 +132,16 @@ export function JobTimeline({ job }: { job: JobRow }) {
               <div className="flex flex-wrap items-baseline gap-2">
                 <span className="text-sm font-medium">{event.label}</span>
                 {event.state && <StateBadge state={event.state} />}
-                <time className="ml-auto text-xs tabular-nums text-muted-fg">
-                  {new Date(event.timestamp).toLocaleString()}
-                </time>
+                <Time
+                  value={event.timestamp}
+                  format="absolute"
+                  className="ml-auto text-xs tabular-nums text-muted-fg"
+                />
               </div>
               {event.detail && (
-                <p className="mt-1 text-sm text-danger">{event.detail}</p>
+                <p className="mt-1 truncate text-sm text-danger-subtle-fg" title={event.detail}>
+                  {event.detail}
+                </p>
               )}
             </div>
           </div>
@@ -145,7 +149,7 @@ export function JobTimeline({ job }: { job: JobRow }) {
       })}
 
       {/* Transparency note */}
-      <p className="pt-2 text-xs text-muted-fg/60">
+      <p className="pt-2 text-xs text-muted-fg">
         Timeline reconstructed from job timestamps and error history.
       </p>
     </div>

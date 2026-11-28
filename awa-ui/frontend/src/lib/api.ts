@@ -11,6 +11,8 @@ export interface JobRow {
   priority: number;
   attempt: number;
   max_attempts: number;
+  /** The attempt's lease number; absent from servers that don't send it. */
+  run_lease?: number;
   run_at: string;
   heartbeat_at: string | null;
   deadline_at: string | null;
@@ -433,11 +435,13 @@ export function fetchJob(id: number): Promise<JobRow> {
   return apiRead(`/jobs/${id}`);
 }
 
-export function retryJob(id: number): Promise<JobRow> {
+/** Resolves to null when the job was no longer eligible and nothing changed. */
+export function retryJob(id: number): Promise<JobRow | null> {
   return apiFetch(`/jobs/${id}/retry`, { method: "POST" });
 }
 
-export function cancelJob(id: number): Promise<JobRow> {
+/** Resolves to null when the job was no longer eligible and nothing changed. */
+export function cancelJob(id: number): Promise<JobRow | null> {
   return apiFetch(`/jobs/${id}/cancel`, { method: "POST" });
 }
 
@@ -466,6 +470,10 @@ export function fetchBatchOperations(params: {
   }
   const query = qs.toString();
   return apiRead(`/batch-ops${query ? `?${query}` : ""}`);
+}
+
+export function fetchBatchOperation(id: string): Promise<BatchOperation> {
+  return apiRead(`/batch-ops/${encodeURIComponent(id)}`);
 }
 
 export function previewBatchOperation(

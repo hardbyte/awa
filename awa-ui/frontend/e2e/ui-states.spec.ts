@@ -101,10 +101,10 @@ test.describe("Phone navigation", () => {
 test.describe("Navigation", () => {
   test("Dead letters is in the sidebar and opens the DLQ", async ({ page }) => {
     await page.goto("/");
-    const nav = page.locator('[data-slot="sidebar-section"]').first();
+    const nav = page.getByRole("navigation", { name: "Primary" });
     await nav.getByRole("link", { name: "Dead letters" }).click();
     await expect(page).toHaveURL(/\/dlq$/);
-    await expect(page.getByRole("heading", { name: "Dead Letter Queue" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Dead letters", exact: true })).toBeVisible();
     await expect(nav.getByRole("link", { name: "Dead letters" })).toHaveAttribute("aria-current", "page");
   });
 
@@ -114,18 +114,18 @@ test.describe("Navigation", () => {
     await page.goto("/dlq");
     await expect(page).toHaveTitle(/^Dead letters · /);
     await page.goto("/");
-    await expect(page).toHaveTitle(/^Dashboard · /);
+    await expect(page).toHaveTitle(/^Overview · /);
   });
 });
 
 test.describe("Failed reads are not shown as empty", () => {
-  test("dashboard tiles show no count when stats fail", async ({ page }) => {
+  test("overview tiles show no count when stats fail", async ({ page }) => {
     await failApi(page, "**/api/stats");
     await page.goto("/");
-    await expect(page.getByTestId("stats-error")).toContainText("Failed to load job counts");
-    const tiles = page.locator('a[href*="/jobs?state="]');
-    await expect(tiles.first()).toContainText("—");
-    await expect(tiles.filter({ hasText: /^0/ })).toHaveCount(0);
+    for (const tile of ["tile-retrying", "tile-failed"]) {
+      await expect(page.getByTestId(tile)).toContainText("Failed to load");
+      await expect(page.getByTestId(tile).getByTestId("tile-value")).toHaveText("—");
+    }
   });
 
   test("batch operations show an error with retry, then the list", async ({ page }) => {
@@ -214,8 +214,8 @@ test.describe("Not-found detail pages", () => {
   for (const { path, title, back } of [
     { path: "/jobs/999999999", title: "Job #999999999 not found", back: "Back to jobs" },
     { path: "/queues/no-such-queue", title: 'Queue "no-such-queue" not found', back: "Back to queues" },
-    { path: "/dlq/999999999", title: "DLQ row #999999999 not found", back: "Back to DLQ" },
-    { path: "/runtime/no-such-instance", title: "Runtime instance not found", back: "Back to runtime" },
+    { path: "/dlq/999999999", title: "Dead letter #999999999 not found", back: "Back to dead letters" },
+    { path: "/runtime/no-such-instance", title: "Fleet instance not found", back: "Back to fleet" },
   ]) {
     test(`${path} explains and links back`, async ({ page }) => {
       await page.goto(path);
@@ -246,7 +246,7 @@ test.describe("Job retry safety", () => {
     await page.getByRole("button", { name: "Restart…" }).click();
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toContainText("may happen twice");
-    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await dialog.getByRole("button", { name: "Keep" }).click();
     expect(retried).toBe(0);
 
     await page.getByRole("button", { name: "Restart…" }).click();

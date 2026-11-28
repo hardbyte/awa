@@ -8,13 +8,12 @@ import { ObservationDriver } from "./driver.ts";
 import { bindPageLifecycle } from "./lifecycle.ts";
 
 export const refreshScheduler = new RefreshScheduler();
-export const observationPolicy = refreshScheduler.policy;
 export function managedQueryId(key: QueryKey) {
   const backend = typeof window === "undefined" ? "/api" : `${window.location.origin}${apiPath("")}`;
   return hashKey([backend, "trusted-admin", ...key]);
 }
-export function getReadStatus() { return refreshScheduler.readStatus(); }
-export function subscribeReadStatus(listener: () => void) { return refreshScheduler.subscribe(listener); }
+export function getFreshness() { return refreshScheduler.freshness(); }
+export function subscribeFreshness(listener: () => void) { return refreshScheduler.subscribe(listener); }
 let started = false;
 let requestProbe = () => {};
 

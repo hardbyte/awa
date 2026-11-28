@@ -3,7 +3,7 @@ import { test, expect } from "@playwright/test";
 test.describe("Runtime page", () => {
   test("navigate to /runtime, heading visible", async ({ page }) => {
     await page.goto("/runtime");
-    await expect(page.getByRole("heading", { name: "Runtime" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Fleet", exact: true })).toBeVisible();
   });
 
   test("renders empty states when no runtime snapshots exist", async ({ page }) => {
@@ -177,7 +177,8 @@ test.describe("Runtime page", () => {
     await expect(instancesGrid.getByRole("rowheader", { name: /worker-b/ })).toBeVisible();
     await expect(instancesGrid.getByText("instance 11111111")).toBeVisible();
     await expect(instancesGrid.getByText("Leader", { exact: true })).toBeVisible();
-    await expect(instancesGrid.getByText("Degraded", { exact: true })).toBeVisible();
+    await expect(instancesGrid.getByText("Unhealthy", { exact: true })).toBeVisible();
+    await expect(instancesGrid.getByText("Healthy", { exact: true })).toHaveCount(0);
     const queueGrid = page.getByRole("grid", { name: "Queue runtime summary" });
     await expect(queueGrid).toBeVisible();
     await expect(queueGrid.getByRole("rowheader", { name: "email" })).toBeVisible();
@@ -274,8 +275,7 @@ test.describe("Runtime page", () => {
 
     await page.goto("/runtime");
     const instancesGrid = page.getByRole("grid", { name: "Runtime instances" });
-    // Whole row is clickable (design refresh: affordance fix)
-    await instancesGrid.getByRole("rowheader", { name: /worker-a/ }).click();
+    await instancesGrid.getByRole("link", { name: "worker-a" }).click();
 
     await expect(page).toHaveURL(/\/runtime\/11111111-1111-4111-8111-111111111111$/);
     await expect(page.getByRole("heading", { name: "worker-a" })).toBeVisible();

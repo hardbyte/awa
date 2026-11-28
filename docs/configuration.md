@@ -805,7 +805,7 @@ Per-queue retention overrides go through `RetentionPolicy.dlq` on `queue_retenti
 
 Once DLQ is on, operators interact with it through:
 
-- **Web UI** — DLQ tab with retry, purge, and per-row failure detail.
+- **Web UI** — Dead letters page (and a Dead letters tab on each queue) with retry, purge, and per-row failure detail.
 - **CLI** — `awa dlq list`, `awa dlq retry <id>`, `awa dlq purge`.
 - **REST** — `/api/dlq/*` endpoints (same actions as the UI).
 - **Python / Rust** — `client.dlq_*` admin methods for programmatic retry / purge.
@@ -846,7 +846,7 @@ If you're connecting to a read replica, increase `--cache-ttl` to reduce load. T
 
 ### Read-only mode
 
-`awa serve` disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. `/api/capabilities` reports `read_only: true` and the frontend hides the corresponding buttons. Mutation requests against a read-only server return `503 Service Unavailable` with a clear error body.
+`awa serve` disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. `/api/capabilities` reports `read_only: true` and the frontend shows the corresponding actions disabled, with the reason. Mutation requests against a read-only server return `503 Service Unavailable` with a clear error body.
 
 There are two ways to opt in:
 

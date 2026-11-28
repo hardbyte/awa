@@ -27,5 +27,34 @@ export const PAGE_SIZES = [20, 50, 100] as const;
 /** Max suggestions in autocomplete */
 export const MAX_SUGGESTIONS = 8;
 
-/** Dashboard queue table limit */
-export const DASHBOARD_QUEUE_LIMIT = 10;
+/** Queues the Overview lists under "Queues needing attention". */
+export const OVERVIEW_QUEUE_LIMIT = 5;
+
+/** Newest failed jobs the Overview groups by kind and error. */
+export const OVERVIEW_FAILED_SAMPLE = 50;
+
+/** Newest running jobs the Overview checks for stuck ones. */
+export const OVERVIEW_RUNNING_SAMPLE = 100;
+
+/** Failure groups the attention list shows. */
+export const ATTENTION_FAILURE_GROUPS = 5;
+
+/** An unpaused queue whose oldest ready job has waited this long needs attention. */
+export const LAG_ATTENTION_SECONDS = 60;
+
+/** A running job whose heartbeat is older than this reads as stuck: three of
+ * the default 30-second heartbeat intervals. */
+export const STUCK_HEARTBEAT_MS = 90_000;
+
+/** A failed bulk operation stays on the Overview for this long. */
+export const BATCH_FAILURE_WINDOW_MS = 24 * 3600_000;
+
+/** A schedule whose next fire is this far in the past reads as overdue. */
+export const CRON_OVERDUE_GRACE_MS = 60_000;
+
+/** A bulk cancel or retry over this many jobs, or over a count the server
+ * could only bound from below, asks the user to type the count to confirm. */
+export const TYPE_TO_CONFIRM_MIN_JOBS = 1_000;
+
+/** Rows of a bulk action's preview sample shown in its dialog. */
+export const BULK_SAMPLE_ROWS = 8;

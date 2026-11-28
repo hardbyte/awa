@@ -1,4 +1,5 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
   effectiveEngine,
@@ -16,7 +17,8 @@ import {
   shouldShowStorageTransitionCard,
   StorageTransitionCard,
 } from "@/components/StorageTransition";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
+import { InstanceLink } from "@/components/links";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -27,14 +29,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
 import {
-  formatDateTime,
   formatSnapshotInterval,
   instanceLabel,
   LoopStatus,
   PostgresBadge,
-  dlqPolicyIntent,
   dlqPolicyLabel,
   queueCapacityLabel,
   queueConfigDetails,
@@ -155,8 +154,8 @@ export function RuntimePage() {
   };
 
   return (
-    <div className="space-y-6">
-      <Heading level={2}>Runtime</Heading>
+    <Page>
+      <PageHeader title="Fleet" />
 
       {hasAttention && (
         <Card>
@@ -350,11 +349,11 @@ export function RuntimePage() {
           ) : (
             <div className="space-y-3 sm:hidden">
               {visibleInstances.map((instance) => (
-                <button
+                <Link
                   key={instance.instance_id}
-                  type="button"
-                  onClick={() => navigateToInstance(instance.instance_id)}
-                  className="block w-full rounded-lg border p-4 text-left transition hover:bg-secondary/40"
+                  to="/runtime/$instanceId"
+                  params={{ instanceId: instance.instance_id }}
+                  className="block w-full rounded-lg border p-4 text-left text-fg no-underline transition hover:bg-secondary/40"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -378,11 +377,11 @@ export function RuntimePage() {
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                     <span className="text-muted-fg">Snapshot</span>
-                    <span>{timeAgo(instance.last_seen_at)}</span>
+                    <Time value={instance.last_seen_at} />
                     <span className="text-muted-fg">Interval</span>
                     <span>{formatSnapshotInterval(instance.snapshot_interval_ms)}</span>
                     <span className="text-muted-fg">Started</span>
-                    <span>{timeAgo(instance.started_at)}</span>
+                    <Time value={instance.started_at} />
                     <span className="text-muted-fg">DB</span>
                     <span>{instance.postgres_connected ? "Connected" : "Disconnected"}</span>
                     <span className="text-muted-fg">Global max</span>
@@ -390,7 +389,7 @@ export function RuntimePage() {
                     <span className="text-muted-fg">Queues</span>
                     <span>{queueListLabel(instance)}</span>
                   </div>
-                </button>
+                </Link>
               ))}
             </div>
           )}
@@ -441,7 +440,7 @@ export function RuntimePage() {
                       className="cursor-pointer"
                     >
                       <TableCell className="font-medium">
-                        <div>{instanceLabel(instance)}</div>
+                        <InstanceLink instanceId={instance.instance_id}>{instanceLabel(instance)}</InstanceLink>
                         <div className="text-xs text-muted-fg">
                           {instance.version} · pid {instance.pid}
                         </div>
@@ -473,15 +472,15 @@ export function RuntimePage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div>{timeAgo(instance.last_seen_at)}</div>
+                      <div><Time value={instance.last_seen_at} /></div>
                       <div className="text-xs text-muted-fg">
                         every {formatSnapshotInterval(instance.snapshot_interval_ms)}
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div>{timeAgo(instance.started_at)}</div>
+                      <div><Time value={instance.started_at} /></div>
                       <div className="text-xs text-muted-fg">
-                        {formatDateTime(instance.started_at)}
+                        <Time value={instance.started_at} format="absolute" />
                       </div>
                     </TableCell>
                     <TableCell>
@@ -552,18 +551,16 @@ export function RuntimePage() {
                 <div key={queue.queue} className="rounded-lg border p-4">
                   <div className="flex items-center justify-between gap-3">
                     <Link
-                      to="/jobs"
-                      search={{ q: `queue:${queue.queue}` }}
+                      to="/queues/$name"
+                      params={{ name: queue.queue }}
                       className="font-medium text-primary no-underline hover:underline"
                     >
                       {queue.queue}
                     </Link>
                     {queue.config ? (
-                      <Badge intent={queue.config.mode === "weighted" ? "secondary" : "outline"}>
-                        {queue.config.mode === "weighted" ? "Weighted" : "Reserved"}
-                      </Badge>
+                      <span className="text-sm">{queue.config.mode === "weighted" ? "Weighted" : "Reserved"}</span>
                     ) : (
-                      <Badge intent="outline">Unknown</Badge>
+                      <span className="text-sm text-muted-fg">Unknown mode</span>
                     )}
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
@@ -576,9 +573,7 @@ export function RuntimePage() {
                     <span className="text-muted-fg">DLQ</span>
                     <span>
                       {queue.config ? (
-                        <Badge intent={dlqPolicyIntent(queue.config)}>
-                          {dlqPolicyLabel(queue.config)}
-                        </Badge>
+                        <span>{dlqPolicyLabel(queue.config)}</span>
                       ) : (
                         "—"
                       )}
@@ -636,8 +631,8 @@ export function RuntimePage() {
                   <TableRow key={queue.queue} id={queue.queue}>
                     <TableCell className="font-medium">
                       <Link
-                        to="/jobs"
-                        search={{ q: `queue:${queue.queue}` }}
+                        to="/queues/$name"
+                        params={{ name: queue.queue }}
                         className="text-primary no-underline hover:underline"
                       >
                         {queue.queue}
@@ -645,9 +640,7 @@ export function RuntimePage() {
                     </TableCell>
                     <TableCell>
                       {queue.config ? (
-                        <Badge intent={queue.config.mode === "weighted" ? "secondary" : "outline"}>
-                          {queue.config.mode === "weighted" ? "Weighted" : "Reserved"}
-                        </Badge>
+                        <span className="text-sm">{queue.config.mode === "weighted" ? "Weighted" : "Reserved"}</span>
                       ) : (
                         "—"
                       )}
@@ -664,9 +657,7 @@ export function RuntimePage() {
                     </TableCell>
                     <TableCell>
                       {queue.config ? (
-                        <Badge intent={dlqPolicyIntent(queue.config)}>
-                          {dlqPolicyLabel(queue.config)}
-                        </Badge>
+                        <span>{dlqPolicyLabel(queue.config)}</span>
                       ) : (
                         "—"
                       )}
@@ -699,6 +690,6 @@ export function RuntimePage() {
           </Table>
         </CardContent>
       </Card>
-    </div>
+    </Page>
   );
 }

@@ -45,6 +45,30 @@ interface Entry {
   loaded: boolean;
   /** The last failure was a 404: the view shows not-found, not a failure. */
   missing: boolean;
+  /** When the last read succeeded, on the scheduler's clock; null before any. */
+  lastSuccess: number | null;
+}
+
+/** How current the views on screen are, for the freshness indicator. */
+export interface Freshness {
+  /** Views that refresh by themselves. Not-found, refused, paused and manual-only views don't count. */
+  views: number;
+  /** Views whose last read failed. */
+  failed: number;
+  /** Failed views that never loaded, so they show no data at all. */
+  unloaded: number;
+  /** Views waiting for a read to start or finish. */
+  pending: number;
+  /** Milliseconds since the least recently loaded view last loaded; null before every view has loaded once. */
+  ageMs: number | null;
+  /** A view has paused its refresh, e.g. a list while rows are selected. */
+  paused: boolean;
+  /** Views refused at the key limit. */
+  rejected: number;
+  /** Reads stopped after a 401 or 403 until an explicit refresh. */
+  halted: boolean;
+  /** Views whose request the server refused (a 4xx other than 404), waiting for an explicit refresh. */
+  blocked: number;
 }
 
 /** Whether a failed read would fail the same way if repeated, so the view
@@ -116,7 +140,7 @@ export class RefreshScheduler {
       if (this.entries.size >= this.policy.maxKeys) throw new CapacityError(`At most ${this.policy.maxKeys} active observation keys are allowed`);
       entry = { observers: new Map(), dirty: true, pendingSince: null, during: false, manual: !!demand.manualOnly,
         running: null, lastStart: -Infinity, nextAllowed: 0, nextPoll: Infinity, nextReconcile: null,
-        failures: 0, blocked: false, absent: false, error: false, loaded: false, missing: false };
+        failures: 0, blocked: false, absent: false, error: false, loaded: false, missing: false, lastSuccess: null };
       this.entries.set(demand.id, entry);
     }
     const token = Symbol(); const observer = { ...demand }; let attached = true;
@@ -175,18 +199,28 @@ export class RefreshScheduler {
       if ([429, 503].includes(error.status)) this.until = Math.max(this.until, this.now() + error.retryAfterMs);
     }
   }
-  readStatus() {
-    if (this.rejected) return `${this.rejected} view(s) rejected at the ${this.policy.maxKeys}-key limit; close a view to retry`;
-    const entries = [...this.entries.values()].filter(entry => !entry.absent && !(entry.error && entry.missing && !entry.loaded));
-    const failed = entries.filter(entry => entry.error);
-    const retained = failed.filter(entry => entry.loaded).length;
-    const unloaded = failed.length - retained;
-    const stale = entries.filter(entry => entry.dirty || entry.running || entry.during).length;
-    if (failed.length) {
-      return [retained ? `${retained} view(s) failed to refresh; retained data is stale` : "",
-        unloaded ? `${unloaded} view(s) failed to load` : ""].filter(Boolean).join("; ");
-    }
-    return stale ? `${stale} view(s) awaiting authoritative refresh` : "";
+  freshness(): Freshness {
+    const all = [...this.entries.values()].filter(entry => !entry.absent && !(entry.error && entry.missing));
+    const paused = all.some(entry => this.paused(entry));
+    const refused = (entry: Entry) => entry.error && entry.blocked;
+    const automatic = all.filter(entry => !this.paused(entry) && !this.representative(entry).manualOnly);
+    const views = automatic.filter(entry => !refused(entry));
+    const failed = views.filter(entry => entry.error);
+    const loads = views.map(entry => entry.lastSuccess);
+    const ageMs = loads.length > 0 && loads.every(at => at !== null)
+      ? this.now() - Math.min(...(loads as number[]))
+      : null;
+    return {
+      views: views.length,
+      failed: failed.length,
+      unloaded: failed.filter(entry => !entry.loaded).length,
+      pending: views.filter(entry => entry.dirty || entry.running || entry.during).length,
+      ageMs,
+      paused,
+      rejected: this.rejected,
+      halted: this.halted,
+      blocked: automatic.filter(refused).length,
+    };
   }
   private eligible(entry: Entry) {
     const debounce = entry.manual || entry.pendingSince === null ? -Infinity : entry.pendingSince + Math.min(this.policy.debounceMs, this.policy.maxDebounceMs);
@@ -220,6 +254,7 @@ export class RefreshScheduler {
       void boundedRead(controller, this.policy.readTimeoutMs, () => demand.run(controller.signal)).then(value => {
         if (controller.signal.aborted || this.entries.get(id) !== entry) return;
         entry.dirty = entry.during; entry.error = false; entry.missing = false; entry.loaded = true; entry.failures = 0;
+        entry.lastSuccess = this.now();
         if (demand.stopAfterNull && value === null) { entry.absent = true; entry.blocked = true; }
         entry.nextReconcile = this.automatic(entry) ? this.watchdog() : null;
         entry.nextPoll = this.now() + this.cadence(entry);

@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchDistinctKinds, fetchDistinctQueues } from "@/lib/api";
 import { POLL, MAX_SUGGESTIONS } from "@/lib/constants";
+import { LockClosedIcon } from "@heroicons/react/16/solid";
 
 export interface SearchFilters {
   kind?: string;
@@ -80,6 +81,14 @@ export interface InvalidTerm {
   error: string;
 }
 
+/** The prefixes a search term can start with. */
+export const FILTER_PREFIXES = ["kind:", "queue:", "tag:", "id:", "created>=", "created<"] as const;
+
+/** The filter prefix `term` starts with, if any. */
+export function filterPrefix(term: string): (typeof FILTER_PREFIXES)[number] | undefined {
+  return FILTER_PREFIXES.find((p) => term.startsWith(p));
+}
+
 /**
  * The terms of a search, typed or from the URL, that `parseSearch` would
  * drop. Dropping one leaves a wider filter than the one written, so a page
@@ -88,9 +97,7 @@ export interface InvalidTerm {
 export function invalidTerms(search: string): InvalidTerm[] {
   const out: InvalidTerm[] = [];
   for (const term of search.trim().split(/\s+/).filter(Boolean)) {
-    const prefix = ["kind:", "queue:", "tag:", "id:", "created>=", "created<"].find((p) =>
-      term.startsWith(p)
-    );
+    const prefix = filterPrefix(term);
     const value = prefix ? term.slice(prefix.length) : "";
     let error: string | undefined;
     if (!prefix) {
@@ -176,6 +183,8 @@ interface SearchBarProps {
   /** The full filter string (e.g. "queue:ui_demo kind:data_import") */
   value: string;
   onChange: (value: string) => void;
+  /** Terms the page fixes, shown as chips that can't be removed. */
+  locked?: string[];
 }
 
 /**
@@ -183,7 +192,7 @@ interface SearchBarProps {
  * Applied filters appear as removable chips. The text input is for
  * adding new filters only — it clears after each filter is applied.
  */
-export function SearchBar({ value, onChange }: SearchBarProps) {
+export function SearchBar({ value, onChange, locked = [] }: SearchBarProps) {
   const [inputValue, setInputValue] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -392,7 +401,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   }, []);
 
   const applied = terms(activeFilters);
-  const hasFilters = applied.length > 0 || malformed.length > 0;
+  const hasFilters = applied.length > 0 || malformed.length > 0 || locked.length > 0;
 
   return (
     <div ref={containerRef} className="relative">
@@ -401,6 +410,17 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         className="flex flex-wrap items-center gap-1.5 rounded-lg border border-input bg-bg px-3 py-1.5 text-sm focus-within:ring-2 focus-within:ring-ring/20 focus-within:border-ring"
         onClick={() => containerRef.current?.querySelector("input")?.focus()}
       >
+        {locked.map((term) => (
+          <span
+            key={`locked:${term}`}
+            className="inline-flex items-center gap-1 rounded-md bg-secondary px-2 py-0.5 text-xs font-medium text-secondary-fg"
+            title="Set by this page"
+            data-testid="locked-filter"
+          >
+            <LockClosedIcon aria-hidden="true" className="size-3" />
+            {term}
+          </span>
+        ))}
         {/* Applied filter chips */}
         {applied.map((term) => (
           <FilterChip

@@ -1,12 +1,6 @@
 import type { QueueRuntimeConfigSnapshot, RuntimeInstance } from "@/lib/api";
+import { CheckIcon, ClockIcon, XCircleIcon } from "@heroicons/react/16/solid";
 import { Badge } from "@/components/ui/badge";
-
-export function formatDateTime(value: string): string {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value));
-}
 
 export function formatSnapshotInterval(ms: number): string {
   if (ms < 1_000) return `${ms}ms`;
@@ -33,12 +27,9 @@ export function dlqPolicyLabel(config?: QueueRuntimeConfigSnapshot | null): stri
   return "DLQ unknown";
 }
 
-export function dlqPolicyIntent(
-  config?: QueueRuntimeConfigSnapshot | null,
-): "success" | "outline" | "secondary" {
-  if (config?.dlq_enabled === true) return "success";
-  if (config?.dlq_enabled === false) return "outline";
-  return "secondary";
+/** A badge for a queue whose dead-letter queue is on; off and unknown get none. */
+export function DlqOnBadge({ config }: { config?: QueueRuntimeConfigSnapshot | null }) {
+  return config?.dlq_enabled === true ? <Badge intent="secondary">DLQ on</Badge> : null;
 }
 
 export function instanceLabel(instance: RuntimeInstance): string {
@@ -65,17 +56,44 @@ export function queueConfigDetails(config?: QueueRuntimeConfigSnapshot | null): 
   return `poll ${formatSnapshotInterval(config.poll_interval_ms)} · deadline ${config.deadline_duration_secs}s · aging ${config.priority_aging_interval_secs}s · ${dlqPolicyLabel(config)}`;
 }
 
+/** A badge only for an instance that is stale or unhealthy. */
 export function RuntimeHealthBadge({ instance }: { instance: RuntimeInstance }) {
-  if (instance.stale) return <Badge intent="warning">Stale</Badge>;
-  if (instance.healthy) return <Badge intent="success">Healthy</Badge>;
-  return <Badge intent="danger">Degraded</Badge>;
+  if (instance.stale) {
+    return (
+      <Badge intent="secondary">
+        <ClockIcon className="size-3" aria-hidden="true" />
+        Stale
+      </Badge>
+    );
+  }
+  if (instance.healthy) return null;
+  return (
+    <Badge intent="danger">
+      <XCircleIcon className="size-3" aria-hidden="true" />
+      Unhealthy
+    </Badge>
+  );
 }
 
-export function LoopBadge({ label, healthy }: { label: string; healthy: boolean }) {
-  return <Badge intent={healthy ? "success" : "danger"}>{label}</Badge>;
+/** One loop's state in words: "alive" plainly, "down" as a red badge. */
+export function LoopBadge({ healthy }: { healthy: boolean }) {
+  if (healthy) {
+    return (
+      <span className="inline-flex items-center gap-1 text-sm text-muted-fg">
+        <CheckIcon className="size-3.5" aria-hidden="true" />
+        Alive
+      </span>
+    );
+  }
+  return (
+    <Badge intent="danger">
+      <XCircleIcon className="size-3" aria-hidden="true" />
+      Down
+    </Badge>
+  );
 }
 
-// Inline dot+label row for the three worker loops.
+// The three worker loops in one row, each with an icon and its state in text.
 export function LoopStatus({
   instance,
 }: {
@@ -88,28 +106,27 @@ export function LoopStatus({
   ];
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-      {items.map((item) => (
-        <span key={item.label} className="inline-flex items-center gap-1.5">
-          <span
-            aria-hidden="true"
-            className={`inline-block size-1.5 rounded-full ${
-              item.healthy ? "bg-success" : "bg-danger"
-            }`}
-          />
-          <span className={item.healthy ? "text-muted-fg" : "text-danger-subtle-fg"}>
+      {items.map((item) =>
+        item.healthy ? (
+          <span key={item.label} className="inline-flex items-center gap-1 text-muted-fg">
+            <CheckIcon className="size-3" aria-hidden="true" />
             {item.label}
-            <span className="sr-only">
-              {item.healthy ? " healthy" : " unhealthy"}
-            </span>
+            <span className="sr-only"> alive</span>
           </span>
-        </span>
-      ))}
+        ) : (
+          <span key={item.label} className="inline-flex items-center gap-1 font-medium text-danger-subtle-fg">
+            <XCircleIcon className="size-3" aria-hidden="true" />
+            {item.label} down
+          </span>
+        )
+      )}
     </div>
   );
 }
 
+/** A badge only when the instance has lost its database connection. */
 export function PostgresBadge({ connected }: { connected: boolean }) {
-  return <Badge intent={connected ? "secondary" : "danger"}>{connected ? "db ok" : "db down"}</Badge>;
+  return connected ? null : <Badge intent="danger">Database down</Badge>;
 }
 
 export function ShutdownBadge({ shuttingDown }: { shuttingDown: boolean }) {

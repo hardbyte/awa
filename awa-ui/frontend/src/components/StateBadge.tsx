@@ -1,30 +1,29 @@
-import { Badge, type BadgeProps } from "@/components/ui/badge";
+import { Badge } from "@/components/ui/badge";
+import { batchStateMeta, jobStateMeta, TONE_BADGE, type StateMeta, type StateTone } from "@/lib/states";
 
-const STATE_INTENT_MAP: Record<string, BadgeProps["intent"]> = {
-  available: "info",
-  scheduled: "secondary",
-  running: "success",
-  completed: "success",
-  retryable: "warning",
-  failed: "danger",
-  cancelled: "secondary",
-  waiting_external: "outline",
-};
-
-// Custom styling for waiting_external (indigo/purple per design spec)
-const WAITING_EXTERNAL_CLASS =
-  "[--badge-bg:oklch(0.87_0.07_280)] [--badge-fg:oklch(0.45_0.15_280)] [--badge-border:transparent] dark:[--badge-bg:oklch(0.55_0.15_280/0.2)] dark:[--badge-fg:oklch(0.82_0.1_280)]";
+function ToneBadge({ state, meta, short, tone }: { state: string; meta: StateMeta; short?: boolean; tone?: StateTone }) {
+  const { Icon } = meta;
+  return (
+    <Badge className={TONE_BADGE[tone ?? meta.tone]} data-state={state}>
+      <Icon data-slot="icon" aria-hidden="true" />
+      {short ? meta.shortLabel : meta.label}
+    </Badge>
+  );
+}
 
 interface StateBadgeProps {
   state: string;
+  /** Use the short label ("Waiting"). */
+  short?: boolean;
 }
 
-export function StateBadge({ state }: StateBadgeProps) {
-  const intent = STATE_INTENT_MAP[state] ?? "secondary";
-  const className = state === "waiting_external" ? WAITING_EXTERNAL_CLASS : undefined;
-  return (
-    <Badge intent={intent} className={className}>
-      {state}
-    </Badge>
-  );
+/** A job state, with its colour, icon and sentence-case label. */
+export function StateBadge({ state, short }: StateBadgeProps) {
+  return <ToneBadge state={state} meta={jobStateMeta(state)} short={short} />;
+}
+
+/** A batch operation state, in the job state palette. `tone` overrides the
+ * colour, e.g. amber for a completed operation that changed nothing. */
+export function BatchStateBadge({ state, tone }: { state: string; tone?: StateTone }) {
+  return <ToneBadge state={state} meta={batchStateMeta(state)} tone={tone} />;
 }

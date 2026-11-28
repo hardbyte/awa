@@ -23,7 +23,7 @@ awa dlq list --queue billing --kind charge_card --limit 50
 awa dlq list --tag urgent --before-dlq-at 2026-04-30T00:00:00Z
 ```
 
-The web UI's **DLQ** tab (the one served by `awa serve`) shows the same data with filters and per-row drill-down.
+The web UI's **Dead letters** page (served by `awa serve`), and the Dead letters tab on each queue, show the same data with filters and per-row drill-down.
 
 Each DLQ row carries:
 
@@ -105,9 +105,9 @@ awa batch-ops submit --op-kind purge_dlq --filter '{"kind":"charge_card"}'
 awa batch-ops submit --op-kind move_to_dlq --filter '{"queue":"billing"}' --spec '{"reason":"triage"}'
 ```
 
-The same kinds are in the admin UI's batch operations page, `POST /api/batch-ops` and the Python client's `submit_batch_operation`. See [ADR-030](adr/030-batch-operations.md#bulk-action-operations) for each kind's eligible jobs.
+The same kinds are on the admin UI's Bulk operations page (`/batch-ops/new`), `POST /api/batch-ops` and the Python client's `submit_batch_operation`. See [ADR-030](adr/030-batch-operations.md#bulk-action-operations) for each kind's eligible jobs.
 
-The admin UI's DLQ page submits its **Retry matching** and **Purge matching** actions as `retry_from_dlq` and `purge_dlq` batch operations, and links to the batch operations page to follow them. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` do the same: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge` and the Python client's `purge_dlq_before` still act in one transaction and report a count.
+The admin UI's Dead letters page, and each queue's Dead letters tab, offer **Retry** and **Purge** on all the rows a filter matches: the dialog shows the count and some of the rows (Purge also asks you to type the count), submits a `retry_from_dlq` or `purge_dlq` batch operation, and opens the operation's page to follow it. `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching` submit the same operations: they take `{"filter": {...}}` (or `{"filter": {}, "all": true}` for the whole DLQ), answer `202 Accepted` with the submitted operation, and leave the rows to the maintenance leader, so the DLQ changes only while a worker runs maintenance. The 0.6 endpoints `/api/dlq/bulk-retry` and `/bulk-purge` and the Python client's `purge_dlq_before` still act in one transaction and report a count.
 
 ## Retention
 

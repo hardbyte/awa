@@ -1,10 +1,12 @@
 import { useManagedQuery } from "@/hooks/use-managed-query";
+import { Time } from "@/components/Time";
 import { Link, useParams } from "@tanstack/react-router";
 import { fetchRuntime } from "@/lib/api";
 import type { RuntimeInstance, RuntimeOverview } from "@/lib/api";
 import { Copyable } from "@/components/CopyButton";
 import { ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -20,9 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { timeAgo } from "@/lib/time";
 import {
-  formatDateTime,
   formatSnapshotInterval,
   instanceLabel,
   LoopBadge,
@@ -69,7 +69,7 @@ export function RuntimeInstancePage() {
         error={runtimeQuery.error}
         onRetry={() => void runtimeQuery.refetch()}
         backTo="/runtime"
-        backLabel="Back to runtime"
+        backLabel="Back to fleet"
       />
     );
   }
@@ -81,10 +81,10 @@ export function RuntimeInstancePage() {
   if (!instance) {
     return (
       <ResourceNotFound
-        title="Runtime instance not found"
+        title="Fleet instance not found"
         reason="The snapshot may have expired or this URL is stale."
         backTo="/runtime"
-        backLabel="Back to runtime"
+        backLabel="Back to fleet"
       />
     );
   }
@@ -92,21 +92,19 @@ export function RuntimeInstancePage() {
   const notes = attentionItems(instance);
 
   return (
-    <div className="space-y-6">
-      <Link
-        to="/runtime"
-        className="text-sm text-muted-fg no-underline hover:text-fg"
-      >
-        &larr; Back to runtime
-      </Link>
-
-      <div className="flex flex-wrap items-center gap-3">
-        <Heading level={2}>{instanceLabel(instance)}</Heading>
-        <RuntimeHealthBadge instance={instance} />
-        {instance.leader && <Badge intent="primary">Leader</Badge>}
-        <PostgresBadge connected={instance.postgres_connected} />
-        <ShutdownBadge shuttingDown={instance.shutting_down} />
-      </div>
+    <Page width="readable">
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/runtime"], href: "/runtime" }]}
+        title={instanceLabel(instance)}
+        status={
+          <>
+            <RuntimeHealthBadge instance={instance} />
+            {instance.leader && <Badge intent="primary">Leader</Badge>}
+            <PostgresBadge connected={instance.postgres_connected} />
+            <ShutdownBadge shuttingDown={instance.shutting_down} />
+          </>
+        }
+      />
 
       <Card>
         <CardHeader
@@ -138,13 +136,13 @@ export function RuntimeInstancePage() {
 
             <DescriptionTerm>Snapshot</DescriptionTerm>
             <DescriptionDetails>
-              {timeAgo(instance.last_seen_at)} (every{" "}
+              <Time value={instance.last_seen_at} /> (every{" "}
               {formatSnapshotInterval(instance.snapshot_interval_ms)})
             </DescriptionDetails>
 
             <DescriptionTerm>Started</DescriptionTerm>
             <DescriptionDetails>
-              {formatDateTime(instance.started_at)}
+              <Time value={instance.started_at} format="absolute" />
             </DescriptionDetails>
 
             <DescriptionTerm>Hostname</DescriptionTerm>
@@ -193,22 +191,19 @@ export function RuntimeInstancePage() {
             <div className="rounded-lg border p-4">
               <div className="text-xs uppercase tracking-wide text-muted-fg">Poll</div>
               <div className="mt-2">
-                <LoopBadge label="poll" healthy={instance.poll_loop_alive} />
+                <LoopBadge healthy={instance.poll_loop_alive} />
               </div>
             </div>
             <div className="rounded-lg border p-4">
               <div className="text-xs uppercase tracking-wide text-muted-fg">Heartbeat</div>
               <div className="mt-2">
-                <LoopBadge label="heartbeat" healthy={instance.heartbeat_alive} />
+                <LoopBadge healthy={instance.heartbeat_alive} />
               </div>
             </div>
             <div className="rounded-lg border p-4">
               <div className="text-xs uppercase tracking-wide text-muted-fg">Maintenance</div>
               <div className="mt-2">
-                <LoopBadge
-                  label="maintenance"
-                  healthy={instance.maintenance_alive}
-                />
+                <LoopBadge healthy={instance.maintenance_alive} />
               </div>
             </div>
           </div>
@@ -231,8 +226,8 @@ export function RuntimeInstancePage() {
                 <div key={queue.queue} className="rounded-lg border p-4">
                     <div className="flex items-center justify-between gap-3">
                       <Link
-                        to="/jobs"
-                        search={{ q: `queue:${queue.queue}` }}
+                        to="/queues/$name"
+                        params={{ name: queue.queue }}
                         className="font-medium text-primary no-underline hover:underline"
                       >
                         {queue.queue}
@@ -285,8 +280,8 @@ export function RuntimeInstancePage() {
                     <TableRow key={queue.queue} id={queue.queue}>
                       <TableCell className="font-medium">
                         <Link
-                          to="/jobs"
-                          search={{ q: `queue:${queue.queue}` }}
+                          to="/queues/$name"
+                          params={{ name: queue.queue }}
                           className="text-primary no-underline hover:underline"
                         >
                           {queue.queue}
@@ -325,6 +320,6 @@ export function RuntimeInstancePage() {
           </Table>
         </CardContent>
       </Card>
-    </div>
+    </Page>
   );
 }

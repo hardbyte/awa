@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { FilterLink, KindLink } from "@/components/links";
 import { fetchKinds } from "@/lib/api";
 import type { JobKindOverview } from "@/lib/api";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import {
   Table,
@@ -15,13 +15,8 @@ import {
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
 import { JsonView } from "@/components/JsonView";
-
-function kindLabel(kind: JobKindOverview): string {
-  // Treat empty display_name the same as missing — the contract is
-  // "display name if set, otherwise the raw key". `??` alone would let
-  // `display_name: ""` render a blank label.
-  return kind.display_name?.trim() ? kind.display_name : kind.kind;
-}
+import { RowCards } from "@/components/RowCards";
+import { formatNumber, plural } from "@/lib/number";
 
 // The output type the kind declares, with its JSON Schema behind a toggle
 // when the runtime published one.
@@ -53,6 +48,20 @@ function descriptorSyncLabel(kind: JobKindOverview): string | null {
   return null;
 }
 
+/** Badges for the exceptions only: an undeclared, stale or drifting descriptor. */
+function KindStatusBadges({ kind }: { kind: JobKindOverview }) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {!kind.descriptor_last_seen_at ? (
+        <Badge intent="secondary">Not declared</Badge>
+      ) : kind.descriptor_stale ? (
+        <Badge intent="secondary">Descriptor stale</Badge>
+      ) : null}
+      {kind.descriptor_mismatch && <Badge intent="warning">Descriptor drift</Badge>}
+    </div>
+  );
+}
+
 export function KindsPage() {
   const poll = usePollInterval();
   const kindsQuery = useQuery<JobKindOverview[]>({
@@ -65,86 +74,36 @@ export function KindsPage() {
   const kinds = kindsQuery.data ?? [];
 
   return (
-    <div className="space-y-4">
-      <Heading level={2}>Job Kinds</Heading>
+    <Page className="space-y-4">
+      <PageHeader title="Job kinds" />
 
-      {kinds.length === 0 ? (
-        <div
-          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-subtle-fg" : "text-muted-fg"}`}
-        >
-          {kindsQuery.isLoading
-            ? "Loading job kinds…"
-            : kindsQuery.isError
-              ? "Failed to load job kinds."
-              : "No job kinds found."}
-        </div>
-      ) : (
-        <div className="space-y-3 sm:hidden">
-          {kinds.map((kind) => (
-            <div key={kind.kind} className="rounded-lg border p-4">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <Link
-                    to="/jobs"
-                    search={{ q: `kind:${kind.kind}` }}
-                    className="font-medium text-primary no-underline hover:underline"
-                  >
-                    {kindLabel(kind)}
-                  </Link>
-                  {kind.display_name && (
-                    <div className="text-xs text-muted-fg">{kind.kind}</div>
-                  )}
-                  {descriptorSyncLabel(kind) && (
-                    <div className="mt-1 text-xs text-muted-fg">
-                      {descriptorSyncLabel(kind)}
-                    </div>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-1">
-                  {!kind.descriptor_last_seen_at ? (
-                    <Badge intent="secondary">Not declared</Badge>
-                  ) : kind.descriptor_stale ? (
-                    <Badge intent="warning">Descriptor stale</Badge>
-                  ) : null}
-                  {kind.descriptor_mismatch && (
-                    <Badge intent="danger">Descriptor drift</Badge>
-                  )}
-                </div>
-              </div>
-
-              {kind.description && (
-                <p className="mt-2 text-sm text-muted-fg">{kind.description}</p>
-              )}
-              <OutputType kind={kind} />
-
-              <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-                <span className="text-muted-fg">Jobs</span>
-                <span>{kind.job_count.toLocaleString()}</span>
-                <span className="text-muted-fg">Queues</span>
-                <span>{kind.queue_count.toLocaleString()}</span>
-                <span className="text-muted-fg">Completed/hr</span>
-                <span>{kind.completed_last_hour.toLocaleString()}</span>
-                {kind.owner && (
-                  <>
-                    <span className="text-muted-fg">Owner</span>
-                    <span>{kind.owner}</span>
-                  </>
-                )}
-              </div>
-
-              {kind.tags.length > 0 && (
-                <div className="mt-3 flex flex-wrap gap-1">
-                  {kind.tags.map((tag) => (
-                    <Badge key={tag} intent="secondary">
-                      {tag}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      <RowCards
+        label="Job kinds"
+        placeholder={
+          kindsQuery.isLoading ? (
+            "Loading job kinds…"
+          ) : kindsQuery.isError ? (
+            <span className="text-danger-subtle-fg">Failed to load job kinds.</span>
+          ) : (
+            "No job kinds found."
+          )
+        }
+        items={kinds.map((kind) => ({
+          key: kind.kind,
+          title: kind.display_name?.trim() ? kind.display_name : kind.kind,
+          link: { to: "/kinds/$kind", params: { kind: kind.kind } },
+          status: <KindStatusBadges kind={kind} />,
+          why: descriptorSyncLabel(kind) ?? undefined,
+          meta: (
+            <>
+              <span>{plural(kind.job_count, "job")}</span>
+              <span>{plural(kind.queue_count, "queue")}</span>
+              <span>{formatNumber(kind.completed_last_hour)} completed/hr</span>
+              {kind.owner && <span>{kind.owner}</span>}
+            </>
+          ),
+        }))}
+      />
 
       <Table aria-label="Job kinds" className="hidden sm:block">
         <TableHeader>
@@ -172,16 +131,10 @@ export function KindsPage() {
               <TableRow key={kind.kind} id={kind.kind}>
                 <TableCell className="font-medium">
                   <div>
-                    <Link
-                      to="/jobs"
-                      search={{ q: `kind:${kind.kind}` }}
-                      className="text-primary no-underline hover:underline"
-                    >
-                      {kindLabel(kind)}
-                    </Link>
-                    {kind.display_name?.trim() && (
-                      <div className="text-xs font-normal text-muted-fg">{kind.kind}</div>
-                    )}
+                    <KindLink kind={kind.kind} descriptor={kind} />
+                    <FilterLink filter={{ kind: kind.kind }} className="ml-2 text-xs font-normal" aria-label={`Jobs of kind ${kind.kind}`}>
+                      jobs
+                    </FilterLink>
                     {kind.description && (
                       <div className="mt-1 text-xs font-normal text-muted-fg">
                         {kind.description}
@@ -206,23 +159,12 @@ export function KindsPage() {
                 </TableCell>
                 <TableCell>{kind.owner ?? "—"}</TableCell>
                 <TableCell>
-                  <div className="flex flex-wrap gap-1">
-                    {!kind.descriptor_last_seen_at ? (
-                      <Badge intent="secondary">Not declared</Badge>
-                    ) : kind.descriptor_stale ? (
-                      <Badge intent="warning">Descriptor stale</Badge>
-                    ) : (
-                      <Badge intent="success">Live</Badge>
-                    )}
-                    {kind.descriptor_mismatch && (
-                      <Badge intent="danger">Descriptor drift</Badge>
-                    )}
-                  </div>
+                  <KindStatusBadges kind={kind} />
                 </TableCell>
               </TableRow>
             ))}
         </TableBody>
       </Table>
-    </div>
+    </Page>
   );
 }

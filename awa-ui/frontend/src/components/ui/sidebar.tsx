@@ -527,9 +527,9 @@ const SidebarLink = ({ className, ref, ...props }: SidebarLinkProps) => {
   )
 }
 
-const SidebarInset = ({ className, ref, ...props }: React.ComponentProps<"main">) => {
+const SidebarInset = ({ className, ref, ...props }: React.ComponentProps<"div">) => {
   return (
-    <main
+    <div
       data-slot="sidebar-inset"
       ref={ref}
       className={twMerge(

@@ -1,6 +1,6 @@
 # AWA Web UI
 
-The `awa-ui` crate provides a built-in web dashboard for monitoring and managing AWA job queues. It ships as an axum router with an embedded React/TypeScript frontend — no separate Node.js runtime or build step needed at deployment time.
+The `awa-ui` crate provides a built-in web admin UI for monitoring and managing AWA job queues. It ships as an axum router with an embedded React/TypeScript frontend — no separate Node.js runtime or build step needed at deployment time.
 
 ```bash
 awa --database-url $DATABASE_URL serve --host 127.0.0.1 --port 3000
@@ -53,7 +53,7 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 ### API Endpoints
 
 ```
-GET  /api/stats                         Dashboard summary (state counts)
+GET  /api/stats                         Job counts by state
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
 GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&limit=&before_id=
@@ -113,81 +113,89 @@ GET  /api/capabilities                  Feature flags / read-only detection
 
 ## Pages
 
-### Dashboard (`/`)
+The sidebar groups the pages: Overview; Investigate (Jobs, Dead letters); Configure (Queues, Job kinds, Schedules); Operate (Fleet, Bulk operations). Dead letters, Fleet and Bulk operations carry a count badge for dead letters, unhealthy live instances and active operations. Page names changed in 0.7; the paths did not, so Fleet is still `/runtime`, Schedules `/cron` and Bulk operations `/batch-ops`.
 
-At-a-glance health check. Shows state counter cards (available, running, failed, scheduled, waiting_external, completed/hr), a runtime summary, a queue table, and recent failures. Counter cards link to the filtered jobs view. Skeleton loading states prevent false-zero flashes.
+### Overview (`/`)
+
+A health strip and a ranked list of what needs attention, built from reads the other pages already make.
+
+- **Health strip**: ready jobs in unpaused queues with the oldest one's wait (jobs held in paused queues are counted apart), retrying jobs and the queue with the most, failed jobs with the completions of the last hour, dead letters and the queue with the most, stuck running jobs (past their deadline or without a heartbeat for 90 seconds, among the 100 newest running jobs), and bulk operations in flight with the latest failure. Each figure links to the jobs behind it. A figure whose read failed shows "—" and the error, never 0.
+- **Fleet and deferred work** each get one line: how many live instances are healthy, which one leads and how many are stale; and how many jobs are scheduled or waiting for a callback, with the next schedule fire. Work that isn't due yet is not counted as backlog.
+- **Needs attention** ranks problems, each linking to a scoped view: unhealthy instances, no live workers, stuck running jobs, failure groups (kind and error class across the 50 newest failed jobs, dead letters left out), recently failed bulk operations, paused queues holding ready jobs, more or fewer than one maintenance leader, queues whose oldest ready job has waited a minute, dead letters per queue, queue config drift between workers, overdue and paused schedules, descriptor drift, mixed worker versions and running bulk operations. Red marks what needs an operator now, amber what needs one soon, grey what's worth knowing. With nothing to report it says "Nothing needs attention" and when it last checked; checks whose reads failed are named.
+- **Queues needing attention** lists up to five queues with failures, dead letters, retries or held work, with a link to every queue.
+
+Failure rate against a baseline and a dead-letter trend need outcome counts bucketed by finish time, which the API doesn't provide yet.
 
 ### Jobs (`/jobs`)
 
-Filterable, paginated job list with state filter pills (showing counts), a search bar supporting `kind:`, `queue:`, and `tag:` prefix filters, and checkbox-based bulk selection for retry/cancel operations. Queue and kind cells show declared display names when a descriptor is present; raw names otherwise.
+Filterable, paginated job list with state filter pills (showing counts), a search bar and a bulk-action bar. The search takes `kind:`, `queue:`, `tag:`, `id:`, `created>=` and `created<` terms. The bar acts on the selected rows (Retry and Cancel, at once) or on all the jobs the filter matches (Retry, Cancel, Discard and Move to DLQ as bulk operations, plus Set priority and Move queue through the new-operation form); an action that can't apply to the filter is disabled and says why. The jobs list includes dead-lettered rows, but job actions never change them, so the "all matching" scope counts only live jobs ("All 18 matching live jobs") and agrees with the count the action's preview shows.
 
-Desktop uses a table layout; mobile switches to a card layout. Both show the job kind with an inline `#ID` suffix for easy reference. Cursor-based pagination using `before_id` on the primary key.
+Kind and queue cells show declared display names, with the raw name as a tooltip. A "why" column gives a failed, retryable or cancelled job's last error, when a retryable or scheduled job runs next and when a waiting job's callback times out; its header follows the state filter (Last error, Next attempt, Runs, Callback or Detail). Priority shows only when it isn't the default or was aged. Badges mark exceptions only.
+
+Desktop uses a table; phones get cards whose title links to the job, so Tab and Enter open it, with a labelled checkbox for selection. Cursor-based pagination uses `before_id` on the primary key.
 
 ### Job Detail (`/jobs/:id`)
 
-Full inspection of a single job: state badge, queue (linked), priority, attempt count, creation time, a timeline reconstructed from timestamps and error history, syntax-highlighted JSON arguments, and retry/cancel actions. Declared queue and job-kind descriptors render alongside the raw fields so operators can jump from a job instance to its owning team or runbook without leaving the page.
+Full inspection of a single job. A line under the title says where it stands: how long a running job has run, its heartbeat age ("no heartbeat yet" for a short-job claim, which has none), deadline, attempt and progress; when a retryable or scheduled job runs next; how long a waiting job has waited and when its callback times out; how long an available job has been ready; how long a completed job took and waited; when a failed or cancelled job ended and after how many attempts. Which runtime instance holds an attempt isn't recorded, so it isn't shown. Below it: state badge, queue (linked), priority, attempt count, creation time, a timeline reconstructed from timestamps and error history, syntax-highlighted JSON arguments, and retry/cancel actions. Errors show once: the latest formatted (class, message and traceback, with library frames dimmed), then a table of every failed attempt with when it failed, the gap since the one before and its outcome. Runs are split where the attempt number goes down (a manual retry), identical consecutive errors collapse into one row, and the raw JSON is a toggle away. Entries record when an attempt failed but not when it started, so only the final attempt's duration is shown. The dead-letter page uses the same card. Declared queue and job-kind descriptors render alongside the raw fields so operators can jump from a job instance to its owning team or runbook without leaving the page.
 
 ### Queues (`/queues`)
 
-Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
+Per-queue table: ready jobs with the oldest one's wait, running, retrying, failed, dead letters, deferred (scheduled, plus jobs waiting for a callback), completions per hour and capacity, with Pause, Resume and Drain in each row's Actions menu. Badges beside the name mark exceptions only: Paused, DLQ on, a stale or drifted descriptor and config mismatch between workers. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
 
-Descriptor display name, owner, tags, and docs URL (when declared) appear inline; a stale or drifted descriptor shows a subdued status badge so operators can tell when the catalog diverged from any live runtime.
+### Queue hub (`/queues/:name`)
 
-### Queue Detail (`/queues/:name`)
+Each queue's page, with Pause, Resume and Drain in its header and four tabs: Overview (counts linking into the jobs tab, failing kinds, the schedules that enqueue into it and serving instances), Jobs (the jobs list locked to the queue), Dead letters (the dead-letter list locked to the queue) and Config (the runtime configuration each worker reports). Tabs are deep links: `/queues/:name/jobs`, `/queues/:name/dlq` and `/queues/:name/config`.
 
-Reuses the Jobs list with a pre-applied queue filter, plus a summary bar showing the queue's status and counts with Pause/Resume/Drain controls. The declared descriptor (display name, description, owner, docs URL, tags, extra JSON) renders above the filter; stale/drift status is surfaced the same way as on the Queues listing.
+### Job kinds (`/kinds`, `/kinds/:kind`)
 
-### Job Kinds (`/kinds`)
+Catalog of every declared job kind, with job and queue counts, completions per hour, owner and declared output type. Declared-but-never-enqueued kinds still appear because the descriptor catalog is authoritative. A kind's page shows its descriptor, its recent failures grouped by error, the schedules that enqueue it and the queues it runs in, with a "Retry all failed" bulk action.
 
-Catalog of every declared job kind. Shows display name, owner, tags, descriptor last-seen time, and job count. Declared-but-never-enqueued kinds still appear here because the descriptor catalog is authoritative, which lets operators see the full vocabulary of jobs the fleet could emit even during a quiet period. Each row links to the jobs view pre-filtered by `kind:<kind>`. Stale/drift status is surfaced the same way as on queue surfaces.
+### Fleet (`/runtime`, `/runtime/:instanceId`)
 
-### Runtime (`/runtime`)
+Cluster overview: instance count, liveness, leader status, and an attention panel for unexpected states (no live workers, a missing or extra leader, unhealthy instances, queue config mismatch). Healthy instances carry no badge; a stale or unhealthy one does, and each worker loop shows its state in words. An instance's page shows its summary, loop health and the queues it serves.
 
-Cluster overview: instance count, liveness, leader status, and an attention panel for unexpected states (e.g. missing leader). Shows per-instance health and queue runtime configuration when workers are running.
+### Schedules (`/cron`, `/cron/:name`)
 
-### Cron (`/cron`)
+Table of registered schedules: the schedule in words and as a cron expression, next fire, last enqueue, target kind and queue, and badges for Paused, Retired, Queue paused and Overdue. Each row has Pause or Resume, Trigger now and Retire or Restore. "Trigger now" fires the job immediately without affecting the next scheduled run, and is allowed on a paused schedule after a confirmation, because pause stops automatic fires only. Pausing leaves `last_enqueued_at` untouched, so resume respects the schedule's existing missed-fire policy. A schedule's page shows its definition, its recent runs and its ownership.
 
-Accordion list of registered periodic job schedules. Each entry shows the cron expression, job kind, target queue, priority, next fire time (countdown), and last run. Expandable to see full details including arguments and tags. "Trigger now" fires the job immediately without affecting the next scheduled run.
+When the target queue is itself paused, the row shows a "Queue paused" badge: fires continue to enqueue jobs into the paused queue, and those jobs dispatch only after the queue is resumed. Cron pause and queue pause are independent — one is "stop scheduling," the other is "stop dispatching."
 
-Paused schedules render with a "paused" badge and the `paused_by` label. Pause/Resume controls sit next to "Trigger now"; a manual trigger is allowed on a paused schedule, which is called out in the expanded detail so operators understand pause stops automatic fires only. Pausing leaves `last_enqueued_at` untouched, so resume respects the schedule's existing missed-fire policy.
-
-When the target queue is itself paused, the row shows a "queue paused" badge alongside the queue name and the expanded detail explains that fires continue to enqueue jobs into the paused queue but those jobs dispatch only after the queue is resumed. Cron pause and queue pause are independent — one is "stop scheduling," the other is "stop dispatching."
-
-### Batch Operations (`/batch-ops`)
+### Bulk operations (`/batch-ops`, `/batch-ops/:id`, `/batch-ops/new`)
 
 Operator surface for durable async mutations recorded in `awa.batch_operations`.
 
-- **New operation form** — choose `set_priority`, `move_queue`, `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` or `purge_dlq`, filter by queue, kind, or explicit ids, then preview before submitting. The state filter offers the states the chosen kind acts on.
-- **Preview** — calls `/api/batch-ops/preview` and reports the eligible row count. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation.
-- **History table** — lists recent operations with id, kind, state, progress, error count, and submitted age.
-- **Cancellation** — active `pending`, `scanning`, and `running` operations expose a Cancel action, which requests cooperative cancellation at chunk boundaries.
-
-The first UI form intentionally covers the common operator paths. The API and Python/Rust surfaces also support tag, state, and created-at filters for callers that need more precise automation.
+- **History** lists recent operations with kind, state, progress, processed, skipped and errored counts, the last error and submitted age. An operation that skipped every row says it changed nothing.
+- **An operation's page** shows its filter with a link to the matching jobs, its spec, progress, last error, submitter and runner. Active operations offer Cancel, which requests cooperative cancellation at chunk boundaries.
+- **New operation** (`/batch-ops/new`) chooses `set_priority`, `move_queue`, `retry`, `cancel`, `discard`, `move_to_dlq`, `retry_from_dlq` or `purge_dlq`, filters by queue, kind, tags, ids, state or created time, and previews the exact count and sample rows before submitting. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation. The Jobs and Dead letters lists open this form with their filter for Set priority and Move queue.
 
 ### Dead Letter Queue (`/dlq`, `/dlq/:id`)
 
 Operator surface for queue-storage `dlq_entries`.
 
-- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, age, and attempts.
-- **Bulk actions** — filter-scoped bulk retry and purge, each confirmed and then submitted as a `retry_from_dlq` or `purge_dlq` batch operation; the page names the submitted operation and links to the batch operations page, where its progress shows. Empty-filter actions require explicit `all=true` confirmation through the API.
+- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, last error, attempts and age; phones get cards.
+- **Bulk actions** — Retry and Purge on all the rows a filter matches, each previewed and then submitted as a `retry_from_dlq` or `purge_dlq` bulk operation, whose page then opens. Empty-filter actions require explicit `all=true` confirmation through the API.
 - **Detail (`/dlq/:id`)** — single-row inspection with retry and purge actions.
-- **Queue badge** — `/queues` shows a `+N DLQ` link next to queues with non-zero DLQ depth.
+- **Queue counts** — `/queues` links each queue's non-zero dead-letter count to its Dead letters tab.
 
 The shared `/jobs/:id` detail page also carries DLQ metadata when a job has already moved into the DLQ, so direct links keep working after routing.
 
 ## Interaction Patterns
 
-**Data freshness:** Polling via TanStack Query `refetchInterval` (2s for jobs, 5s for dashboard/queues/cron). Pauses when a selection is active or the browser tab is backgrounded. Manual refresh button in the nav.
+**Data freshness:** Views poll through one scheduler per tab (see [admin observation](admin-observation.md)). A pill in the header says how current the page is: "Live · updated 3s ago" (the age of the least recently loaded view), amber "Last updated 2m ago — reconnecting" while some reads fail, red "Server unreachable" when every read fails, which also dims the page, "Paused while rows are selected" while a list holds its rows still for a selection, and "A view's request was refused — refresh to retry" when the server refused a view's request with a 4xx, which is not retried until a refresh. Not-found and refused views don't count as failing. Polling stops while the tab is in the background, and the header's refresh button reads everything again.
 
-**URL-driven state:** All filters live in URL search params (`/jobs?state=failed&kind=send_email`). Back/forward and bookmarks work naturally.
+**URL-driven state:** All filters live in URL search params (`/jobs?state=failed&q=kind:send_email`). Back/forward and bookmarks work naturally. The older form `/jobs?state=failed&kind=send_email` is folded into `q`.
 
-**Bulk operations:** Select jobs via checkboxes → action toolbar appears with count and Retry/Cancel buttons. Destructive operations (cancel, drain) require a confirmation dialog.
+**Confirming actions:** Confirmation scales with what an action can break. Pausing or resuming a queue or schedule takes one click and its toast offers Undo. An action on one job with side effects (Retry, Cancel, retrying or purging a dead letter, triggering a paused schedule, cancelling a bulk operation) opens a dialog that names the object and the risk. Acting on several selected jobs lists them in the dialog. An action on everything a filter matches previews it first: the dialog shows the exact count, the filter in words and some of the matching jobs, and submitting opens the bulk operation's page. Discarding failed jobs, purging dead letters, and cancelling or retrying 1,000 or more jobs or dead letters (or a count the server could only bound from below) also ask you to type the count, since a retry runs handlers again and repeats their side effects, and draining a queue asks for its name after showing how many jobs it cancels. A dialog's confirm button names the action ("Cancel job #918"), its dismiss button is "Keep", it stays open until the server answers and shows the server's error in place, and it says "This can't be undone" only when that is true.
+
+**Jump to:** ⌘K (Ctrl+K elsewhere) or the header's "Jump to…" button opens a palette that goes to a job by id (a dead-lettered one opens its DLQ row), a queue, job kind or schedule by name or display name, a bulk operation by id or its first eight characters, a jobs search (`kind:send_email`, or `tenant:acme` as a tag), or any page. It loads names when it opens and doesn't poll.
 
 **Dark mode:** Three modes — Light, Dark, System (follows OS). Persisted in localStorage. Theme toggle cycles through all three.
 
-**Responsive:** Desktop table layouts, mobile card layouts. Nav collapses to a hamburger menu on small screens.
+**Responsive:** Desktop table layouts; on phones the Jobs, Dead letters, Queues, Job kinds, Bulk operations and Schedules lists become cards whose titles are links. Nav collapses to a drawer on small screens.
 
-**Read-only detection:** When connected to a read replica, write actions are automatically hidden.
+**Reduced motion:** With the system's reduced-motion setting on, animations and transitions settle at once.
+
+**Read-only:** When the server is read-only (a read replica, or `--read-only`), admin actions stay in place but disabled, each giving the reason "Read-only server — admin actions are off" on hover and to assistive technology.
 
 ## Development
 

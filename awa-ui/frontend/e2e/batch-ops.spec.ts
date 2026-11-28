@@ -37,9 +37,15 @@ async function stubSharedApi(page, operations) {
     if (url.pathname !== "/api/batch-ops") return route.fallback();
     return route.fulfill({ json: operations });
   });
+  await page.route("**/api/batch-ops/*", (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const id = new URL(route.request().url()).pathname.split("/").pop();
+    const found = operations.find((op) => op.id === id);
+    return found ? route.fulfill({ json: found }) : route.fallback();
+  });
 }
 
-test.describe("Batch operations page", () => {
+test.describe("Bulk operations form", () => {
   test("previews and submits a set-priority operation", async ({ page }) => {
     const operations = [];
 
@@ -69,7 +75,9 @@ test.describe("Batch operations page", () => {
     });
 
     await page.goto("/batch-ops");
-    await expect(page.getByRole("heading", { name: "Batch Operations" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Bulk operations" })).toBeVisible();
+    await page.getByRole("link", { name: "New operation" }).click();
+    await expect(page).toHaveURL(/\/batch-ops\/new$/);
     await page.getByLabel("Queue filter").fill("e2e_test");
     await page.getByRole("textbox", { name: "Priority" }).fill("1");
     await page.getByRole("button", { name: "Preview" }).click();
@@ -79,8 +87,9 @@ test.describe("Batch operations page", () => {
     await expect(dialog).toContainText(
       "Set priority to 1 on 2 available or scheduled jobs with queue e2e_test."
     );
-    await dialog.getByRole("button", { name: "Submit" }).click();
-    await expect(page.getByRole("gridcell", { name: "11111111" })).toBeVisible();
+    await dialog.getByRole("button", { name: "Set priority on 2 jobs" }).click();
+    await expect(page).toHaveURL(/\/batch-ops\/11111111-1111-4111-8111-111111111111$/);
+    await expect(page.getByRole("heading", { name: "Set priority" })).toBeVisible();
   });
 
   test("submits a move-queue operation with filters", async ({ page }) => {
@@ -130,7 +139,7 @@ test.describe("Batch operations page", () => {
       await route.fallback();
     });
 
-    await page.goto("/batch-ops");
+    await page.goto("/batch-ops/new");
     await page.getByRole("combobox", { name: /^Operation/ }).selectOption("move_queue");
     await page.getByLabel("Queue filter").fill("e2e_test");
     await page.getByLabel("Kind filter").fill("e2e_job");
@@ -144,8 +153,25 @@ test.describe("Batch operations page", () => {
     await expect(dialog).toContainText(
       "Move 1 available or scheduled jobs with queue e2e_test, kind e2e_job, id 800006 to queue escalations at priority 2."
     );
-    await dialog.getByRole("button", { name: "Submit" }).click();
-    await expect(page.getByRole("gridcell", { name: "move queue" })).toBeVisible();
+    await dialog.getByRole("button", { name: "Move 1 job" }).click();
+    await expect(page.getByRole("heading", { name: "Move queue" })).toBeVisible();
+    await expect(page.getByTestId("batch-op-spec")).toHaveText("To queue escalations, priority 2");
+  });
+
+  test("a prefilled link opens the form and the form lives in the URL", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.goto("/batch-ops?queue=e2e_test&kind=e2e_job");
+    await expect(page).toHaveURL(/\/batch-ops\/new\?/);
+    await expect(page.getByLabel("Queue filter")).toHaveValue("e2e_test");
+    await expect(page.getByLabel("Kind filter")).toHaveValue("e2e_job");
+
+    await page.getByRole("combobox", { name: /^Operation/ }).selectOption("retry");
+    await page.getByLabel("Tags filter").fill("e2e");
+    await expect(page).toHaveURL(/op=retry/);
+    await page.reload();
+    await expect(page.getByRole("combobox", { name: /^Operation/ })).toHaveValue("retry");
+    await expect(page.getByLabel("Tags filter")).toHaveValue("e2e");
+    await expect(page.getByLabel("Queue filter")).toHaveValue("e2e_test");
   });
 
   test("sends tags, state and created bounds in the shared filter", async ({ page }) => {
@@ -267,9 +293,40 @@ test.describe("Batch operations page", () => {
     await expect(dialog).toContainText(
       "Set priority to 1 on at least 10,000 scheduled jobs with kind e2e_job."
     );
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).toHaveCount(0);
     expect(submits).toEqual([]);
+  });
+
+  test("cancelling an at-least count asks for the count to be typed", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({ json: { total_matched: { kind: "at_least", value: 10000 }, sample: [] } })
+    );
+    await page.goto("/batch-ops/new?op=cancel&kind=e2e_job");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Submit" }).click();
+    const dialog = page.getByRole("alertdialog");
+    const confirm = dialog.getByRole("button", { name: "Cancel at least 10,000 jobs" });
+    await expect(confirm).toBeDisabled();
+    await expect(dialog).not.toContainText("undone");
+    await dialog.getByRole("textbox", { name: /Type 10000/ }).fill("10000");
+    await expect(confirm).toBeEnabled();
+  });
+
+  test("retrying an at-least count asks for the count to be typed", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", (route) =>
+      route.fulfill({ json: { total_matched: { kind: "at_least", value: 10000 }, sample: [] } })
+    );
+    await page.goto("/batch-ops/new?op=retry&kind=e2e_job");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Submit" }).click();
+    const dialog = page.getByRole("alertdialog");
+    const confirm = dialog.getByRole("button", { name: /^Retry at least 10,000/ });
+    await expect(confirm).toBeDisabled();
+    await dialog.getByRole("textbox", { name: /Type 10000/ }).fill("10000");
+    await expect(confirm).toBeEnabled();
   });
 
   test("a created date that doesn't parse blocks preview and submit", async ({ page }) => {
@@ -290,6 +347,9 @@ test.describe("Batch operations page", () => {
     await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();
   });
 
+});
+
+test.describe("Bulk operations history", () => {
   test("requests cancellation for an active operation", async ({ page }) => {
     const operations = [
       operation({
@@ -312,9 +372,20 @@ test.describe("Batch operations page", () => {
     });
 
     await page.goto("/batch-ops");
-    await expect(page.getByRole("gridcell", { name: "running" })).toBeVisible();
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expect(page.getByText("Cancellation requested")).toBeVisible();
-    await expect(page.getByRole("gridcell", { name: "cancelling" })).toBeVisible();
+    await expect(page.getByRole("gridcell", { name: "Running" })).toBeVisible();
+    await page.getByRole("button", { name: "Cancel operation 11111111" }).click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog).toContainText("The 3 of 10 job(s) it has already changed stay changed.");
+    await dialog.getByRole("button", { name: "Cancel operation 11111111" }).click();
+    await expect(page.getByText("Cancellation of operation 11111111 requested")).toBeVisible();
+    await expect(page.getByRole("gridcell", { name: "Cancelling" })).toBeVisible();
+  });
+
+  test("a row opens the operation's page", async ({ page }) => {
+    await stubSharedApi(page, [operation({ state: "completed", total_matched: 2, processed: 2 })]);
+    await page.goto("/batch-ops");
+    await page.getByRole("link", { name: "11111111" }).click();
+    await expect(page).toHaveURL(/\/batch-ops\/11111111-1111-4111-8111-111111111111$/);
+    await expect(page.getByTestId("batch-op-outcome")).toHaveText("2 changed, 0 skipped");
   });
 });

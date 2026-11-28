@@ -25,17 +25,18 @@ test.describe("Queues page", () => {
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
-    // Columns were consolidated: Scheduled/Available fold into Queued;
-    // Mode/RateLimit fold into Capacity; Waiting is a subline under Queue.
+    // Ready work is split from work that isn't due yet; mode and rate limit
+    // fold into Capacity.
     for (const header of [
       "Queue",
-      "Queued",
+      "Ready",
       "Running",
-      "Retry",
+      "Retrying",
       "Failed",
+      "Dead letters",
+      "Deferred",
       "Completed/hr",
       "Capacity",
-      "Status",
       "Actions",
     ]) {
       await expect(
@@ -43,9 +44,8 @@ test.describe("Queues page", () => {
       ).toBeVisible();
     }
 
-    // Descriptor-backed queue shows display name and raw key
-    await expect(queueTable.getByText("E2E Queue")).toBeVisible();
-    await expect(queueTable.getByText("e2e_test")).toBeVisible();
+    // A descriptor-backed queue shows its display name, with the key as its tooltip.
+    await expect(queueTable.getByRole("link", { name: "E2E Queue" })).toHaveAttribute("title", "e2e_test");
     await expect(
       queueTable.getByRole("link", { name: "legacy_queue", exact: true })
     ).toBeVisible();
@@ -67,14 +67,14 @@ test.describe("Queues page", () => {
     await expect(queueTable).toBeVisible();
 
     // Mode / rate limit / waiting folded into the Capacity and Queue cells.
-    for (const header of ["Capacity", "Status", "Actions"]) {
+    for (const header of ["Capacity", "Actions"]) {
       await expect(
         queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();
     }
   });
 
-  test("queue table surfaces DLQ policy from runtime config", async ({ page }) => {
+  test("queue table shows badges only for exceptions", async ({ page }) => {
     await page.route("**/api/queues", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -138,7 +138,9 @@ test.describe("Queues page", () => {
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable.getByRole("rowheader", { name: /DLQ Off Queue/ })).toBeVisible();
-    await expect(queueTable.getByText("DLQ off", { exact: true })).toBeVisible();
+    await expect(queueTable.getByText("DLQ off", { exact: true })).toHaveCount(0);
+    await expect(queueTable.getByText("Active", { exact: true })).toHaveCount(0);
+    await expect(queueTable.getByText("Paused", { exact: true })).toHaveCount(0);
   });
 
   test("click queue navigates to queue detail", async ({ page }) => {
@@ -163,11 +165,13 @@ test.describe("Queues page", () => {
     await expect(page.getByRole("heading", { name: "E2E Queue" })).toBeVisible();
     await expect(page.getByText("e2e_test").first()).toBeVisible();
     await expect(page.getByText("End-to-end queue used for UI coverage")).toBeVisible();
+    await page.getByRole("tab", { name: "Config" }).click();
+    await expect(page).toHaveURL(/\/queues\/e2e_test\/config$/);
     await expect(page.getByText("qa-platform")).toBeVisible();
     await expect(page.getByText("critical")).toBeVisible();
   });
 
-  test("queue detail links to filtered DLQ rows when DLQ is enabled", async ({ page }) => {
+  test("the Dead letters tab shows rows whenever depth > 0", async ({ page }) => {
     await page.route("**/api/queues/payments", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -217,7 +221,7 @@ test.describe("Queues page", () => {
               poll_interval_ms: 200,
               deadline_duration_secs: 300,
               priority_aging_interval_secs: 60,
-              dlq_enabled: true,
+              dlq_enabled: false,
               rate_limit: null,
             },
           },
@@ -227,19 +231,23 @@ test.describe("Queues page", () => {
     await page.route("**/api/dlq/depth", async (route) => {
       await route.fulfill({
         contentType: "application/json",
-        body: JSON.stringify({ total: 0, by_queue: [] }),
+        body: JSON.stringify({ total: 2, by_queue: [{ queue: "payments", count: 2 }] }),
       });
     });
-    await page.route("**/api/dlq**", async (route) => {
+    let listUrl = "";
+    await page.route("**/api/dlq?*", async (route) => {
+      listUrl = route.request().url();
       await route.fulfill({ contentType: "application/json", body: JSON.stringify([]) });
     });
 
+    // Rows can reach the DLQ by `dlq move` even with the queue's DLQ off.
     await page.goto("/queues/payments");
-
-    const dlqLink = page.getByRole("link", { name: "View DLQ rows" });
-    await expect(dlqLink).toBeVisible();
+    const dlqLink = page.getByTestId("queue-dlq-rows").getByRole("link");
+    await expect(dlqLink).toHaveText("2 dead-lettered job(s)");
     await dlqLink.click();
-    await expect(page).toHaveURL(/\/dlq\?q=queue%3Apayments$/);
+    await expect(page).toHaveURL(/\/queues\/payments\/dlq$/);
+    await expect(page.getByTestId("locked-filter")).toHaveText("queue:payments");
+    await expect.poll(() => new URL(listUrl || "http://x/").searchParams.get("queue")).toBe("payments");
   });
 
   test("legacy queue still renders without descriptors", async ({ page }) => {
@@ -249,6 +257,7 @@ test.describe("Queues page", () => {
     ]);
 
     await expect(page.getByRole("heading", { name: "legacy_queue" })).toBeVisible();
+    await page.getByRole("tab", { name: "Config" }).click();
     await expect(page.getByText("Descriptor health")).toBeVisible();
     await expect(page.getByText("Not declared by a live worker")).toBeVisible();
   });
@@ -299,7 +308,9 @@ test.describe("Queues page", () => {
 
   async function openActionsMenu(page: Page, queueName: string) {
     const queueTable = page.getByRole("grid", { name: "Queues" });
-    const row = queueTable.getByRole("row", { name: new RegExp(queueName) });
+    const row = queueTable.getByRole("row").filter({
+      has: page.getByRole("button", { name: `Actions for ${queueName}`, exact: true }),
+    });
     await expect(row).toBeVisible();
     await row
       .getByRole("button", { name: new RegExp(`Actions for ${queueName}`) })
@@ -351,6 +362,15 @@ test.describe("Queues page", () => {
       pauseItem.click(),
     ]);
     expect(pauseResponse.ok()).toBeTruthy();
+
+    // Its toast offers Undo, which resumes the queue.
+    const toast = page.locator("[data-sonner-toast]").filter({ hasText: 'Queue "e2e_test" paused' });
+    await expect(toast).toBeVisible();
+    const [undoResponse] = await Promise.all([
+      page.waitForResponse((r) => r.url().endsWith("/api/queues/e2e_test/resume") && r.request().method() === "POST"),
+      toast.getByRole("button", { name: "Undo" }).click(),
+    ]);
+    expect(undoResponse.ok()).toBeTruthy();
   });
 
   test("Resume executes mutation from the Actions menu", async ({ page }) => {
@@ -393,10 +413,21 @@ test.describe("Queues page", () => {
 
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
-    await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
-    await expect(dialog.getByText("Running jobs will not be affected")).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: 'Drain queue "e2e_test"?' })).toBeVisible();
+    await expect(dialog.getByText(/Running jobs are not affected/)).toBeVisible();
 
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "Keep", exact: true }).click();
     await expect(dialog).not.toBeVisible();
+  });
+
+  test("on a read-only server the Actions menu is disabled and says why", async ({ page }) => {
+    await page.route("**/api/capabilities", async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), read_only: true } });
+    });
+    await loadQueuesPage(page);
+    const trigger = page.getByRole("grid", { name: "Queues" }).getByRole("button", { name: "Actions for e2e_test" });
+    await expect(trigger).toBeDisabled();
+    await expect(trigger).toHaveAccessibleDescription("Read-only server — admin actions are off");
   });
 });

@@ -25,7 +25,8 @@ test("16 exact keys are a hard cap; duplicate observers share admission and deta
   const handles = Array.from({ length: 16 }, (_, n) => scheduler.attach(demand(String(n), async () => {})));
   const duplicate = scheduler.attach(demand("0", async () => {}));
   assert.throws(() => scheduler.attach(demand("17", async () => {})), CapacityError);
-  const clear = scheduler.recordRejection(); assert.match(scheduler.readStatus(), /rejected/); clear(); clear();
+  const clear = scheduler.recordRejection(); assert.equal(scheduler.freshness().rejected, 1); clear(); clear();
+  assert.equal(scheduler.freshness().rejected, 0);
   handles[0]!.detach(); assert.equal(scheduler.size, 16);
   duplicate.detach(); assert.equal(scheduler.size, 15);
   const replacement = scheduler.attach(demand("0", async () => {}));
@@ -61,7 +62,7 @@ test("debounce is anchored to the first mark, while polling and reconciliation k
   now = 29_100; scheduler.tick(); await settle(); assert.equal(reads, 2);
   assert.equal(scheduler.nextWakeAt(), 30_000); // A pending read/mark did not renew the watchdog.
   now = 30_000; scheduler.tick(); finish(); await settle();
-  assert.match(scheduler.readStatus(), /awaiting/);
+  assert.equal(scheduler.freshness().pending, 1);
 });
 
 test("lost local invalidation converges through ordinary scheduled reads", async () => {
@@ -107,7 +108,7 @@ test("hung or synchronous-failing reads release slots and late results cannot cl
   scheduler.attach(demand("healthy", async () => { healthy++; }));
   scheduler.tick(); await settle(); scheduler.tick(); await settle(); assert.equal(healthy, 1);
   t.mock.timers.tick(35_001); await settle();
-  assert.match(scheduler.readStatus(), /failed/); finish(); await settle(); assert.match(scheduler.readStatus(), /failed/);
+  assert.equal(scheduler.freshness().failed, 2); finish(); await settle(); assert.equal(scheduler.freshness().failed, 2);
   now = 1000; scheduler.tick(); await settle(); assert.equal(healthy, 1);
 });
 
@@ -119,7 +120,7 @@ test("filter/backend replacement cancels old work, releases capacity and fences 
   scheduler.attach(demand("backend-b/admin/jobs/filter2/page1", async () => { fresh = true; }));
   scheduler.tick(); await settle(); finish(); await settle();
   assert.equal(fresh, true); assert.equal(scheduler.size, 1); assert.equal(scheduler.inFlight, 0);
-  assert.equal(scheduler.readStatus(), "");
+  assert.equal(scheduler.freshness().failed, 0); assert.equal(scheduler.freshness().pending, 0);
 });
 
 test("hidden and BFCache lifecycles cancel work and resume one paced demand", async () => {
@@ -329,18 +330,58 @@ test("scheduled job reads mark manual counts stale without fetching them", async
   scheduler.mark("count", true); scheduler.tick(); await settle(); assert.equal(stale, false); assert.equal(counts, 2);
 });
 
-test("read status separates failed first loads, stale retained data and not-found", async () => {
+test("freshness separates failed first loads, stale retained data and not-found", async () => {
   let fail = false; let now = 0;
   const scheduler = new RefreshScheduler({}, () => now); scheduler.setReady(true);
   scheduler.attach(demand("missing", async () => { throw new HttpError("job not found", 404); }));
   scheduler.tick(); await settle();
-  assert.equal(scheduler.readStatus(), "");
+  assert.deepEqual(
+    { views: scheduler.freshness().views, failed: scheduler.freshness().failed },
+    { views: 0, failed: 0 },
+  );
   scheduler.attach(demand("down", async () => { throw new HttpError("unavailable", 500); }));
   scheduler.attach(demand("flaky", async () => { if (fail) throw new HttpError("unavailable", 500); }));
   scheduler.tick(); await settle();
-  assert.equal(scheduler.readStatus(), "1 view(s) failed to load");
+  assert.equal(scheduler.freshness().failed, 1); assert.equal(scheduler.freshness().unloaded, 1);
+  assert.equal(scheduler.freshness().ageMs, null);
   fail = true; now = 120_000; scheduler.mark("flaky", true); scheduler.tick(); await settle();
-  assert.equal(scheduler.readStatus(), "1 view(s) failed to refresh; retained data is stale; 1 view(s) failed to load");
+  assert.equal(scheduler.freshness().failed, 2); assert.equal(scheduler.freshness().unloaded, 1);
+  scheduler.setVisible(false); await settle();
+});
+
+test("freshness counts a refused view apart from failed ones until it is refreshed", async () => {
+  let refuse = true;
+  const scheduler = new RefreshScheduler({}, () => 0, () => 1); scheduler.setReady(true);
+  scheduler.attach(demand("jobs", async () => { if (refuse) throw new HttpError("unknown parameter", 400); }));
+  scheduler.tick(); await settle();
+  assert.deepEqual(
+    { views: scheduler.freshness().views, failed: scheduler.freshness().failed, blocked: scheduler.freshness().blocked },
+    { views: 0, failed: 0, blocked: 1 },
+  );
+  scheduler.attach(demand("queues", async () => {}));
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.freshness().views, 1); assert.equal(scheduler.freshness().failed, 0);
+  assert.equal(scheduler.freshness().blocked, 1);
+  refuse = false; scheduler.mark("jobs", true); scheduler.tick(); await settle();
+  assert.equal(scheduler.freshness().views, 2); assert.equal(scheduler.freshness().blocked, 0);
+  scheduler.setVisible(false); await settle();
+});
+
+test("freshness ages from the least recently loaded view and ignores paused and manual-only ones", async () => {
+  let now = 0;
+  const scheduler = new RefreshScheduler({}, () => now, () => 1); scheduler.setReady(true);
+  scheduler.attach(demand("a", async () => {}));
+  scheduler.attach(demand("b", async () => {}));
+  assert.equal(scheduler.freshness().ageMs, null);
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.freshness().ageMs, 0);
+  now = 6000; scheduler.mark("a", true); scheduler.tick(); await settle();
+  now = 9000;
+  assert.equal(scheduler.freshness().ageMs, 9000);
+  const list = scheduler.attach(demand("list", async () => {}, { paused: true }));
+  scheduler.attach(demand("count", async () => {}, { manualOnly: true }));
+  assert.equal(scheduler.freshness().views, 2); assert.equal(scheduler.freshness().paused, true);
+  list.setPaused(false); assert.equal(scheduler.freshness().paused, false); assert.equal(scheduler.freshness().ageMs, null);
   scheduler.setVisible(false); await settle();
 });
 
@@ -348,6 +389,6 @@ test("a replacement entry whose view still holds cached data reports a stale ref
   const scheduler = new RefreshScheduler({}, () => 0); scheduler.setReady(true);
   scheduler.attach(demand("runtime", async () => { throw new HttpError("unavailable", 500); }, { retained: () => true }));
   scheduler.tick(); await settle();
-  assert.equal(scheduler.readStatus(), "1 view(s) failed to refresh; retained data is stale");
+  assert.equal(scheduler.freshness().failed, 1); assert.equal(scheduler.freshness().unloaded, 0);
   scheduler.setVisible(false); await settle();
 });
