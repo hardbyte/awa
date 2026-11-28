@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/table";
 import { LagValue } from "@/components/LagValue";
 import { dlqDepthQuery } from "@/lib/shared-queries";
+import { liveFailedCount } from "@/lib/attention";
 import { formatNumber } from "@/lib/number";
 import { timeAgo } from "@/lib/time";
 import { DlqOnBadge } from "@/components/RuntimeDisplay";
@@ -63,8 +64,9 @@ function QueueStatusBadges({ queue, runtime }: { queue: QueueStats; runtime: Que
 
 /** The one fact a phone card leads with. */
 function queueWhy(q: QueueStats, deadLetters: number): string {
+  const failed = liveFailedCount(q.failed, deadLetters);
   const parts = [
-    q.failed > 0 && `${formatNumber(q.failed)} failed`,
+    failed > 0 && `${formatNumber(failed)} failed`,
     deadLetters > 0 && `${formatNumber(deadLetters)} dead letters`,
     q.retryable > 0 && `${formatNumber(q.retryable)} retrying`,
     q.available > 0 &&
@@ -221,6 +223,7 @@ export function QueuesPage() {
         >
           {queues.map((q) => {
               const runtime = runtimeByQueue.get(q.queue);
+              const failed = liveFailedCount(q.failed, dlqByQueue?.get(q.queue));
               return (
                 <TableRow key={q.queue} id={q.queue}>
                   <TableCell className="max-w-[13rem] font-medium">
@@ -263,9 +266,9 @@ export function QueuesPage() {
                     {formatNumber(q.retryable)}
                   </TableCell>
                   <TableCell
-                    className={`text-right tabular-nums ${q.failed === 0 ? "text-muted-fg" : "text-danger-subtle-fg"}`}
+                    className={`text-right tabular-nums ${failed === 0 ? "text-muted-fg" : "text-danger-subtle-fg"}`}
                   >
-                    {formatNumber(q.failed)}
+                    {formatNumber(failed)}
                   </TableCell>
                   <TableCell className="text-right tabular-nums">
                     <DlqCount queue={q.queue} counts={dlqByQueue} />

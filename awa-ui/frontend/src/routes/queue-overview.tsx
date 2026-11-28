@@ -4,6 +4,7 @@ import { useQueueHub } from "@/hooks/use-queue-hub";
 import { fetchCronJobs, fetchJobs, fetchRuntime, type CronJobRow, type JobRow, type RuntimeOverview } from "@/lib/api";
 import { fleetCapacity } from "@/lib/capacity";
 import { dlqDepthQuery } from "@/lib/shared-queries";
+import { liveFailedCount } from "@/lib/attention";
 import { groupFailures } from "@/lib/errors";
 import { formatNumber } from "@/lib/number";
 import { formatDuration } from "@/lib/time";
@@ -27,7 +28,7 @@ function Stat({
   label: string;
   value: string;
   hint?: string;
-  to?: { tab: "jobs" | "dlq"; state?: string };
+  to?: { tab: "jobs" | "dlq"; state?: string; liveOnly?: boolean };
   testId: string;
   name: string;
 }) {
@@ -40,7 +41,10 @@ function Stat({
           <Link
             to={to.tab === "jobs" ? "/queues/$name/jobs" : "/queues/$name/dlq"}
             params={{ name }}
-            search={to.state ? { state: to.state } : {}}
+            search={{
+              ...(to.state ? { state: to.state } : {}),
+              ...(to.liveOnly ? { dead_lettered: false } : {}),
+            }}
             className="text-fg no-underline hover:underline"
           >
             {content}
@@ -105,7 +109,14 @@ export function QueueOverviewTab() {
           to={{ tab: "jobs", state: "running" }}
         />
         <Stat name={name} testId="queue-stat-retryable" label="Retrying" value={formatNumber(queue.retryable)} to={{ tab: "jobs", state: "retryable" }} />
-        <Stat name={name} testId="queue-stat-failed" label="Failed" value={formatNumber(queue.failed)} to={{ tab: "jobs", state: "failed" }} />
+        <Stat
+          name={name}
+          testId="queue-stat-failed"
+          label="Failed"
+          value={formatNumber(liveFailedCount(queue.failed, dlqRows))}
+          hint={dlqRows > 0 ? "not counting dead letters" : undefined}
+          to={{ tab: "jobs", state: "failed", liveOnly: true }}
+        />
         <Stat name={name} testId="queue-stat-waiting" label="Waiting for callback" value={formatNumber(queue.waiting_external)} to={{ tab: "jobs", state: "waiting_external" }} />
         <Stat name={name} testId="queue-stat-scheduled" label="Scheduled" value={formatNumber(queue.scheduled)} hint="for later" to={{ tab: "jobs", state: "scheduled" }} />
         <Stat name={name} testId="queue-stat-completed" label="Completed / hour" value={formatNumber(queue.completed_last_hour)} />

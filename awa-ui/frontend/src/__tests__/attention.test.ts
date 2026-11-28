@@ -3,6 +3,7 @@ import {
   attentionItems,
   healthFigures,
   isStuck,
+  liveFailedCount,
   queuesNeedingAttention,
   type AttentionInput,
 } from "@/lib/attention";
@@ -401,5 +402,32 @@ describe("queuesNeedingAttention", () => {
       ["retry", 1],
       ["held", 0],
     ]);
+  });
+
+  it("counts a queue's dead letters once, not again among its failures", () => {
+    const result = queuesNeedingAttention(
+      [queue({ queue: "dead", failed: 10 }), queue({ queue: "live", failed: 6 })],
+      { total: 10, by_queue: [{ queue: "dead", count: 10 }] },
+      5
+    );
+    // dead: 0 live failures * 3 + 10 dead letters * 2 = 20; live: 6 * 3 = 18.
+    expect(result.map((q) => [q.queue, q.liveFailed, q.deadLetters])).toEqual([
+      ["dead", 0, 10],
+      ["live", 6, 0],
+    ]);
+  });
+
+  it("keeps every failure as live when the dead-letter depth is unknown", () => {
+    const [row] = queuesNeedingAttention([queue({ queue: "a", failed: 4 })], undefined, 5);
+    expect(row).toMatchObject({ liveFailed: 4, deadLetters: null });
+  });
+});
+
+describe("liveFailedCount", () => {
+  it("subtracts dead letters from failed jobs, never below zero", () => {
+    expect(liveFailedCount(10, 3)).toBe(7);
+    expect(liveFailedCount(2, 5)).toBe(0);
+    expect(liveFailedCount(4, undefined)).toBe(4);
+    expect(liveFailedCount(4, null)).toBe(4);
   });
 });

@@ -7,8 +7,11 @@ test.describe("Queue hub", () => {
     await expect(page.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByTestId("queue-stat-ready")).toBeVisible();
     await page.getByTestId("queue-stat-failed").getByRole("link").click();
-    await expect(page).toHaveURL(/\/queues\/e2e_test\/jobs\?state=failed$/);
+    await expect(page).toHaveURL(/\/queues\/e2e_test\/jobs\?state=failed&dead_lettered=false$/);
     await expect(page.getByRole("tab", { name: "Jobs" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("dead-letters-hidden")).toBeVisible();
+    await page.getByTestId("dead-letters-hidden").getByRole("button", { name: "Include them" }).click();
+    await expect(page).toHaveURL(/\/queues\/e2e_test\/jobs\?state=failed$/);
   });
 
   test("tabs are deep-linkable and the jobs tab keeps its own filter", async ({ page }) => {

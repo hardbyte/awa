@@ -341,21 +341,38 @@ export function healthFigures(input: AttentionInput): HealthFigures {
   };
 }
 
-/** Queues with something to look at, most pressing first. */
+/**
+ * Failed jobs still in the jobs tables. The server's `failed` counts include
+ * dead letters, so a figure shown beside a dead-letter count subtracts them.
+ */
+export function liveFailedCount(failed: number, deadLetters: number | null | undefined): number {
+  return Math.max(0, failed - (deadLetters ?? 0));
+}
+
+/**
+ * Queues with something to look at, most pressing first. `liveFailed` is the
+ * queue's failed jobs less its dead letters, or all its failed jobs when the
+ * dead-letter depth is unknown.
+ */
 export function queuesNeedingAttention(
   queues: QueueOverview[],
   dlqDepth: DlqDepthResponse | undefined,
   limit: number
-): (QueueOverview & { deadLetters: number | null })[] {
+): (QueueOverview & { deadLetters: number | null; liveFailed: number })[] {
   const dlq = new Map((dlqDepth?.by_queue ?? []).map((row) => [row.queue, row.count]));
   const score = (q: QueueOverview) =>
-    q.failed * 3 +
+    liveFailedCount(q.failed, dlq.get(q.queue)) * 3 +
     (dlq.get(q.queue) ?? 0) * 2 +
     q.retryable +
     (q.paused && q.available > 0 ? q.available : 0) +
     (!q.paused && (q.lag_seconds ?? 0) >= LAG_ATTENTION_SECONDS ? q.available : 0);
   return queues
-    .map((q) => ({ ...q, deadLetters: dlqDepth ? dlq.get(q.queue) ?? 0 : null, score: score(q) }))
+    .map((q) => ({
+      ...q,
+      deadLetters: dlqDepth ? dlq.get(q.queue) ?? 0 : null,
+      liveFailed: liveFailedCount(q.failed, dlq.get(q.queue)),
+      score: score(q),
+    }))
     .filter((q) => q.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)

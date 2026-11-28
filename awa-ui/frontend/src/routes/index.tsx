@@ -24,6 +24,7 @@ import {
 import {
   attentionItems,
   healthFigures,
+  liveFailedCount,
   queuesNeedingAttention,
   type AttentionItem,
   type AttentionSeverity,
@@ -187,6 +188,9 @@ export function DashboardPage() {
     ? queuesNeedingAttention(queuesQuery.data, dlqQuery.data, OVERVIEW_QUEUE_LIMIT)
     : [];
   const statsError = statsQuery.isError ? statsQuery.error : null;
+  // Dead letters have their own tile, so the Failed tile counts the rest.
+  const liveFailed =
+    stats && dlqQuery.data ? liveFailedCount(stats.failed ?? 0, dlqQuery.data.total) : undefined;
 
   return (
     <Page>
@@ -223,10 +227,10 @@ export function DashboardPage() {
         <HealthTile
           label="Failed"
           testId="tile-failed"
-          value={stats ? stats.failed ?? 0 : undefined}
-          error={statsError}
-          tone={(stats?.failed ?? 0) > 0 ? "danger" : "neutral"}
-          link={{ to: "/jobs", search: { state: "failed" } }}
+          value={liveFailed}
+          error={statsError ?? (dlqQuery.isError ? dlqQuery.error : null)}
+          tone={(liveFailed ?? 0) > 0 ? "danger" : "neutral"}
+          link={{ to: "/jobs", search: { state: "failed", dead_lettered: false } }}
         >
           {figures.completedLastHour !== null &&
             `${formatNumber(figures.completedLastHour)} completed in the last hour`}
@@ -375,7 +379,7 @@ export function DashboardPage() {
                       {[
                         q.available > 0 && `${formatNumber(q.available)} ready`,
                         q.retryable > 0 && `${formatNumber(q.retryable)} retrying`,
-                        q.failed > 0 && `${formatNumber(q.failed)} failed`,
+                        q.liveFailed > 0 && `${formatNumber(q.liveFailed)} failed`,
                         (q.deadLetters ?? 0) > 0 && plural(q.deadLetters!, "dead letter"),
                       ]
                         .filter(Boolean)
@@ -407,8 +411,8 @@ export function DashboardPage() {
                         {q.available > 0 && q.lag_seconds !== null ? formatDuration(q.lag_seconds) : "—"}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(q.retryable)}</TableCell>
-                      <TableCell className={`text-right tabular-nums ${q.failed > 0 ? "text-danger-subtle-fg" : ""}`}>
-                        {formatNumber(q.failed)}
+                      <TableCell className={`text-right tabular-nums ${q.liveFailed > 0 ? "text-danger-subtle-fg" : ""}`}>
+                        {formatNumber(q.liveFailed)}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {q.deadLetters === null ? "—" : formatNumber(q.deadLetters)}

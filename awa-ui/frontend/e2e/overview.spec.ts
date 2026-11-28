@@ -129,10 +129,11 @@ async function mockOverview(page: Page, fixture: Fixture) {
 }
 
 const BUSY: Fixture = {
-  stats: { available: 140, running: 1, failed: 3, retryable: 7, scheduled: 3108, waiting_external: 35, completed: 10, cancelled: 0 },
+  // The server's failed counts include the dead letters.
+  stats: { available: 140, running: 1, failed: 5, retryable: 7, scheduled: 3108, waiting_external: 35, completed: 10, cancelled: 0 },
   queues: [
     queue({ queue: "imports", display_name: "Contact imports", paused: true, available: 140, lag_seconds: 540 }),
-    queue({ queue: "billing", available: 4, lag_seconds: 2, retryable: 7, failed: 3, completed_last_hour: 273 }),
+    queue({ queue: "billing", available: 4, lag_seconds: 2, retryable: 7, failed: 5, completed_last_hour: 273 }),
     queue({ queue: "email", scheduled: 3108, completed_last_hour: 1200 }),
   ],
   dlq: { total: 2, by_queue: [{ queue: "billing", count: 2 }] },
@@ -152,6 +153,7 @@ test.describe("Overview", () => {
     await expect(page.getByTestId("tile-retrying")).toContainText("most in billing (7)");
     await expect(page.getByTestId("tile-failed").getByTestId("tile-value")).toHaveText("3");
     await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
+    await expect(page.getByTestId("tile-failed")).toHaveAttribute("href", /\/jobs\?state=failed&dead_lettered=false$/);
     await expect(page.getByTestId("tile-dead-letters").getByTestId("tile-value")).toHaveText("2");
     await expect(page.getByTestId("tile-stuck").getByTestId("tile-value")).toHaveText("1");
     await expect(page.getByTestId("tile-bulk").getByTestId("tile-value")).toHaveText("0");
@@ -200,6 +202,8 @@ test.describe("Overview", () => {
     await expect(table).toContainText("Contact imports");
     await expect(table).toContainText("Paused");
     await expect(table).not.toContainText("email");
+    const billing = table.getByRole("row").filter({ hasText: "billing" });
+    await expect(billing.getByRole("gridcell")).toHaveText(["4", "2s", "7", "3", "2"]);
     await page.getByRole("link", { name: "All queues →" }).click();
     await expect(page).toHaveURL(/\/queues$/);
   });

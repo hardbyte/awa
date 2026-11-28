@@ -141,6 +141,9 @@ function useJobFilters() {
   return {
     state: searchParams.state ?? "all",
     search: searchParams.q ?? "",
+    // `dead_lettered=false` leaves dead letters out. The router may hand the
+    // value over as a boolean or a string.
+    liveOnly: String(searchParams.dead_lettered) === "false",
     beforeId: searchParams.before_id
       ? Number(searchParams.before_id)
       : undefined,
@@ -159,7 +162,7 @@ export interface JobsListProps {
 
 /** The filterable jobs list: state pills, search, selection actions, table
  * and phone cards, and pagination. Its filter lives in the current URL's
- * `state`, `q`, `before_id` and `limit`. */
+ * `state`, `q`, `dead_lettered`, `before_id` and `limit`. */
 export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
   const navigate = useNavigate();
   const nowMs = useNow();
@@ -177,6 +180,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
     ids: searchFilters.ids,
     created_at_gte: toRfc3339(searchFilters.createdGte),
     created_at_lt: toRfc3339(searchFilters.createdLt),
+    dead_lettered: filters.liveOnly ? false : undefined,
   };
   const params: ListJobsParams = {
     ...filterParams,
@@ -184,7 +188,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
     limit: filters.limit,
   };
   const hasFilter =
-    filters.state !== "all" || Object.keys(searchFilters).length > 0;
+    filters.state !== "all" || Object.keys(searchFilters).length > 0 || filters.liveOnly;
 
   const hasSel = selected.size > 0;
   const searchError = termError(filters.search);
@@ -398,6 +402,21 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
                 ? `${countQuery.data.value.toLocaleString()}+`
                 : countQuery.data.value.toLocaleString()}{" "}
               matching{countQuery.isObservationStale ? " (stale)" : ""}
+            </span>
+          )}
+          {filters.liveOnly && mayMatchDeadLetters && (
+            <span data-testid="dead-letters-hidden">
+              Dead letters left out ·{" "}
+              <button
+                type="button"
+                className="text-primary hover:underline"
+                onClick={() => {
+                  setSelected(new Set());
+                  setUrlParams({ dead_lettered: undefined, before_id: undefined });
+                }}
+              >
+                Include them
+              </button>
             </span>
           )}
           {countQuery.isError && (
