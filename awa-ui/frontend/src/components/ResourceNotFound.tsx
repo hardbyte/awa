@@ -1,9 +1,8 @@
 import { Link } from "@tanstack/react-router";
-import { Heading } from "@/components/ui/heading";
 import { Button } from "@/components/ui/button";
+import { Page, PageHeader } from "@/components/Page";
 import { HttpError } from "@/lib/observation/read-control";
-
-type ListRoute = "/jobs" | "/queues" | "/dlq" | "/runtime";
+import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
 
 export function isNotFoundError(error: unknown): boolean {
   return error instanceof HttpError && error.status === 404;
@@ -19,13 +18,19 @@ interface ResourceNotFoundProps {
 /** Detail page for an id or name that does not (or no longer) exist. */
 export function ResourceNotFound({ title, reason, backTo, backLabel }: ResourceNotFoundProps) {
   return (
-    <div className="space-y-4" data-testid="resource-not-found">
-      <Link to={backTo} className="text-sm text-muted-fg no-underline hover:text-fg">
-        &larr; {backLabel}
-      </Link>
-      <Heading level={2}>{title}</Heading>
-      <p className="text-sm text-muted-fg">{reason}</p>
-    </div>
+    <Page width="readable">
+      <div className="space-y-4" data-testid="resource-not-found">
+        <PageHeader
+          title={title}
+          crumbLabel="Not found"
+          breadcrumbs={[{ label: SECTION_LABELS[backTo], href: backTo }]}
+        />
+        <p className="text-sm text-muted-fg">{reason}</p>
+        <Link to={backTo} className="text-sm text-primary no-underline hover:underline">
+          &larr; {backLabel}
+        </Link>
+      </div>
+    </Page>
   );
 }
 
@@ -41,10 +46,12 @@ interface ResourceLoadErrorProps {
 /** Detail page whose first read failed for a reason other than not-found. */
 export function ResourceLoadError({ noun, error, onRetry, backTo, backLabel }: ResourceLoadErrorProps) {
   return (
-    <div className="space-y-4">
-      <Link to={backTo} className="text-sm text-muted-fg no-underline hover:text-fg">
-        &larr; {backLabel}
-      </Link>
+    <Page width="readable">
+      <PageHeader
+        title={`Could not load ${noun}`}
+        crumbLabel="Error"
+        breadcrumbs={[{ label: SECTION_LABELS[backTo], href: backTo }]}
+      />
       <div className="flex flex-wrap items-center gap-3" role="alert">
         <p className="text-sm text-danger-subtle-fg">
           Failed to load {noun}: {error.message}
@@ -53,6 +60,9 @@ export function ResourceLoadError({ noun, error, onRetry, backTo, backLabel }: R
           Try again
         </Button>
       </div>
-    </div>
+      <Link to={backTo} className="text-sm text-primary no-underline hover:underline">
+        &larr; {backLabel}
+      </Link>
+    </Page>
   );
 }

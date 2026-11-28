@@ -222,7 +222,7 @@ test.describe("Job detail page", () => {
     expect(retryResponse.ok()).toBeTruthy();
   });
 
-  test("back link navigates to /jobs", async ({ page }) => {
+  test("breadcrumb navigates to /jobs", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
       page.goto("/jobs?q=queue%3Ae2e_test"),
@@ -232,9 +232,9 @@ test.describe("Job detail page", () => {
     await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
 
-    const backLink = page.getByRole("link", { name: /Back to jobs/ });
-    await expect(backLink).toBeVisible();
-    await backLink.click();
+    const crumbs = page.getByRole("navigation", { name: "Breadcrumbs" });
+    await expect(crumbs.getByText(/^#\d+$/)).toBeVisible();
+    await crumbs.getByRole("link", { name: "Jobs" }).click();
 
     await page.waitForURL(/\/jobs$/);
   });

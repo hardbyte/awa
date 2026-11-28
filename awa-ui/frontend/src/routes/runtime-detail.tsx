@@ -5,7 +5,8 @@ import { fetchRuntime } from "@/lib/api";
 import type { RuntimeInstance, RuntimeOverview } from "@/lib/api";
 import { Copyable } from "@/components/CopyButton";
 import { ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -91,21 +92,19 @@ export function RuntimeInstancePage() {
   const notes = attentionItems(instance);
 
   return (
-    <div className="space-y-6">
-      <Link
-        to="/runtime"
-        className="text-sm text-muted-fg no-underline hover:text-fg"
-      >
-        &larr; Back to runtime
-      </Link>
-
-      <div className="flex flex-wrap items-center gap-3">
-        <Heading level={2}>{instanceLabel(instance)}</Heading>
-        <RuntimeHealthBadge instance={instance} />
-        {instance.leader && <Badge intent="primary">Leader</Badge>}
-        <PostgresBadge connected={instance.postgres_connected} />
-        <ShutdownBadge shuttingDown={instance.shutting_down} />
-      </div>
+    <Page width="readable">
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/runtime"], href: "/runtime" }]}
+        title={instanceLabel(instance)}
+        status={
+          <>
+            <RuntimeHealthBadge instance={instance} />
+            {instance.leader && <Badge intent="primary">Leader</Badge>}
+            <PostgresBadge connected={instance.postgres_connected} />
+            <ShutdownBadge shuttingDown={instance.shutting_down} />
+          </>
+        }
+      />
 
       <Card>
         <CardHeader
@@ -324,6 +323,6 @@ export function RuntimeInstancePage() {
           </Table>
         </CardContent>
       </Card>
-    </div>
+    </Page>
   );
 }

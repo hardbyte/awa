@@ -15,7 +15,7 @@ import {
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Menu, MenuContent, MenuItem, MenuTrigger } from "@/components/ui/menu";
@@ -127,8 +127,8 @@ export function QueuesPage() {
   }
 
   return (
-    <div className="space-y-4">
-      <Heading level={2}>Queues</Heading>
+    <Page className="space-y-4">
+      <PageHeader title="Queues" />
 
       {/* Mobile card layout */}
       {queues.length === 0 ? (
@@ -455,6 +455,6 @@ export function QueuesPage() {
         }}
         isPending={drainMutation.isPending}
       />
-    </div>
+    </Page>
   );
 }

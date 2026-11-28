@@ -15,7 +15,7 @@ import type {
 } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { jobStateMeta, TONE_SURFACE } from "@/lib/states";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Table,
@@ -77,8 +77,8 @@ export function DashboardPage() {
     queuesQuery.data && queuesQuery.data.length > DASHBOARD_QUEUE_LIMIT;
 
   return (
-    <div className="space-y-6">
-      <Heading level={2}>Dashboard</Heading>
+    <Page>
+      <PageHeader title="Dashboard" />
 
       {/* Headline counter cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -524,6 +524,6 @@ export function DashboardPage() {
           </Table>
         </CardContent>
       </Card>
-    </div>
+    </Page>
   );
 }

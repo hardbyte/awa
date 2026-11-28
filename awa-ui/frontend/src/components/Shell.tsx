@@ -451,6 +451,16 @@ export function Shell() {
       onOpenChange={setSidebarOpen}
       style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}
     >
+      <a
+        href="#content"
+        className="sr-only z-50 rounded-md bg-bg px-3 py-2 text-sm font-medium text-fg shadow focus:not-sr-only focus:fixed focus:left-2 focus:top-2"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById("content")?.focus();
+        }}
+      >
+        Skip to content
+      </a>
       <CloseMobileOnNavigate path={currentPath} />
       <Sidebar collapsible="dock">
         <SidebarHeader>
@@ -465,6 +475,7 @@ export function Shell() {
           </AriaLink>
         </SidebarHeader>
         <SidebarContent>
+          <nav aria-label="Primary">
           <SidebarSection title="Navigation">
             {NAV_ITEMS.map((item) => (
               <SidebarItem
@@ -478,6 +489,7 @@ export function Shell() {
               </SidebarItem>
             ))}
           </SidebarSection>
+          </nav>
         </SidebarContent>
         <SidebarFooter>
           <div className="group-data-[collapsible=dock]:hidden">
@@ -537,7 +549,7 @@ export function Shell() {
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        <main id="content" tabIndex={-1} className="w-full px-4 py-6 outline-none sm:px-6 lg:px-8">
           <div className="text-xs text-muted-fg">Polling; scheduled reconciliation maximum: {observationPolicy.reconcileMaxMs / 1000}s.</div>
           {readStatus && <div role="status" className="text-sm text-muted-fg">{readStatus}</div>}
           {showReadOnlyBanner && (

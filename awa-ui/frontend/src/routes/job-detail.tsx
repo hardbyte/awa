@@ -11,7 +11,8 @@ import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import {
@@ -138,31 +139,22 @@ export function JobDetailPage() {
   const canCancel = !["completed", "failed", "cancelled"].includes(job.state);
 
   return (
-    <div className="space-y-6">
+    <Page width="readable">
       {jobQuery.isRetainedNotFound && <p role="status">Last observed job shown. The latest read reports that this job was not found.</p>}
-      {/* Back link */}
-      <Link
-        to="/jobs"
-        className="text-sm text-muted-fg no-underline hover:text-fg"
-      >
-        &larr; Back to jobs
-      </Link>
-
-      <div className="flex flex-wrap items-center gap-4">
-        <Heading level={2}>
-          Job #{job.id} &mdash; {jobKindLabel(job)}
-        </Heading>
-        {job.kind_descriptor?.display_name?.trim() && (
-          <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
-        )}
-        <StateBadge state={job.state} />
-      </div>
-
-      {job.kind_descriptor?.description?.trim() && (
-        <p className="max-w-3xl text-sm text-muted-fg">
-          {job.kind_descriptor.description}
-        </p>
-      )}
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/jobs"], href: "/jobs" }]}
+        crumbLabel={`#${job.id}`}
+        title={<>Job #{job.id} &mdash; {jobKindLabel(job)}</>}
+        status={
+          <>
+            {job.kind_descriptor?.display_name?.trim() && (
+              <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
+            )}
+            <StateBadge state={job.state} />
+          </>
+        }
+        description={job.kind_descriptor?.description?.trim() || undefined}
+      />
 
       {/* Actions */}
       <div className="flex flex-wrap items-center gap-2">
@@ -488,6 +480,6 @@ export function JobDetailPage() {
           </CardContent>
         </Card>
       )}
-    </div>
+    </Page>
   );
 }

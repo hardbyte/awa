@@ -16,7 +16,7 @@ import type { BatchOperation, DlqRow, ListDlqParams } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -160,12 +160,12 @@ export function DlqPage() {
   };
 
   return (
-    <div className="space-y-4 p-4">
+    <Page className="space-y-4">
       {dlqQuery.isPlaceholderData && <p role="status">Previous filter results are shown while the new read finishes.</p>}
-      <div className="flex items-center justify-between">
-        <Heading>Dead Letter Queue</Heading>
-        {depthQuery.data && (
-          <div className="flex gap-2 items-center">
+      <PageHeader
+        title="Dead Letter Queue"
+        status={depthQuery.data && (
+          <div className="flex flex-wrap gap-2 items-center">
             <Badge intent="danger">
               {depthQuery.data.total.toLocaleString()} total
             </Badge>
@@ -176,7 +176,7 @@ export function DlqPage() {
             ))}
           </div>
         )}
-      </div>
+      />
 
       <SearchBar value={filters.search} onChange={setSearch} />
 
@@ -323,6 +323,6 @@ export function DlqPage() {
         confirmIntent="danger"
         onConfirm={() => purgeFilterMutation.mutate()}
       />
-    </div>
+    </Page>
   );
 }

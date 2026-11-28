@@ -16,7 +16,7 @@ import {
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { CronJobRow, QueueOverview } from "@/lib/api";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
@@ -105,8 +105,8 @@ export function CronPage() {
   const cronJobs = cronQuery.data ?? [];
 
   return (
-    <div className="space-y-4">
-      <Heading level={2}>Cron Schedules</Heading>
+    <Page className="space-y-4">
+      <PageHeader title="Cron Schedules" />
       {(reconciliation.data ?? []).map((plan) => (
         <details key={plan.owner_id} className="rounded-lg border p-3">
           <summary className="cursor-pointer font-medium">
@@ -400,6 +400,6 @@ export function CronPage() {
           empty="No cron schedules found."
         />
       )}
-    </div>
+    </Page>
   );
 }

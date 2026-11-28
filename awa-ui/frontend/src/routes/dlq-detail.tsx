@@ -4,14 +4,15 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useParams, useNavigate, Link } from "@tanstack/react-router";
+import { useParams, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { fetchDlqJob, retryDlqJob, purgeDlqJob } from "@/lib/api";
 import type { DlqRow } from "@/lib/api";
 import { isNotFoundError, ResourceLoadError, ResourceNotFound } from "@/components/ResourceNotFound";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
@@ -93,15 +94,12 @@ export function DlqDetailPage() {
   }
 
   return (
-    <div className="space-y-4 p-4">
-      <div className="flex items-center justify-between gap-2">
-        <Heading>
-          <Link to="/dlq" className="text-muted-fg hover:underline">
-            DLQ
-          </Link>{" "}
-          / #{row.id}
-        </Heading>
-        {!readOnly && (
+    <Page width="readable" className="space-y-4">
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/dlq"], href: "/dlq" }]}
+        crumbLabel={`#${row.id}`}
+        title={`Dead letter #${row.id}`}
+        actions={!readOnly && (
           <div className="flex gap-2">
             <Button
               size="xs"
@@ -121,7 +119,7 @@ export function DlqDetailPage() {
             </Button>
           </div>
         )}
-      </div>
+      />
 
       <Card>
         <CardHeader>
@@ -198,6 +196,6 @@ export function DlqDetailPage() {
         confirmIntent="danger"
         onConfirm={() => purgeMutation.mutate()}
       />
-    </div>
+    </Page>
   );
 }

@@ -14,7 +14,8 @@ import {
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
+import { SECTION_LABELS } from "@/lib/sections";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonStyles } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -126,38 +127,33 @@ export function QueueDetailPage() {
     : null;
 
   return (
-    <div className="space-y-6">
-      <Link
-        to="/queues"
-        className="text-sm text-muted-fg no-underline hover:text-fg"
-      >
-        &larr; Back to queues
-      </Link>
-
-      <div className="flex flex-wrap items-center gap-4">
-        <Heading level={2}>{title}</Heading>
-        {queue.display_name?.trim() && (
-          <code className="rounded bg-muted px-1.5 py-0.5 text-sm">
-            {queue.queue}
-          </code>
-        )}
-        {queue.paused ? (
-          <Badge intent="warning">Paused</Badge>
-        ) : (
-          <Badge intent="success">Active</Badge>
-        )}
-        {runtime?.config && (
-          <Badge intent={dlqPolicyIntent(runtime.config)}>
-            {dlqPolicyLabel(runtime.config)}
-          </Badge>
-        )}
-        {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
-        {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
-      </div>
-
-      {queue.description && (
-        <p className="max-w-3xl text-sm text-muted-fg">{queue.description}</p>
-      )}
+    <Page width="readable">
+      <PageHeader
+        breadcrumbs={[{ label: SECTION_LABELS["/queues"], href: "/queues" }]}
+        title={title}
+        status={
+          <>
+            {queue.display_name?.trim() && (
+              <code className="rounded bg-muted px-1.5 py-0.5 text-sm">
+                {queue.queue}
+              </code>
+            )}
+            {queue.paused ? (
+              <Badge intent="warning">Paused</Badge>
+            ) : (
+              <Badge intent="success">Active</Badge>
+            )}
+            {runtime?.config && (
+              <Badge intent={dlqPolicyIntent(runtime.config)}>
+                {dlqPolicyLabel(runtime.config)}
+              </Badge>
+            )}
+            {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
+            {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
+          </>
+        }
+        description={queue.description || undefined}
+      />
 
       <div className="flex flex-wrap gap-2">
         <Button
@@ -378,6 +374,6 @@ export function QueueDetailPage() {
         confirmLabel="Drain queue"
         isPending={drainMutation.isPending}
       />
-    </div>
+    </Page>
   );
 }

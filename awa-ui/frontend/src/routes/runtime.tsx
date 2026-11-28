@@ -17,7 +17,7 @@ import {
   shouldShowStorageTransitionCard,
   StorageTransitionCard,
 } from "@/components/StorageTransition";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -154,8 +154,8 @@ export function RuntimePage() {
   };
 
   return (
-    <div className="space-y-6">
-      <Heading level={2}>Runtime</Heading>
+    <Page>
+      <PageHeader title="Runtime" />
 
       {hasAttention && (
         <Card>
@@ -698,6 +698,6 @@ export function RuntimePage() {
           </Table>
         </CardContent>
       </Card>
-    </div>
+    </Page>
   );
 }

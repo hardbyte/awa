@@ -27,7 +27,7 @@ import { StateBadge } from "@/components/StateBadge";
 import { jobStateMeta, TONE_TEXT } from "@/lib/states";
 import { CheckIcon } from "@heroicons/react/16/solid";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -313,21 +313,18 @@ export function JobsPage() {
   const nextAnchor = nextPageAnchor(jobs, filters.limit, jobsQuery);
 
   return (
-    <div className="space-y-4">
+    <Page className="space-y-4">
       {jobsQuery.isPlaceholderData && <p role="status">Previous filter results are shown while the new read finishes.</p>}
-      <div className="flex flex-wrap items-center gap-4">
-        <Heading level={2}>
-          {activeQueue ? `Queue: ${activeQueueLabel}` : "Jobs"}
-        </Heading>
-        {activeQueue && queueStats?.display_name && (
-          <span className="text-sm text-muted-fg">{queueStats.queue}</span>
-        )}
-        {total !== undefined && !activeQueue && (
-          <span className="text-sm text-muted-fg">
-            {total.toLocaleString()} total
-          </span>
-        )}
-      </div>
+      <PageHeader
+        title={activeQueue ? `Queue: ${activeQueueLabel}` : "Jobs"}
+        status={
+          activeQueue && queueStats?.display_name ? (
+            <span className="text-sm text-muted-fg">{queueStats.queue}</span>
+          ) : total !== undefined && !activeQueue ? (
+            <span className="text-sm text-muted-fg">{total.toLocaleString()} total</span>
+          ) : null
+        }
+      />
 
       {/* Queue context banner — shown when filtering by a single queue */}
       {activeQueue && queueStats && (
@@ -807,6 +804,6 @@ export function JobsPage() {
           isPending={drainQueueMutation.isPending}
         />
       )}
-    </div>
+    </Page>
   );
 }

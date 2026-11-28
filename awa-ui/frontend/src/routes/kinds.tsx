@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { fetchKinds } from "@/lib/api";
 import type { JobKindOverview } from "@/lib/api";
-import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Badge } from "@/components/ui/badge";
 import {
   Table,
@@ -65,8 +65,8 @@ export function KindsPage() {
   const kinds = kindsQuery.data ?? [];
 
   return (
-    <div className="space-y-4">
-      <Heading level={2}>Job Kinds</Heading>
+    <Page className="space-y-4">
+      <PageHeader title="Job Kinds" />
 
       {kinds.length === 0 ? (
         <div
@@ -223,6 +223,6 @@ export function KindsPage() {
             ))}
         </TableBody>
       </Table>
-    </div>
+    </Page>
   );
 }

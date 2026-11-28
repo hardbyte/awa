@@ -5,7 +5,7 @@ export function NotFoundPage() {
   return (
     <div className="flex flex-col items-center justify-center py-24 text-center">
       <div className="text-6xl font-bold text-muted-fg/30">404</div>
-      <Heading level={2} className="mt-4">
+      <Heading level={1} className="mt-4">
         Page not found
       </Heading>
       <p className="mt-2 text-sm text-muted-fg">

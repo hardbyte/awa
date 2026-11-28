@@ -23,6 +23,7 @@ import { describeFilter, formatCount, isNarrowing, previewCount, sameFilter } fr
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
+import { Page, PageHeader } from "@/components/Page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -299,13 +300,11 @@ export function BatchOpsPage() {
   const operations = operationsQuery.data ?? [];
 
   return (
-    <div className="space-y-6">
-      <div>
-        <Heading level={1}>Batch Operations</Heading>
-        <p className="mt-2 text-sm text-muted-fg">
-          Preview, submit, and monitor durable bulk mutations, applied a chunk at a time.
-        </p>
-      </div>
+    <Page>
+      <PageHeader
+        title="Batch Operations"
+        description="Preview, submit, and monitor durable bulk mutations, applied a chunk at a time."
+      />
 
       <section className="rounded-xl border bg-bg p-4 shadow-sm">
         <Heading level={2} className="text-base">New Operation</Heading>
@@ -479,6 +478,6 @@ export function BatchOpsPage() {
           ))}
         </TableBody>
       </Table>
-    </div>
+    </Page>
   );
 }
