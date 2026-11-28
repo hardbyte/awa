@@ -312,9 +312,9 @@ test.describe("Batch operations page", () => {
     });
 
     await page.goto("/batch-ops");
-    await expect(page.getByRole("gridcell", { name: "running" })).toBeVisible();
+    await expect(page.getByRole("gridcell", { name: "Running" })).toBeVisible();
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(page.getByText("Cancellation requested")).toBeVisible();
-    await expect(page.getByRole("gridcell", { name: "cancelling" })).toBeVisible();
+    await expect(page.getByRole("gridcell", { name: "Cancelling" })).toBeVisible();
   });
 });

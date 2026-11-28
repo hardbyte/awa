@@ -10,6 +10,7 @@
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "./StateBadge";
 import { Time } from "./Time";
+import { jobStateMeta, TONE_DOT } from "@/lib/states";
 
 interface TimelineEvent {
   timestamp: string;
@@ -88,16 +89,6 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
   return events;
 }
 
-const STATE_DOT_COLOR: Record<string, string> = {
-  available: "bg-info",
-  scheduled: "bg-secondary-fg/30",
-  running: "bg-success",
-  completed: "bg-success",
-  retryable: "bg-warning",
-  failed: "bg-danger",
-  cancelled: "bg-muted-fg/40",
-  waiting_external: "bg-[oklch(0.45_0.15_280)]",
-};
 
 export function JobTimeline({ job }: { job: JobRow }) {
   const events = buildTimeline(job);
@@ -109,7 +100,7 @@ export function JobTimeline({ job }: { job: JobRow }) {
       {events.map((event, i) => {
         const isLast = i === events.length - 1;
         const dotColor = event.state
-          ? STATE_DOT_COLOR[event.state] ?? "bg-muted-fg/30"
+          ? TONE_DOT[jobStateMeta(event.state).tone]
           : "bg-muted-fg/30";
 
         return (

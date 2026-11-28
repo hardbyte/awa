@@ -14,6 +14,7 @@ import type {
   RuntimeOverview,
 } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
+import { jobStateMeta, TONE_SURFACE } from "@/lib/states";
 import { Heading } from "@/components/ui/heading";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -28,14 +29,6 @@ import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
 import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
 
-/** Background tint per state for counter cards */
-const STATE_CARD_BG: Record<string, string> = {
-  available: "bg-info-subtle",
-  running: "bg-success-subtle",
-  failed: "bg-danger-subtle",
-  scheduled: "bg-secondary/50",
-  waiting_external: "bg-[oklch(0.87_0.07_280)]/30 dark:bg-[oklch(0.55_0.15_280)]/15",
-};
 
 /** Headline metrics — includes deferred and callback-blocked work */
 const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_external"] as const;
@@ -91,13 +84,15 @@ export function DashboardPage() {
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {COUNTER_KEYS.map((key) => {
           const count = statsQuery.data?.[key];
-          const bg = STATE_CARD_BG[key] ?? "";
+          const bg = TONE_SURFACE[jobStateMeta(key).tone];
           return (
             <Link
               key={key}
               to="/jobs"
               search={{ state: key }}
               className="no-underline"
+              data-testid="state-tile"
+              data-state={key}
             >
               <Card
                 className={`text-center transition-colors hover:opacity-80 ${bg}`}
@@ -120,8 +115,8 @@ export function DashboardPage() {
             </Link>
           );
         })}
-        <Link to="/jobs" search={{ state: "completed" }} className="no-underline">
-          <Card className="bg-success-subtle/50 text-center transition-colors hover:opacity-80">
+        <Link to="/jobs" search={{ state: "completed" }} className="no-underline" data-testid="completed-rate-tile">
+          <Card className="bg-state-completed-subtle text-center transition-colors hover:opacity-80">
             <CardContent className="py-4">
               <div className="text-3xl font-bold tabular-nums">
                 {queuesQuery.isLoading ? (

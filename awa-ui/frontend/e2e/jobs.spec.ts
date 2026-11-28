@@ -1,8 +1,12 @@
-import { test, expect, type Response } from "@playwright/test";
+import { test, expect, type Page, type Response } from "@playwright/test";
 
 function isQueuesListResponse(response: Response): boolean {
   const url = new URL(response.url());
   return response.ok() && response.request().method() === "GET" && url.pathname === "/api/queues";
+}
+
+function statePill(page: Page, state: string) {
+  return page.locator(`[data-testid="state-pill"][data-state="${state}"]`);
 }
 
 test.describe("Jobs page", () => {
@@ -15,9 +19,8 @@ test.describe("Jobs page", () => {
     await page.goto("/jobs");
     await page.waitForResponse("**/api/stats");
 
-    // Check for key filter pills (buttons, not tabs now)
-    for (const label of ["all", "available", "failed", "running"]) {
-      await expect(page.getByRole("button", { name: label, exact: false })).toBeVisible();
+    for (const label of ["All", "Available", "Failed", "Running"]) {
+      await expect(page.getByRole("button", { name: new RegExp(`^${label}`) })).toBeVisible();
     }
   });
 
@@ -70,9 +73,8 @@ test.describe("Jobs page", () => {
       page.goto("/jobs?state=failed"),
     ]);
 
-    // The active pill has bg-primary class (check visually active)
-    const failedPill = page.getByRole("button", { name: /^failed/ });
-    await expect(failedPill).toBeVisible();
+    const failedPill = statePill(page, "failed");
+    await expect(failedPill).toHaveAttribute("aria-pressed", "true");
     // Table should show only failed jobs
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await expect(jobTable).toBeVisible();
@@ -95,7 +97,7 @@ test.describe("Jobs page", () => {
     ]);
 
     // Click the "failed" pill
-    const failedPill = page.getByRole("button", { name: /^failed/ });
+    const failedPill = statePill(page, "failed");
     await expect(failedPill).toBeVisible();
 
     const [filteredResponse] = await Promise.all([
@@ -111,7 +113,7 @@ test.describe("Jobs page", () => {
     expect(page.url()).toContain("state=failed");
 
     // Click "all" to clear the filter
-    const allPill = page.getByRole("button", { name: /^all/ });
+    const allPill = statePill(page, "all");
     await allPill.click();
 
     expect(page.url()).not.toContain("state=");
@@ -124,7 +126,7 @@ test.describe("Jobs page", () => {
     ]);
 
     // Click available pill
-    const availablePill = page.getByRole("button", { name: /^available/ });
+    const availablePill = statePill(page, "available");
     await Promise.all([
       page.waitForResponse(
         (r) =>
@@ -137,7 +139,7 @@ test.describe("Jobs page", () => {
     expect(page.url()).toContain("state=available");
 
     // Switch to running
-    const runningPill = page.getByRole("button", { name: /^running/ });
+    const runningPill = statePill(page, "running");
     await Promise.all([
       page.waitForResponse(
         (r) =>
@@ -435,7 +437,7 @@ test.describe("Bulk actions", () => {
     await selectAll.click({ force: true });
 
     // Cancel button should be enabled (available jobs are cancellable)
-    const cancelBtn = page.getByRole("button", { name: /^Cancel/ }).first();
+    const cancelBtn = page.getByRole("button", { name: /^Cancel \(\d+\)$/ });
     await expect(cancelBtn).toBeVisible();
     await expect(cancelBtn).toBeEnabled();
 

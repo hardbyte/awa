@@ -24,6 +24,8 @@ import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
+import { jobStateMeta, TONE_TEXT } from "@/lib/states";
+import { CheckIcon } from "@heroicons/react/16/solid";
 import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
@@ -384,9 +386,15 @@ export function JobsPage() {
         {STATES.map((s) => {
           const count = s === "all" ? total : statsQuery.data?.[s];
           const isActive = filters.state === s;
+          const meta = s === "all" ? null : jobStateMeta(s);
+          const Icon = isActive ? CheckIcon : meta?.Icon;
           return (
             <button
               key={s}
+              type="button"
+              aria-pressed={isActive}
+              data-testid="state-pill"
+              data-state={s}
               onClick={() => setStateFilter(s)}
               className={[
                 "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium transition-colors",
@@ -395,7 +403,13 @@ export function JobsPage() {
                   : "border-border bg-bg text-muted-fg hover:bg-secondary hover:text-fg",
               ].join(" ")}
             >
-              {s === "waiting_external" ? "waiting" : s}
+              {Icon && (
+                <Icon
+                  aria-hidden="true"
+                  className={`size-3.5 ${isActive || !meta ? "" : TONE_TEXT[meta.tone]}`}
+                />
+              )}
+              {meta ? meta.shortLabel : "All"}
               {count !== undefined && count > 0 && (
                 <span
                   className={
