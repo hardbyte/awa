@@ -197,7 +197,7 @@ test.describe("Search bar filters", () => {
       page.goto("/jobs?state=cancelled&q=kind%3Ae2e_job"),
     ]);
     const bar = page.getByRole("toolbar", { name: "Bulk actions" });
-    await expect(bar.getByTestId("bulk-scope-all")).toHaveText(/^All \d+ matching$/);
+    await expect(bar.getByTestId("bulk-scope-all")).toHaveText(/^All \d+ matching live jobs$/);
     await bar.getByRole("button", { name: "Retry…" }).click();
 
     const dialog = page.getByRole("alertdialog");
@@ -209,6 +209,38 @@ test.describe("Search bar filters", () => {
 
     await expect(page).toHaveURL(new RegExp(`/batch-ops/${id}$`));
     expect(submitted).toEqual({ op_kind: "retry", filter: { kind: "e2e_job", state: "cancelled" }, spec: {}, submitted_by: "ui" });
+  });
+
+  test("the all-matching scope counts only live jobs, leaving dead letters out", async ({ page }) => {
+    const counted: string[] = [];
+    await page.route(
+      (url) => url.pathname === "/api/jobs/count",
+      (route) => {
+        const url = new URL(route.request().url());
+        counted.push(url.search);
+        const live = url.searchParams.get("dead_lettered") === "false";
+        return route.fulfill({ json: { kind: "exact", value: live ? 3 : 5 } });
+      }
+    );
+    await page.goto("/jobs?state=failed&q=kind%3Ae2e_job");
+    await expect(page.getByTestId("match-count")).toHaveText("5 matching");
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    await expect(bar.getByTestId("bulk-scope-all")).toHaveText("All 3 matching live jobs");
+    expect(counted.some((search) => search.includes("dead_lettered=false"))).toBe(true);
+  });
+
+  test("a state that holds no dead letters counts once", async ({ page }) => {
+    const counted: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/api/jobs/count") counted.push(url.search);
+    });
+    await page.goto("/jobs?state=cancelled&q=kind%3Ae2e_job");
+    const bar = page.getByRole("toolbar", { name: "Bulk actions" });
+    await expect(page.getByTestId("match-count")).toHaveText(/^[\d,]+ matching$/);
+    const total = (await page.getByTestId("match-count").textContent())!.replace(" matching", "");
+    await expect(bar.getByTestId("bulk-scope-all")).toHaveText(`All ${total} matching live jobs`);
+    expect(counted.filter((search) => search.includes("dead_lettered"))).toEqual([]);
   });
 
   test("a state alone disables the all-matching actions and says why", async ({ page }) => {

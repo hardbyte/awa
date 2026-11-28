@@ -410,12 +410,23 @@ export function bulkConfirmText(count: JobCount): string {
   return String(count.value);
 }
 
+/** The "everything" scope's label. Job actions never change dead letters, so
+ * the jobs list counts only live jobs and says so. */
+export function scopeCountLabel(count: JobCount | undefined, target: "jobs" | "dlq"): string {
+  const noun = target === "jobs" ? " live jobs" : "";
+  if (!count) return `All matching${noun}`;
+  const value = count.value.toLocaleString();
+  return `All ${count.kind === "at_least" ? `${value}+` : value} matching${noun}`;
+}
+
 export interface BulkContext {
   /** The states the list shows; empty or undefined for all of them. */
   states?: string[];
   filter: BatchOperationFilter;
   /** What the list's filter matches, when counted. */
   count?: JobCount;
+  /** The count covers live jobs only, leaving dead letters out. */
+  live?: boolean;
 }
 
 /**
@@ -434,7 +445,7 @@ export function bulkActionReason(kind: BatchOperationKind, context: BulkContext)
     return `${option.label} acts on ${option.scope} jobs, and this list shows ${states.join(" or ").replace(/_/g, " ")} jobs`;
   }
   if (context.count && context.count.kind === "exact" && context.count.value === 0) {
-    return "Nothing matches this filter";
+    return context.live ? "No live job matches this filter" : "Nothing matches this filter";
   }
   return null;
 }

@@ -13,6 +13,7 @@ import {
   isNarrowing,
   previewCount,
   sameFilter,
+  scopeCountLabel,
   searchFromForm,
 } from "@/lib/batch";
 import { toWireFilter } from "@/lib/api";
@@ -195,8 +196,27 @@ describe("bulkActionReason", () => {
     expect(bulkActionReason("retry", { filter, count: { kind: "at_least", value: 0 } })).toBeNull();
   });
 
+  it("says no live job matches when the count leaves dead letters out", () => {
+    expect(bulkActionReason("retry", { filter, live: true, count: { kind: "exact", value: 0 } })).toBe(
+      "No live job matches this filter"
+    );
+  });
+
   it("ignores states for dead-letter kinds", () => {
     expect(bulkActionReason("purge_dlq", { filter: { queue: "q" } })).toBeNull();
+  });
+});
+
+describe("scopeCountLabel", () => {
+  it("names live jobs for the jobs list, so it doesn't read as the list's total", () => {
+    expect(scopeCountLabel({ kind: "exact", value: 3000 }, "jobs")).toBe("All 3,000 matching live jobs");
+    expect(scopeCountLabel({ kind: "at_least", value: 10000 }, "jobs")).toBe("All 10,000+ matching live jobs");
+    expect(scopeCountLabel(undefined, "jobs")).toBe("All matching live jobs");
+  });
+
+  it("counts dead letters plainly on the dead-letter list", () => {
+    expect(scopeCountLabel({ kind: "exact", value: 4 }, "dlq")).toBe("All 4 matching");
+    expect(scopeCountLabel(undefined, "dlq")).toBe("All matching");
   });
 });
 

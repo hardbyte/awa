@@ -6,7 +6,7 @@ import {
   type JobCount,
   type JobFilterParams,
 } from "@/lib/api";
-import { bulkActionReason, bulkVerb } from "@/lib/batch";
+import { bulkActionReason, bulkVerb, scopeCountLabel } from "@/lib/batch";
 import { AdminButton } from "@/components/AdminAction";
 import { BulkActionDialog } from "@/components/BulkActionDialog";
 
@@ -18,7 +18,8 @@ export interface BulkScopeBarProps {
   target: "jobs" | "dlq";
   /** The list's filter, without paging. */
   filter: JobFilterParams;
-  /** What the filter matches, as the list counted it. */
+  /** What the filter matches that the actions can change: live jobs for
+   * the jobs list, dead letters for the DLQ list. */
   count?: JobCount;
   /** Selected rows and the actions for them, which act on those rows only. */
   selection?: { count: number; actions: React.ReactNode };
@@ -29,11 +30,10 @@ export interface BulkScopeBarProps {
   unavailableReason?: string;
 }
 
-function countLabel(count: JobCount | undefined): string {
-  if (!count) return "All matching";
-  const value = count.value.toLocaleString();
-  return `All ${count.kind === "at_least" ? `${value}+` : value} matching`;
-}
+const SCOPE_TITLE = {
+  jobs: "Jobs this filter matches outside the dead letter queue: the jobs these actions can change",
+  dlq: "Dead letters this filter matches",
+} as const;
 
 /**
  * Bulk actions for a list: on the selected rows, or as a bulk operation on
@@ -58,6 +58,7 @@ export function BulkScopeBar({ target, filter, count, selection, formPrefill, un
     states: filter.states,
     filter: wire,
     count,
+    live: target === "jobs",
   };
   const actions = target === "dlq" ? DLQ_ACTIONS : JOB_ACTIONS;
   const formReason =
@@ -79,18 +80,19 @@ export function BulkScopeBar({ target, filter, count, selection, formPrefill, un
               type="button"
               aria-pressed={scope === option}
               onClick={() => setScope(option)}
+              title={option === "all" ? SCOPE_TITLE[target] : undefined}
               className={[
                 "rounded px-2 py-0.5 text-sm",
                 scope === option ? "bg-primary text-primary-fg" : "hover:bg-secondary",
               ].join(" ")}
             >
-              {option === "selected" ? `Selected (${selectedCount.toLocaleString()})` : countLabel(count)}
+              {option === "selected" ? `Selected (${selectedCount.toLocaleString()})` : scopeCountLabel(count, target)}
             </button>
           ))}
         </div>
       ) : (
-        <span className="text-sm font-medium" data-testid="bulk-scope-all">
-          {countLabel(count)}
+        <span className="text-sm font-medium" data-testid="bulk-scope-all" title={SCOPE_TITLE[target]}>
+          {scopeCountLabel(count, target)}
         </span>
       )}
       <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />

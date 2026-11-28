@@ -180,6 +180,18 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
     staleTime: 30_000,
   });
 
+  // Bulk actions on the whole filter change live jobs only. Dead letters are
+  // failed, so only an all-states or failed filter can match any of them.
+  const mayMatchDeadLetters = filters.state === "all" || filters.state === "failed";
+  const liveFilterParams: ListJobsParams = { ...filterParams, dead_lettered: false };
+  const liveCountQuery = useManagedQuery<JobCount>({
+    queryKey: ["jobs-count", liveFilterParams],
+    queryFn: () => fetchJobCount(liveFilterParams),
+    enabled: hasFilter && !searchError && mayMatchDeadLetters,
+    staleTime: 30_000,
+  });
+  const liveCount = mayMatchDeadLetters ? liveCountQuery.data : countQuery.data;
+
   const statsQuery = useManagedQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
@@ -360,7 +372,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
         <BulkScopeBar
           target="jobs"
           filter={filterParams}
-          count={searchError ? undefined : countQuery.data}
+          count={searchError ? undefined : liveCount}
           unavailableReason={searchError ? "Fix the search first" : undefined}
           formPrefill={
             tagWithComma ? "A tag containing a comma can't be carried into the new-operation form" : batchSearch
