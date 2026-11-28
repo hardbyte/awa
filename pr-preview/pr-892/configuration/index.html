@@ -4492,7 +4492,7 @@ the participation path for SQL-native producers.</p>
 <h3 id="operator-workflow">Operator workflow<a class="headerlink" href="#operator-workflow" title="Permanent link">&para;</a></h3>
 <p>Once DLQ is on, operators interact with it through:</p>
 <ul>
-<li><strong>Web UI</strong> — DLQ tab with retry, purge, and per-row failure detail.</li>
+<li><strong>Web UI</strong> — Dead letters page (and a Dead letters tab on each queue) with retry, purge, and per-row failure detail.</li>
 <li><strong>CLI</strong> — <code>awa dlq list</code>, <code>awa dlq retry &lt;id&gt;</code>, <code>awa dlq purge</code>.</li>
 <li><strong>REST</strong> — <code>/api/dlq/*</code> endpoints (same actions as the UI).</li>
 <li><strong>Python / Rust</strong> — <code>client.dlq_*</code> admin methods for programmatic retry / purge.</li>

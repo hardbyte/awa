@@ -3112,7 +3112,7 @@ producers and migrations.</p>
 <p>For a UI pinned to a less-trusted network or shared with stakeholders who shouldn't trigger retries, cancels, or pauses, run with <code>--read-only</code> (or set <code>AWA_READ_ONLY=1</code>):</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>serve<span class="w"> </span>--read-only
 </span></code></pre></div>
-<p>This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See <a href="../configuration/#read-only-mode">Read-only mode</a> for the tradeoff versus pointing at a read replica.</p>
+<p>This forces read-only even when the Postgres connection is fully writable — the UI disables admin actions and says why, and every mutation endpoint returns 503. See <a href="../configuration/#read-only-mode">Read-only mode</a> for the tradeoff versus pointing at a read replica.</p>
 <p>If you expose the callback receiver endpoints for <code>HttpWorker</code>, also configure <code>AWA_CALLBACK_HMAC_SECRET</code> (or <code>--callback-hmac-secret</code>) so <code>awa-ui</code> verifies <code>X-Awa-Signature</code> on callback requests. See <a href="../http-callbacks/">HTTP workers and callback signatures</a> for the worker, function, and receiver contract.</p>
 <h2 id="next">Next<a class="headerlink" href="#next" title="Permanent link">&para;</a></h2>
 <ul>

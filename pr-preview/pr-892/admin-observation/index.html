@@ -2526,6 +2526,7 @@ results while the replacement read completes. Job selection and operator form
 state are retained. Selected job lists pause automatic replacement; explicit
 refresh uses the same scheduler. Counts become stale on automatic marks, and
 fetch only on filter change or explicit refresh.</p>
+<p>The header's freshness pill reads the scheduler's view of the managed keys on the page. It shows the age of the least recently loaded one ("Live · updated 3s ago"), turns amber with the age of the retained data while some reads fail ("Last updated 2m ago — reconnecting"), and red ("Server unreachable") when every read fails, which also dims the page. It names the other cases too: refused access after a 401 or 403, keys refused at the limit, and a list paused for a selection. Not-found keys, paused keys and manual-only counts don't count towards its age or failures. The age is the time since the last successful read, not a promise about how old the underlying data may be.</p>
 <h2 id="aggregate-cache-behavior">Aggregate cache behavior<a class="headerlink" href="#aggregate-cache-behavior" title="Permanent link">&para;</a></h2>
 <p>The stats, queue list, runtime, queue-runtime and storage caches use monotonic
 local generations. After a successful local admin mutation, the shared helper

@@ -807,7 +807,7 @@ Per-queue retention overrides go through `RetentionPolicy.dlq` on `queue_retenti
 
 Once DLQ is on, operators interact with it through:
 
-- **Web UI** — DLQ tab with retry, purge, and per-row failure detail.
+- **Web UI** — Dead letters page (and a Dead letters tab on each queue) with retry, purge, and per-row failure detail.
 - **CLI** — `awa dlq list`, `awa dlq retry <id>`, `awa dlq purge`.
 - **REST** — `/api/dlq/*` endpoints (same actions as the UI).
 - **Python / Rust** — `client.dlq_*` admin methods for programmatic retry / purge.
