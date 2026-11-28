@@ -2,6 +2,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -1142,4 +1143,61 @@ async fn test_batch_ops_api_preview_submit_and_cancel() {
         .await
         .expect("request should succeed");
     assert_eq!(patch_response.status(), StatusCode::OK);
+}
+
+/// A never-used install has no queue_storage backend yet, so its DLQ is
+/// empty; the read endpoints say so instead of failing, and writes still
+/// report that the DLQ is unavailable.
+#[tokio::test]
+async fn test_dlq_reads_are_empty_before_queue_storage_is_active() {
+    let url = awa_testing::setup::database_url();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("failed to connect admin pool");
+    let database = format!("awa_ui_dlq_empty_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await
+        .expect("failed to create test database");
+    let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+        .expect("database url should parse")
+        .database(&database);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("failed to connect test database");
+    awa_model::migrations::run(&pool)
+        .await
+        .expect("failed to run migrations");
+    assert!(awa_model::queue_storage::QueueStorage::active_schema(&pool)
+        .await
+        .unwrap()
+        .is_none());
+    let app = awa_ui::router(pool.clone(), Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    assert_eq!(get_json(&app, "/api/dlq").await, serde_json::json!([]));
+    assert_eq!(
+        get_json(&app, "/api/dlq?queue=billing").await,
+        serde_json::json!([])
+    );
+    assert_eq!(
+        get_json(&app, "/api/dlq/depth").await,
+        serde_json::json!({ "total": 0, "by_queue": [] })
+    );
+    assert_eq!(get_json(&app, "/api/dlq/42").await, Value::Null);
+
+    let (status, body) = post_json(&app, "/api/dlq/42/retry", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    drop(app);
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .expect("failed to drop test database");
 }
