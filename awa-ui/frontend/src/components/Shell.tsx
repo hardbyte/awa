@@ -23,6 +23,7 @@ import {
   normalizeInstanceColor,
 } from "@/lib/instance";
 import { Button } from "@/components/ui/button";
+import { CommandPalette } from "@/components/CommandPalette";
 import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
 import { ACTIVE_BATCH_STATES, batchOpsQuery, dlqDepthQuery } from "@/lib/shared-queries";
 import {
@@ -589,6 +590,7 @@ export function Shell() {
           )}
           <div className="flex-1" />
           <div className="flex items-center gap-1">
+            <CommandPalette />
             <RefreshControl />
             <TimeZoneToggle />
             <ThemeToggle />
