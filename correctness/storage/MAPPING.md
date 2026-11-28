@@ -400,13 +400,21 @@ Replica identity controls old-row WAL images; it adds no lifecycle transition. `
 | --- | --- |
 | `Resolve`, `Lock` | the first statement of `claim_ready_runtime`: the `ready_segments` probe with the smallest `next_lane_seq` past the cursor, and `FOR UPDATE OF claims SKIP LOCKED` |
 | `Retarget` (`Reresolve`) | the statement that re-resolves `v_target_slot` and `v_target_generation` after the lock |
-| `Head` | the head read of `ready_entries` in `claim_ready_runtime` and the `set_sequence_next` that moves the cursor to it |
-| `Read` | the `selected` CTE of `claim_ready_slot_N` and the evidence the claim writes, from which the cursor advances |
-| `Bound(t)` (`Bounded`) | the `lane_seq <` subquery over the first `max_batch + 1` segments past the cursor, in the head step and in the slot function, evaluated in the statement that reads the rows |
+| `Head` | the head read of `ready_entries` in `claim_ready_runtime`, bounded by the first two segments past the cursor, and the `set_sequence_next` that moves the cursor to it |
+| `Read` | the `selected` CTE of `claim_ready_slot_N`, and the cursor moving past the rows it took |
+| `Bound(t, n)` (`Bounded`) | the `lane_seq <` subquery over the first `n + 1` segments past the cursor, evaluated in the statement that reads the rows: `n = 1` in the head step, `n = max_batch` in the slot function |
 | `Move` | not in a release; the batched or whole-range mover of #779 |
 | `Prune` | queue-ring prune, gated on the claim cursor |
 
 The hardened configuration passes with prefix moves. The three `Unbounded` configurations are expected counterexamples: an interleaved lane with no mover, a prefix move that makes a stale target skip rows, and a whole-range move followed by a new row in the source slot. The bound alone is sufficient in the model, because it is read in the statement that reads the rows; the re-resolve only keeps a claim from starting on a stale target. The model does not cover the cost of the extra probes, which the claim benchmarks measure.
+
+Not modelled:
+
+- **The evidence fold.** The model moves the cursor in the claim's own step. In the SQL it moves after the claim commits, or at the next claim, which folds it to `max(next_lane_seq)` of the committed evidence in the target slot with no bound. A model with evidence keyed by `ready_slot` and a lagging cursor would be needed to check it.
+- **A mover acting on a lagging cursor.** Movers read the model's cursor, which is always current.
+- **A prefix move that splits a multi-row segment.** Each position is its own segment in the model, so a split never cuts a segment, and evidence and tombstones keyed by `ready_slot` are not represented.
+
+ADR-054 states the obligations these leave on a mover.
 
 ## Cursor folding and mixed versions (#513 / v048)
 
