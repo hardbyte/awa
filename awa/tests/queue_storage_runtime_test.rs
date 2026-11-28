@@ -4928,11 +4928,9 @@ async fn measure_queue_ring_release_after_cancelling_a_large_lane() {
         if pin.is_none() {
             break cancelled_at.elapsed();
         }
-        // Enqueue-to-claim latency on a lane that is not pinned.
-        let enqueued = Instant::now();
-        enqueue_job(
-            &pool,
-            &store,
+        // Claim latency on a lane that is not pinned. The insert is outside
+        // the timed window, and so is any lookup of the new job.
+        let params = [insert::params_with(
             &CompleteJob { id: -1 },
             InsertOpts {
                 queue: claim_queue.to_string(),
@@ -4940,7 +4938,12 @@ async fn measure_queue_ring_release_after_cancelling_a_large_lane() {
                 ..Default::default()
             },
         )
-        .await;
+        .expect("build probe insert params")];
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("enqueue probe job");
+        let enqueued = Instant::now();
         loop {
             let claimed = store
                 .claim_runtime_batch(&pool, claim_queue, 1, Duration::from_secs(60))

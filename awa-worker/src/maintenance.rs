@@ -1025,11 +1025,22 @@ const QUEUE_RING_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// advances past per pin read.
 const QUEUE_RING_PIN_ADVANCE_LANES: usize = 32;
 
-/// How long one pin read keeps advancing lanes' claim cursors, in windows of
-/// at most 1,000 positions, each its own short transaction. A read that uses
-/// it all and moved a cursor is followed by another on the next tick, not
-/// after [`QUEUE_RING_PIN_REFRESH_INTERVAL`].
+/// The longest one pin read keeps advancing lanes' claim cursors, in windows
+/// of at most 1,000 positions, each its own short transaction. A read that
+/// uses its whole budget and moved a cursor is followed by another on the
+/// next tick, not after [`QUEUE_RING_PIN_REFRESH_INTERVAL`].
 const QUEUE_RING_PIN_ADVANCE_BUDGET: Duration = Duration::from_millis(400);
+
+/// The budget of one pin read: [`QUEUE_RING_PIN_ADVANCE_BUDGET`], or half the
+/// queue rotation interval when that is shorter, so the read fits in the
+/// tick that runs it.
+fn queue_ring_pin_advance_budget(runtime: &QueueStorageRuntime) -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = runtime.ring_pin_advance_budget_override {
+        return budget;
+    }
+    QUEUE_RING_PIN_ADVANCE_BUDGET.min(runtime.queue_rotate_interval / 2)
+}
 
 /// A `(queue, priority, enqueue_shard)` ready lane.
 type ReadyLaneKey = (String, i16, i16);
@@ -4322,8 +4333,7 @@ impl MaintenanceService {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_due(Instant::now());
             if refresh_due {
-                self.observe_queue_ring_pin(&runtime.store, prune_tracker)
-                    .await;
+                self.observe_queue_ring_pin(runtime, prune_tracker).await;
             }
             return;
         }
@@ -4345,10 +4355,7 @@ impl MaintenanceService {
                     PruneOutcome::SkippedActive {
                         reason: SkipReason::QueuePendingReady | SkipReason::QueueActiveLeases,
                         ..
-                    } => {
-                        self.observe_queue_ring_pin(&runtime.store, prune_tracker)
-                            .await
-                    }
+                    } => self.observe_queue_ring_pin(runtime, prune_tracker).await,
                     PruneOutcome::Blocked { .. } => {}
                     _ => self.clear_queue_ring_pin(),
                 }
@@ -4398,10 +4405,10 @@ impl MaintenanceService {
     /// the next tick.
     async fn observe_queue_ring_pin(
         &self,
-        store: &QueueStorage,
+        runtime: &QueueStorageRuntime,
         prune_tracker: &PruneBackoffTracker,
     ) {
-        let pin = match store.queue_ring_pin(&self.pool).await {
+        let pin = match runtime.store.queue_ring_pin(&self.pool).await {
             Ok(Some(pin)) => pin,
             Ok(None) => {
                 self.clear_queue_ring_pin();
@@ -4413,7 +4420,7 @@ impl MaintenanceService {
             }
         };
         let (pin, released, advance_pending) = if self.control.allowed() {
-            self.release_spent_pinning_lanes(store, pin).await
+            self.release_spent_pinning_lanes(runtime, pin).await
         } else {
             (Some(pin), false, false)
         };
@@ -4464,12 +4471,14 @@ impl MaintenanceService {
     /// whole budget and moved a cursor, so the next read should not wait.
     async fn release_spent_pinning_lanes(
         &self,
-        store: &QueueStorage,
+        runtime: &QueueStorageRuntime,
         pin: QueueRingPin,
     ) -> (Option<QueueRingPin>, bool, bool) {
         let lanes = &pin.lanes[..pin.lanes.len().min(QUEUE_RING_PIN_ADVANCE_LANES)];
+        let store = &runtime.store;
+        let budget = queue_ring_pin_advance_budget(runtime);
         let outcome = match store
-            .advance_spent_claim_heads_within(&self.pool, lanes, QUEUE_RING_PIN_ADVANCE_BUDGET)
+            .advance_spent_claim_heads_within(&self.pool, lanes, budget)
             .await
         {
             Ok(outcome) => outcome,
@@ -7602,6 +7611,150 @@ mod tests {
         assert!(
             report.observe(std::slice::from_ref(&paused), &metrics, start),
             "a pin after a clear warns again"
+        );
+    }
+
+    #[test]
+    fn queue_ring_pin_advance_budget_fits_the_rotation_tick() {
+        let runtime = |rotate_ms| {
+            QueueStorageRuntime::new(
+                QueueStorageConfig::default(),
+                Duration::from_millis(rotate_ms),
+                Duration::from_secs(1),
+            )
+            .expect("queue storage runtime")
+        };
+        assert_eq!(
+            queue_ring_pin_advance_budget(&runtime(1_000)),
+            QUEUE_RING_PIN_ADVANCE_BUDGET
+        );
+        assert_eq!(
+            queue_ring_pin_advance_budget(&runtime(800)),
+            QUEUE_RING_PIN_ADVANCE_BUDGET
+        );
+        assert_eq!(
+            queue_ring_pin_advance_budget(&runtime(300)),
+            Duration::from_millis(150)
+        );
+    }
+
+    /// A lane that needs several budgets is released on consecutive rotation
+    /// ticks: each read that uses its budget and moves a cursor makes the next
+    /// read due on the next tick, instead of after
+    /// [`QUEUE_RING_PIN_REFRESH_INTERVAL`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_ring_pin_advance_releases_a_large_cancelled_lane_on_consecutive_ticks() {
+        const JOBS: usize = 3_500;
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(6).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.expect("migrations");
+        let config = QueueStorageConfig::default();
+        let store = QueueStorage::new(config.clone()).expect("queue storage");
+        store.install(&pool).await.expect("install");
+
+        let queue = "ring_pin_advance_pacing";
+        for start in (0..JOBS).step_by(1_000) {
+            let jobs: Vec<_> = (start..JOBS.min(start + 1_000))
+                .map(|id| awa_model::InsertParams {
+                    kind: "ring_pin_advance_pacing".into(),
+                    args: serde_json::json!({ "id": id }),
+                    opts: awa_model::InsertOpts {
+                        queue: queue.into(),
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            store
+                .enqueue_params_batch(&pool, &jobs)
+                .await
+                .expect("enqueue");
+        }
+        let job_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT job_id FROM awa.ready_entries WHERE queue = $1 ORDER BY lane_seq",
+        )
+        .bind(queue)
+        .fetch_all(&pool)
+        .await
+        .expect("read lane job ids");
+        assert_eq!(job_ids.len(), JOBS);
+        let rotated = store.rotate(&pool).await.expect("rotate queue ring");
+        assert!(
+            matches!(rotated, RotateOutcome::Rotated { .. }),
+            "{rotated:?}"
+        );
+
+        // Newest first leaves every tombstone behind the claim cursor, which
+        // only follows the call that cancels the lane's first job.
+        for chunk in job_ids.rchunks(500) {
+            awa_model::admin::bulk_cancel(&pool, chunk)
+                .await
+                .expect("bulk cancel");
+        }
+        assert!(
+            store
+                .queue_ring_pin(&pool)
+                .await
+                .expect("read queue ring pin")
+                .is_some(),
+            "the cancelled lane pins the sealed slot"
+        );
+
+        // A zero budget runs one 1,000-position window per read, so the lane
+        // needs one read per window.
+        let runtime =
+            QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("queue storage runtime")
+                .with_ring_pin_advance_budget(Duration::ZERO);
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        );
+        service
+            .control
+            .observe_pool(&pool)
+            .await
+            .expect("observe the runtime control");
+        assert!(service.control.allowed(), "pruning is allowed");
+        let prune_tracker = PruneBackoffTracker::new();
+        let started = Instant::now();
+        let mut ticks = 0;
+        while ticks < 8 {
+            service.rotate_queue_storage_queue(&prune_tracker).await;
+            ticks += 1;
+            if store
+                .queue_ring_pin(&pool)
+                .await
+                .expect("read queue ring pin")
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert!(
+            store
+                .queue_ring_pin(&pool)
+                .await
+                .expect("read queue ring pin")
+                .is_none(),
+            "the lane still pins the ring after {ticks} ticks"
+        );
+        assert!(
+            ticks >= 3,
+            "the lane needed at least three budgets, took {ticks} ticks"
+        );
+        assert!(
+            started.elapsed() < QUEUE_RING_PIN_REFRESH_INTERVAL,
+            "released in {:?}, not on the refresh cadence",
+            started.elapsed()
         );
     }
 

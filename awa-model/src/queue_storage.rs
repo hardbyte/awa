@@ -11494,8 +11494,10 @@ impl QueueStorage {
     /// Like [`Self::advance_spent_claim_heads`], bounded by time instead of a
     /// window count: a lane keeps advancing, one transaction per window,
     /// while each window moves a full [`DRAIN_BATCH_SIZE`] positions, until
-    /// `budget` has elapsed. Lanes are advanced in turn, so a lane that
-    /// exhausts the budget leaves the others for the next call. At least one
+    /// `budget` has elapsed. Lanes are advanced in turn, in
+    /// (queue, priority, shard) order, and every call starts at the first
+    /// lane again, so a lane that exhausts the budget delays the lanes after
+    /// it until it reaches a claimable row. At least one
     /// window runs whatever the budget, and the window in flight when the
     /// budget elapses finishes, so a call can overrun it by one window.
     /// [`SpentClaimHeadAdvances::budget_exhausted`] says whether spent rows

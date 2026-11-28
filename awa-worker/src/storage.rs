@@ -8,6 +8,8 @@ pub(crate) struct QueueStorageRuntime {
     pub queue_rotate_interval: Duration,
     pub lease_rotate_interval: Duration,
     pub claim_rotate_interval: Duration,
+    #[cfg(test)]
+    pub ring_pin_advance_budget_override: Option<Duration>,
 }
 
 impl QueueStorageRuntime {
@@ -26,11 +28,19 @@ impl QueueStorageRuntime {
             queue_rotate_interval,
             lease_rotate_interval,
             claim_rotate_interval,
+            #[cfg(test)]
+            ring_pin_advance_budget_override: None,
         })
     }
 
     pub fn with_claim_rotate_interval(mut self, claim_rotate_interval: Duration) -> Self {
         self.claim_rotate_interval = claim_rotate_interval;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_ring_pin_advance_budget(mut self, budget: Duration) -> Self {
+        self.ring_pin_advance_budget_override = Some(budget);
         self
     }
 
