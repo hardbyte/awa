@@ -119,13 +119,13 @@ test.describe("Navigation", () => {
 });
 
 test.describe("Failed reads are not shown as empty", () => {
-  test("dashboard tiles show no count when stats fail", async ({ page }) => {
+  test("overview tiles show no count when stats fail", async ({ page }) => {
     await failApi(page, "**/api/stats");
     await page.goto("/");
-    await expect(page.getByTestId("stats-error")).toContainText("Failed to load job counts");
-    const tiles = page.locator('a[href*="/jobs?state="]');
-    await expect(tiles.first()).toContainText("—");
-    await expect(tiles.filter({ hasText: /^0/ })).toHaveCount(0);
+    for (const tile of ["tile-retrying", "tile-failed"]) {
+      await expect(page.getByTestId(tile)).toContainText("Failed to load");
+      await expect(page.getByTestId(tile).getByTestId("tile-value")).toHaveText("—");
+    }
   });
 
   test("batch operations show an error with retry, then the list", async ({ page }) => {
