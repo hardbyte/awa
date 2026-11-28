@@ -392,6 +392,30 @@ The shared BRIN FSM SQL fragment follows `FSM_TREE_DEPTH` in PostgreSQL 17/18 so
 
 Replica identity controls old-row WAL images; it adds no lifecycle transition. `replica_identity_test` checks every regular/partitioned relation in canonical and custom queue-storage schemas, then runs real unique enqueue/completion, failure/DLQ retry/purge, cron and maintenance UPDATE/DELETE paths under an all-tables publication. It covers default and custom schemas and partition routing. PostgreSQL 17/18 execute these tests as the database owner/superuser in full CI; a catalog-only test is insufficient. This is publication/executor compatibility evidence, not an end-to-end Debezium or logical subscriber delivery rehearsal. Managed service role restrictions and CDC configuration remain documented in `deploying-on-managed-postgres.md`.
 
+## Claim target bound (#885 / v064)
+
+`AwaClaimTargetBound` models one lane's claim as separate statements: the first statement resolves the target slot from a snapshot, the head lock is granted after it, a fresh statement re-resolves the target, the head step moves the cursor to the first visible row of the target slot, and the slot function reads up to `Limit` rows and the cursor moves past them. Enqueues into either slot, movers that relocate a prefix or the whole of a lane's unclaimed rows between slots, and prune gated on the cursor interleave between any two statements. A position is its own segment, the worst case for the bounded scan. `NoSkippedRow` (the cursor never passes an unclaimed row) and `NoLostRow` (prune never removes one) are the invariants.
+
+| Model | SQL |
+| --- | --- |
+| `Resolve`, `Lock` | the first statement of `claim_ready_runtime`: the `ready_segments` probe with the smallest `next_lane_seq` past the cursor, and `FOR UPDATE OF claims SKIP LOCKED` |
+| `Retarget` (`Reresolve`) | the statement that re-resolves `v_target_slot` and `v_target_generation` after the lock |
+| `Head` | the head read of `ready_entries` in `claim_ready_runtime`, bounded by the first two segments past the cursor, and the `set_sequence_next` that moves the cursor to it |
+| `Read` | the `selected` CTE of `claim_ready_slot_N`, and the cursor moving past the rows it took |
+| `Bound(t, n)` (`Bounded`) | the `lane_seq <` subquery over the first `n + 1` segments past the cursor, evaluated in the statement that reads the rows: `n = 1` in the head step, `n = max_batch` in the slot function |
+| `Move` | not in a release; the batched or whole-range mover of #779 |
+| `Prune` | queue-ring prune, gated on the claim cursor |
+
+The hardened configuration passes with prefix moves. The three `Unbounded` configurations are expected counterexamples: an interleaved lane with no mover, a prefix move that makes a stale target skip rows, and a whole-range move followed by a new row in the source slot. The bound alone is sufficient in the model, because it is read in the statement that reads the rows; the re-resolve only keeps a claim from starting on a stale target. The model does not cover the cost of the extra probes, which the claim benchmarks measure.
+
+Not modelled:
+
+- **The evidence fold.** The model moves the cursor in the claim's own step. In the SQL it moves after the claim commits, or at the next claim, which folds it to `max(next_lane_seq)` of the committed evidence in the target slot with no bound. A model with evidence keyed by `ready_slot` and a lagging cursor would be needed to check it.
+- **A mover acting on a lagging cursor.** Movers read the model's cursor, which is always current.
+- **A prefix move that splits a multi-row segment.** Each position is its own segment in the model, so a split never cuts a segment, and evidence and tombstones keyed by `ready_slot` are not represented.
+
+ADR-054 states the obligations these leave on a mover.
+
 ## Cursor folding and mixed versions (#513 / v048)
 
 `AwaClaimCursorFold` refines the lane cursor independently of lifecycle ownership: a single claim-head owner selects a prefix of the visible lane, commits receipt evidence or a legacy lease, and queues a guarded advance after every commit; a later claim folds committed attempt evidence whenever that advance never ran. A fold can survive a later transaction abort because it uses prior committed evidence. The bounded model includes permanent reservation gaps, tombstones, segment generation changes, closure, prune and stale post-claim replays. The non-prefix configuration is an expected skip counterexample: `max(next_lane_seq)` is not a proof for arbitrary ranges.

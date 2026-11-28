@@ -4881,6 +4881,20 @@ BEGIN
                 RETURN;
             END IF;
 
+            -- The head lock can be granted after the statement above took its
+            -- snapshot, and a transaction that moved rows between slots and
+            -- committed in between is not visible to it. Resolve the target
+            -- again in a fresh statement, with the lock held.
+            SELECT segment.ready_slot, segment.ready_generation
+            INTO v_target_slot, v_target_generation
+            FROM %1$I.ready_segments AS segment
+            WHERE segment.queue = p_queue
+              AND segment.priority = v_lane_priority
+              AND segment.enqueue_shard = v_lane_shard
+              AND segment.next_lane_seq > v_lane_claim_seq
+            ORDER BY segment.next_lane_seq ASC
+            LIMIT 1;
+
             IF v_target_slot IS NULL THEN
                 SELECT
                     segment.ready_slot,
@@ -4998,6 +5012,31 @@ BEGIN
               AND ready.ready_slot = v_target_slot
               AND ready.ready_generation = v_target_generation
               AND ready.lane_seq >= v_lane_claim_seq
+              -- Rows of this slot at or after the next segment of another
+              -- slot are out of reach of this claim, whether to take or to
+              -- move the cursor to.
+              -- This reads one row, and every segment holds a row, so the
+              -- first row at or after the cursor lies in the first segment
+              -- past it when that is in this slot, and the second segment is
+              -- all that is needed to see where another slot begins.
+              AND ready.lane_seq < COALESCE((
+                  SELECT min(bounding.first_lane_seq)
+                  FROM (
+                      SELECT
+                          segment.ready_slot,
+                          segment.ready_generation,
+                          segment.first_lane_seq
+                      FROM %1$I.ready_segments AS segment
+                      WHERE segment.queue = p_queue
+                        AND segment.priority = v_lane_priority
+                        AND segment.enqueue_shard = v_lane_shard
+                        AND segment.next_lane_seq > v_lane_claim_seq
+                      ORDER BY segment.next_lane_seq ASC
+                      LIMIT 2
+                  ) AS bounding
+                  WHERE (bounding.ready_slot, bounding.ready_generation)
+                        IS DISTINCT FROM (v_target_slot, v_target_generation)
+              ), 9223372036854775807)
             ORDER BY ready.lane_seq ASC
             LIMIT 1;
 
@@ -5536,6 +5575,26 @@ BEGIN
                   AND ready.ready_slot = p_target_slot
                   AND ready.ready_generation = p_target_generation
                   AND ready.lane_seq >= p_lane_claim_seq
+                  -- Stop below the next segment of another slot, from the
+                  -- same snapshot as the rows; see claim_ready_runtime.
+                  AND ready.lane_seq < COALESCE((
+                      SELECT min(bounding.first_lane_seq)
+                      FROM (
+                          SELECT
+                              segment.ready_slot,
+                              segment.ready_generation,
+                              segment.first_lane_seq
+                          FROM %1$I.ready_segments AS segment
+                          WHERE segment.queue = p_queue
+                            AND segment.priority = p_lane_priority
+                            AND segment.enqueue_shard = p_lane_shard
+                            AND segment.next_lane_seq > p_lane_claim_seq
+                          ORDER BY segment.next_lane_seq ASC
+                          LIMIT GREATEST(p_claim_limit, 0) + 1
+                      ) AS bounding
+                      WHERE (bounding.ready_slot, bounding.ready_generation)
+                            IS DISTINCT FROM (p_target_slot, p_target_generation)
+                  ), 9223372036854775807)
                 ORDER BY ready.lane_seq ASC
                 LIMIT p_claim_limit
             ),

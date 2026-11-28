@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 63;
+pub const CURRENT_VERSION: i32 = 64;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -347,6 +347,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Let batch operations retry, cancel, discard and dead-letter jobs",
         &[V63_UP],
     ),
+    (
+        64,
+        "Bound a claim's read of its target slot",
+        &[V23_UP, V64_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -419,6 +424,7 @@ const V60_UP: &str = include_str!("../migrations/v060_correlated_claim_tombstone
 const V61_UP: &str = include_str!("../migrations/v061_claim_spent_prefix_gaps.sql");
 const V62_UP: &str = include_str!("../migrations/v062_queue_ring_generation_floor.sql");
 const V63_UP: &str = include_str!("../migrations/v063_batch_operation_bulk_actions.sql");
+const V64_UP: &str = include_str!("../migrations/v064_claim_target_bound.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
