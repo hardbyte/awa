@@ -39,6 +39,7 @@ export function useManagedQuery<T>(options: Options<T>) {
       if (disposed || attachment.current) return;
       try {
         attachment.current = refreshScheduler.attach({ id, ...limits, paused: paused.current, stale: setStale,
+          retained: () => client.getQueryData(current.queryKey) !== undefined,
           run: async signal => {
             const cancel = () => { void client.cancelQueries({ queryKey: current.queryKey, exact: true }); };
             signal.addEventListener("abort", cancel, { once: true });
