@@ -4,7 +4,7 @@
 
 Awa (Māori: river) fills the gap between Postgres event queues that are too narrow for real job-queue behavior and language-specific job frameworks (River, Oban, Sidekiq) that couple you to one ecosystem. If you run Rust or Python (or both) on Postgres and want priorities, cron, DLQ, and transactional enqueue without Redis or RabbitMQ, Awa is built for you.
 
-![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
+![AWA Web UI — Overview with health strip and attention list (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
 ## Core Concepts
 
@@ -43,13 +43,13 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 
 ### Operations
 
-- **Web UI** — dashboard, job inspector, queue management, cron controls, DLQ retry/purge.
+- **Web UI** — overview of what needs attention, job inspector with errors and timeline, queue hubs, schedules, previewed bulk actions, DLQ retry/purge.
 - **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
 - **OpenTelemetry metrics** — 20+ built-in counters, histograms, and gauges for Prometheus/Grafana. Python workers enable export with `awa.init_telemetry(endpoint, service)`; Rust workers install their own provider.
 - **Operator descriptors** — code-declared queue and job-kind names/descriptions with stale/drift visibility in the UI.
 - **Postgres-only** — one dependency you already have; no Redis, no RabbitMQ, no separate scheduler.
 
-![AWA Web UI — Queue detail (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-queue-detail-dark.png)
+![AWA Web UI — A failed job with its summary line and errors (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-job-detail-dark.png)
 
 ## Correctness
 
