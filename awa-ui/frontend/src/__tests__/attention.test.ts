@@ -525,6 +525,11 @@ describe("outcomeTrends", () => {
     expect(trends.failureRate?.current).toEqual({ finished: 60, failed: 0, rate: 0 });
   });
 
+  it("has no failure rate without terminal coverage, as on the canonical engine", () => {
+    const canonical = { ...outcomes({}, {}, NOW + 3600_000), covered_since: null };
+    expect(outcomeTrends(canonical, 60)).toEqual({ failureRate: null, deadLetteredLastHour: 0 });
+  });
+
   it("keeps dead letters out of the failure rate", () => {
     const trends = outcomeTrends(outcomes({ completed: 1 }, { completed: 1, dead_lettered: 5 }), 60);
     expect(trends.failureRate?.current).toEqual({ finished: 60, failed: 0, rate: 0 });

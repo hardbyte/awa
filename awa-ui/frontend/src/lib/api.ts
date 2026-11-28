@@ -222,8 +222,10 @@ export interface OutcomeBucket {
 
 /** `GET /api/stats/outcomes`. */
 export interface JobOutcomes {
-  /** The earliest time the completed, failed and cancelled counts are complete from. */
-  covered_since: string;
+  /** The earliest time the completed, failed and cancelled counts are
+   * complete from; null when they are complete for no time, as on the
+   * canonical engine. */
+  covered_since: string | null;
   /** The earliest time the dead-lettered counts are complete from. */
   dead_lettered_covered_since: string;
   /** Oldest first, from the earlier coverage time; the last holds the current time. */

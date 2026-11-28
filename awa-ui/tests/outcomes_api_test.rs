@@ -1,6 +1,7 @@
-//! `GET /api/stats/outcomes` on both engines: bucket boundaries, the queue
+//! `GET /api/stats/outcomes`: bucket boundaries, the queue
 //! and kind filters, `covered_since` after queue-ring prune, the dead-letter
-//! series' own coverage, and parameter validation.
+//! series' own coverage, no terminal coverage on the canonical engine, and
+//! parameter validation.
 
 use awa_model::queue_storage::{PruneOutcome, QueueStorage, RotateOutcome};
 use awa_testing::setup::TestDatabase;
@@ -14,7 +15,7 @@ use tower::util::ServiceExt;
 
 #[derive(Debug, Deserialize)]
 struct Outcomes {
-    covered_since: DateTime<Utc>,
+    covered_since: Option<DateTime<Utc>>,
     dead_lettered_covered_since: DateTime<Utc>,
     buckets: Vec<Bucket>,
 }
@@ -57,7 +58,9 @@ fn totals(outcomes: &Outcomes) -> (i64, i64, i64, i64) {
 fn assert_coverage(uri: &str, outcomes: &Outcomes) {
     let first = outcomes
         .covered_since
-        .min(outcomes.dead_lettered_covered_since);
+        .map_or(outcomes.dead_lettered_covered_since, |since| {
+            since.min(outcomes.dead_lettered_covered_since)
+        });
     if let Some(bucket) = outcomes.buckets.first() {
         assert!(bucket.bucket >= first, "{uri}: bucket before coverage");
         assert!(
@@ -66,7 +69,9 @@ fn assert_coverage(uri: &str, outcomes: &Outcomes) {
         );
     }
     for bucket in &outcomes.buckets {
-        let terminal = bucket.bucket >= outcomes.covered_since;
+        let terminal = outcomes
+            .covered_since
+            .is_some_and(|since| bucket.bucket >= since);
         for value in [bucket.completed, bucket.failed, bucket.cancelled] {
             assert_eq!(value.is_some(), terminal, "{uri}: {bucket:?}");
         }
@@ -119,115 +124,6 @@ async fn insert(pool: &PgPool, kind: &str, queue: &str, count: usize) -> Vec<i64
         .into_iter()
         .map(|job| job.id)
         .collect()
-}
-
-/// Finalise canonical job `id` in `state` at `at`.
-async fn finalize_canonical(pool: &PgPool, id: i64, state: &str, at: DateTime<Utc>) {
-    sqlx::query(
-        "UPDATE awa.jobs_hot SET state = $2::awa.job_state, finalized_at = $3, attempt = 1 \
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(state)
-    .bind(at)
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn canonical_buckets_split_at_their_boundaries() {
-    let db = TestDatabase::canonical().await;
-    let pool = db.pool().clone();
-    let app = awa_ui::router(pool.clone(), Duration::ZERO).await.unwrap();
-    let uri = "/api/stats/outcomes?minutes=30&bucket=300s";
-    let ids = insert(&pool, "outcome_job", "outcome_q", 6).await;
-
-    // A bucket boundary can pass between the reads; retry from the start
-    // when the window moved.
-    for _ in 0..3 {
-        let before = outcomes(&app, uri).await;
-        assert_eq!(before.buckets.len(), 6);
-        assert_eq!(before.covered_since, before.buckets[0].bucket);
-        let start = |n: usize| before.buckets[n].bucket;
-        let step = TimeDelta::seconds(300);
-        for pair in before.buckets.windows(2) {
-            assert_eq!(pair[1].bucket - pair[0].bucket, step);
-        }
-        let micro = TimeDelta::microseconds(1);
-        finalize_canonical(&pool, ids[0], "completed", start(0)).await;
-        finalize_canonical(&pool, ids[1], "completed", start(1) - micro).await;
-        finalize_canonical(&pool, ids[2], "completed", start(0) - micro).await;
-        finalize_canonical(&pool, ids[3], "failed", start(5)).await;
-        finalize_canonical(&pool, ids[4], "cancelled", start(2) + TimeDelta::seconds(1)).await;
-        finalize_canonical(&pool, ids[5], "failed", start(2)).await;
-
-        let after = outcomes(&app, uri).await;
-        if after.buckets[0].bucket != before.buckets[0].bucket {
-            continue;
-        }
-        let counts: Vec<_> = after.buckets.iter().map(Bucket::counts).collect();
-        assert_eq!(
-            counts,
-            vec![
-                (2, 0, 0, 0),
-                (0, 0, 0, 0),
-                (0, 1, 1, 0),
-                (0, 0, 0, 0),
-                (0, 0, 0, 0),
-                (0, 1, 0, 0),
-            ]
-        );
-        assert_eq!(after.covered_since, after.buckets[0].bucket);
-        return;
-    }
-    panic!("the window moved on every attempt");
-}
-
-#[tokio::test]
-async fn canonical_counts_follow_the_queue_and_kind_filters() {
-    let db = TestDatabase::canonical().await;
-    let pool = db.pool().clone();
-    let app = awa_ui::router(pool.clone(), Duration::ZERO).await.unwrap();
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let recent = now - TimeDelta::seconds(5);
-
-    let a_send = insert(&pool, "send", "out_a", 4).await;
-    let a_sync = insert(&pool, "sync", "out_a", 2).await;
-    let b_send = insert(&pool, "send", "out_b", 3).await;
-    for (n, id) in a_send.iter().enumerate() {
-        let state = if n < 3 { "completed" } else { "failed" };
-        finalize_canonical(&pool, *id, state, recent).await;
-    }
-    for id in &a_sync {
-        finalize_canonical(&pool, *id, "cancelled", recent).await;
-    }
-    for (n, id) in b_send.iter().enumerate() {
-        let state = if n == 0 { "completed" } else { "failed" };
-        finalize_canonical(&pool, *id, state, recent).await;
-    }
-    // Outside a one-hour window.
-    let old = insert(&pool, "send", "out_a", 1).await;
-    finalize_canonical(&pool, old[0], "failed", now - TimeDelta::hours(2)).await;
-
-    for (query, expected) in [
-        ("", (4, 3, 2, 0)),
-        ("&queue=out_a", (3, 1, 2, 0)),
-        ("&queue=out_b", (1, 2, 0, 0)),
-        ("&kind=send", (4, 3, 0, 0)),
-        ("&kind=sync", (0, 0, 2, 0)),
-        ("&queue=out_a&kind=send", (3, 1, 0, 0)),
-        ("&queue=out_b&kind=sync", (0, 0, 0, 0)),
-        ("&queue=missing", (0, 0, 0, 0)),
-    ] {
-        let uri = format!("/api/stats/outcomes?minutes=60&bucket=60s{query}");
-        let result = outcomes(&app, &uri).await;
-        assert_eq!(result.buckets.len(), 60, "{uri}");
-        assert_eq!(totals(&result), expected, "{uri}");
-    }
 }
 
 #[tokio::test]
@@ -358,7 +254,11 @@ async fn queue_storage_counts_every_terminal_source_and_filter() {
         let uri = format!("/api/stats/outcomes?minutes=60&bucket=60s{query}");
         let result = outcomes(&app, &uri).await;
         assert_eq!(result.buckets.len(), 60, "{uri}");
-        assert_eq!(result.covered_since, result.buckets[0].bucket, "{uri}");
+        assert_eq!(
+            result.covered_since,
+            Some(result.buckets[0].bucket),
+            "{uri}"
+        );
         assert_eq!(totals(&result), expected, "{uri}");
     }
 
@@ -426,7 +326,7 @@ async fn queue_storage_covered_since_follows_ring_prune() {
     // Generation 0: nothing can have been pruned.
     let fresh = outcomes(&app, uri).await;
     assert_eq!(fresh.buckets.len(), 60);
-    assert_eq!(fresh.covered_since, fresh.buckets[0].bucket);
+    assert_eq!(fresh.covered_since, Some(fresh.buckets[0].bucket));
     assert_eq!(totals(&fresh), (2, 1, 0, 0));
 
     // Seal generation 0 and prune it.
@@ -440,7 +340,7 @@ async fn queue_storage_covered_since_follows_ring_prune() {
     ));
     let opened = queue_rotated_at(&pool, 1).await;
     let pruned = outcomes(&app, uri).await;
-    assert_eq!(pruned.covered_since, opened);
+    assert_eq!(pruned.covered_since, Some(opened));
     // No dead letter is retained, so that series covers the window, and
     // every terminal count before the horizon is unknown, not zero.
     assert_eq!(pruned.dead_lettered_covered_since, pruned.buckets[0].bucket);
@@ -464,7 +364,7 @@ async fn queue_storage_covered_since_follows_ring_prune() {
     .unwrap();
     let opened = queue_rotated_at(&pool, 1).await;
     let after = outcomes(&app, uri).await;
-    assert_eq!(after.covered_since, opened);
+    assert_eq!(after.covered_since, Some(opened));
     let terminal: Vec<_> = after
         .buckets
         .iter()
@@ -521,7 +421,7 @@ async fn queue_storage_dead_letters_keep_their_own_coverage() {
         .unwrap();
     let opened = queue_rotated_at(&pool, 1).await;
     let result = outcomes(&app, uri).await;
-    assert_eq!(result.covered_since, opened);
+    assert_eq!(result.covered_since, Some(opened));
     assert_eq!(result.dead_lettered_covered_since, oldest);
     assert!(result.buckets[0].bucket - oldest < TimeDelta::seconds(60));
     // The oldest's own bucket starts before it, so only the other two count.
@@ -557,37 +457,22 @@ async fn jobs_hot_reads(pool: &PgPool) -> (i64, i64) {
     .unwrap()
 }
 
-/// The canonical read finds completed rows along the window and failed or
-/// cancelled ones along their state, never by scanning retained history.
+/// The canonical engine's cleanup removes terminal rows past a retention
+/// the database does not record, so none of its counts can be told complete:
+/// the read reports no terminal coverage, and does not read `awa.jobs_hot`.
 #[tokio::test]
-async fn canonical_outcomes_read_along_indexes() {
+async fn canonical_reports_no_terminal_coverage_and_reads_nothing() {
     let db = TestDatabase::canonical().await;
+    // Retained terminal rows of every kind inside the window, as a short
+    // retention would leave them: none of them may be reported.
     sqlx::raw_sql(
         "INSERT INTO awa.jobs_hot (kind, queue, state, attempt, run_at, created_at, finalized_at) \
-         SELECT 'k' || (g % 5), 'q' || (g % 8), 'completed', 1, at, at, at \
-         FROM generate_series(1, 60000) AS g, \
-              LATERAL (SELECT now() - (g % 86400) * interval '1 second' AS at) AS t; \
-         INSERT INTO awa.jobs_hot (kind, queue, state, attempt, run_at, created_at, finalized_at) \
-         SELECT 'k' || (g % 5), 'q' || (g % 8), \
-                (CASE WHEN g % 4 = 0 THEN 'cancelled' ELSE 'failed' END)::awa.job_state, 1, at, at, at \
+         SELECT 'k' || (g % 3), 'q' || (g % 2), \
+                (ARRAY['completed', 'failed', 'cancelled'])[1 + g % 3]::awa.job_state, 1, at, at, at \
          FROM generate_series(1, 3000) AS g, \
-              LATERAL (SELECT now() - (g * 80) * interval '1 second' AS at) AS t; \
-         INSERT INTO awa.jobs_hot (kind, queue, state, run_at) \
-         SELECT 'k' || (g % 5), 'q' || (g % 8), 'available', now() \
-         FROM generate_series(1, 20000) AS g",
+              LATERAL (SELECT now() - (g % 3600) * interval '1 second' AS at) AS t",
     )
     .execute(db.pool())
-    .await
-    .unwrap();
-    sqlx::query("VACUUM (ANALYZE) awa.jobs_hot")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let in_window: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM awa.jobs_hot \
-         WHERE state = 'completed' AND finalized_at >= now() - interval '2 hours 1 minute'",
-    )
-    .fetch_one(db.pool())
     .await
     .unwrap();
 
@@ -595,12 +480,9 @@ async fn canonical_outcomes_read_along_indexes() {
         .max_connections(1)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
-                sqlx::raw_sql(
-                    "SET max_parallel_workers_per_gather = 0; \
-                     SET stats_fetch_consistency = 'none'",
-                )
-                .execute(conn)
-                .await?;
+                sqlx::raw_sql("SET stats_fetch_consistency = 'none'")
+                    .execute(conn)
+                    .await?;
                 Ok(())
             })
         })
@@ -609,16 +491,32 @@ async fn canonical_outcomes_read_along_indexes() {
         .unwrap();
     let app = awa_ui::router(pool.clone(), Duration::ZERO).await.unwrap();
     let (scans_before, tuples_before) = jobs_hot_reads(&pool).await;
-    let result = outcomes(&app, "/api/stats/outcomes?minutes=120&bucket=60s").await;
+    for (query, count) in [
+        ("minutes=60&bucket=60s", 60),
+        ("minutes=120&bucket=300s&queue=q0", 24),
+        ("minutes=1440&bucket=3600s&kind=k1", 24),
+        ("minutes=30&bucket=900s&queue=q1&kind=k2", 2),
+    ] {
+        let uri = format!("/api/stats/outcomes?{query}");
+        let result = outcomes(&app, &uri).await;
+        assert_eq!(result.covered_since, None, "{uri}");
+        assert_eq!(result.buckets.len(), count, "{uri}");
+        assert_eq!(
+            result.dead_lettered_covered_since, result.buckets[0].bucket,
+            "{uri}"
+        );
+        for bucket in &result.buckets {
+            assert_eq!(bucket.completed, None, "{uri}");
+            assert_eq!(bucket.failed, None, "{uri}");
+            assert_eq!(bucket.cancelled, None, "{uri}");
+            assert_eq!(bucket.dead_lettered, Some(0), "{uri}");
+        }
+        for pair in result.buckets.windows(2) {
+            assert!(pair[1].bucket > pair[0].bucket, "{uri}");
+        }
+    }
     let (scans_after, tuples_after) = jobs_hot_reads(&pool).await;
     pool.close().await;
-
-    assert_eq!(result.buckets.len(), 120);
-    assert!(totals(&result).0 > 0);
     assert_eq!(scans_after - scans_before, 0, "awa.jobs_hot was scanned");
-    // At most the window's completions and every retained failure or
-    // cancellation, with room for the plan's own probes.
-    let budget = in_window + 3000 + 500;
-    let read = tuples_after - tuples_before;
-    assert!(read <= budget, "read {read} tuples, budget {budget}");
+    assert_eq!(tuples_after - tuples_before, 0, "awa.jobs_hot was read");
 }

@@ -112,7 +112,7 @@ export function outcomeTrends(outcomes: JobOutcomes | null | undefined, bucketSe
     const finished = failed + sum(start, (b) => b.completed);
     return { finished, failed, rate: finished > 0 ? failed / finished : null };
   };
-  const terminalSince = Date.parse(outcomes.covered_since);
+  const terminalSince = outcomes.covered_since === null ? Infinity : Date.parse(outcomes.covered_since);
   const deadLetteredSince = Date.parse(outcomes.dead_lettered_covered_since);
   const lastHour = end - HOUR_MS;
   const previousHour = end - 2 * HOUR_MS;

@@ -4452,13 +4452,15 @@ pub struct OutcomeBucket {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobOutcomes {
     /// The earliest time the completed, failed and cancelled counts are
-    /// complete from.
-    pub covered_since: DateTime<Utc>,
+    /// complete from, or `None` where they are complete for no time at all:
+    /// on the canonical engine, whose cleanup removes terminal rows past a
+    /// retention the database does not record.
+    pub covered_since: Option<DateTime<Utc>>,
     /// The earliest time the dead-lettered counts are complete from.
     pub dead_lettered_covered_since: DateTime<Utc>,
     /// Oldest first, from the first bucket that starts at or after the
-    /// earlier of the two coverage times; the last holds the current time. A
-    /// covered bucket with no outcomes has zero counts.
+    /// earlier coverage time; the last holds the current time. A covered
+    /// bucket with no outcomes has zero counts.
     pub buckets: Vec<OutcomeBucket>,
 }
 
@@ -4710,56 +4712,6 @@ fn queue_storage_oldest_dead_letter_sql(schema: &str, queue: bool) -> String {
     }
 }
 
-/// Statements counting `(bucket, outcome, count)` on the canonical engine,
-/// whose terminal rows stay in `awa.jobs_hot` until cleanup removes them.
-fn canonical_outcome_sources(filter: &OutcomeFilter<'_>) -> Vec<String> {
-    let bucket = outcome_bucket_sql("job.finalized_at");
-    let terms = filter.terms("job", true, true);
-    // Along the partial `(finalized_at, queue)` index of completed rows.
-    let completed = format!(
-        r#"
-        SELECT {bucket} AS bucket, 'completed', count(*)::bigint
-        FROM awa.jobs_hot AS job
-        WHERE job.state = 'completed'
-          AND job.finalized_at IS NOT NULL
-          AND job.finalized_at >= $1{terms}
-        GROUP BY 1
-        "#
-    );
-    // Failed and cancelled rows are found along `(queue, state)`, or
-    // `(kind, state)` for a kind alone, and filtered by time.
-    let failed = if filter.queue.is_some() || filter.kind.is_some() {
-        format!(
-            r#"
-            SELECT {bucket} AS bucket, job.state::text, count(*)::bigint
-            FROM awa.jobs_hot AS job
-            WHERE job.state IN ('failed', 'cancelled')
-              AND job.finalized_at >= $1{terms}
-            GROUP BY 1, 2
-            "#
-        )
-    } else {
-        format!(
-            r#"
-            WITH RECURSIVE {queues}
-            SELECT {bucket} AS bucket, job.state::text, count(*)::bigint
-            FROM queues
-            CROSS JOIN LATERAL (
-                SELECT job.state, job.finalized_at
-                FROM awa.jobs_hot AS job
-                WHERE job.queue = queues.queue
-                  AND job.state IN ('failed', 'cancelled')
-                  AND job.finalized_at >= $1
-            ) AS job
-            WHERE queues.queue IS NOT NULL
-            GROUP BY 1, 2
-            "#,
-            queues = distinct_queues_sql("awa.jobs_hot"),
-        )
-    };
-    vec![completed, failed]
-}
-
 /// Jobs that completed, failed, were cancelled or were dead-lettered, per
 /// bucket over the last `query.minutes`, by the time each reached that
 /// outcome.
@@ -4774,11 +4726,14 @@ fn canonical_outcome_sources(filter: &OutcomeFilter<'_>) -> Vec<String> {
 /// default), so [`JobOutcomes::dead_lettered_covered_since`] is the later of
 /// the window start and the oldest dead letter retained on the queue (or on
 /// any queue): a retention shorter than the window shows there, at the cost
-/// of reading a queue's first dead letter as the start of its coverage. On
-/// the canonical engine the terminal rows are `awa.jobs_hot`'s, which cleanup
-/// removes only past its retention (24 hours for completed jobs by default),
-/// both series are taken as complete across the window, and dead letters do
-/// not exist.
+/// of reading a queue's first dead letter as the start of its coverage.
+///
+/// On the canonical engine nothing is read. Its cleanup removes terminal
+/// rows past `completed_retention` and `failed_retention`, worker settings
+/// with per-queue overrides that the database does not record, so no
+/// retained count can be told complete: `covered_since` is `None` and every
+/// completed, failed and cancelled count is `None`. No dead letter can exist
+/// there, so that series is zero across the window.
 ///
 /// Retries are not counted: a retry leaves no terminal row.
 ///
@@ -4786,13 +4741,34 @@ fn canonical_outcome_sources(filter: &OutcomeFilter<'_>) -> Vec<String> {
 /// the read never holds locks across every ring partition at once.
 pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutcomes, AwaError> {
     query.validate()?;
-    let store = active_queue_storage(pool).await?;
-    let filter = OutcomeFilter::new(query);
-    let sources = match &store {
-        Some(store) => queue_storage_outcome_sources(store.schema(), &filter),
-        None => canonical_outcome_sources(&filter),
-    };
     let width = i64::from(query.bucket_seconds);
+    // The window ends with the bucket holding the database's current time.
+    let last: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT date_bin($1::bigint * interval '1 second', clock_timestamp(), \
+         TIMESTAMPTZ '1970-01-01 00:00:00+00')",
+    )
+    .bind(width)
+    .fetch_one(pool)
+    .await?;
+    let since = last - Duration::seconds(width * (query.bucket_count() - 1));
+
+    let Some(store) = active_queue_storage(pool).await? else {
+        // Nothing is read: no terminal count is known, and no dead letter
+        // exists on the canonical engine.
+        return Ok(JobOutcomes {
+            covered_since: None,
+            dead_lettered_covered_since: since,
+            buckets: fill_outcome_buckets(
+                since,
+                width,
+                query.bucket_count(),
+                (None, since),
+                Vec::new(),
+            ),
+        });
+    };
+    let filter = OutcomeFilter::new(query);
+    let sources = queue_storage_outcome_sources(store.schema(), &filter);
 
     let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
     let mut tx = sqlx::Connection::begin_with(
@@ -4804,15 +4780,6 @@ pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutc
     sqlx::query("SET LOCAL jit = off")
         .execute(tx.as_mut())
         .await?;
-    // The window ends with the bucket holding the database's current time.
-    let last: DateTime<Utc> = sqlx::query_scalar(
-        "SELECT date_bin($1::bigint * interval '1 second', clock_timestamp(), \
-         TIMESTAMPTZ '1970-01-01 00:00:00+00')",
-    )
-    .bind(width)
-    .fetch_one(tx.as_mut())
-    .await?;
-    let since = last - Duration::seconds(width * (query.bucket_count() - 1));
 
     let mut rows: Vec<(DateTime<Utc>, String, i64)> = Vec::new();
     for sql in sources {
@@ -4830,37 +4797,28 @@ pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutc
             .execute(tx.as_mut())
             .await?;
     }
-    let oldest_dead_letter: Option<DateTime<Utc>> = match &store {
-        Some(store) => {
-            sqlx::query("SAVEPOINT awa_outcome_source")
-                .execute(tx.as_mut())
-                .await?;
-            let sql = queue_storage_oldest_dead_letter_sql(store.schema(), query.queue.is_some());
-            let mut statement = sqlx::query_scalar(audited_sql(sql));
-            if let Some(queue) = &query.queue {
-                statement = statement.bind(queue);
-            }
-            let oldest = statement.fetch_optional(tx.as_mut()).await?;
-            sqlx::query("ROLLBACK TO SAVEPOINT awa_outcome_source")
-                .execute(tx.as_mut())
-                .await?;
-            sqlx::query("RELEASE SAVEPOINT awa_outcome_source")
-                .execute(tx.as_mut())
-                .await?;
-            oldest
-        }
-        None => None,
-    };
+    sqlx::query("SAVEPOINT awa_outcome_source")
+        .execute(tx.as_mut())
+        .await?;
+    let sql = queue_storage_oldest_dead_letter_sql(store.schema(), query.queue.is_some());
+    let mut statement = sqlx::query_scalar(audited_sql(sql));
+    if let Some(queue) = &query.queue {
+        statement = statement.bind(queue);
+    }
+    let oldest_dead_letter: Option<DateTime<Utc>> = statement.fetch_optional(tx.as_mut()).await?;
+    sqlx::query("ROLLBACK TO SAVEPOINT awa_outcome_source")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT awa_outcome_source")
+        .execute(tx.as_mut())
+        .await?;
     // Read after the rows, each statement on a fresh snapshot: a rotation
     // that let prune reclaim rows read above moves the horizon past them.
-    let horizon = match &store {
-        Some(store) => store.terminal_retention_horizon(&mut tx).await?,
-        None => None,
-    };
+    let horizon = store.terminal_retention_horizon(&mut tx).await?;
     tx.commit().await?;
     drop(begin_guard);
 
-    let covered_since = horizon.map_or(since, |horizon| max(horizon, since));
+    let covered_since = Some(horizon.map_or(since, |horizon| max(horizon, since)));
     let dead_lettered_covered_since = oldest_dead_letter.map_or(since, |at| max(at, since));
     Ok(JobOutcomes {
         covered_since,
@@ -4876,20 +4834,22 @@ pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutc
 }
 
 /// Every bucket from `since` that starts at or after the earlier of the
-/// terminal and dead-letter coverage times, with the counted rows added in,
-/// zeros where a covered series has none, and `None` where a series is not
-/// covered.
+/// terminal and dead-letter coverage times (the dead-letter one when the
+/// terminal series has none), with the counted rows added in, zeros where a
+/// covered series has none, and `None` where a series is not covered.
 fn fill_outcome_buckets(
     since: DateTime<Utc>,
     width: i64,
     count: i64,
-    (terminal_since, dead_lettered_since): (DateTime<Utc>, DateTime<Utc>),
+    (terminal_since, dead_lettered_since): (Option<DateTime<Utc>>, DateTime<Utc>),
     rows: Vec<(DateTime<Utc>, String, i64)>,
 ) -> Vec<OutcomeBucket> {
     let mut buckets: Vec<OutcomeBucket> = (0..count)
         .map(|n| since + Duration::seconds(width * n))
         .map(|bucket| {
-            let terminal = (bucket >= terminal_since).then_some(0);
+            let terminal = terminal_since
+                .is_some_and(|since| bucket >= since)
+                .then_some(0);
             OutcomeBucket {
                 bucket,
                 completed: terminal,
@@ -4916,7 +4876,7 @@ fn fill_outcome_buckets(
             *total += n;
         }
     }
-    let first = min(terminal_since, dead_lettered_since);
+    let first = terminal_since.map_or(dead_lettered_since, |since| min(since, dead_lettered_since));
     buckets.retain(|bucket| bucket.bucket >= first);
     buckets
 }

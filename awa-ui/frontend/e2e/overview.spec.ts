@@ -270,6 +270,16 @@ test.describe("Overview", () => {
     await expect(page.getByTestId("failure-rate")).toHaveCount(0);
   });
 
+  test("a canonical server reports no terminal coverage, so the Failed tile stays as it was", async ({ page }) => {
+    const canonical = { ...outcomes({}, {}, -60), covered_since: null };
+    await mockOverview(page, { ...BUSY, outcomes: canonical });
+    await page.goto("/");
+    await expect(page.getByTestId("tile-failed")).toContainText("1,473 completed in the last hour");
+    await expect(page.getByTestId("failure-rate")).toHaveCount(0);
+    await expect(page.locator("[data-id='jobs:failure-rate']")).toHaveCount(0);
+    await expect(page.getByTestId("dead-letter-trend")).toHaveText("none added in the last hour");
+  });
+
   test("a failed read shows a dash and the error, never zero", async ({ page }) => {
     await mockOverview(page, BUSY);
     await page.route("**/api/stats", (route) => route.fulfill({ status: 500, json: { error: "database unavailable" } }));
