@@ -31,19 +31,24 @@ dashboard links automatically. To accept both root forms, use
 `Router::new().nest_service("/awa", ui)` instead; assets, API and deep links work
 the same way.
 
-## Tabs
+## Pages
 
-- **Dashboard** — job state counts, throughput timeseries, runtime capability summary.
-- **Jobs** — search, filter (state, kind, queue, has-error, tag), bulk retry / cancel, and a detail view with progress, attempt history, lifecycle hooks, and structured metadata.
-- **Kinds** — registered job kinds with descriptor metadata (display name, description, owner, tags, docs URL) and stale / drift indicators.
-- **Queues** — per-queue stats, descriptor metadata, pause / resume / drain.
-- **Runtime** — live worker instances and their capabilities. Hosts the **storage-transition card** when the cluster is mid-migration: prepared / mixed / finalized state, drain progress, and the gates blocking finalization.
-- **Cron** — registered periodic schedules with next-run preview, per-schedule pause / resume / trigger controls, and a target-queue paused indicator.
-- **DLQ** (`/dlq`) — Dead Letter Queue browser with kind / queue / tag filters, single and bulk retry, move, and purge actions. The DLQ tab is reachable from the Jobs tab via the row links on DLQ-state jobs.
+The sidebar groups pages as Overview; Investigate (Jobs, Dead letters); Configure (Queues, Job kinds, Schedules); Operate (Fleet, Bulk operations).
+
+- **Overview** (`/`) — a health strip (ready, retrying, failed, dead letters, stuck running, bulk operations in flight) and a ranked list of what needs attention, each item linking to a scoped view.
+- **Jobs** (`/jobs`) — search, filter (state, kind, queue, tag, id, created time), act on selected jobs or on all matching live jobs as a previewed bulk operation, and a detail view with a state summary line, errors, timeline, progress and metadata.
+- **Dead letters** (`/dlq`) — dead-letter browser with kind / queue / tag filters, single retry and purge, and retry or purge of all matching rows as a bulk operation.
+- **Queues** (`/queues`, `/queues/:name`) — per-queue stats and pause / resume / drain; each queue's page has Overview, Jobs, Dead letters and Config tabs.
+- **Job kinds** (`/kinds`, `/kinds/:kind`) — registered job kinds with descriptor metadata (display name, description, owner, tags, docs URL), stale / drift indicators and recent failures.
+- **Schedules** (`/cron`, `/cron/:name`) — periodic schedules with next-run preview, pause / resume / trigger controls and a target-queue paused indicator.
+- **Fleet** (`/runtime`) — live worker instances and their capabilities. Hosts the **storage-transition card** when the cluster is mid-migration: prepared / mixed / finalized state, drain progress, and the gates blocking finalization.
+- **Bulk operations** (`/batch-ops`) — history, each operation's page, and a form for new operations with a preview.
+
+A pill in the header says how current the page is and whether reads are failing.
 
 ## Read-only mode
 
-When the backend is read-only — either Postgres reports `transaction_read_only = on` (e.g. a read replica) or the operator passes `--read-only` to `awa serve` — every mutation endpoint returns 503 and `/api/capabilities` reports `read_only: true`. The frontend hides destructive actions in that mode.
+When the backend is read-only — either Postgres reports `transaction_read_only = on` (e.g. a read replica) or the operator passes `--read-only` to `awa serve` — every mutation endpoint returns 503 and `/api/capabilities` reports `read_only: true`. The frontend disables admin actions in that mode and says why.
 
 ## REST surface
 

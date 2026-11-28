@@ -277,10 +277,10 @@ awa batch-ops cancel <id>
   `retry_from_dlq`, `purge_dlq`, plus `set_priority` and `move_queue`. Each
   accepts only the states it can act on; `retry_from_dlq` and `purge_dlq` act
   on DLQ rows only.
-- The admin UI's DLQ "retry/purge all matching" buttons and
+- The admin UI's Dead letters "retry/purge all matching" buttons and
   `POST /api/dlq/retry-matching` / `/purge-matching` submit a `retry_from_dlq`
-  / `purge_dlq` operation and answer `202` with it; follow it on the Batch
-  Operations page or with `awa batch-ops get`. Nothing changes until a worker's
+  / `purge_dlq` operation and answer `202` with it; follow it on its operation
+  page (`/batch-ops/<id>`) or with `awa batch-ops get`. Nothing changes until a worker's
   maintenance leader runs it. `awa dlq retry-bulk` and `purge` submit the same
   operations.
 - An item whose row another transaction holds stays pending and is retried on
@@ -518,8 +518,9 @@ queries and two reads at once. The UI shows retained data as stale on read
 failure; authentication failures stop retries until an explicit refresh. Hidden
 tabs pause reads and resume with one paced refresh. Selecting jobs pauses that
 list; filtered counts refresh on filter change or explicit refresh, not every
-poll. The displayed reconciliation bound is a scheduling policy, not a data-age
-SLO. Other processes and workers are observed through ordinary timed reads.
+poll. A pill in the header says how old the page's data is and turns amber
+while some reads fail and red when every read does; the reconciliation interval
+is a scheduling policy, not a data-age SLO. Other processes and workers are observed through ordinary timed reads.
 See [admin observation](../../docs/admin-observation.md) for cache metadata and
 the remaining strict-read/server-deadline validation requirements.
 
