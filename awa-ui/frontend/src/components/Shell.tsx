@@ -1,6 +1,6 @@
-import { refreshAll, getReadStatus, subscribeReadStatus, observationPolicy } from "@/lib/observation/coordinator";
+import { refreshAll } from "@/lib/observation/coordinator";
 import { useManagedQuery } from "@/hooks/use-managed-query";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useState } from "react";
 import { Outlet, useRouter, useRouterState, useNavigate } from "@tanstack/react-router";
 import { isExternalHref } from "@/lib/base-path";
 import {
@@ -24,6 +24,7 @@ import {
 } from "@/lib/instance";
 import { Button } from "@/components/ui/button";
 import { CommandPalette } from "@/components/CommandPalette";
+import { DimWhenUnreachable, FreshnessPill } from "@/components/FreshnessPill";
 import { SECTION_LABELS, type ListRoute } from "@/lib/sections";
 import { ACTIVE_BATCH_STATES, batchOpsQuery, dlqDepthQuery } from "@/lib/shared-queries";
 import {
@@ -421,7 +422,6 @@ export function Shell() {
     enabled: false, refetchOnWindowFocus: false, refetchOnReconnect: false, retry: false,
     staleTime: 60_000,
   });
-  const readStatus = useSyncExternalStore(subscribeReadStatus, getReadStatus, getReadStatus);
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
   // Instance identity (#437): the UI is single-backend by design; when the
@@ -584,6 +584,7 @@ export function Shell() {
           )}
           <div className="flex-1" />
           <div className="flex items-center gap-1">
+            <FreshnessPill />
             <CommandPalette />
             <RefreshControl />
             <TimeZoneToggle />
@@ -592,14 +593,14 @@ export function Shell() {
         </header>
 
         <main id="content" tabIndex={-1} className="w-full px-4 py-6 outline-none sm:px-6 lg:px-8">
-          <div className="text-xs text-muted-fg">Polling; scheduled reconciliation maximum: {observationPolicy.reconcileMaxMs / 1000}s.</div>
-          {readStatus && <div role="status" className="text-sm text-muted-fg">{readStatus}</div>}
           {showReadOnlyBanner && (
             <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-subtle-fg">
               Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
             </div>
           )}
-          <Outlet />
+          <DimWhenUnreachable>
+            <Outlet />
+          </DimWhenUnreachable>
         </main>
       </SidebarInset>
     </SidebarProvider>

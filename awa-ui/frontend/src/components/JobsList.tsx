@@ -391,7 +391,7 @@ export function JobsList({ lockedFilter, stateCounts }: JobsListProps) {
       )}
 
       {hasFilter && !searchError && (
-        <div className="flex flex-wrap items-center gap-3 text-sm text-muted-fg">
+        <div className="flex min-h-5 flex-wrap items-center gap-3 text-sm text-muted-fg">
           {countQuery.data && (
             <span data-testid="match-count">
               {countQuery.data.kind === "at_least"

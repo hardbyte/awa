@@ -1,9 +1,8 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
 
-/** Click the first job once the match count, which loads after the list
- * and moves the rows, has rendered. The status line above the page can
- * still appear or go between the click's aim and the press, so a click that
- * lands beside the row is tried again. */
+/** Click the first job once the match count has rendered. A press on a row
+ * occasionally doesn't reach the row's action, so a click that leaves the
+ * page on the list is tried again. */
 async function openFirstJob(page: Page, jobTable: Locator) {
   await expect(page.getByTestId("match-count")).toBeVisible();
   await expect(async () => {
