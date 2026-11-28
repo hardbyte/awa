@@ -773,14 +773,18 @@ impl Dispatcher {
                     // smallint), and the failed claim moved no cursor. Claim
                     // with the configured interval instead, and leave the
                     // queue unescalated until the pin is read again.
+                    self.metrics
+                        .record_dispatch_ring_pin_escalation_overflow(&self.queue);
                     if let Some(watch) = &self.ring_pin_watch {
-                        watch.suppress(&self.queue);
+                        watch.suppress(&self.queue, aging_interval);
+                        if watch.overflow_warn_due(&self.queue, Instant::now()) {
+                            warn!(
+                                queue = %self.queue,
+                                escalated_interval_secs = aging_interval.as_secs_f64(),
+                                "A claim with the escalated aging interval overflowed on an old row; claiming with the configured interval until the queue ring pin is read again, and escalating to a longer interval after"
+                            );
+                        }
                     }
-                    warn!(
-                        queue = %self.queue,
-                        escalated_interval_secs = aging_interval.as_secs_f64(),
-                        "A claim with the escalated aging interval overflowed on an old row; claiming with the configured interval until the queue ring pin is read again"
-                    );
                     aging_escalated = false;
                     claimed = claim_with(self.config.priority_aging_interval).await;
                 }

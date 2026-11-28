@@ -6603,6 +6603,7 @@ const ESCALATION_HOLD: Duration = Duration::from_secs(25);
 /// interval, so the queue keeps being claimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ring_pin_aging_escalation_falls_back_when_a_claim_overflows_on_an_old_row() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     ring_pin_events();
     let (_db_guard, pool) = setup_pool(12).await;
     let queue = "qs_ring_pin_escalation_fallback";
@@ -6698,6 +6699,7 @@ async fn test_ring_pin_aging_escalation_leaves_an_advancing_lane_alone() {
 /// #779: a runtime that is not the maintenance leader reads the pin itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ring_pin_aging_escalation_on_a_runtime_that_is_not_the_leader() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     let (_db_guard, pool) = setup_pool(12).await;
     let queue = "qs_ring_pin_escalation_follower";
     let store_config = ring_pin_store_config("awa_qs_ring_pin_escalation_follower");
@@ -6796,6 +6798,7 @@ async fn assert_escalation_claims_survive_an_old_lane(
     old_lane_age: Duration,
     hold: Duration,
 ) {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     ring_pin_events();
     let (_db_guard, pool) = setup_pool(10).await;
     let store_config = ring_pin_store_config(schema);
@@ -6856,6 +6859,7 @@ async fn test_ring_pin_aging_escalation_interval_is_floored_for_the_oldest_lane(
 /// #779: the pin warning says why no runtime claims the lane.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_ring_pin_warning_names_an_unserved_queue() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     ring_pin_events();
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_ring_pin_unserved";
@@ -6883,6 +6887,7 @@ async fn test_queue_ring_pin_warning_names_an_unserved_queue() {
 /// #779: whether a queue is paused and whether a live runtime serves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_serving_states_report_paused_and_served() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_serving_states";
     let store_config = ring_pin_store_config("awa_qs_serving_states");

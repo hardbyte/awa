@@ -38,6 +38,12 @@ const MIN_ESCALATED_AGING_INTERVAL: Duration = Duration::from_secs(1);
 /// quotient passes 32,767. Escalation keeps it at half that.
 const MAX_AGING_STEPS: f64 = 16_384.0;
 
+/// How often a queue's escalation overflow is logged.
+const OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The longest interval an overflow raises a queue's escalation to.
+const MAX_RAISED_INTERVAL: Duration = Duration::from_secs(365 * 24 * 3600);
+
 /// A lane of the queue ring: queue, priority and enqueue shard.
 pub(crate) type LaneKey = (String, i16, i16);
 
@@ -234,6 +240,9 @@ struct Observation {
     escalating: HashSet<LaneKey>,
     /// Escalated queues, by queue without stripe suffixes.
     queues: HashMap<String, QueueEscalation>,
+    /// The shortest interval a queue is escalated to in this slot, raised each
+    /// time a claim with its escalated interval overflows.
+    raised: HashMap<String, Duration>,
 }
 
 impl Observation {
@@ -265,6 +274,7 @@ impl Observation {
 #[derive(Default)]
 pub(crate) struct RingPinWatch {
     observation: Mutex<Observation>,
+    overflow_warned_at: Mutex<HashMap<String, Instant>>,
 }
 
 impl RingPinWatch {
@@ -283,6 +293,7 @@ impl RingPinWatch {
             observation.slot = Some(reading.slot);
             observation.baselines.clear();
             observation.escalating.clear();
+            observation.raised.clear();
         }
         let pinning: HashSet<&LaneKey> = reading.lanes.iter().map(|lane| &lane.key).collect();
         observation
@@ -322,6 +333,10 @@ impl RingPinWatch {
             ) else {
                 continue;
             };
+            let wanted = observation
+                .raised
+                .get(&lane.logical_queue)
+                .map_or(wanted, |raised| wanted.max(*raised));
             queues
                 .entry(lane.logical_queue.clone())
                 .and_modify(|queue| queue.wanted = queue.wanted.min(wanted))
@@ -334,10 +349,36 @@ impl RingPinWatch {
         causes
     }
 
-    /// Stops escalating `queue` until the next reading: a claim made with its
-    /// escalated interval failed on a row older than the interval allows.
-    pub(crate) fn suppress(&self, queue: &str) {
-        self.lock().queues.remove(queue);
+    /// Stops escalating `queue` until the next reading, and keeps the
+    /// interval it is then escalated to above twice `failed_interval` while
+    /// the pin stays in this slot: a claim made with that interval failed on
+    /// a row older than it allows. Each further overflow doubles the floor,
+    /// so escalation gets past the row in a few readings.
+    pub(crate) fn suppress(&self, queue: &str, failed_interval: Duration) {
+        let mut observation = self.lock();
+        observation.queues.remove(queue);
+        let raised = failed_interval.saturating_mul(2).min(MAX_RAISED_INTERVAL);
+        observation
+            .raised
+            .entry(queue.to_string())
+            .and_modify(|current| *current = (*current).max(raised))
+            .or_insert(raised);
+    }
+
+    /// Whether to log an overflow of `queue`'s escalated claim: at most once
+    /// per [`OVERFLOW_WARN_INTERVAL`] for each queue.
+    pub(crate) fn overflow_warn_due(&self, queue: &str, now: Instant) -> bool {
+        let mut warned_at = self
+            .overflow_warned_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = warned_at
+            .get(queue)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= OVERFLOW_WARN_INTERVAL);
+        if due {
+            warned_at.insert(queue.to_string(), now);
+        }
+        due
     }
 
     /// Records that no lane pins the queue ring.
@@ -788,7 +829,7 @@ mod tests {
         publish_starved(&watch, lanes, start);
         let at = start + secs(10);
         assert!(interval(&watch, "emails", at).is_some());
-        watch.suppress("emails");
+        watch.suppress("emails", secs(1));
         assert_eq!(interval(&watch, "emails", at), None);
         assert!(
             interval(&watch, "reports", at).is_some(),
@@ -796,6 +837,59 @@ mod tests {
         );
         watch.publish(reading(0, lanes(), 600), start + secs(20));
         assert!(interval(&watch, "emails", start + secs(20)).is_some());
+    }
+
+    #[test]
+    fn each_overflow_doubles_the_floor_until_the_pin_leaves_the_slot() {
+        let watch = RingPinWatch::default();
+        let start = Instant::now();
+        let lanes = || vec![lane("emails", 4, 7, 6)];
+        publish_starved(&watch, lanes, start);
+        let at = |n: u64| start + secs(n);
+        assert_eq!(interval(&watch, "emails", at(10)), Some(secs(2)));
+
+        watch.suppress("emails", secs(2));
+        watch.publish(reading(0, lanes(), 600), at(20));
+        assert_eq!(
+            interval(&watch, "emails", at(20)),
+            Some(secs(4)),
+            "the next escalation is at twice the interval that overflowed"
+        );
+        watch.suppress("emails", secs(4));
+        watch.publish(reading(0, lanes(), 600), at(30));
+        assert_eq!(interval(&watch, "emails", at(30)), Some(secs(8)));
+        assert_eq!(
+            interval(&watch, "reports", at(30)),
+            None,
+            "only the queue that overflowed is raised"
+        );
+
+        publish_starved_in_slot(&watch, 1, lanes, at(40));
+        assert_eq!(
+            interval(&watch, "emails", at(50)),
+            Some(secs(2)),
+            "a new slot starts from the lane's own interval"
+        );
+    }
+
+    fn publish_starved_in_slot(
+        watch: &RingPinWatch,
+        slot: i32,
+        lanes: impl Fn() -> Vec<LaneReading>,
+        start: Instant,
+    ) {
+        watch.publish(reading(slot, lanes(), 600), start);
+        watch.publish(reading(slot, lanes(), 600), start + secs(10));
+    }
+
+    #[test]
+    fn an_overflow_is_logged_once_a_minute_for_each_queue() {
+        let watch = RingPinWatch::default();
+        let start = Instant::now();
+        assert!(watch.overflow_warn_due("emails", start));
+        assert!(!watch.overflow_warn_due("emails", start + secs(30)));
+        assert!(watch.overflow_warn_due("reports", start + secs(30)));
+        assert!(watch.overflow_warn_due("emails", start + secs(60)));
     }
 
     #[test]
