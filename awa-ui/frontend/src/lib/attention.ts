@@ -69,6 +69,11 @@ function queueName(queues: QueueOverview[] | undefined, queue: string): string {
   return name ? name : queue;
 }
 
+function kindName(jobs: JobRow[], kind: string): string {
+  const name = jobs.find((job) => job.kind === kind)?.kind_descriptor?.display_name?.trim();
+  return name ? name : kind;
+}
+
 function instanceLabel(instance: Pick<RuntimeInstance, "hostname" | "pid">): string {
   return instance.hostname ?? `pid ${instance.pid}`;
 }
@@ -159,7 +164,7 @@ export function attentionItems(input: AttentionInput): AttentionItem[] {
       push(3, group.count, {
         id: `failures:${group.kind}:${group.key}`,
         severity: "action",
-        title: `${formatNumber(group.count)}× ${group.key} in ${group.kind}`,
+        title: `${formatNumber(group.count)}× ${group.key} in ${kindName(failedJobs, group.kind)}`,
         detail: group.summary,
         target: { to: "/jobs", search: { state: "failed", q: `kind:${group.kind}` } },
       });
@@ -231,12 +236,22 @@ export function attentionItems(input: AttentionInput): AttentionItem[] {
   }
 
   if (queueRuntime) {
-    for (const q of queueRuntime.filter((q) => q.config_mismatch)) {
+    const mismatched = queueRuntime.filter((q) => q.config_mismatch);
+    if (mismatched.length === 1) {
+      const q = mismatched[0]!;
       push(9, 1, {
         id: `queue:config:${q.queue}`,
         severity: "warning",
         title: `${queueName(queues, q.queue)}: workers run different configs`,
         target: { to: "/queues/$name/config", params: { name: q.queue } },
+      });
+    } else if (mismatched.length > 1) {
+      push(9, mismatched.length, {
+        id: "queue:config",
+        severity: "warning",
+        title: `Workers run different configs for ${mismatched.length} queues`,
+        detail: mismatched.map((q) => queueName(queues, q.queue)).join(", "),
+        target: { to: "/runtime" },
       });
     }
   }

@@ -351,22 +351,22 @@ export function DashboardPage() {
             </Link>
           </CardAction>
         </CardHeader>
-        <CardContent className="px-0">
+        <CardContent>
           {queuesQuery.isError ? (
-            <p className="px-(--gutter) text-sm text-danger-subtle-fg" role="alert">
+            <p className="text-sm text-danger-subtle-fg" role="alert">
               Failed to load queues: {queuesQuery.error.message}
             </p>
           ) : queuesQuery.isLoading ? (
-            <p className="px-(--gutter) text-sm text-muted-fg">Loading queues…</p>
+            <p className="text-sm text-muted-fg">Loading queues…</p>
           ) : topQueues.length === 0 ? (
-            <p className="px-(--gutter) text-sm text-muted-fg" data-testid="queues-attention-empty">
+            <p className="text-sm text-muted-fg" data-testid="queues-attention-empty">
               No queue has failures, retries, dead letters or held work.
             </p>
           ) : (
             <>
-              <ul className="divide-y border-t sm:hidden" aria-label="Queues needing attention">
+              <ul className="divide-y sm:hidden" aria-label="Queues needing attention">
                 {topQueues.map((q) => (
-                  <li key={q.queue} className="px-(--gutter) py-3">
+                  <li key={q.queue} className="py-3">
                     <div className="flex items-center gap-2">
                       <QueueLink queue={q.queue} descriptor={q} className="font-medium" />
                       {q.paused && <Badge intent="warning">Paused</Badge>}

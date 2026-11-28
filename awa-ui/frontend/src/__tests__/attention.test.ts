@@ -293,6 +293,21 @@ describe("attentionItems", () => {
     ).toEqual(["cron:overdue:late", "cron:paused:held"]);
   });
 
+  it("names a failing kind by its display name", () => {
+    const items = attentionItems({
+      now: NOW,
+      failedJobs: [job({ kind: "charge", kind_descriptor: { display_name: "Charge invoice", description: null, owner: null, docs_url: null, tags: [], extra: null }, errors: [{ error: "Boom: x" }] })],
+    });
+    expect(items[0]!.title).toBe("1× Boom in Charge invoice");
+  });
+
+  it("folds config mismatch on several queues into one item", () => {
+    const summary = (queue: string) => ({ queue, instance_count: 2, live_instances: 2, stale_instances: 0, healthy_instances: 2, total_in_flight: 0, overflow_held_total: null, config_mismatch: true, config: null });
+    const items = attentionItems({ now: NOW, queues: [queue({ queue: "a", display_name: "A" })], queueRuntime: [summary("a"), summary("b")] });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ id: "queue:config", title: "Workers run different configs for 2 queues", detail: "A, b", target: { to: "/runtime" } });
+  });
+
   it("flags config mismatch and descriptor drift", () => {
     expect(
       ids({
