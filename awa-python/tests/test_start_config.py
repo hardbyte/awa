@@ -380,6 +380,26 @@ async def test_per_queue_priority_aging_and_deadline_in_dict_config(client):
 
 
 @pytest.mark.asyncio
+async def test_per_queue_ring_pin_aging_escalation_opt_out_in_dict_config(client):
+    queue = "cfg_per_queue_ring_pin_escalation"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    await client.start(
+        [{"name": queue, "max_workers": 4, "ring_pin_aging_escalation": False}]
+    )
+    try:
+        await client.insert(ConfigTestJob(value="no-escalation"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=5.0)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_per_queue_claimer_knobs_in_dict_config(client):
     """Dict form accepts per-queue claim parallelism knobs."""
     queue = "cfg_per_queue_claimer_knobs"

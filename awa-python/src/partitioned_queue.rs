@@ -104,7 +104,7 @@ impl PyPartitionedQueue {
     ///
     /// Capacity arguments are named per partition because the returned config
     /// declares each physical queue partition independently.
-    #[pyo3(signature = (max_workers_per_partition=None, *, min_workers_per_partition=None, weight=1, rate_limit_per_partition=None, priority_aging_interval_ms=None, deadline_duration_ms=None, claimers=None, claim_batch_size=None))]
+    #[pyo3(signature = (max_workers_per_partition=None, *, min_workers_per_partition=None, weight=1, rate_limit_per_partition=None, priority_aging_interval_ms=None, deadline_duration_ms=None, claimers=None, claim_batch_size=None, ring_pin_aging_escalation=None))]
     #[allow(clippy::too_many_arguments)]
     fn queue_configs(
         &self,
@@ -117,6 +117,7 @@ impl PyPartitionedQueue {
         deadline_duration_ms: Option<u64>,
         claimers: Option<u16>,
         claim_batch_size: Option<usize>,
+        ring_pin_aging_escalation: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         match (max_workers_per_partition, min_workers_per_partition) {
             (Some(_), Some(_)) => {
@@ -169,6 +170,9 @@ impl PyPartitionedQueue {
             }
             if let Some(value) = claim_batch_size {
                 config.set_item("claim_batch_size", value)?;
+            }
+            if let Some(value) = ring_pin_aging_escalation {
+                config.set_item("ring_pin_aging_escalation", value)?;
             }
             configs.append(config)?;
         }

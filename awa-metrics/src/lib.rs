@@ -58,6 +58,7 @@ pub mod names {
     pub const DISPATCH_RATE_LIMITED: &str = "awa.dispatch.rate_limited";
     pub const DISPATCH_CLAIM_BATCH_SIZE: &str = "awa.dispatch.claim_batch_size";
     pub const DISPATCH_CLAIM_DURATION: &str = "awa.dispatch.claim_duration";
+    pub const DISPATCH_RING_PIN_ESCALATED_CLAIMS: &str = "awa.dispatch.ring_pin_escalated_claims";
     pub const COMPLETION_FLUSHES: &str = "awa.completion.flushes";
     pub const COMPLETION_FLUSH_BATCH_SIZE: &str = "awa.completion.flush_batch_size";
     pub const COMPLETION_FLUSH_DURATION: &str = "awa.completion.flush_duration";
@@ -156,6 +157,9 @@ pub struct AwaMetrics {
     pub dispatch_unused_permits: Counter<u64>,
     /// Number of wakes that were blocked by rate limiting.
     pub dispatch_rate_limited: Counter<u64>,
+    /// Number of claims made with an aging interval shortened because a lane
+    /// of the queue pins the queue ring.
+    pub dispatch_ring_pin_escalated_claims: Counter<u64>,
     /// Claim batch size distribution.
     pub claim_batch_size: Histogram<u64>,
     /// Claim query duration.
@@ -417,6 +421,11 @@ impl AwaMetrics {
                 .u64_counter(names::DISPATCH_RATE_LIMITED)
                 .with_description("Number of dispatcher wakes that could not claim because of rate limiting")
                 .with_unit("{wake}")
+                .build(),
+            dispatch_ring_pin_escalated_claims: meter
+                .u64_counter(names::DISPATCH_RING_PIN_ESCALATED_CLAIMS)
+                .with_description("Number of claims that returned jobs with an aging interval shortened because a lane of the queue pins the queue ring")
+                .with_unit("{claim}")
                 .build(),
             claim_batch_size: meter
                 .u64_histogram(names::DISPATCH_CLAIM_BATCH_SIZE)
@@ -853,6 +862,16 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
         ];
         self.dispatch_rate_limited.add(1, &attrs);
+    }
+
+    /// Record a claim made with an aging interval shortened because a lane of
+    /// the queue pins the queue ring.
+    pub fn record_dispatch_ring_pin_escalated_claim(&self, queue: &str) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.dispatch_ring_pin_escalated_claims.add(1, &attrs);
     }
 
     /// Record a completion batch flush.
@@ -1646,6 +1665,49 @@ mod tests {
             BTreeMap::from([
                 (lane("emails", "4", "0"), 120.0),
                 (lane("reports", "2", "3"), 0.0)
+            ])
+        );
+    }
+
+    #[test]
+    fn ring_pin_escalated_claims_count_per_queue() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_dispatch_ring_pin_escalated_claim("emails");
+        metrics.record_dispatch_ring_pin_escalated_claim("emails");
+        metrics.record_dispatch_ring_pin_escalated_claim("reports");
+        provider.force_flush().expect("flush metrics");
+
+        let mut claims = BTreeMap::new();
+        for resource in &exporter.get_finished_metrics().expect("read metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let (
+                        names::DISPATCH_RING_PIN_ESCALATED_CLAIMS,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    else {
+                        continue;
+                    };
+                    for point in sum.data_points() {
+                        let queue: Vec<String> = point
+                            .attributes()
+                            .map(|kv| format!("{}={}", kv.key, kv.value))
+                            .collect();
+                        claims.insert(queue, point.value());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            claims,
+            BTreeMap::from([
+                (vec!["awa.job.queue=emails".to_string()], 2),
+                (vec!["awa.job.queue=reports".to_string()], 1),
             ])
         );
     }

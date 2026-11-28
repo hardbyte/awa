@@ -76,6 +76,17 @@ def test_partitioned_queue_queue_configs_hard_reserved():
     ]
 
 
+def test_partitioned_queue_queue_configs_ring_pin_aging_escalation():
+    partitioned_queue = awa.PartitionedQueue("email", 2)
+
+    assert partitioned_queue.queue_configs(
+        max_workers_per_partition=8, ring_pin_aging_escalation=False
+    ) == [
+        {"name": "email", "max_workers": 8, "ring_pin_aging_escalation": False},
+        {"name": "email__p1", "max_workers": 8, "ring_pin_aging_escalation": False},
+    ]
+
+
 def test_partitioned_queue_queue_configs_weighted():
     partitioned_queue = awa.PartitionedQueue("email", 2)
 

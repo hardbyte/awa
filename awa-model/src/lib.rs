@@ -63,9 +63,9 @@ pub use partitioned_queue::{
 };
 pub use queue_storage::{
     ClaimedEntry, ClaimedRuntimeJob, GatedRotateOutcome, PendingReadyLane, PromoteOutcome,
-    PromotionLane, PruneOutcome, QueueCounts, QueueRingPin, QueueStorage, QueueStorageConfig,
-    RescueBatch, RescueBatchOptions, RescueScanCursor, RescueScanProgress, RescueSlotOrder,
-    RotateOutcome, RuntimeBatchCompletion, SkipReason, SpentClaimHeadAdvance,
+    PromotionLane, PruneOutcome, QueueCounts, QueueRingPin, QueueServingState, QueueStorage,
+    QueueStorageConfig, RescueBatch, RescueBatchOptions, RescueScanCursor, RescueScanProgress,
+    RescueSlotOrder, RotateOutcome, RuntimeBatchCompletion, SkipReason, SpentClaimHeadAdvance,
     SpentClaimHeadAdvances, SpentClaimHeadFailure, TerminalDeltaRollupOutcome,
 };
 pub use storage::StorageStatus;

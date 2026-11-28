@@ -1037,8 +1037,51 @@ type ReadyLaneKey = (String, i16, i16);
 #[derive(Default)]
 struct QueueRingPinReport {
     lanes: HashSet<ReadyLaneKey>,
+    /// Each lane's first pending row at the last read, and the slot it was
+    /// read in.
+    heads: HashMap<ReadyLaneKey, (i32, i64)>,
     last_warned_at: Option<Instant>,
     last_observed_at: Option<Instant>,
+}
+
+/// Why a lane keeps queue prune from reclaiming the oldest sealed ring slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinCause {
+    /// The lane's queue is paused.
+    Paused,
+    /// No live runtime serves the lane's queue.
+    NoRuntime,
+    /// A runtime serves the queue and the lane's claim cursor has not moved.
+    Starved,
+    /// The lane's claim cursor moved since the previous read: it is being
+    /// claimed, more slowly than rows arrive or than the ring rotates.
+    Advancing,
+    /// The cause could not be read.
+    Unknown,
+}
+
+impl PinCause {
+    /// `serving` is whether the lane's queue is paused and whether a live
+    /// runtime serves it, when that could be read.
+    fn classify(serving: Option<(bool, bool)>, advancing: bool) -> Self {
+        match serving {
+            Some((true, _)) => Self::Paused,
+            Some((false, false)) => Self::NoRuntime,
+            Some((false, true)) if advancing => Self::Advancing,
+            Some((false, true)) => Self::Starved,
+            None => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::NoRuntime => "no_runtime",
+            Self::Starved => "starved",
+            Self::Advancing => "advancing",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 impl QueueRingPinReport {
@@ -1076,6 +1119,31 @@ impl QueueRingPinReport {
         warn
     }
 
+    /// Remembers where each lane of `pin` stands and returns those whose
+    /// first pending row is past where the previous read left it, in the same
+    /// slot.
+    fn record_heads(
+        &mut self,
+        slot: i32,
+        lanes: impl IntoIterator<Item = (ReadyLaneKey, i64)>,
+    ) -> HashSet<ReadyLaneKey> {
+        let heads: HashMap<ReadyLaneKey, (i32, i64)> = lanes
+            .into_iter()
+            .map(|(lane, head_lane_seq)| (lane, (slot, head_lane_seq)))
+            .collect();
+        let advancing = heads
+            .iter()
+            .filter(|(lane, (slot, seq))| {
+                self.heads
+                    .get(*lane)
+                    .is_some_and(|(prev_slot, prev_seq)| prev_slot == slot && prev_seq < seq)
+            })
+            .map(|(lane, _)| lane.clone())
+            .collect();
+        self.heads = heads;
+        advancing
+    }
+
     /// Whether lanes were pinning the ring when last read and that read is
     /// [`QUEUE_RING_PIN_REFRESH_INTERVAL`] old.
     fn refresh_due(&self, now: Instant) -> bool {
@@ -1088,6 +1156,7 @@ impl QueueRingPinReport {
     /// Zeroes the gauges of the lanes last reported. Returns whether any were.
     fn clear(&mut self, metrics: &AwaMetrics) -> bool {
         self.last_observed_at = None;
+        self.heads.clear();
         for (queue, priority, enqueue_shard) in self.lanes.drain() {
             metrics.record_queue_ring_pinned_ready_age(
                 &queue,
@@ -1153,6 +1222,9 @@ pub struct MaintenanceService {
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
     queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
+    /// Where the leader's reads of the queue ring pin are shared with this
+    /// runtime's dispatchers.
+    ring_pin_watch: Option<Arc<crate::ring_pin::RingPinWatch>>,
     /// The connection the leader runs the ring idle checks on while it leads,
     /// detached from the pool so it does not take a pool slot.
     idle_check_conn: std::sync::Mutex<Option<sqlx::PgConnection>>,
@@ -1572,6 +1644,7 @@ impl MaintenanceService {
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
             queue_ring_pin: std::sync::Mutex::new(QueueRingPinReport::default()),
+            ring_pin_watch: None,
             idle_check_conn: std::sync::Mutex::new(None),
             queue_ring_advance_warned_at: std::sync::Mutex::new(None),
             rescue_others_first_offset: AtomicUsize::new(0),
@@ -1672,6 +1745,11 @@ impl MaintenanceService {
     /// queue-storage deferred backlog after the routing flip.
     pub(crate) fn standby_queue_storage(mut self, runtime: Option<QueueStorageRuntime>) -> Self {
         self.standby_queue_storage = runtime;
+        self
+    }
+
+    pub(crate) fn ring_pin_watch(mut self, watch: Arc<crate::ring_pin::RingPinWatch>) -> Self {
+        self.ring_pin_watch = Some(watch);
         self
     }
 
@@ -4416,6 +4494,9 @@ impl MaintenanceService {
             self.clear_queue_ring_pin();
             return;
         };
+        if let Some(watch) = &self.ring_pin_watch {
+            watch.publish_pin(Some(&pin), Instant::now());
+        }
         let pinning: Vec<(ReadyLaneKey, Duration)> = pin
             .lanes
             .iter()
@@ -4426,14 +4507,28 @@ impl MaintenanceService {
                 )
             })
             .collect();
-        let warn = self
-            .queue_ring_pin
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .observe(&pinning, &self.metrics, Instant::now());
+        let (warn, advancing) = {
+            let mut report = self
+                .queue_ring_pin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let advancing = report.record_heads(
+                pin.slot,
+                pin.lanes.iter().map(|lane| {
+                    (
+                        (lane.queue.clone(), lane.priority, lane.enqueue_shard),
+                        lane.head_lane_seq,
+                    )
+                }),
+            );
+            let warn = report.observe(&pinning, &self.metrics, Instant::now());
+            (warn, advancing)
+        };
         if warn {
             let oldest = &pin.lanes[0];
+            let cause = self.pin_cause(store, oldest, &advancing).await;
             warn!(
+                cause = %cause.as_str(),
                 slot = pin.slot,
                 queue = %oldest.queue,
                 priority = oldest.priority,
@@ -4443,6 +4538,29 @@ impl MaintenanceService {
                 "Queue ring prune is pinned by unclaimed ready rows; queue-storage partitions are not reclaimed until this lane is claimed",
             );
         }
+    }
+
+    /// Why `lane` pins the queue ring. One query; `Unknown` when it fails.
+    async fn pin_cause(
+        &self,
+        store: &QueueStorage,
+        lane: &awa_model::PendingReadyLane,
+        advancing: &HashSet<ReadyLaneKey>,
+    ) -> PinCause {
+        let serving = match store
+            .queue_serving_states(&self.pool, std::slice::from_ref(&lane.queue))
+            .await
+        {
+            Ok(mut states) => states
+                .remove(&lane.queue)
+                .map(|state| (state.paused, state.served)),
+            Err(err) => {
+                debug!(error = %err, "Failed to read why a lane pins the queue ring");
+                None
+            }
+        };
+        let key = (lane.queue.clone(), lane.priority, lane.enqueue_shard);
+        PinCause::classify(serving, advancing.contains(&key))
     }
 
     /// Advances the claim cursors of `pin`'s lanes over spent head rows.
@@ -4555,6 +4673,9 @@ impl MaintenanceService {
     }
 
     fn clear_queue_ring_pin(&self) {
+        if let Some(watch) = &self.ring_pin_watch {
+            watch.publish_pin(None, Instant::now());
+        }
         let cleared = self
             .queue_ring_pin
             .lock()
@@ -7582,6 +7703,65 @@ mod tests {
             report.observe(std::slice::from_ref(&paused), &metrics, start),
             "a pin after a clear warns again"
         );
+    }
+
+    fn heads(lanes: &[(&str, i16, i64)]) -> Vec<(ReadyLaneKey, i64)> {
+        lanes
+            .iter()
+            .map(|(queue, priority, head)| ((queue.to_string(), *priority, 0), *head))
+            .collect()
+    }
+
+    #[test]
+    fn queue_ring_pin_cause_prefers_paused_then_unserved_then_cursor_movement() {
+        let state = |paused, served| Some((paused, served));
+        assert_eq!(
+            PinCause::classify(state(true, true), true),
+            PinCause::Paused
+        );
+        assert_eq!(
+            PinCause::classify(state(true, false), false),
+            PinCause::Paused
+        );
+        assert_eq!(
+            PinCause::classify(state(false, false), true),
+            PinCause::NoRuntime
+        );
+        assert_eq!(
+            PinCause::classify(state(false, true), true),
+            PinCause::Advancing
+        );
+        assert_eq!(
+            PinCause::classify(state(false, true), false),
+            PinCause::Starved
+        );
+        assert_eq!(PinCause::classify(None, false), PinCause::Unknown);
+        assert_eq!(PinCause::NoRuntime.as_str(), "no_runtime");
+    }
+
+    #[test]
+    fn queue_ring_pin_report_flags_lanes_whose_head_moved_in_the_same_slot() {
+        let mut report = QueueRingPinReport::default();
+        let lane = |queue: &str, priority| (queue.to_string(), priority, 0);
+        assert!(
+            report
+                .record_heads(0, heads(&[("a", 1, 10), ("b", 4, 5)]))
+                .is_empty(),
+            "the first read has nothing to compare with"
+        );
+        assert_eq!(
+            report.record_heads(0, heads(&[("a", 1, 14), ("b", 4, 5)])),
+            HashSet::from([lane("a", 1)]),
+            "only the lane whose head moved is advancing"
+        );
+        assert!(
+            report
+                .record_heads(1, heads(&[("a", 1, 20), ("b", 4, 5)]))
+                .is_empty(),
+            "a different slot is not comparable"
+        );
+        report.clear(&AwaMetrics::from_global());
+        assert!(report.record_heads(1, heads(&[("a", 1, 30)])).is_empty());
     }
 
     #[test]

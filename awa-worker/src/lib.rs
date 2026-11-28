@@ -12,6 +12,7 @@ pub mod http_worker;
 pub mod maintenance;
 pub mod metrics;
 mod notify_hub;
+mod ring_pin;
 mod runtime;
 mod runtime_control;
 mod storage;
