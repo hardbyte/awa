@@ -1254,6 +1254,38 @@ async fn post_status(app: &axum::Router, path: &str, payload: Value) -> StatusCo
         .status()
 }
 
+/// A never-used install has no queue_storage backend yet, so its DLQ is
+/// empty; the read endpoints say so instead of failing, and writes still
+/// report that the DLQ is unavailable.
+#[tokio::test]
+async fn test_dlq_reads_are_empty_before_queue_storage_is_active() {
+    let db = awa_testing::setup::TestDatabase::canonical().await;
+    let pool = db.pool().clone();
+    assert!(awa_model::queue_storage::QueueStorage::active_schema(&pool)
+        .await
+        .unwrap()
+        .is_none());
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    assert_eq!(get_json(&app, "/api/dlq").await, serde_json::json!([]));
+    assert_eq!(
+        get_json(&app, "/api/dlq?queue=billing").await,
+        serde_json::json!([])
+    );
+    assert_eq!(
+        get_json(&app, "/api/dlq/depth").await,
+        serde_json::json!({ "total": 0, "by_queue": [] })
+    );
+    assert_eq!(get_json(&app, "/api/dlq/42").await, Value::Null);
+
+    assert_eq!(
+        post_status(&app, "/api/dlq/42/retry", serde_json::json!({})).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 /// A 0.6 server reads any body on the bulk-retry and bulk-purge paths as its
 /// flat fields, so the full filter lives on the matching paths, which it
 /// answers with 405. Neither path accepts a body that a 0.6 server would
