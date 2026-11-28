@@ -2,10 +2,16 @@
 
 ## Status
 
-Accepted. Tracked in [#340](https://github.com/hardbyte/awa/issues/340). The worker-local baseline
-and the fleet-exact protocol remain experiment-gated by E5 in
+Accepted. Tracked in [#340](https://github.com/hardbyte/awa/issues/340), targeted at 0.8. The
+worker-local baseline and the fleet-exact protocol remain experiment-gated by E5 in
 [the 0.7 roadmap](../0.7-roadmap.md); acceptance fixes the contract and candidate constraints,
-not evidence that either tier has shipped.
+not evidence that either tier has shipped. Deferred and DLQ rows keep the
+enqueue shard their job was routed to, which both tiers build on; the concurrency key and its digest
+do not exist yet.
+
+The [reconciliation with the current claim path](#reconciliation-with-the-current-claim-path)
+section records what changed in the storage engine after acceptance and which E5 questions it
+raises. Where it and an earlier section differ, the reconciliation section governs.
 
 ## Context
 
@@ -16,7 +22,7 @@ jobs for this tenant across the fleet."
 `InsertOpts::ordering_key` does not provide that guarantee. It chooses an enqueue shard and
 therefore preserves FIFO claim order inside that shard, but it does not prevent two already
 claimed jobs from executing concurrently. It is also a routing input rather than durable job
-identity: retry, callback-resume, and DLQ-retry paths do not currently retain the original key.
+identity: deferred and DLQ rows keep the shard the key selected, but not the key itself.
 
 Three constraints make fleet-exact control a storage protocol rather than another local
 semaphore:
@@ -105,8 +111,7 @@ non-compliant producer from a silent queue-wide probe-cost regression into a bou
 
 The selected `enqueue_shard` becomes durable routing metadata on deferred/retry, callback, and DLQ
 representations and is reused when those rows return to ready. It is not recomputed through the
-unkeyed rotor. This also closes the current retry-path gap where an original ordering-key route is
-not retained. Lowering `enqueue_shards` follows ADR-025's drain/compatibility rules for lanes that
+unkeyed rotor. Lowering `enqueue_shards` follows ADR-025's drain/compatibility rules for lanes that
 were selected under the old width. A same-queue priority move retains the shard. A cross-queue
 administrative move resolves the retained shard against the destination width as
 `retained_enqueue_shard % destination_enqueue_shards`; it must not copy an out-of-range shard or
@@ -318,6 +323,86 @@ sub-lanes or append-only hole/skip evidence that the allocator and prune model c
 ship without claiming cross-key fairness. Metrics must expose gated lanes, lock contention, oldest
 gated age, and ready-but-gated outcomes so the trade-off is visible.
 
+## Reconciliation with the current claim path
+
+The decision above was written against the claim path as it stood at acceptance. These later
+changes bear on it.
+
+| Change | Effect on this ADR |
+| --- | --- |
+| Per-slot claim functions (v051) | The claim CTE runs in `claim_ready_slot_<n>`, one function per queue-ring slot, and `claim_ready_runtime` dispatches to it. Key gating belongs in the template the installer generates the slot functions from; the bounded lane probe stays in `claim_ready_runtime` around the dispatch. |
+| Cursor catch-up and spent prefixes (v048, v061) | A claim moves a lane's cursor over committed claim evidence and over spent rows, crossing rolled-back reservations between them. A gated row is live and unclaimed, so the spent-prefix scan must stop at it exactly as at a claimable head. |
+| Ring generation floor (v062) | Claims scan one `(slot, generation)` segment at a time. A gated head holds its lane's cursor inside one segment for as long as the key stays saturated. |
+| Indexed compact claim batches (v054, v056) | `lease_claim_batches` carries a GIN index on `job_ids`, built on each claim partition after truncation. The same technique could index a parallel array of key digests, which weakens the reason [key arrays on compact claim batches](#put-key-arrays-on-compact-claim-batches) was rejected. It is now E5 candidate (b3). |
+| Coordination off the commit path (ADR-053) | Grant-close wakeups go through the post-commit coalescer, so post-closure pickup in session mode includes its per-queue window. E5 measures pickup with the coalescer in place. |
+| Stripes (#749, #752) | A striped queue picks a stripe from the ordering key, else the unique key. The policy id spans stripes, so exactness holds, but a key without an ordering key can land on several stripes. Stripes are deprecated in favour of enqueue shards, so Tier 2 does not add stripe routing by concurrency key; on a striped queue, only an explicit ordering key gives locality. |
+| Retained enqueue shard (v064) | Deferred and DLQ rows keep the shard their job was claimed from, and a scheduled job with an ordering key keeps the shard its key selects. A job returns to that shard when it becomes ready again, taken modulo the destination queue's current width. Rows written by older binaries or the SQL compat insert functions carry no retained shard and are routed through the rotor. Tier 2 adds the concurrency-key digest beside the shard. |
+
+### Head-of-line blocking across keys that share a lane
+
+With concurrency-key shard locality, the keys a saturated key blocks are predictable: every key
+whose jobs sit behind it in the same `(priority, enqueue_shard)` lane. At `max_in_flight = 1`, a
+long-running job for one hot key holds back roughly `1/enqueue_shards` of the queue's other keys for
+as long as it runs. The queue does not look idle while this happens, because other lanes keep
+claiming, but those keys make no progress.
+
+That is the motivating workload for limit 1: one runner per entity, for example change events for
+one row, during a rolling deploy in which an old and a new runtime both claim. It turns the choice
+between lane-head gating ((b1), (b2), (b3)) and parking (d) from a performance comparison into a
+question about which keys can be starved, and for how long. Raising `enqueue_shards` narrows the
+blocked set but adds lanes to probe on every claim.
+
+### E5 scope after reconciliation
+
+E5 compares (b1) row-local claims, (b3) key-digest arrays on indexed compact batches, and (d)
+parking with closure-time promotion. (b2), a separate grant ledger, runs only if (b1) and (b3)
+both fail the #246 gate. (a) and (c) remain baselines.
+
+Each candidate runs at limits 1 and N, with uniform and Zipf keys, and at `enqueue_shards` of 1, 4
+and 16. In addition to the measurements in the 0.7 roadmap, E5 records:
+
+- the delay to the oldest admissible job of a key that shares a lane with a saturated key, against
+  the hot key's attempt duration;
+- whether a long-gated head delays queue-ring rotation or prune, compared with an equally old
+  unclaimed backlog on a paused queue; and
+- for (b3), claim p99 on a claim partition whose index has not been rebuilt since truncation.
+
+It also runs these scenarios:
+
+- two runtimes on different binaries, one draining and one starting, claiming the same key at
+  limit 1, with exactly one admitted attempt;
+- a gated head directly after a spent prefix; and
+- a key that stays gated across a queue-ring rotation.
+
+If lane-head gating's cross-key delay is unbounded by anything an operator controls, Tier 2 does not
+ship on that shape alone: it needs parking (d), or per-key sub-lanes designed and proved separately.
+Tier 1 does not depend on E5. Its prerequisite is the durable concurrency key, not the claim
+protocol.
+
+### Tier 1 and fleet rate limits (#718)
+
+[#718](https://github.com/hardbyte/awa/issues/718) gives a queue a fleet rate limit. Each runtime
+enforces its share of the limit: the fleet rate times this runtime's permits for the queue, divided
+by the permits of every live runtime serving it. The share is recomputed on the
+[ADR-038](038-queue-runtime-overrides.md) override refresh. Base value, override, who set it and why,
+and the value each runtime applied are kept in the database. Tier 1 reuses that plumbing instead of
+adding its own configuration channel:
+
+- A per-key rate is configured as a fleet rate per key and enforced at each runtime's share, like
+  the queue limit. The fleet then never exceeds the configured rate, replacing the
+  `per-runtime limit x runtimes` bound for rates. It can under-admit when one runtime claims most of
+  a key's jobs; shard locality spreads a key's jobs across the runtimes that claim its lane, which
+  keeps that gap roughly proportional to permits. Metrics report per-key admission against the
+  configured rate so the gap is visible.
+- A per-key concurrency cap does not divide: a share of `max_in_flight = 1` is not a whole permit.
+  Tier 1 keeps concurrency caps per runtime with the stated bound, and a fleet-wide cap is Tier 2.
+- Per-key policies and their overrides sit beside #718's queue overrides, with the same audit and
+  applied-state reporting. Tier 1 adds a key dimension to the dispatcher's bucket map, bounded by
+  idle eviction so key cardinality cannot grow runtime memory without limit.
+
+#718 ships first and Tier 1 builds on it. Neither adds a per-key or per-queue counter row on the
+claim path.
+
 ## Guarantees and non-guarantees
 
 Tier 2 guarantees:
@@ -442,8 +527,14 @@ write and correctness surface.
 
 ### Put key arrays on compact claim batches
 
-Rejected for the capacity-query index. It keeps the batch compact, but PostgreSQL cannot index each
-member by `(key_policy_id, key_digest)` without expanding retained arrays on the hot claim path.
+Retained as E5 candidate (b3). It keeps the batch compact. A B-tree cannot index each member by
+`(key_policy_id, key_digest)`, but a GIN index on an array of policy-qualified digests can, as v054
+does for `job_ids`. The capacity query then finds the batches that contain a key through the index
+and unnests only those, anti-joined with closure evidence.
+
+The costs to measure are GIN maintenance on every keyed claim insert, a claim partition whose index
+has not yet been rebuilt after truncation (the query stays correct but scans), and counting
+members rather than rows.
 
 ### Park gated jobs and promote them on grant closure
 
@@ -490,6 +581,8 @@ executing, wasting claim/receipt capacity.
 
 - **ADR-005/010/011:** priority aging, rate limiting, and worker capacity continue to decide when a
   dispatcher asks for work; the execution grant is an additional storage admission condition.
+- **ADR-038 and #718:** Tier 1 per-key policies use the queue override, audit and applied-state
+  plumbing, and per-key rates use #718's fleet share.
 - **ADR-013:** `(job_id, run_lease)` is the attempt identity attached to and allowed to close a
   grant.
 - **ADR-019/023/026:** the preferred grant representation reuses the append-only claim/closure ring

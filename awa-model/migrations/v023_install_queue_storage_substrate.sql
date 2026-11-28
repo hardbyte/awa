@@ -953,6 +953,65 @@ $job_output$;
 
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_job_output(TEXT) FROM PUBLIC;
 
+-- Retained enqueue shard (ADR-033): add a nullable enqueue_shard to
+-- deferred_jobs and dlq_entries, so a job returns to the shard it was routed
+-- to when it becomes ready again. Called by the installer and by migration
+-- v064, which does not replay the installer. The column is added only when
+-- missing, so a re-run takes no lock on the tables. It is nullable without a
+-- default: adding it rewrites nothing, and NULL means the job is routed
+-- through the rotor, as rows written before v064 are.
+CREATE OR REPLACE FUNCTION awa.install_queue_storage_retained_shard(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, awa, public
+SET quote_all_identifiers = off
+AS $retained_shard$
+DECLARE
+    v_deferred REGCLASS := to_regclass(format('%I.deferred_jobs', p_schema));
+    v_dlq REGCLASS := to_regclass(format('%I.dlq_entries', p_schema));
+    v_deferred_missing BOOLEAN;
+    v_dlq_missing BOOLEAN;
+BEGIN
+    IF v_deferred IS NULL OR v_dlq IS NULL THEN
+        RETURN;
+    END IF;
+
+    v_deferred_missing := NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = v_deferred AND attname = 'enqueue_shard' AND NOT attisdropped
+    );
+    v_dlq_missing := NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = v_dlq AND attname = 'enqueue_shard' AND NOT attisdropped
+    );
+    IF NOT (v_deferred_missing OR v_dlq_missing) THEN
+        RETURN;
+    END IF;
+
+    -- Take both locks up front, deferred_jobs first, so the two ALTERs
+    -- cannot interleave with a runtime transaction between them.
+    EXECUTE format(
+        'LOCK TABLE %1$I.deferred_jobs, %1$I.dlq_entries IN ACCESS EXCLUSIVE MODE',
+        p_schema
+    );
+    IF v_deferred_missing THEN
+        EXECUTE format(
+            'ALTER TABLE %I.deferred_jobs ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT',
+            p_schema
+        );
+    END IF;
+    IF v_dlq_missing THEN
+        EXECUTE format(
+            'ALTER TABLE %I.dlq_entries ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT',
+            p_schema
+        );
+    END IF;
+END;
+$retained_shard$;
+
+REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_retained_shard(TEXT) FROM PUBLIC;
+
 -- Installs p_schema.ensure_claim_batch_job_index(p_slot), which adds the GIN
 -- index on job_ids to one lease_claim_batches partition when that partition
 -- is empty and its lock is free, and otherwise does nothing. Building the
@@ -3668,6 +3727,7 @@ BEGIN
             unique_key    BYTEA,
             unique_states TEXT,
             payload       JSONB,
+            enqueue_shard SMALLINT,
             CONSTRAINT deferred_jobs_state_check CHECK (state IN ('scheduled', 'retryable'))
         )
         $ddl$,
@@ -3723,7 +3783,8 @@ BEGIN
             payload            JSONB,
             dlq_reason         TEXT NOT NULL,
             dlq_at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-            original_run_lease BIGINT NOT NULL
+            original_run_lease BIGINT NOT NULL,
+            enqueue_shard      SMALLINT
         )
         $ddl$,
         p_schema
@@ -3733,6 +3794,9 @@ BEGIN
         'CREATE INDEX IF NOT EXISTS idx_%s_dlq_queue_time ON %I.dlq_entries (queue, dlq_at DESC)',
         p_schema, p_schema
     );
+
+    -- Retained enqueue shard (ADR-033) on substrates created before it.
+    PERFORM awa.install_queue_storage_retained_shard(p_schema);
 
     --------------------------------------------------------------------
     -- ready_entries / ready_claim_attempt_batches / ready_tombstones /
