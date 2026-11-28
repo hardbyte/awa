@@ -456,7 +456,7 @@ export function JobsPage() {
               intent="outline"
               isDisabled={readOnly}
               onPress={() =>
-                void navigate({ to: "/batch-ops", search: batchSearch })
+                void navigate({ to: "/batch-ops/new", search: batchSearch })
               }
             >
               Change priority or queue of matching jobs

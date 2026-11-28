@@ -106,7 +106,11 @@ export function InstanceLink({
 
 export function BatchOpLink({ id, className = "", children }: EntityLinkProps & { id: string }) {
   return (
-    <Link to="/batch-ops" className={`${entityLinkClass} font-mono ${className}`}>
+    <Link
+      to="/batch-ops/$id"
+      params={{ id }}
+      className={`${entityLinkClass} font-mono ${className}`}
+    >
       {children ?? id.slice(0, 8)}
     </Link>
   );

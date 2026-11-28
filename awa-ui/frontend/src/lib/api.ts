@@ -468,6 +468,10 @@ export function fetchBatchOperations(params: {
   return apiRead(`/batch-ops${query ? `?${query}` : ""}`);
 }
 
+export function fetchBatchOperation(id: string): Promise<BatchOperation> {
+  return apiRead(`/batch-ops/${encodeURIComponent(id)}`);
+}
+
 export function previewBatchOperation(
   payload: BatchOperationPayload
 ): Promise<BatchOperationPreview> {

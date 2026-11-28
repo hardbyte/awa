@@ -92,8 +92,8 @@ test.describe("DLQ page", () => {
       const status = page.getByTestId("dlq-batch-submitted");
       await expect(status).toContainText(`Submitted ${verb} of the matching DLQ rows as batch operation 0b2c4d6e`);
       expect(body).toEqual({ filter: { queue: "e2e_dlq" } });
-      await status.getByRole("link", { name: /batch operations page/ }).click();
-      await expect(page).toHaveURL(/\/batch-ops$/);
+      await status.getByRole("link", { name: "follow its progress" }).click();
+      await expect(page).toHaveURL(new RegExp(`/batch-ops/${id}$`));
     });
   }
 });

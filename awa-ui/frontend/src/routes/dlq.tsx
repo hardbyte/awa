@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/table";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
 import { dlqDepthQuery } from "@/lib/shared-queries";
+import { BatchOpLink } from "@/components/links";
 import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
@@ -202,12 +203,9 @@ export function DlqPage() {
         <p className="text-sm" role="status" data-testid="dlq-batch-submitted">
           Submitted {submitted.op_kind === "purge_dlq" ? "purge" : "retry"} of
           the matching DLQ rows as batch operation{" "}
-          <span className="font-mono">{submitted.id.slice(0, 8)}</span>. The rows
-          change as the maintenance leader runs it;{" "}
-          <Link to="/batch-ops" className="underline">
-            follow it on the batch operations page
-          </Link>
-          .
+          <BatchOpLink id={submitted.id} />. The rows change as the maintenance
+          leader runs it;{" "}
+          <BatchOpLink id={submitted.id}>follow its progress</BatchOpLink>.
         </p>
       )}
 

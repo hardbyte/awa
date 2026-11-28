@@ -173,7 +173,7 @@ test.describe("Search bar filters", () => {
       page.goto("/jobs?state=available&q=queue%3Ae2e_test%20tag%3Ae2e"),
     ]);
     await page.getByRole("button", { name: "Change priority or queue of matching jobs" }).click();
-    await page.waitForURL(/\/batch-ops\?/);
+    await page.waitForURL(/\/batch-ops\/new\?/);
     await expect(page.getByLabel("Queue filter")).toHaveValue("e2e_test");
     await expect(page.getByLabel("Tags filter")).toHaveValue("e2e");
     await expect(page.getByLabel("State filter")).toHaveValue("available");

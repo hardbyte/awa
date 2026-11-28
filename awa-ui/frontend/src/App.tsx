@@ -4,6 +4,7 @@ import {
   createRouter,
   createRootRoute,
   createRoute,
+  redirect,
   RouterProvider,
 } from "@tanstack/react-router";
 import { QueryClientProvider } from "@tanstack/react-query";
@@ -19,6 +20,9 @@ import { CronPage } from "./routes/cron";
 import { DlqPage } from "./routes/dlq";
 import { DlqDetailPage } from "./routes/dlq-detail";
 import { BatchOpsPage } from "./routes/batch-ops";
+import { BatchOpNewPage } from "./routes/batch-op-new";
+import { BatchOpDetailPage } from "./routes/batch-op-detail";
+import { BATCH_PREFILL_KEYS } from "./lib/batch";
 import { RuntimePage } from "./routes/runtime";
 import { RuntimeInstancePage } from "./routes/runtime-detail";
 import { NotFoundPage } from "./routes/not-found";
@@ -86,7 +90,26 @@ const dlqDetailRoute = createRoute({
 const batchOpsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/batch-ops",
+  // Links from other pages prefill the form with these keys.
+  beforeLoad: ({ search }) => {
+    const values = search as Record<string, unknown>;
+    if (BATCH_PREFILL_KEYS.some((key) => values[key] !== undefined)) {
+      throw redirect({ to: "/batch-ops/new", search: values, replace: true });
+    }
+  },
   component: BatchOpsPage,
+});
+
+const batchOpNewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/batch-ops/new",
+  component: BatchOpNewPage,
+});
+
+const batchOpDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/batch-ops/$id",
+  component: BatchOpDetailPage,
 });
 
 const runtimeRoute = createRoute({
@@ -114,6 +137,8 @@ const routeTree = rootRoute.addChildren([
   dlqRoute,
   dlqDetailRoute,
   batchOpsRoute,
+  batchOpNewRoute,
+  batchOpDetailRoute,
 ]);
 
 const router = createRouter({ routeTree, rewrite: mountRewrite() });

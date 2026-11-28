@@ -43,7 +43,8 @@ export function pageTitle(pathname: string): string {
     case "cron":
       return "Schedules";
     case "batch-ops":
-      return "Bulk operations";
+      if (!detail) return "Bulk operations";
+      return detail === "new" ? "New operation" : `Operation ${detail.slice(0, 8)}`;
     default:
       return "Not found";
   }
