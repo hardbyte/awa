@@ -10,11 +10,13 @@ import { useNow } from "@/hooks/use-now";
 import {
   fetchCronJobs,
   fetchJobs,
+  fetchOutcomes,
   fetchQueueRuntime,
   fetchQueues,
   fetchRuntime,
   fetchStats,
   type CronJobRow,
+  type JobOutcomes,
   type JobRow,
   type QueueOverview,
   type QueueRuntimeSummary,
@@ -28,15 +30,17 @@ import {
   queuesNeedingAttention,
   type AttentionItem,
   type AttentionSeverity,
+  type HealthFigures,
 } from "@/lib/attention";
 import { batchOpsQuery, dlqDepthQuery } from "@/lib/shared-queries";
 import {
   OVERVIEW_FAILED_SAMPLE,
+  OVERVIEW_OUTCOMES,
   OVERVIEW_QUEUE_LIMIT,
   OVERVIEW_RUNNING_SAMPLE,
 } from "@/lib/constants";
 import { formatDuration, formatRelative } from "@/lib/time";
-import { formatNumber, plural } from "@/lib/number";
+import { formatNumber, formatPercent, plural } from "@/lib/number";
 import { Page, PageHeader } from "@/components/Page";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -104,6 +108,19 @@ function HealthTile({ label, value, error, tone = "neutral", link, testId, child
   );
 }
 
+/** The Failed tile's line: the failed share of finished jobs, last hour against the one before. */
+function FailureRateLine({ trend }: { trend: NonNullable<HealthFigures["failureRate"]> }) {
+  const { current, previous } = trend;
+  return (
+    <span data-testid="failure-rate">
+      {current.rate === null ? "no jobs finished in the last hour" : `${formatPercent(current.rate)} failed in the last hour`}
+      <span className="block">
+        {previous.rate === null ? "none finished the hour before" : `${formatPercent(previous.rate)} the hour before`}
+      </span>
+    </span>
+  );
+}
+
 const SEVERITY_ICON: Record<AttentionSeverity, { Icon: typeof XCircleIcon; className: string; label: string }> = {
   action: { Icon: XCircleIcon, className: "text-danger-subtle-fg", label: "Needs action" },
   warning: { Icon: ExclamationTriangleIcon, className: "text-warning-subtle-fg", label: "Warning" },
@@ -149,6 +166,11 @@ export function DashboardPage() {
     queryKey: ["jobs", RUNNING_SAMPLE],
     queryFn: () => fetchJobs(RUNNING_SAMPLE),
   });
+  // Null from a server without the endpoint, which leaves both tiles as they were.
+  const outcomesQuery = useManagedQuery<JobOutcomes | null>({
+    queryKey: ["stats", "outcomes", OVERVIEW_OUTCOMES],
+    queryFn: () => fetchOutcomes(OVERVIEW_OUTCOMES),
+  });
 
   const input = {
     now,
@@ -160,6 +182,8 @@ export function DashboardPage() {
     cron: cronQuery.data,
     failedJobs: failedQuery.data,
     runningJobs: runningQuery.data,
+    outcomes: outcomesQuery.data,
+    outcomeBucketSeconds: OVERVIEW_OUTCOMES.bucketSeconds,
   };
   const figures = healthFigures(input);
   const items = attentionItems(input);
@@ -172,6 +196,7 @@ export function DashboardPage() {
     ["schedules", cronQuery],
     ["failed jobs", failedQuery],
     ["running jobs", runningQuery],
+    ["failure rate", outcomesQuery],
   ];
   const failedChecks = checks.filter(([, q]) => q.isError).map(([name]) => name);
   const loadingChecks = checks.some(([, q]) => q.isLoading);
@@ -232,8 +257,12 @@ export function DashboardPage() {
           tone={(liveFailed ?? 0) > 0 ? "danger" : "neutral"}
           link={{ to: "/jobs", search: { state: "failed", dead_lettered: false } }}
         >
-          {figures.completedLastHour !== null &&
-            `${formatNumber(figures.completedLastHour)} completed in the last hour`}
+          {figures.failureRate ? (
+            <FailureRateLine trend={figures.failureRate} />
+          ) : (
+            figures.completedLastHour !== null &&
+            `${formatNumber(figures.completedLastHour)} completed in the last hour`
+          )}
         </HealthTile>
         <HealthTile
           label="Dead letters"
@@ -243,9 +272,16 @@ export function DashboardPage() {
           tone={(dlqQuery.data?.total ?? 0) > 0 ? "warning" : "neutral"}
           link={{ to: "/dlq" }}
         >
+          {figures.deadLetteredLastHour !== null && (
+            <span className="block" data-testid="dead-letter-trend">
+              {figures.deadLetteredLastHour > 0
+                ? `+${formatNumber(figures.deadLetteredLastHour)} in the last hour`
+                : "none added in the last hour"}
+            </span>
+          )}
           {figures.topDeadLetters
             ? `most in ${figures.topDeadLetters.queue} (${formatNumber(figures.topDeadLetters.count)})`
-            : "none"}
+            : figures.deadLetteredLastHour === null && "none"}
         </HealthTile>
         <HealthTile
           label="Stuck running"

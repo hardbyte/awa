@@ -4280,7 +4280,11 @@ pub struct StateTimeseriesBucket {
     pub count: i64,
 }
 
-/// Return time-bucketed state counts over the last N minutes.
+/// Return time-bucketed state counts over the last N minutes, by creation
+/// time and each job's current state.
+///
+/// This backs `GET /api/stats/timeseries`, which is deprecated: the admin UI
+/// no longer reads it. [`job_outcomes`] counts terminal outcomes over time.
 pub async fn state_timeseries(
     pool: &PgPool,
     minutes: i32,
@@ -4359,6 +4363,237 @@ pub async fn state_timeseries(
             count,
         })
         .collect())
+}
+
+/// The longest window [`job_outcomes`] reads, in minutes.
+pub const MAX_OUTCOME_MINUTES: u32 = 24 * 60;
+
+/// The bucket widths [`job_outcomes`] accepts, in seconds.
+pub const OUTCOME_BUCKET_SECONDS: [u32; 4] = [60, 300, 900, 3600];
+
+/// The window, bucket width and population of a [`job_outcomes`] read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutcomeQuery {
+    /// How far back the window reaches, in minutes: a whole number of
+    /// buckets, at most [`MAX_OUTCOME_MINUTES`].
+    pub minutes: u32,
+    /// Bucket width in seconds, one of [`OUTCOME_BUCKET_SECONDS`].
+    pub bucket_seconds: u32,
+    /// Only jobs on this queue.
+    pub queue: Option<String>,
+    /// Only jobs of this kind.
+    pub kind: Option<String>,
+}
+
+impl Default for OutcomeQuery {
+    fn default() -> Self {
+        Self {
+            minutes: 60,
+            bucket_seconds: 60,
+            queue: None,
+            kind: None,
+        }
+    }
+}
+
+impl OutcomeQuery {
+    pub fn validate(&self) -> Result<(), AwaError> {
+        if !OUTCOME_BUCKET_SECONDS.contains(&self.bucket_seconds) {
+            return Err(AwaError::Validation(format!(
+                "bucket must be one of {}",
+                OUTCOME_BUCKET_SECONDS
+                    .iter()
+                    .map(|seconds| format!("{seconds}s"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if self.minutes == 0 || self.minutes > MAX_OUTCOME_MINUTES {
+            return Err(AwaError::Validation(format!(
+                "minutes must be between 1 and {MAX_OUTCOME_MINUTES}"
+            )));
+        }
+        if !(self.minutes * 60).is_multiple_of(self.bucket_seconds) {
+            return Err(AwaError::Validation(format!(
+                "minutes must be a whole number of {}s buckets",
+                self.bucket_seconds
+            )));
+        }
+        for (name, value) in [("queue", &self.queue), ("kind", &self.kind)] {
+            if value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(AwaError::Validation(format!("`{name}` needs a value")));
+            }
+        }
+        Ok(())
+    }
+
+    fn bucket_count(&self) -> i64 {
+        i64::from(self.minutes * 60 / self.bucket_seconds)
+    }
+}
+
+/// Jobs that reached each terminal outcome within one bucket, by the time
+/// they reached it. A count is `None` where it is not known: unknown, not
+/// zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutcomeBucket {
+    /// The start of the bucket.
+    pub bucket: DateTime<Utc>,
+    /// Reserved; `None` until terminal coverage can be reported (see
+    /// [`job_outcomes`]).
+    pub completed: Option<i64>,
+    /// Reserved, as `completed`.
+    pub failed: Option<i64>,
+    /// Reserved, as `completed`.
+    pub cancelled: Option<i64>,
+    pub dead_lettered: Option<i64>,
+}
+
+/// Terminal outcomes over time; see [`job_outcomes`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobOutcomes {
+    /// The earliest time the completed, failed and cancelled counts are
+    /// complete from. Reserved: `None` on both engines, which record no time
+    /// at which terminal rows leave, so no retained count can be told
+    /// complete.
+    pub covered_since: Option<DateTime<Utc>>,
+    /// The earliest time the dead-lettered counts are complete from: the
+    /// window start.
+    pub dead_lettered_covered_since: DateTime<Utc>,
+    /// Every bucket of the window, oldest first; the last holds the current
+    /// time. A bucket with no dead letters has a zero count.
+    pub buckets: Vec<OutcomeBucket>,
+}
+
+/// Dead letters per bucket of `$2` seconds from `$1`, optionally for the
+/// queue and kind bound after them.
+fn queue_storage_dead_letter_sql(schema: &str, query: &OutcomeQuery) -> String {
+    let bucket = "date_bin($2::bigint * interval '1 second', dlq.dlq_at, \
+                  TIMESTAMPTZ '1970-01-01 00:00:00+00')";
+    let kind = match (&query.queue, &query.kind) {
+        (_, None) => "",
+        (Some(_), Some(_)) => " AND dlq.kind = $4",
+        (None, Some(_)) => " AND dlq.kind = $3",
+    };
+    if query.queue.is_some() {
+        format!(
+            r#"
+            SELECT {bucket} AS bucket, count(*)::bigint
+            FROM {schema}.dlq_entries AS dlq
+            WHERE dlq.queue = $3 AND dlq.dlq_at >= $1{kind}
+            GROUP BY 1
+            "#
+        )
+    } else {
+        // Dead letters are kept for weeks: read each queue's window along its
+        // `(queue, dlq_at)` index, one probe per queue, rather than scanning
+        // them all.
+        let table = format!("{schema}.dlq_entries");
+        format!(
+            r#"
+            WITH RECURSIVE queues AS (
+                (SELECT queue FROM {table} ORDER BY queue LIMIT 1)
+                UNION ALL
+                SELECT (
+                    SELECT next.queue FROM {table} AS next
+                    WHERE next.queue > queues.queue
+                    ORDER BY next.queue
+                    LIMIT 1
+                )
+                FROM queues
+                WHERE queues.queue IS NOT NULL
+            )
+            SELECT {bucket} AS bucket, count(*)::bigint
+            FROM queues
+            CROSS JOIN LATERAL (
+                SELECT dlq.dlq_at
+                FROM {table} AS dlq
+                WHERE dlq.queue = queues.queue AND dlq.dlq_at >= $1{kind}
+            ) AS dlq
+            WHERE queues.queue IS NOT NULL
+            GROUP BY 1
+            "#
+        )
+    }
+}
+
+/// Jobs dead-lettered per bucket over the last `query.minutes`, by `dlq_at`,
+/// with the completed, failed and cancelled series reserved.
+///
+/// Terminal counts are not reported on either engine: every count is
+/// `None` and [`JobOutcomes::covered_since`] is `None`. Queue-ring prune
+/// truncates a generation's terminal rows whenever their jobs finished, and
+/// canonical cleanup removes them past `completed_retention` and
+/// `failed_retention` (worker settings with per-queue overrides); neither
+/// records when rows leave, so no retained count can be told complete, and a
+/// missing completion would read as a higher failure rate. The fields stay
+/// in the response for when prune or a rollup records that time.
+///
+/// Dead letters are counted on queue storage from `dlq_entries`, which ring
+/// prune does not touch. DLQ cleanup removes them past a retention (30 days
+/// by default, configurable per queue) that the database does not record;
+/// it is taken to be longer than the window, at most 24 hours, so
+/// [`JobOutcomes::dead_lettered_covered_since`] is the window start. A
+/// shorter retention undercounts. No dead letter exists on the canonical
+/// engine, so the series is zero there and nothing is read.
+pub async fn job_outcomes(pool: &PgPool, query: &OutcomeQuery) -> Result<JobOutcomes, AwaError> {
+    query.validate()?;
+    let width = i64::from(query.bucket_seconds);
+    let count = query.bucket_count();
+    // The window ends with the bucket holding the database's current time.
+    let last: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT date_bin($1::bigint * interval '1 second', clock_timestamp(), \
+         TIMESTAMPTZ '1970-01-01 00:00:00+00')",
+    )
+    .bind(width)
+    .fetch_one(pool)
+    .await?;
+    let since = last - Duration::seconds(width * (count - 1));
+
+    let rows: Vec<(DateTime<Utc>, i64)> = match active_queue_storage(pool).await? {
+        Some(store) => {
+            let mut statement = sqlx::query_as::<_, (DateTime<Utc>, i64)>(audited_sql(
+                queue_storage_dead_letter_sql(store.schema(), query),
+            ))
+            .bind(since)
+            .bind(width);
+            if let Some(queue) = &query.queue {
+                statement = statement.bind(queue);
+            }
+            if let Some(kind) = &query.kind {
+                statement = statement.bind(kind);
+            }
+            statement.fetch_all(pool).await?
+        }
+        None => Vec::new(),
+    };
+
+    let mut buckets: Vec<OutcomeBucket> = (0..count)
+        .map(|n| OutcomeBucket {
+            bucket: since + Duration::seconds(width * n),
+            completed: None,
+            failed: None,
+            cancelled: None,
+            dead_lettered: Some(0),
+        })
+        .collect();
+    for (bucket, n) in rows {
+        let offset = (bucket - since).num_seconds();
+        if offset < 0 || offset % width != 0 || offset / width >= count {
+            continue;
+        }
+        if let Some(total) = &mut buckets[(offset / width) as usize].dead_lettered {
+            *total += n;
+        }
+    }
+    Ok(JobOutcomes {
+        covered_since: None,
+        dead_lettered_covered_since: since,
+        buckets,
+    })
 }
 
 /// Register a callback for a running job, writing the callback_id and timeout

@@ -54,7 +54,19 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 
 ```
 GET  /api/stats                         Job counts by state
-GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
+GET  /api/stats/outcomes?minutes=60&bucket=60s
+                                        Optional `queue=<name>` and `kind=<kind>` narrow it.
+                                        { covered_since, dead_lettered_covered_since, buckets: [{ bucket,
+                                        completed, failed, cancelled, dead_lettered }] }: dead letters
+                                        per bucket by `dlq_at`. `minutes` is 1 to 1440 and a whole
+                                        number of buckets; `bucket` is 60s, 300s, 900s or 3600s.
+                                        Buckets are aligned to the Unix epoch and cover the window,
+                                        oldest first, the last holding the current time; empty ones
+                                        are zeros. `covered_since`, `completed`, `failed` and
+                                        `cancelled` are reserved and null (see below). Unknown or
+                                        empty parameters are a 400.
+GET  /api/stats/timeseries?minutes=60   Deprecated: jobs by creation minute and current state.
+                                        Unused by the UI; use /api/stats/outcomes.
 
 GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&limit=&before_id=
                                         The shared job filter (ADR-049): `state` and `tag` repeat
@@ -111,6 +123,8 @@ POST /api/callbacks/:callback_id/heartbeat
 GET  /api/capabilities                  Feature flags / read-only detection
 ```
 
+`GET /api/stats/outcomes` reports no terminal outcomes on either engine: `covered_since` is null and every `completed`, `failed` and `cancelled` count is null, and no terminal row is read. Queue-ring prune truncates a generation's terminal rows whenever their jobs finished, and canonical cleanup removes them past `completed_retention` and `failed_retention` (worker settings with per-queue overrides). Neither records when rows leave, so no retained count can be told complete, and a missing completion would read as a higher failure rate. The fields are reserved for when prune or a rollup records that time. Dead letters are counted from `dlq_entries` on queue storage, which ring prune does not touch, from the window start (`dead_lettered_covered_since`). That assumes the DLQ retention, which the database does not record (30 days by default, configurable per queue), is longer than the window, at most 24 hours; a shorter retention undercounts. The canonical engine has no dead letters, so the series is zero there. The response is cached server-side for the dashboard cache TTL, per parameter set. A server without the endpoint answers 404.
+
 ## Pages
 
 The sidebar groups the pages: Overview; Investigate (Jobs, Dead letters); Configure (Queues, Job kinds, Schedules); Operate (Fleet, Bulk operations). Dead letters, Fleet and Bulk operations carry a count badge for dead letters, unhealthy live instances and active operations. Page names changed in 0.7; the paths did not, so Fleet is still `/runtime`, Schedules `/cron` and Bulk operations `/batch-ops`.
@@ -119,12 +133,12 @@ The sidebar groups the pages: Overview; Investigate (Jobs, Dead letters); Config
 
 A health strip and a ranked list of what needs attention, built from reads the other pages already make.
 
-- **Health strip**: ready jobs in unpaused queues with the oldest one's wait (jobs held in paused queues are counted apart), retrying jobs and the queue with the most, failed jobs with the completions of the last hour, dead letters and the queue with the most, stuck running jobs (past their deadline or without a heartbeat for 90 seconds, among the 100 newest running jobs), and bulk operations in flight with the latest failure. Each figure links to the jobs behind it. A figure whose read failed shows "—" and the error, never 0.
+- **Health strip**: ready jobs in unpaused queues with the oldest one's wait (jobs held in paused queues are counted apart), retrying jobs and the queue with the most, failed jobs with the completions of the last hour (the share of finished jobs that failed in the last hour and the hour before replaces it once the server reports terminal coverage), dead letters with how many were added in the last hour and the queue with the most, stuck running jobs (past their deadline or without a heartbeat for 90 seconds, among the 100 newest running jobs), and bulk operations in flight with the latest failure. Each figure links to the jobs behind it. A figure whose read failed shows "—" and the error, never 0.
 - **Fleet and deferred work** each get one line: how many live instances are healthy, which one leads and how many are stale; and how many jobs are scheduled or waiting for a callback, with the next schedule fire. Work that isn't due yet is not counted as backlog.
-- **Needs attention** ranks problems, each linking to a scoped view: unhealthy instances, no live workers, stuck running jobs, failure groups (kind and error class across the 50 newest failed jobs, dead letters left out), recently failed bulk operations, paused queues holding ready jobs, more or fewer than one maintenance leader, queues whose oldest ready job has waited a minute, dead letters per queue, queue config drift between workers, overdue and paused schedules, descriptor drift, mixed worker versions and running bulk operations. Red marks what needs an operator now, amber what needs one soon, grey what's worth knowing. With nothing to report it says "Nothing needs attention" and when it last checked; checks whose reads failed are named.
+- **Needs attention** ranks problems, each linking to a scoped view: unhealthy instances, no live workers, stuck running jobs, failure groups (kind and error class across the 50 newest failed jobs, dead letters left out), recently failed bulk operations, a failure rate that rose sharply over the hour before (at least 20 failed jobs, 5% of finished jobs and twice the previous hour's rate; only once the server reports terminal coverage), paused queues holding ready jobs, more or fewer than one maintenance leader, queues whose oldest ready job has waited a minute, dead letters per queue, queue config drift between workers, overdue and paused schedules, descriptor drift, mixed worker versions and running bulk operations. Red marks what needs an operator now, amber what needs one soon, grey what's worth knowing. With nothing to report it says "Nothing needs attention" and when it last checked; checks whose reads failed are named.
 - **Queues needing attention** lists up to five queues with failures, dead letters, retries or held work, with a link to every queue.
 
-Failure rate against a baseline and a dead-letter trend need outcome counts bucketed by finish time, which the API doesn't provide yet.
+The dead letters added come from `GET /api/stats/outcomes` over the last two hours in one-minute buckets; the hours end with the current minute. The failure rate would come from the same read, but uses an hour only when `covered_since` reaches back to its start, and no server reports terminal coverage yet, so the Failed tile shows the completions of the last hour and the failure-rate item never fires. Dead letters stay out of the failure rate. A server without the endpoint answers 404: the strip stays as it was and the endpoint is not read again. The read is one of the Overview's 11 observation keys, against the limit of 16.
 
 ### Jobs (`/jobs`)
 

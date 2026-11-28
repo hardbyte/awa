@@ -90,6 +90,7 @@ impl AppState {
         self.cache.runtime.invalidate_all();
         self.cache.queue_runtime.invalidate_all();
         self.cache.storage.invalidate_all();
+        self.cache.outcomes.invalidate_all();
     }
 }
 

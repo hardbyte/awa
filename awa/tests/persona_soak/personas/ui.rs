@@ -238,7 +238,10 @@ pub async fn run_watchers(shared: Arc<Shared>) -> Result<(), String> {
                 // The overview page and the shell, in parallel as the browser does.
                 tokio::join!(
                     http.get("/api/stats", "/api/stats"),
-                    http.get("/api/stats/timeseries", "/api/stats/timeseries?minutes=60"),
+                    http.get(
+                        "/api/stats/outcomes",
+                        "/api/stats/outcomes?minutes=120&bucket=60s"
+                    ),
                     http.get("/api/queues", "/api/queues"),
                     http.get("/api/jobs", "/api/jobs?state=failed&limit=10"),
                     http.get("/api/runtime", "/api/runtime"),
@@ -683,7 +686,7 @@ pub async fn run_impatient(shared: Arc<Shared>) -> Result<(), String> {
         "/api/kinds",
         "/api/queues",
         "/api/stats",
-        "/api/stats/timeseries?minutes=1440",
+        "/api/stats/outcomes?minutes=1440&bucket=60s",
         "/api/jobs?limit=100",
         "/api/jobs?state=completed&limit=100",
         "/api/dlq?limit=100",

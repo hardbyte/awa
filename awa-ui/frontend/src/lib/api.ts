@@ -202,10 +202,42 @@ export interface CronJobRow {
 
 export type StateCounts = Record<string, number>;
 
+/** @deprecated The shape of the deprecated `GET /api/stats/timeseries`. */
 export interface TimeseriesBucket {
   bucket: string;
   state: string;
   count: number;
+}
+
+/** Jobs that reached each terminal outcome within one bucket; null where
+ * the bucket starts before that series' coverage (unknown, not zero). */
+export interface OutcomeBucket {
+  /** The bucket's start. */
+  bucket: string;
+  completed: number | null;
+  failed: number | null;
+  cancelled: number | null;
+  dead_lettered: number | null;
+}
+
+/** `GET /api/stats/outcomes`. */
+export interface JobOutcomes {
+  /** The earliest time the completed, failed and cancelled counts are
+   * complete from; null when they are complete for no time, as both engines
+   * report until prune or a rollup records when terminal rows leave. */
+  covered_since: string | null;
+  /** The earliest time the dead-lettered counts are complete from. */
+  dead_lettered_covered_since: string;
+  /** Oldest first, from the earlier coverage time; the last holds the current time. */
+  buckets: OutcomeBucket[];
+}
+
+export interface OutcomeParams {
+  minutes: number;
+  /** Bucket width in seconds: 60, 300, 900 or 3600. */
+  bucketSeconds: number;
+  queue?: string;
+  kind?: string;
 }
 
 /** A named link to a peer Awa UI serving a different database. */
@@ -690,6 +722,20 @@ export function fetchCapabilities(): Promise<Capabilities> {
   return pending;
 }
 
+/** Terminal outcomes over time; null from a server without the endpoint. */
+export async function fetchOutcomes(params: OutcomeParams): Promise<JobOutcomes | null> {
+  const search = new URLSearchParams({ minutes: String(params.minutes), bucket: `${params.bucketSeconds}s` });
+  if (params.queue) search.set("queue", params.queue);
+  if (params.kind) search.set("kind", params.kind);
+  const res = await fetch(apiPath(`/stats/outcomes?${search}`), {
+    headers: { "Content-Type": "application/json" }, credentials: "same-origin", cache: "no-store",
+    redirect: "error", signal: currentReadSignal(),
+  });
+  if (res.status === 404) return null;
+  return checkedJson<JobOutcomes>(res);
+}
+
+/** @deprecated `GET /api/stats/timeseries` is deprecated; use {@link fetchOutcomes}. */
 export function fetchTimeseries(
   minutes?: number
 ): Promise<TimeseriesBucket[]> {

@@ -1,4 +1,4 @@
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -19,6 +19,9 @@ pub struct TimeseriesParams {
     pub minutes: Option<i32>,
 }
 
+/// `GET /api/stats/timeseries`: deprecated. Jobs by creation minute and
+/// current state; the admin UI no longer reads it. Use
+/// `GET /api/stats/outcomes` for outcomes over time.
 pub async fn get_timeseries(
     State(state): State<AppState>,
     Query(params): Query<TimeseriesParams>,
@@ -26,6 +29,22 @@ pub async fn get_timeseries(
     let minutes = params.minutes.unwrap_or(60);
     let buckets = admin::state_timeseries(&state.pool, minutes).await?;
     Ok(Json(buckets))
+}
+
+/// `GET /api/stats/outcomes`: terminal outcomes per bucket; see
+/// [`admin::job_outcomes`].
+pub async fn get_outcomes(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
+    let query = super::filter_params::parse_outcomes(raw.as_deref())?;
+    let pool = state.pool.clone();
+    let outcomes = state
+        .cache
+        .outcomes
+        .get_keyed(query.clone(), || admin::job_outcomes(&pool, &query))
+        .await?;
+    Ok(outcomes.into_response())
 }
 
 pub async fn get_distinct_kinds(

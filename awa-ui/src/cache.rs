@@ -28,17 +28,26 @@ pub struct DashboardCache {
     pub runtime: FencedCache<admin::RuntimeOverview>,
     pub queue_runtime: FencedCache<Vec<admin::QueueRuntimeSummary>>,
     pub storage: FencedCache<awa_model::storage::StorageStatusReport>,
+    pub outcomes: FencedCache<admin::JobOutcomes, admin::OutcomeQuery>,
 }
 
-/// A fill is keyed by the generation it observed before starting. Old fills
-/// can finish, but can neither satisfy a new-generation request nor be returned
-/// as current. Moka targets two retained generation entries; a shared fill
-/// budget independently bounds obsolete work.
+/// A fill is keyed by the generation it observed before starting, and by the
+/// request's parameters `K` for an endpoint that takes any. Old fills can
+/// finish, but can neither satisfy a new-generation request nor be returned
+/// as current. Moka bounds the retained entries; a shared fill budget
+/// independently bounds obsolete work.
 #[derive(Clone)]
-pub struct FencedCache<V: Clone + Send + Sync + 'static> {
-    values: Cache<u64, Observed<V>>,
+pub struct FencedCache<V: Clone + Send + Sync + 'static, K = ()>
+where
+    K: CacheKey,
+{
+    values: Cache<(u64, K), Observed<V>>,
     generation: Arc<AtomicU64>,
 }
+
+/// Request parameters a [`FencedCache`] keys its values by.
+pub trait CacheKey: Clone + Eq + std::hash::Hash + Send + Sync + 'static {}
+impl<K: Clone + Eq + std::hash::Hash + Send + Sync + 'static> CacheKey for K {}
 
 #[derive(Clone)]
 pub struct Observed<V> {
@@ -96,8 +105,25 @@ impl FillBudget {
 
 impl<V: Clone + Send + Sync + 'static> FencedCache<V> {
     fn new(ttl: Duration) -> Self {
+        Self::with_capacity(ttl, 2)
+    }
+
+    pub async fn get<F, Fut>(&self, fetch: F) -> Result<Observed<V>, Arc<CacheError>>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: Future<Output = Result<V, AwaError>> + Send,
+    {
+        self.get_keyed((), fetch).await
+    }
+}
+
+impl<V: Clone + Send + Sync + 'static, K: CacheKey> FencedCache<V, K> {
+    fn with_capacity(ttl: Duration, capacity: u64) -> Self {
         Self {
-            values: Cache::builder().time_to_live(ttl).max_capacity(2).build(),
+            values: Cache::builder()
+                .time_to_live(ttl)
+                .max_capacity(capacity)
+                .build(),
             generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -118,7 +144,7 @@ impl<V: Clone + Send + Sync + 'static> FencedCache<V> {
         }
         self.values.invalidate_all();
     }
-    pub async fn get<F, Fut>(&self, fetch: F) -> Result<Observed<V>, Arc<CacheError>>
+    pub async fn get_keyed<F, Fut>(&self, key: K, fetch: F) -> Result<Observed<V>, Arc<CacheError>>
     where
         F: Fn() -> Fut + Send + Sync,
         Fut: Future<Output = Result<V, AwaError>> + Send,
@@ -131,7 +157,7 @@ impl<V: Clone + Send + Sync + 'static> FencedCache<V> {
             }
             let observed = self
                 .values
-                .try_get_with(generation, async {
+                .try_get_with((generation, key.clone()), async {
                     let _permit = FillBudget::shared().admit(admission_deadline).await?;
                     if self.generation.load(Ordering::SeqCst) != generation {
                         return Err(CacheError::Changed);
@@ -173,6 +199,8 @@ impl DashboardCache {
             runtime: build_cache(ttl),
             queue_runtime: build_cache(ttl),
             storage: build_cache(ttl),
+            // Room for two generations of a handful of parameter sets.
+            outcomes: FencedCache::with_capacity(ttl, 16),
         }
     }
 }

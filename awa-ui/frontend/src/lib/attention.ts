@@ -6,6 +6,7 @@ import type {
   BatchOperation,
   CronJobRow,
   DlqDepthResponse,
+  JobOutcomes,
   JobRow,
   QueueOverview,
   QueueRuntimeSummary,
@@ -18,13 +19,14 @@ import { ACTIVE_BATCH_STATES } from "@/lib/shared-queries";
 import {
   ATTENTION_FAILURE_GROUPS,
   BATCH_FAILURE_WINDOW_MS,
+  FAILURE_RATE_ATTENTION,
   LAG_ATTENTION_SECONDS,
   OVERVIEW_FAILED_SAMPLE,
   OVERVIEW_RUNNING_SAMPLE,
   STUCK_HEARTBEAT_MS,
 } from "@/lib/constants";
 import { formatDuration } from "@/lib/time";
-import { formatNumber, plural } from "@/lib/number";
+import { formatNumber, formatPercent, plural } from "@/lib/number";
 
 /** "action" needs an operator now, "warning" soon; a "notice" is worth knowing. */
 export type AttentionSeverity = "action" | "warning" | "notice";
@@ -64,6 +66,72 @@ export interface AttentionInput {
    * API lists newest first only, so older running jobs go unchecked when
    * there are more. */
   runningJobs?: JobRow[];
+  /** Outcomes over the last two hours in `outcomeBucketSeconds` buckets;
+   * null from a server without the endpoint. */
+  outcomes?: JobOutcomes | null;
+  outcomeBucketSeconds?: number;
+}
+
+/** One hour's finished (completed or failed) jobs and the failed share. */
+export interface HourOutcomes {
+  finished: number;
+  failed: number;
+  /** failed / finished; null when no job finished. */
+  rate: number | null;
+}
+
+export interface OutcomeTrends {
+  /** The last hour and the one before; null unless the counts cover both. */
+  failureRate: { current: HourOutcomes; previous: HourOutcomes } | null;
+  /** Jobs dead-lettered in the last hour; null unless the counts cover it. */
+  deadLetteredLastHour: number | null;
+}
+
+const HOUR_MS = 3600_000;
+
+/**
+ * Hourly figures from outcome buckets. The hours end with the newest bucket.
+ * Each series counts for an hour only when its own coverage reaches back to
+ * the hour's start: the server reports a bucket it cannot count completely
+ * as null, which is not a zero. Dead letters stay out of the failure rate.
+ */
+export function outcomeTrends(outcomes: JobOutcomes | null | undefined, bucketSeconds: number): OutcomeTrends {
+  const none = { failureRate: null, deadLetteredLastHour: null };
+  const newest = outcomes?.buckets[outcomes.buckets.length - 1];
+  if (!outcomes || !newest) return none;
+  const end = Date.parse(newest.bucket) + bucketSeconds * 1000;
+  const sum = (start: number, series: (bucket: JobOutcomes["buckets"][number]) => number | null) =>
+    outcomes.buckets
+      .filter((bucket) => {
+        const at = Date.parse(bucket.bucket);
+        return at >= start && at < start + HOUR_MS;
+      })
+      .reduce((total, bucket) => total + (series(bucket) ?? 0), 0);
+  const hour = (start: number): HourOutcomes => {
+    const failed = sum(start, (b) => b.failed);
+    const finished = failed + sum(start, (b) => b.completed);
+    return { finished, failed, rate: finished > 0 ? failed / finished : null };
+  };
+  const terminalSince = outcomes.covered_since === null ? Infinity : Date.parse(outcomes.covered_since);
+  const deadLetteredSince = Date.parse(outcomes.dead_lettered_covered_since);
+  const lastHour = end - HOUR_MS;
+  const previousHour = end - 2 * HOUR_MS;
+  return {
+    failureRate:
+      terminalSince <= previousHour ? { current: hour(lastHour), previous: hour(previousHour) } : null,
+    deadLetteredLastHour: deadLetteredSince <= lastHour ? sum(lastHour, (b) => b.dead_lettered) : null,
+  };
+}
+
+/** Whether the last hour's failure rate rose sharply over the previous hour's. */
+export function failureRateRising(trend: OutcomeTrends["failureRate"]): boolean {
+  if (!trend || trend.current.rate === null || trend.previous.rate === null) return false;
+  const { minFailed, minRate, factor } = FAILURE_RATE_ATTENTION;
+  return (
+    trend.current.failed >= minFailed &&
+    trend.current.rate >= minRate &&
+    trend.current.rate >= factor * trend.previous.rate
+  );
 }
 
 const SEVERITY_ORDER: Record<AttentionSeverity, number> = { action: 0, warning: 1, notice: 2 };
@@ -97,6 +165,7 @@ export function liveVersions(runtime: RuntimeOverview): string[] {
 /** Ranked problems, most urgent first. Inputs that failed to load are skipped. */
 export function attentionItems(input: AttentionInput): AttentionItem[] {
   const { now, queues, queueRuntime, runtime, dlqDepth, batchOps, cron, failedJobs, runningJobs } = input;
+  const trends = outcomeTrends(input.outcomes, input.outcomeBucketSeconds ?? 60);
   const items: (AttentionItem & { order: number; weight: number })[] = [];
   const push = (order: number, weight: number, item: AttentionItem) => items.push({ ...item, order, weight });
 
@@ -179,6 +248,17 @@ export function attentionItems(input: AttentionInput): AttentionItem[] {
         target: { to: "/jobs", search: { state: "failed", q: `kind:${group.kind}` } },
       });
     }
+  }
+
+  if (failureRateRising(trends.failureRate)) {
+    const { current, previous } = trends.failureRate!;
+    push(3, current.failed, {
+      id: "jobs:failure-rate",
+      severity: "warning",
+      title: `Failure rate rose to ${formatPercent(current.rate!)} in the last hour`,
+      detail: `${formatNumber(current.failed)} of ${plural(current.finished, "finished job")} failed, against ${formatPercent(previous.rate!)} the hour before`,
+      target: { to: "/jobs", search: { state: "failed" } },
+    });
   }
 
   if (batchOps) {
@@ -309,6 +389,11 @@ export interface HealthFigures {
   topRetrying: { queue: string; count: number } | null;
   /** Jobs completed in the last hour across queues. */
   completedLastHour: number | null;
+  /** Failed share of finished jobs, last hour and the one before; null
+   * unless the outcome counts cover both hours. */
+  failureRate: OutcomeTrends["failureRate"];
+  /** Jobs dead-lettered in the last hour; null unless covered. */
+  deadLetteredLastHour: number | null;
   /** The queue with the most dead letters. */
   topDeadLetters: { queue: string; count: number } | null;
   /** Stuck jobs among the running sample, and the sample's size. */
@@ -321,6 +406,7 @@ export interface HealthFigures {
 
 export function healthFigures(input: AttentionInput): HealthFigures {
   const { now, queues, dlqDepth, batchOps, runningJobs } = input;
+  const trends = outcomeTrends(input.outcomes, input.outcomeBucketSeconds ?? 60);
   let oldestReady: HealthFigures["oldestReady"] = null;
   let topRetrying: HealthFigures["topRetrying"] = null;
   for (const q of queues ?? []) {
@@ -344,6 +430,8 @@ export function healthFigures(input: AttentionInput): HealthFigures {
       : null,
     topRetrying,
     completedLastHour: queues ? queues.reduce((sum, q) => sum + q.completed_last_hour, 0) : null,
+    failureRate: trends.failureRate,
+    deadLetteredLastHour: trends.deadLetteredLastHour,
     topDeadLetters: topDlq && topDlq.count > 0 ? topDlq : null,
     stuck: runningJobs ? { count: runningJobs.filter((job) => isStuck(job, now)).length, sampled: runningJobs.length } : null,
     activeBatchOps: batchOps ? batchOps.filter((op) => ACTIVE_BATCH_STATES.has(op.state)).length : null,

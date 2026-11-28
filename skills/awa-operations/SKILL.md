@@ -534,6 +534,16 @@ stops repeated dashboard polls from piling up slow queries. When embedding
 The release hook recovers connections whose request was dropped mid-query;
 without it, a cancelled query can leak the pool slot over TLS.
 
+`GET /api/stats/outcomes?minutes=&bucket=[&queue=][&kind=]` counts jobs
+dead-lettered per bucket by `dlq_at`, from the window start
+(`dead_lettered_covered_since`); that assumes DLQ retention (30 days by
+default, configurable per queue, not recorded in the database) is longer than
+the window, at most 24 hours. Its completed, failed and cancelled series and
+`covered_since` are reserved and null on both engines: queue-ring prune and
+canonical cleanup record no time at which terminal rows leave, so no retained
+count can be told complete. `GET /api/stats/timeseries` is deprecated; the UI
+no longer reads it.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.
