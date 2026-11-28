@@ -525,6 +525,116 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
             .unwrap_or(0.0)
             > 0.0
     );
+    assert_eq!(queue_stats["paused_by"], Value::from("test"));
+    assert!(queue_stats["paused_at"].is_string(), "{queue_stats}");
+
+    awa_model::admin::resume_queue(&pool, queue)
+        .await
+        .expect("resume should succeed");
+    let payload = get_json(&app, &format!("/api/queues/{queue}")).await;
+    assert_eq!(payload["paused"], Value::from(false));
+    assert!(payload["paused_at"].is_null(), "{payload}");
+    assert!(payload["paused_by"].is_null(), "{payload}");
+}
+
+#[tokio::test]
+async fn test_kinds_endpoint_breaks_out_states_and_lists_queues() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let kind = "api_kind_state_counts";
+    let queues = ["api_kind_counts_b", "api_kind_counts_a"];
+    clean_jobs(&pool, &queues, &[kind]).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at, finalized_at)
+        VALUES
+            ($1, $2, '{}'::jsonb, 'available', now(), NULL),
+            ($1, $2, '{}'::jsonb, 'available', now(), NULL),
+            ($1, $2, '{}'::jsonb, 'retryable', now() + interval '10 minutes', NULL),
+            ($1, $3, '{}'::jsonb, 'running', now(), NULL),
+            ($1, $3, '{}'::jsonb, 'waiting_external', now(), NULL),
+            ($1, $3, '{}'::jsonb, 'failed', now(), now()),
+            ($1, $3, '{}'::jsonb, 'completed', now(), now())
+        "#,
+    )
+    .bind(kind)
+    .bind(queues[0])
+    .bind(queues[1])
+    .execute(&pool)
+    .await
+    .expect("fixture insert should succeed");
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
+        .await
+        .unwrap();
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+    let payload = get_json(&app, "/api/kinds").await;
+    let overview = payload
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry["kind"] == kind)
+        .expect("seeded kind should be present")
+        .clone();
+    clean_jobs(&pool, &queues, &[kind]).await;
+
+    assert_eq!(overview["available"], Value::from(2));
+    assert_eq!(overview["retryable"], Value::from(1));
+    assert_eq!(
+        overview["running"],
+        Value::from(1),
+        "waiting jobs are apart"
+    );
+    assert_eq!(overview["failed"], Value::from(1));
+    assert_eq!(overview["dead_lettered"], Value::from(0));
+    assert_eq!(overview["queue_count"], Value::from(2));
+    assert_eq!(
+        overview["queues"],
+        serde_json::json!(["api_kind_counts_a", "api_kind_counts_b"])
+    );
+}
+
+#[tokio::test]
+async fn test_queue_and_kind_overviews_on_queue_storage() {
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
+    let kind = "qs_overview_kind";
+    insert_job(&pool, kind, "qs_overview_b", 2).await;
+    insert_job(&pool, kind, "qs_overview_a", 2).await;
+    insert_job(&pool, kind, "qs_overview_a", 2).await;
+    awa_model::admin::pause_queue(&pool, "qs_overview_a", Some("ops"))
+        .await
+        .expect("pause should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+    let queue = get_json(&app, "/api/queues/qs_overview_a").await;
+    assert_eq!(queue["paused"], Value::from(true));
+    assert_eq!(queue["paused_by"], Value::from("ops"));
+    assert!(queue["paused_at"].is_string(), "{queue}");
+    let other = get_json(&app, "/api/queues/qs_overview_b").await;
+    assert!(other["paused_at"].is_null() && other["paused_by"].is_null());
+
+    let kinds = get_json(&app, "/api/kinds").await;
+    let overview = kinds
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry["kind"] == kind)
+        .expect("inserted kind should be present");
+    assert_eq!(overview["available"], Value::from(3));
+    assert_eq!(overview["retryable"], Value::from(0));
+    assert_eq!(overview["running"], Value::from(0));
+    assert_eq!(overview["failed"], Value::from(0));
+    assert_eq!(overview["dead_lettered"], Value::from(0));
+    assert_eq!(
+        overview["queues"],
+        serde_json::json!(["qs_overview_a", "qs_overview_b"])
+    );
 }
 
 #[tokio::test]

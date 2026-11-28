@@ -77,14 +77,20 @@ GET  /api/batch-ops?state=&limit=&before_submitted_at=&before_id=
 GET  /api/batch-ops/:id                 404 for an unknown id or one that isn't a UUID
 PATCH /api/batch-ops/:id                { state: "cancelling" }
 
-GET  /api/queues
+GET  /api/queues                         Per-queue counts; `failed` includes dead letters. `paused_at` and
+                                        `paused_by` say when and by whom a paused queue was paused (null
+                                        while it isn't paused; `paused_by` also null when the pause named no one)
 GET  /api/queues/:name
 GET  /api/queues/runtime
 POST /api/queues/:name/pause
 POST /api/queues/:name/resume
 POST /api/queues/:name/drain
 
-GET  /api/kinds                         Job kinds with descriptor metadata
+GET  /api/kinds                         Job kinds with descriptor metadata, `job_count`, `queue_count` and
+                                        `queues` (the queues counted, sorted), and per-state counts:
+                                        `available`, `retryable`, `running` (callback waits left out),
+                                        `failed` (dead letters left out) and `dead_lettered` (0 without
+                                        queue storage)
 
 GET  /api/runtime                       Worker instances and health
 GET  /api/storage                       Storage transition status

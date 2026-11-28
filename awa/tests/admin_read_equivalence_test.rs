@@ -356,11 +356,21 @@ async fn reference_job_kind_overviews(
             ) >= now()
             GROUP BY descriptor.key
         ),
+        dead_letters AS (
+            SELECT kind, count(*)::bigint AS dead_lettered
+            FROM {schema}.dlq_entries
+            GROUP BY kind
+        ),
         kind_counts AS (
             SELECT
                 kind,
                 count(*)::bigint AS job_count,
-                count(DISTINCT queue)::bigint AS queue_count
+                count(DISTINCT queue)::bigint AS queue_count,
+                array_agg(DISTINCT queue ORDER BY queue) AS queues,
+                count(*) FILTER (WHERE state = 'available')::bigint AS available,
+                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
+                count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                count(*) FILTER (WHERE state = 'failed')::bigint AS failed_with_dead_letters
             FROM current_jobs
             GROUP BY kind
         ),
@@ -392,9 +402,16 @@ async fn reference_job_kind_overviews(
             COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
             COALESCE(kc.job_count, 0) AS job_count,
             COALESCE(kc.queue_count, 0) AS queue_count,
-            COALESCE(cr.completed_last_hour, 0) AS completed_last_hour
+            COALESCE(kc.queues, ARRAY[]::text[]) AS queues,
+            COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
+            COALESCE(kc.available, 0) AS available,
+            COALESCE(kc.retryable, 0) AS retryable,
+            COALESCE(kc.running, 0) AS running,
+            COALESCE(kc.failed_with_dead_letters, 0) - COALESCE(dl.dead_lettered, 0) AS failed,
+            COALESCE(dl.dead_lettered, 0) AS dead_lettered
         FROM all_kinds k
         LEFT JOIN kind_counts kc ON kc.kind = k.kind
+        LEFT JOIN dead_letters dl ON dl.kind = k.kind
         LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
         LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
         LEFT JOIN completed_recent cr ON cr.kind = k.kind
@@ -464,6 +481,24 @@ async fn job_kind_overviews_match_the_current_jobs_definition() -> TestResult {
         assert_eq!(by_kind["idle_kind"].job_count, 0);
         assert_eq!(by_kind["runtime_only"].job_count, 0);
         assert!(by_kind["alpha"].descriptor_mismatch);
+        for overview in &actual {
+            assert_eq!(
+                overview.queues.len() as i64,
+                overview.queue_count,
+                "{} lists the queues it counts",
+                overview.kind
+            );
+        }
+        let total = |field: fn(&JobKindOverview) -> i64| actual.iter().map(field).sum::<i64>();
+        for (name, sum) in [
+            ("available", total(|o| o.available)),
+            ("retryable", total(|o| o.retryable)),
+            ("running", total(|o| o.running)),
+            ("failed", total(|o| o.failed)),
+            ("dead_lettered", total(|o| o.dead_lettered)),
+        ] {
+            assert!(sum > 0, "the fixture exercises per-kind {name}");
+        }
         Ok::<_, Box<dyn std::error::Error>>(())
     }
     .await;
