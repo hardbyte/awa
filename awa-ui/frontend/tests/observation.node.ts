@@ -349,6 +349,24 @@ test("freshness separates failed first loads, stale retained data and not-found"
   scheduler.setVisible(false); await settle();
 });
 
+test("freshness counts a refused view apart from failed ones until it is refreshed", async () => {
+  let refuse = true;
+  const scheduler = new RefreshScheduler({}, () => 0, () => 1); scheduler.setReady(true);
+  scheduler.attach(demand("jobs", async () => { if (refuse) throw new HttpError("unknown parameter", 400); }));
+  scheduler.tick(); await settle();
+  assert.deepEqual(
+    { views: scheduler.freshness().views, failed: scheduler.freshness().failed, blocked: scheduler.freshness().blocked },
+    { views: 0, failed: 0, blocked: 1 },
+  );
+  scheduler.attach(demand("queues", async () => {}));
+  scheduler.tick(); await settle();
+  assert.equal(scheduler.freshness().views, 1); assert.equal(scheduler.freshness().failed, 0);
+  assert.equal(scheduler.freshness().blocked, 1);
+  refuse = false; scheduler.mark("jobs", true); scheduler.tick(); await settle();
+  assert.equal(scheduler.freshness().views, 2); assert.equal(scheduler.freshness().blocked, 0);
+  scheduler.setVisible(false); await settle();
+});
+
 test("freshness ages from the least recently loaded view and ignores paused and manual-only ones", async () => {
   let now = 0;
   const scheduler = new RefreshScheduler({}, () => now, () => 1); scheduler.setReady(true);

@@ -1,7 +1,8 @@
 import type { Freshness } from "@/lib/observation/scheduler";
 import { formatDuration } from "@/lib/time";
 
-/** live: current; stale: some reads failing; down: nothing refreshes; paused: a view stopped itself. */
+/** live: current; stale: some reads failing; down: nothing refreshes; paused: a view stopped itself or
+ * waits for a refresh after the server refused its request. */
 export type FreshnessTone = "live" | "stale" | "down" | "paused";
 
 export interface FreshnessStatus {
@@ -33,6 +34,9 @@ export function freshnessStatus(f: Freshness): FreshnessStatus {
   }
   if (f.rejected > 0) {
     return { tone: "stale", short: "Too many views", label: "Too many live views on this page; some don't refresh" };
+  }
+  if (f.blocked > 0) {
+    return { tone: "paused", short: "Stopped", label: "A view's request was refused — refresh to retry" };
   }
   if (f.paused) {
     return { tone: "paused", short: "Paused", label: "Paused while rows are selected" };

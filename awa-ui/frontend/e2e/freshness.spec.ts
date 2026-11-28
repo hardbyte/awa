@@ -26,6 +26,19 @@ test.describe("Freshness pill", () => {
     await expect(page.locator("[data-stale]")).toHaveCount(0);
   });
 
+  test("a refused request waits for a refresh without reading as unreachable", async ({ page }) => {
+    await page.route("**/api/**", (route) =>
+      new URL(route.request().url()).pathname === "/api/capabilities"
+        ? route.fallback()
+        : route.fulfill({ status: 400, json: { error: "unknown parameter" } })
+    );
+    await page.goto("/");
+    const pill = page.getByTestId("freshness");
+    await expect(pill).toHaveAttribute("data-tone", "paused", { timeout: 15_000 });
+    await expect(pill).toHaveAccessibleName("A view's request was refused — refresh to retry");
+    await expect(page.locator("[data-stale]")).toHaveCount(0);
+  });
+
   test("the page no longer prints a polling or refresh status line", async ({ page }) => {
     await page.goto("/jobs");
     await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible();

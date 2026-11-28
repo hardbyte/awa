@@ -51,7 +51,7 @@ interface Entry {
 
 /** How current the views on screen are, for the freshness indicator. */
 export interface Freshness {
-  /** Views that refresh by themselves. Not-found views and paused or manual-only ones don't count. */
+  /** Views that refresh by themselves. Not-found, refused, paused and manual-only views don't count. */
   views: number;
   /** Views whose last read failed. */
   failed: number;
@@ -67,6 +67,8 @@ export interface Freshness {
   rejected: number;
   /** Reads stopped after a 401 or 403 until an explicit refresh. */
   halted: boolean;
+  /** Views whose request the server refused (a 4xx other than 404), waiting for an explicit refresh. */
+  blocked: number;
 }
 
 /** Whether a failed read would fail the same way if repeated, so the view
@@ -200,7 +202,9 @@ export class RefreshScheduler {
   freshness(): Freshness {
     const all = [...this.entries.values()].filter(entry => !entry.absent && !(entry.error && entry.missing));
     const paused = all.some(entry => this.paused(entry));
-    const views = all.filter(entry => !this.paused(entry) && !this.representative(entry).manualOnly);
+    const refused = (entry: Entry) => entry.error && entry.blocked;
+    const automatic = all.filter(entry => !this.paused(entry) && !this.representative(entry).manualOnly);
+    const views = automatic.filter(entry => !refused(entry));
     const failed = views.filter(entry => entry.error);
     const loads = views.map(entry => entry.lastSuccess);
     const ageMs = loads.length > 0 && loads.every(at => at !== null)
@@ -215,6 +219,7 @@ export class RefreshScheduler {
       paused,
       rejected: this.rejected,
       halted: this.halted,
+      blocked: automatic.filter(refused).length,
     };
   }
   private eligible(entry: Entry) {

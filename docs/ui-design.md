@@ -181,7 +181,7 @@ The shared `/jobs/:id` detail page also carries DLQ metadata when a job has alre
 
 ## Interaction Patterns
 
-**Data freshness:** Views poll through one scheduler per tab (see [admin observation](admin-observation.md)). A pill in the header says how current the page is: "Live · updated 3s ago" (the age of the least recently loaded view), amber "Last updated 2m ago — reconnecting" while some reads fail, red "Server unreachable" when every read fails, which also dims the page, and "Paused while rows are selected" while a list holds its rows still for a selection. Not-found views don't count as failing. Polling stops while the tab is in the background, and the header's refresh button reads everything again.
+**Data freshness:** Views poll through one scheduler per tab (see [admin observation](admin-observation.md)). A pill in the header says how current the page is: "Live · updated 3s ago" (the age of the least recently loaded view), amber "Last updated 2m ago — reconnecting" while some reads fail, red "Server unreachable" when every read fails, which also dims the page, "Paused while rows are selected" while a list holds its rows still for a selection, and "A view's request was refused — refresh to retry" when the server refused a view's request with a 4xx, which is not retried until a refresh. Not-found and refused views don't count as failing. Polling stops while the tab is in the background, and the header's refresh button reads everything again.
 
 **URL-driven state:** All filters live in URL search params (`/jobs?state=failed&q=kind:send_email`). Back/forward and bookmarks work naturally. The older form `/jobs?state=failed&kind=send_email` is folded into `q`.
 
