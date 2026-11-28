@@ -1,10 +1,15 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
 
 /** Click the first job once the match count, which loads after the list
- * and moves the rows, has rendered. */
+ * and moves the rows, has rendered. The status line above the page can
+ * still appear or go between the click's aim and the press, so a click that
+ * lands beside the row is tried again. */
 async function openFirstJob(page: Page, jobTable: Locator) {
   await expect(page.getByTestId("match-count")).toBeVisible();
-  await jobTable.getByRole("row").nth(1).click();
+  await expect(async () => {
+    await jobTable.getByRole("row").nth(1).click();
+    await expect(page).toHaveURL(/\/jobs\/\d+/, { timeout: 1_000 });
+  }).toPass({ timeout: 10_000 });
 }
 
 test.describe("Job detail page", () => {
